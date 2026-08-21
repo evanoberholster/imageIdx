@@ -64,6 +64,40 @@ func UnionInto(dst []ImageID, indexes ...*BitmapIndex) []ImageID {
 	return dst
 }
 
+// FilterInto appends candidates present in every index to dst. It enters each
+// distinct reader epoch once and supports dst reusing candidates' backing
+// storage, allowing a scheduler to filter an existing candidate slice in
+// place.
+func FilterInto(dst, candidates []ImageID, indexes ...*BitmapIndex) []ImageID {
+	if len(indexes) == 0 {
+		return append(dst, candidates...)
+	}
+	guards := enterEpochs(indexes)
+	defer exitGuards(guards)
+
+	planned := PlanAND(indexes)
+	views := make([]*BitmapIndexView, len(planned))
+	for index, bitmap := range planned {
+		if bitmap == nil || bitmap.closed.Load() {
+			return dst
+		}
+		views[index] = bitmap.view.Load()
+	}
+	for _, id := range candidates {
+		present := true
+		for _, view := range views {
+			if !view.Contains(uint64(id)) {
+				present = false
+				break
+			}
+		}
+		if present {
+			dst = append(dst, id)
+		}
+	}
+	return dst
+}
+
 func enterEpochs(indexes []*BitmapIndex) []ReadGuard {
 	seen := make(map[*Epoch]struct{}, len(indexes))
 	guards := make([]ReadGuard, 0, 1)

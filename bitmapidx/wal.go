@@ -6,6 +6,8 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
@@ -58,10 +60,10 @@ func (w *bitmapWAL) append(key BitmapKey, indexID uint64, mutation BitmapMutatio
 	binary.LittleEndian.PutUint32(header[24:28], uint32(len(mutation.Removals)))
 	binary.LittleEndian.PutUint64(header[32:40], indexID)
 	binary.LittleEndian.PutUint64(header[40:48], key.ValueID)
-	if err := writeFull(w.file, header); err != nil {
+	if err := indexutil.WriteFull(w.file, header); err != nil {
 		return err
 	}
-	if err := writeFull(w.file, payload); err != nil {
+	if err := indexutil.WriteFull(w.file, payload); err != nil {
 		return err
 	}
 	if durability == DurabilitySync {
@@ -127,18 +129,4 @@ func replayBitmapWAL(path string, offset int64) ([]walMutation, error) {
 		}
 		records = append(records, record)
 	}
-}
-
-func writeFull(writer io.Writer, data []byte) error {
-	for len(data) != 0 {
-		n, err := writer.Write(data)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
 }

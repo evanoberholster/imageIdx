@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
@@ -235,32 +237,7 @@ func writeBitmapManifest(dir string, manifest bitmapManifest) error {
 	binary.LittleEndian.PutUint64(data[16:24], uint64(manifest.walOffset))
 	binary.LittleEndian.PutUint64(data[24:32], manifest.count)
 	binary.LittleEndian.PutUint32(data[44:48], crc32.ChecksumIEEE(data[:44]))
-	temporary := filepath.Join(dir, "manifest.tmp")
-	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	if err = writeFull(file, data); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(temporary, filepath.Join(dir, "manifest")); err != nil {
-		return err
-	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	err = directory.Sync()
-	if closeErr := directory.Close(); err == nil {
-		err = closeErr
-	}
-	return err
+	return indexutil.WriteFileAtomic(dir, "manifest.tmp", "manifest", data, 0o644)
 }
 
 func readBitmapManifest(path string) (bitmapManifest, error) {

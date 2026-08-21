@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"sort"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
@@ -70,7 +72,7 @@ func WriteSegment(path string, generation uint64, indexes []*BitmapIndex) error 
 	}()
 
 	directorySize := len(ordered) * segmentEntrySize
-	payloadStart := align(uint64(segmentHeaderSize+directorySize), segmentAlignment)
+	payloadStart := indexutil.Align(uint64(segmentHeaderSize+directorySize), segmentAlignment)
 	if _, err = file.Write(make([]byte, payloadStart)); err != nil {
 		return err
 	}
@@ -87,7 +89,7 @@ func WriteSegment(path string, generation uint64, indexes []*BitmapIndex) error 
 			exitGuards(guards)
 			return seekErr
 		}
-		aligned := align(uint64(offset), segmentAlignment)
+		aligned := indexutil.Align(uint64(offset), segmentAlignment)
 		if padding := int64(aligned) - offset; padding > 0 {
 			if _, err = file.Write(make([]byte, padding)); err != nil {
 				exitGuards(guards)
@@ -259,8 +261,4 @@ func decodeSegmentEntry(src []byte) (BitmapDirectoryEntry, uint32) {
 		Cardinality: binary.LittleEndian.Uint64(src[24:32]), Offset: binary.LittleEndian.Uint64(src[32:40]),
 		Length: binary.LittleEndian.Uint32(src[40:44]), Generation: binary.LittleEndian.Uint64(src[48:56]),
 	}, binary.LittleEndian.Uint32(src[56:60])
-}
-
-func align(value uint64, alignment uint64) uint64 {
-	return (value + alignment - 1) &^ (alignment - 1)
 }

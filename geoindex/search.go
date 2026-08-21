@@ -1,6 +1,9 @@
 package geoindex
 
-import "github.com/golang/geo/s2"
+import (
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/golang/geo/s2"
+)
 
 func (g *GeoIndex) CoverRegion(region s2.Region) ([]S2KeyRange, error) {
 	if region == nil {
@@ -63,6 +66,20 @@ func (g *GeoIndex) SearchRanges(dst []ImageID, ranges []S2KeyRange) []ImageID {
 	}
 	guard.Exit()
 	return dst
+}
+
+// EstimateRanges returns the number of candidates in the currently published
+// sparse and bitmap partitions for ranges. It reads cardinalities only and is
+// intended for cross-index query planning.
+func (g *GeoIndex) EstimateRanges(ranges []S2KeyRange) uint64 {
+	ranges = NormalizeRanges(ranges)
+	guard := g.config.Epoch.Enter()
+	defer guard.Exit()
+	if g.closed.Load() {
+		return 0
+	}
+	view := g.view.Load()
+	return indexutil.SaturatingAdd(view.Sparse.estimateRanges(ranges), view.Bitmap.estimateRanges(ranges))
 }
 
 func (g *GeoIndex) All(dst []ImageID) []ImageID {

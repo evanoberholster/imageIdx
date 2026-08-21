@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexView) error {
@@ -25,13 +26,13 @@ func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexVie
 
 	sparseKeysOffset := uint64(geoHeaderSize)
 	sparseKeysLength := uint64(len(view.Sparse.keys)) * 8
-	sparseValuesOffset := align(sparseKeysOffset+sparseKeysLength, 8)
+	sparseValuesOffset := indexutil.Align(sparseKeysOffset+sparseKeysLength, 8)
 	sparseValuesLength := uint64(len(view.Sparse.imageIDs)) * 8
-	bitmapKeysOffset := align(sparseValuesOffset+sparseValuesLength, 8)
+	bitmapKeysOffset := indexutil.Align(sparseValuesOffset+sparseValuesLength, 8)
 	bitmapKeysLength := uint64(len(view.Bitmap.keys)) * 8
-	bitmapMetaOffset := align(bitmapKeysOffset+bitmapKeysLength, 8)
+	bitmapMetaOffset := indexutil.Align(bitmapKeysOffset+bitmapKeysLength, 8)
 	bitmapMetaLength := uint64(len(view.Bitmap.keys)) * geoBitmapMetaSize
-	bitmapDataOffset := align(bitmapMetaOffset+bitmapMetaLength, geoStorageAlignment)
+	bitmapDataOffset := indexutil.Align(bitmapMetaOffset+bitmapMetaLength, geoStorageAlignment)
 	if err = file.Truncate(int64(bitmapDataOffset)); err != nil {
 		return err
 	}
@@ -53,7 +54,7 @@ func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexVie
 	dataHash := crc32.NewIEEE()
 	dataLength := uint64(0)
 	for index, bitmap := range view.Bitmap.bitmaps {
-		aligned := align(dataLength, 8)
+		aligned := indexutil.Align(dataLength, 8)
 		if padding := aligned - dataLength; padding != 0 {
 			zeros := make([]byte, padding)
 			if _, err = file.WriteAt(zeros, int64(bitmapDataOffset+dataLength)); err != nil {
@@ -147,19 +148,19 @@ func readGeoGeneration(path string, config Config) (*GeoIndex, uint64, error) {
 	bitmapMetaOffset := binary.LittleEndian.Uint64(header[80:88])
 	bitmapDataOffset := binary.LittleEndian.Uint64(header[88:96])
 	bitmapDataLength := binary.LittleEndian.Uint64(header[96:104])
-	sparseKeysEnd, ok := checkedEnd(sparseKeysOffset, sparseCount, 8, uint64(len(mapping)))
+	sparseKeysEnd, ok := indexutil.CheckedEnd(sparseKeysOffset, sparseCount, 8, uint64(len(mapping)))
 	if !ok {
 		return fail(ErrCorruptStorage)
 	}
-	sparseValuesEnd, ok := checkedEnd(sparseValuesOffset, sparseCount, GeoSparseSlots*8, uint64(len(mapping)))
+	sparseValuesEnd, ok := indexutil.CheckedEnd(sparseValuesOffset, sparseCount, GeoSparseSlots*8, uint64(len(mapping)))
 	if !ok {
 		return fail(ErrCorruptStorage)
 	}
-	bitmapKeysEnd, ok := checkedEnd(bitmapKeysOffset, bitmapCount, 8, uint64(len(mapping)))
+	bitmapKeysEnd, ok := indexutil.CheckedEnd(bitmapKeysOffset, bitmapCount, 8, uint64(len(mapping)))
 	if !ok {
 		return fail(ErrCorruptStorage)
 	}
-	bitmapMetaEnd, ok := checkedEnd(bitmapMetaOffset, bitmapCount, geoBitmapMetaSize, uint64(len(mapping)))
+	bitmapMetaEnd, ok := indexutil.CheckedEnd(bitmapMetaOffset, bitmapCount, geoBitmapMetaSize, uint64(len(mapping)))
 	if !ok || bitmapDataOffset+bitmapDataLength < bitmapDataOffset || bitmapDataOffset+bitmapDataLength > uint64(len(mapping)) {
 		return fail(ErrCorruptStorage)
 	}
@@ -276,14 +277,6 @@ func safeBitmapFromBuffer(data []byte) (result bitmapidx.BitmapRef, err error) {
 	return result, nil
 }
 
-func checkedEnd(offset, count, stride, limit uint64) (uint64, bool) {
-	if count != 0 && stride > (^uint64(0)-offset)/count {
-		return 0, false
-	}
-	end := offset + count*stride
-	return end, end >= offset && end <= limit
-}
-
 func writeS2KeysAt(file *os.File, offset uint64, keys []S2Key) (uint32, error) {
 	hasher := crc32.NewIEEE()
 	buffer := make([]byte, 64*1024)
@@ -323,8 +316,6 @@ func writeUint64At(file *os.File, offset uint64, values []uint64) (uint32, error
 	}
 	return hasher.Sum32(), nil
 }
-
-func align(value, alignment uint64) uint64 { return (value + alignment - 1) &^ (alignment - 1) }
 
 func geoGenerationPath(dir string, generation uint64) string {
 	return filepath.Join(dir, fmt.Sprintf("geo-%020d.base", generation))

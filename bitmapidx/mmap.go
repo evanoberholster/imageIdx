@@ -1,29 +1,17 @@
 package bitmapidx
 
 import (
-	"os"
-	"syscall"
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 func mmapFile(path string) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() == 0 {
+	data, err := indexutil.MmapFile(path)
+	if err == nil && len(data) == 0 {
 		return nil, ErrCorruptSegment
 	}
-	return syscall.Mmap(int(file.Fd()), 0, int(info.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+	return data, err
 }
 
 func unmapFile(data []byte) error {
-	if len(data) == 0 {
-		return nil
-	}
-	return syscall.Munmap(data)
+	return indexutil.UnmapFile(data)
 }

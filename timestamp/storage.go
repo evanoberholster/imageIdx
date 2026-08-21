@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
@@ -308,7 +310,7 @@ func alignFile(file *os.File) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	aligned := (offset + storageAlignment - 1) &^ (storageAlignment - 1)
+	aligned := int64(indexutil.Align(uint64(offset), storageAlignment))
 	if padding := aligned - offset; padding != 0 {
 		zeros := make([]byte, padding)
 		if _, err = file.Write(zeros); err != nil {
@@ -421,32 +423,7 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 
 func writeManifestAtomic(dir string, manifest diskManifest) error {
 	data := encodeManifest(manifest)
-	temporary := filepath.Join(dir, "manifest.tmp")
-	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err = file.Write(data); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(temporary, filepath.Join(dir, "manifest")); err != nil {
-		return err
-	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	err = directory.Sync()
-	if closeErr := directory.Close(); err == nil {
-		err = closeErr
-	}
-	return err
+	return indexutil.WriteFileAtomicOnce(dir, "manifest.tmp", "manifest", data, 0o644)
 }
 
 func encodeManifest(manifest diskManifest) []byte {

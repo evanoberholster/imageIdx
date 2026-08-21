@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sort"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
@@ -64,10 +66,10 @@ func (w *geoWAL) append(mutations map[uint64]pendingMutation, durability Durabil
 		_, _ = w.file.Seek(0, io.SeekEnd)
 		return writeErr
 	}
-	if err := writeFull(w.file, header); err != nil {
+	if err := indexutil.WriteFull(w.file, header); err != nil {
 		return rollback(err)
 	}
-	if err := writeFull(w.file, payload); err != nil {
+	if err := indexutil.WriteFull(w.file, payload); err != nil {
 		return rollback(err)
 	}
 	if durability == DurabilitySync {
@@ -139,18 +141,4 @@ func replayGeoWAL(path string, offset int64) ([]map[uint64]pendingMutation, erro
 		}
 		batches = append(batches, batch)
 	}
-}
-
-func writeFull(writer io.Writer, data []byte) error {
-	for len(data) != 0 {
-		n, err := writer.Write(data)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
 }

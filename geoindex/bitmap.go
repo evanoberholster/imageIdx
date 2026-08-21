@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 type GeoBitmapMeta struct {
@@ -59,6 +60,21 @@ func (b GeoBitmapRef) SearchRanges(dst []ImageID, ranges []S2KeyRange) []ImageID
 		}
 	}
 	return dst
+}
+
+func (b GeoBitmapRef) estimateRanges(ranges []S2KeyRange) uint64 {
+	var count uint64
+	keyIndex := 0
+	for _, keyRange := range ranges {
+		if keyIndex < len(b.keys) && b.keys[keyIndex] < keyRange.Start {
+			keyIndex += lowerBound(b.keys[keyIndex:], keyRange.Start)
+		}
+		for keyIndex < len(b.keys) && b.keys[keyIndex] <= keyRange.End {
+			count = indexutil.SaturatingAdd(count, b.bitmaps[keyIndex].Cardinality())
+			keyIndex++
+		}
+	}
+	return count
 }
 
 func buildBitmap(cells map[S2Key][]uint64) GeoBitmapRef {

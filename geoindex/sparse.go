@@ -1,6 +1,10 @@
 package geoindex
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
+)
 
 type GeoSparseRef struct {
 	keys     []S2Key
@@ -44,6 +48,27 @@ func (s GeoSparseRef) SearchRanges(dst []ImageID, ranges []S2KeyRange) []ImageID
 		}
 	}
 	return dst
+}
+
+func (s GeoSparseRef) estimateRanges(ranges []S2KeyRange) uint64 {
+	var count uint64
+	keyIndex := 0
+	for _, keyRange := range ranges {
+		if keyIndex < len(s.keys) && s.keys[keyIndex] < keyRange.Start {
+			keyIndex += lowerBound(s.keys[keyIndex:], keyRange.Start)
+		}
+		for keyIndex < len(s.keys) && s.keys[keyIndex] <= keyRange.End {
+			offset := keyIndex * GeoSparseSlots
+			for _, id := range s.imageIDs[offset : offset+GeoSparseSlots] {
+				if id == 0 {
+					break
+				}
+				count = indexutil.SaturatingAdd(count, 1)
+			}
+			keyIndex++
+		}
+	}
+	return count
 }
 
 func appendSparseIDs(dst []ImageID, values []uint64) []ImageID {

@@ -1,5 +1,7 @@
 package timestamp
 
+import "github.com/evanoberholster/imageIdx/internal/indexutil"
+
 type ExactTimestampFunc func(ImageID) (uint64, bool)
 
 // Search appends compressed-index candidates for [start, end) to dst. The
@@ -55,6 +57,61 @@ func (i *Index) SearchExact(dst []ImageID, start, end uint64, lookup ExactTimest
 	}
 	i.epoch.exit(epoch)
 	return dst
+}
+
+// EstimateRange returns an upper bound for compressed-index candidates in
+// [start, end). It inspects marker counts but does not materialize ImageIDs,
+// making it suitable for cross-index query planning. Delta deletes and repeated
+// updates may make the estimate larger than the eventual result.
+func (i *Index) EstimateRange(start, end uint64) uint64 {
+	lo, hi, ok := markerRange(start, end, i.offset)
+	if !ok {
+		return 0
+	}
+	epoch := i.epoch.enter()
+	defer i.epoch.exit(epoch)
+	if i.closed.Load() {
+		return 0
+	}
+	directory := i.directory.Load()
+	var estimate uint64
+	first := directory.firstOverlapping(lo)
+	for index := first; index < len(directory.entries); index++ {
+		entry := &directory.entries[index]
+		if entry.startMarker >= hi {
+			break
+		}
+		estimate = indexutil.SaturatingAdd(estimate, estimateBlock(entry.block.view.Load(), lo, hi))
+	}
+	return estimate
+}
+
+func estimateBlock(view *TimestampBlockView, lo, hi uint64) uint64 {
+	active := view.Active
+	for {
+		version := active.stableVersion()
+		baseStart, baseEnd := view.Base.rangeIndexes(lo, hi)
+		estimate := uint64(baseEnd - baseStart)
+		if view.Frozen != nil {
+			estimate = indexutil.SaturatingAdd(estimate, estimateDelta(view.Frozen, lo, hi))
+		}
+		estimate = indexutil.SaturatingAdd(estimate, estimateDelta(active, lo, hi))
+		if active.version.Load() == version {
+			return estimate
+		}
+	}
+}
+
+func estimateDelta(delta *TimestampDelta, lo, hi uint64) uint64 {
+	var estimate uint64
+	count := int(delta.addCount.Load())
+	for index := 0; index < count; index++ {
+		marker := uint64(delta.AddMarkers[index])
+		if marker >= lo && marker < hi {
+			estimate++
+		}
+	}
+	return estimate
 }
 
 func searchBlock(
