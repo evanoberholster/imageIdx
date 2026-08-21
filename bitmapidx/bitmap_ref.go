@@ -34,6 +34,13 @@ func bitmapRefFromMappedBuffer(buffer []byte) BitmapRef {
 	return BitmapRef{bitmap: sroar.FromBuffer(buffer), backing: buffer}
 }
 
+// BitmapRefFromBuffer creates an immutable view over a serialized sroar
+// buffer. The caller must keep the buffer contents unchanged for the returned
+// reference's lifetime. This is intended for mmap-backed sibling indexes.
+func BitmapRefFromBuffer(buffer []byte) BitmapRef {
+	return bitmapRefFromMappedBuffer(buffer)
+}
+
 func (r BitmapRef) valid() bool { return r.bitmap != nil }
 
 func (r BitmapRef) Contains(id uint64) bool {
@@ -54,6 +61,26 @@ func (r BitmapRef) ToArray() []uint64 {
 		return nil
 	}
 	return r.bitmap.ToArray()
+}
+
+// AppendTo emits IDs through the representation boundary. The current sroar
+// iterator materializes internally; future bitmap kernels can remove that cost
+// without changing sibling index packages.
+func (r BitmapRef) AppendTo(dst []ImageID) []ImageID {
+	if r.bitmap == nil {
+		return dst
+	}
+	iterator := r.bitmap.ManyIterator()
+	var buffer [256]uint64
+	for {
+		count := iterator.NextMany(buffer[:])
+		for _, id := range buffer[:count] {
+			dst = append(dst, ImageID(id))
+		}
+		if count != len(buffer) {
+			return dst
+		}
+	}
 }
 
 // MarshalBinary returns an owned serialized sroar image.

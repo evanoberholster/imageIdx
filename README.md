@@ -75,3 +75,37 @@ if err := paris.Add([]uint64{300, 400}); err != nil {
 }
 matches := paris.Search(nil)
 ```
+
+## Geographic index
+
+The `geoindex` package stores one coordinate per image in fixed S2 level-16
+cells. Cells with up to four images use a fixed-width sparse SoA layout; denser
+cells reuse immutable `bitmapidx.BitmapRef` values. Searches load one atomic
+generation and never inspect writer-side mutations.
+
+```go
+geo, err := geoindex.New(1, []geoindex.GeoEntry{
+	{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
+}, geoindex.Config{})
+if err != nil {
+	log.Fatal(err)
+}
+defer geo.Close()
+
+// Small writes become visible at the configured threshold or timer. Flush is
+// available when the caller needs an explicit visibility boundary.
+if err := geo.AddBatch([]geoindex.GeoEntry{
+	{ImageID: 200, Latitude: 34.0522, Longitude: -118.2437},
+}); err != nil {
+	log.Fatal(err)
+}
+if err := geo.Flush(); err != nil {
+	log.Fatal(err)
+}
+
+candidates := geo.SearchBounds(nil, 37.7, -122.5, 37.9, -122.3, nil)
+```
+
+Geo persistence uses checksummed, mmap-oriented generation files, an atomic
+manifest, and a global batch WAL through `geoindex.NewPersistent` and
+`geoindex.OpenPersistent`.
