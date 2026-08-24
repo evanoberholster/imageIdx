@@ -2,12 +2,12 @@ package timestamp
 
 import "sort"
 
-type TimestampBase struct {
-	Markers  []Timemarker
-	ImageIDs []ImageID
+type base struct {
+	markers  []timemarker
+	imageIDs []ImageID
 }
 
-func NewTimestampBase(markers []Timemarker, imageIDs []ImageID) (*TimestampBase, error) {
+func newBase(markers []timemarker, imageIDs []ImageID) (*base, error) {
 	if len(markers) != len(imageIDs) {
 		return nil, ErrInvalidBase
 	}
@@ -16,25 +16,25 @@ func NewTimestampBase(markers []Timemarker, imageIDs []ImageID) (*TimestampBase,
 			return nil, ErrInvalidBase
 		}
 	}
-	return &TimestampBase{Markers: markers, ImageIDs: imageIDs}, nil
+	return &base{markers: markers, imageIDs: imageIDs}, nil
 }
 
-func (b *TimestampBase) Len() int {
+func (b *base) len() int {
 	if b == nil {
 		return 0
 	}
-	return len(b.Markers)
+	return len(b.markers)
 }
 
-func (b *TimestampBase) rangeIndexes(lo, hi uint64) (int, int) {
+func (b *base) rangeIndexes(lo, hi uint64) (int, int) {
 	if b == nil || lo >= hi {
 		return 0, 0
 	}
-	start := sort.Search(len(b.Markers), func(i int) bool {
-		return uint64(b.Markers[i]) >= lo
+	start := sort.Search(len(b.markers), func(i int) bool {
+		return uint64(b.markers[i]) >= lo
 	})
-	end := sort.Search(len(b.Markers), func(i int) bool {
-		return uint64(b.Markers[i]) >= hi
+	end := sort.Search(len(b.markers), func(i int) bool {
+		return uint64(b.markers[i]) >= hi
 	})
 	return start, end
 }

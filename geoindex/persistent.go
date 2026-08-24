@@ -3,16 +3,25 @@ package geoindex
 import (
 	"os"
 	"path/filepath"
+	"sync"
 )
 
-func NewPersistent(dir string, indexID uint64, entries []GeoEntry, config Config, durability Durability) (*GeoIndex, error) {
+type persistentState struct {
+	mu                sync.Mutex
+	dir               string
+	durability        Durability
+	wal               *geoWAL
+	storageGeneration uint64
+}
+
+func NewPersistent(dir string, spec Spec, config Config, durability Durability) (*Index, error) {
 	if durability > DurabilitySync {
 		return nil, ErrInvalidConfig
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	index, err := New(indexID, entries, config)
+	index, err := New(spec, config)
 	if err != nil {
 		return nil, err
 	}
@@ -21,9 +30,7 @@ func NewPersistent(dir string, indexID uint64, entries []GeoEntry, config Config
 		_ = index.Close()
 		return nil, err
 	}
-	index.storeDir = dir
-	index.durability = durability
-	index.wal = wal
+	index.persistence = &persistentState{dir: dir, durability: durability, wal: wal}
 	if err = index.Checkpoint(); err != nil {
 		_ = index.Close()
 		return nil, err
@@ -31,7 +38,7 @@ func NewPersistent(dir string, indexID uint64, entries []GeoEntry, config Config
 	return index, nil
 }
 
-func OpenPersistent(dir string, config Config, durability Durability) (*GeoIndex, error) {
+func OpenPersistent(dir string, config Config, durability Durability) (*Index, error) {
 	if durability > DurabilitySync {
 		return nil, ErrInvalidConfig
 	}
@@ -47,7 +54,7 @@ func OpenPersistent(dir string, config Config, durability Durability) (*GeoIndex
 	if err != nil {
 		return nil, err
 	}
-	if storageGeneration != manifest.storageGeneration || index.IndexID() != manifest.indexID {
+	if storageGeneration != manifest.storageGeneration || index.Metadata().IndexID != manifest.indexID {
 		_ = index.Close()
 		return nil, ErrCorruptManifest
 	}
@@ -56,14 +63,13 @@ func OpenPersistent(dir string, config Config, durability Durability) (*GeoIndex
 		_ = index.Close()
 		return nil, err
 	}
-	index.writerMu.Lock()
 	for _, batch := range batches {
-		for id, mutation := range batch {
-			index.pending[id] = mutation
+		if err = index.Apply(batch); err != nil {
+			_ = index.Close()
+			return nil, ErrCorruptWAL
 		}
 	}
-	err = index.flushLocked()
-	index.writerMu.Unlock()
+	err = index.Flush()
 	if err != nil {
 		_ = index.Close()
 		return nil, err
@@ -73,62 +79,64 @@ func OpenPersistent(dir string, config Config, durability Durability) (*GeoIndex
 		_ = index.Close()
 		return nil, err
 	}
-	index.storeDir = dir
-	index.durability = durability
-	index.wal = wal
-	index.storeGeneration = storageGeneration
+	index.persistence = &persistentState{
+		dir: dir, durability: durability, wal: wal, storageGeneration: storageGeneration,
+	}
 	return index, nil
 }
 
-func (g *GeoIndex) Checkpoint() error {
-	g.persistenceMu.Lock()
-	defer g.persistenceMu.Unlock()
+func (g *Index) Checkpoint() error {
+	if g.persistence == nil {
+		return ErrNotPersistent
+	}
+	g.persistence.mu.Lock()
+	defer g.persistence.mu.Unlock()
 	g.writerMu.Lock()
 	defer g.writerMu.Unlock()
 	if g.closed.Load() {
 		return ErrClosed
 	}
-	if g.wal == nil || g.storeDir == "" {
+	if g.persistence.wal == nil || g.persistence.dir == "" {
 		return ErrNotPersistent
 	}
 	if err := g.flushLocked(); err != nil {
 		return err
 	}
-	offset, err := g.wal.offset()
+	offset, err := g.persistence.wal.offset()
 	if err != nil {
 		return err
 	}
-	storageGeneration := g.storeGeneration + 1
-	finalPath := geoGenerationPath(g.storeDir, storageGeneration)
+	storageGeneration := g.persistence.storageGeneration + 1
+	finalPath := geoGenerationPath(g.persistence.dir, storageGeneration)
 	temporary := finalPath + ".tmp"
-	guard := g.config.Epoch.Enter()
+	token := g.readers.Acquire()
 	err = writeGeoGeneration(temporary, storageGeneration, g.view.Load())
-	guard.Exit()
+	g.readers.Release(token)
 	if err != nil {
 		return err
 	}
 	if err = os.Rename(temporary, finalPath); err != nil {
 		return err
 	}
-	if err = writeGeoManifest(g.storeDir, geoManifest{
-		storageGeneration: storageGeneration, walOffset: offset, indexID: g.IndexID(),
+	if err = writeGeoManifest(g.persistence.dir, geoManifest{
+		storageGeneration: storageGeneration, walOffset: offset, indexID: g.Metadata().IndexID,
 	}); err != nil {
 		return err
 	}
-	g.storeGeneration = storageGeneration
+	g.persistence.storageGeneration = storageGeneration
 	return nil
 }
 
-func (g *GeoIndex) Vacuum() error {
+func (g *Index) Vacuum() error {
 	if err := g.Checkpoint(); err != nil {
 		return err
 	}
-	g.config.Epoch.Synchronize()
-	paths, err := filepath.Glob(filepath.Join(g.storeDir, "geo-*.base"))
+	g.readers.WaitForPriorReaders()
+	paths, err := filepath.Glob(filepath.Join(g.persistence.dir, "geo-*.base"))
 	if err != nil {
 		return err
 	}
-	current := geoGenerationPath(g.storeDir, g.storeGeneration)
+	current := geoGenerationPath(g.persistence.dir, g.persistence.storageGeneration)
 	for _, path := range paths {
 		if path != current {
 			if err = os.Remove(path); err != nil && !os.IsNotExist(err) {

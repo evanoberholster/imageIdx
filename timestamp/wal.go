@@ -36,7 +36,7 @@ func openTimestampWAL(path string, batchCapacity int) (*timestampWAL, error) {
 	}, nil
 }
 
-func (w *timestampWAL) appendBatch(writes []TimestampWrite, durability Durability) error {
+func (w *timestampWAL) appendBatch(writes []write, durability Durability) error {
 	if len(writes) == 0 {
 		return nil
 	}
@@ -55,9 +55,9 @@ func (w *timestampWAL) appendBatch(writes []TimestampWrite, durability Durabilit
 	binary.LittleEndian.PutUint32(record[8:12], uint32(len(writes)*walWriteSize))
 	for index, write := range writes {
 		offset := walHeaderSize + index*walWriteSize
-		binary.LittleEndian.PutUint64(record[offset:offset+8], write.Timestamp)
-		binary.LittleEndian.PutUint64(record[offset+8:offset+16], uint64(write.ImageID))
-		record[offset+16] = byte(write.Op)
+		binary.LittleEndian.PutUint64(record[offset:offset+8], write.timestamp)
+		binary.LittleEndian.PutUint64(record[offset+8:offset+16], uint64(write.imageID))
+		record[offset+16] = byte(write.op)
 		clear(record[offset+17 : offset+walWriteSize])
 	}
 	binary.LittleEndian.PutUint32(record[12:16], crc32.ChecksumIEEE(record[walHeaderSize:]))
@@ -80,7 +80,7 @@ func (w *timestampWAL) offset() (int64, error) {
 
 func (w *timestampWAL) close() error { return w.file.Close() }
 
-func replayWAL(path string, offset int64) ([]TimestampWrite, error) {
+func replayWAL(path string, offset int64) ([]write, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -93,7 +93,7 @@ func replayWAL(path string, offset int64) ([]TimestampWrite, error) {
 		return nil, err
 	}
 
-	var writes []TimestampWrite
+	var writes []write
 	header := make([]byte, walHeaderSize)
 	for {
 		_, err = io.ReadFull(file, header)
@@ -125,14 +125,14 @@ func replayWAL(path string, offset int64) ([]TimestampWrite, error) {
 		}
 		for index := 0; index < count; index++ {
 			position := index * walWriteSize
-			op := WriteOp(payload[position+16])
-			if op != WriteAdd && op != WriteDelete {
+			op := writeOp(payload[position+16])
+			if op != writeAdd && op != writeDelete {
 				return nil, ErrCorruptWAL
 			}
-			writes = append(writes, TimestampWrite{
-				Timestamp: binary.LittleEndian.Uint64(payload[position : position+8]),
-				ImageID:   ImageID(binary.LittleEndian.Uint64(payload[position+8 : position+16])),
-				Op:        op,
+			writes = append(writes, write{
+				timestamp: binary.LittleEndian.Uint64(payload[position : position+8]),
+				imageID:   ImageID(binary.LittleEndian.Uint64(payload[position+8 : position+16])),
+				op:        op,
 			})
 		}
 	}

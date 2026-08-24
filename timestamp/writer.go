@@ -7,37 +7,120 @@ type barrierResult struct {
 	err       error
 }
 
-type TimestampWriteBatch struct {
-	Writes []TimestampWrite
+type mutationKind uint8
+
+const (
+	mutationInsert mutationKind = iota + 1
+	mutationDelete
+	mutationMove
+)
+
+// Mutation is one logical timestamp insertion, deletion, or move. Constructors
+// keep the discriminator private so invalid combinations cannot be built.
+type Mutation struct {
+	imageID ImageID
+	from    uint64
+	to      uint64
+	kind    mutationKind
+}
+
+// Insert creates a mutation for an image absent from the timestamp index.
+func Insert(imageID ImageID, timestamp uint64) Mutation {
+	return Mutation{imageID: imageID, to: timestamp, kind: mutationInsert}
+}
+
+// Delete creates a mutation that removes an image at its canonical timestamp.
+func Delete(imageID ImageID, timestamp uint64) Mutation {
+	return Mutation{imageID: imageID, from: timestamp, kind: mutationDelete}
+}
+
+// Move creates one logical mutation that removes from and inserts at to.
+func Move(imageID ImageID, from, to uint64) Mutation {
+	return Mutation{imageID: imageID, from: from, to: to, kind: mutationMove}
+}
+
+type writeOp uint8
+
+const (
+	writeAdd writeOp = iota + 1
+	writeDelete
+)
+
+type write struct {
+	timestamp uint64
+	imageID   ImageID
+	op        writeOp
+}
+
+// Batch is reusable writer-owned storage for logical mutations. It is not
+// safe for concurrent use and cannot be changed while Apply is in flight.
+type Batch struct {
+	writes    []write
+	mutations int
+	capacity  int
 
 	done     chan error
 	inFlight atomic.Bool
 }
 
-func NewWriteBatch(capacity int) *TimestampWriteBatch {
-	return &TimestampWriteBatch{
-		Writes: make([]TimestampWrite, 0, capacity),
-		done:   make(chan error, 1),
+// NewBatch allocates capacity for logical mutations. Moves expand to two
+// private writes without growing the batch.
+func NewBatch(capacity int) *Batch {
+	if capacity < 0 {
+		capacity = 0
+	}
+	return &Batch{
+		writes:   make([]write, 0, capacity*2),
+		capacity: capacity,
+		done:     make(chan error, 1),
 	}
 }
 
-func (b *TimestampWriteBatch) Append(write TimestampWrite) bool {
-	if len(b.Writes) == cap(b.Writes) || b.inFlight.Load() {
+// Append adds one logical mutation without growing the batch. It returns false
+// for an invalid mutation, a full batch, or a batch currently in flight.
+func (b *Batch) Append(mutation Mutation) bool {
+	if b == nil || b.mutations == b.capacity || b.inFlight.Load() {
 		return false
 	}
-	b.Writes = append(b.Writes, write)
+	switch mutation.kind {
+	case mutationInsert:
+		b.writes = append(b.writes, write{timestamp: mutation.to, imageID: mutation.imageID, op: writeAdd})
+	case mutationDelete:
+		b.writes = append(b.writes, write{timestamp: mutation.from, imageID: mutation.imageID, op: writeDelete})
+	case mutationMove:
+		b.writes = append(b.writes,
+			write{timestamp: mutation.from, imageID: mutation.imageID, op: writeDelete},
+			write{timestamp: mutation.to, imageID: mutation.imageID, op: writeAdd},
+		)
+	default:
+		return false
+	}
+	b.mutations++
 	return true
 }
 
-func (b *TimestampWriteBatch) Reset() bool {
-	if b.inFlight.Load() {
+// Reset clears accepted mutations while retaining storage. It returns false
+// while the batch is in flight.
+func (b *Batch) Reset() bool {
+	if b == nil || b.inFlight.Load() {
 		return false
 	}
-	b.Writes = b.Writes[:0]
+	b.writes = b.writes[:0]
+	b.mutations = 0
 	return true
 }
 
-func (i *Index) Submit(batch *TimestampWriteBatch) error {
+// Len reports the number of logical mutations, counting a move once.
+func (b *Batch) Len() int {
+	if b == nil {
+		return 0
+	}
+	return b.mutations
+}
+
+// Apply sends one reusable batch through the single-owner writer and waits for
+// its atomic acceptance or rejection.
+func (i *Index) Apply(batch *Batch) error {
 	i.lifecycle.RLock()
 	defer i.lifecycle.RUnlock()
 	if batch == nil || batch.done == nil {
@@ -87,13 +170,13 @@ func (i *Index) writerLoop() {
 				batch.done <- ErrClosed
 				continue
 			}
-			rotations, err := i.applyBatch(batch.Writes)
+			rotations, err := i.applyBatch(batch.writes)
 			outstanding += rotations
 			batch.done <- err
 		case response := <-i.barriers:
 			var result barrierResult
-			if i.wal != nil {
-				result.walOffset, result.err = i.wal.offset()
+			if i.persistence != nil && i.persistence.wal != nil {
+				result.walOffset, result.err = i.persistence.wal.offset()
 			}
 			response <- result
 		case result := <-i.compactDone:
@@ -108,18 +191,18 @@ func (i *Index) writerLoop() {
 	}
 }
 
-func (i *Index) applyBatch(writes []TimestampWrite) (int, error) {
+func (i *Index) applyBatch(writes []write) (int, error) {
 	if len(writes) == 0 {
 		return 0, nil
 	}
 	directory := i.directory.Load()
 	i.writerTouched = i.writerTouched[:0]
 	for _, write := range writes {
-		if write.Op != WriteAdd && write.Op != WriteDelete {
+		if write.op != writeAdd && write.op != writeDelete {
 			i.clearWriterNeeds()
-			return 0, ErrInvalidWrite
+			return 0, ErrInvalidMutation
 		}
-		marker, err := EncodeTimemarkerChecked(write.Timestamp, i.offset)
+		marker, err := encodeTimemarkerChecked(write.timestamp, i.offset)
 		if err != nil {
 			i.clearWriterNeeds()
 			return 0, err
@@ -139,13 +222,13 @@ func (i *Index) applyBatch(writes []TimestampWrite) (int, error) {
 		}
 		block := directory.entries[blockIndex].block
 		view := block.view.Load()
-		if needed > view.Active.remaining() && (view.Frozen != nil || block.spare == nil) {
+		if needed > view.active.remaining() && (view.frozen != nil || block.spare == nil) {
 			i.clearWriterNeeds()
 			return 0, ErrBackpressure
 		}
 	}
-	if i.wal != nil {
-		if err := i.wal.appendBatch(writes, i.config.Durability); err != nil {
+	if i.persistence != nil && i.persistence.wal != nil {
+		if err := i.persistence.wal.appendBatch(writes, i.persistence.durability); err != nil {
 			i.clearWriterNeeds()
 			return 0, err
 		}
@@ -155,20 +238,20 @@ func (i *Index) applyBatch(writes []TimestampWrite) (int, error) {
 	for _, blockIndex := range i.writerTouched {
 		block := directory.entries[blockIndex].block
 		view := block.view.Load()
-		if i.writerNeeds[blockIndex] > view.Active.remaining() {
+		if i.writerNeeds[blockIndex] > view.active.remaining() {
 			i.rotateBlock(block, view)
 			rotations++
 		}
 	}
 
 	for _, write := range writes {
-		marker, _ := EncodeTimemarkerChecked(write.Timestamp, i.offset)
+		marker, _ := encodeTimemarkerChecked(write.timestamp, i.offset)
 		block := directory.entries[directory.blockFor(uint64(marker))].block
-		active := block.view.Load().Active
-		if write.Op == WriteAdd {
-			active.appendAdd(marker, write.ImageID)
+		active := block.view.Load().active
+		if write.op == writeAdd {
+			active.appendAdd(marker, write.imageID)
 		} else {
-			active.appendDelete(write.ImageID)
+			active.appendDelete(write.imageID)
 		}
 	}
 	i.clearWriterNeeds()
@@ -182,16 +265,16 @@ func (i *Index) clearWriterNeeds() {
 	i.writerTouched = i.writerTouched[:0]
 }
 
-func (i *Index) rotateBlock(block *TimestampBlock, expected *TimestampBlockView) {
+func (i *Index) rotateBlock(block *block, expected *blockView) {
 	newActive := block.spare
 	block.spare = nil
-	view := &TimestampBlockView{
-		Base:       expected.Base,
-		Frozen:     expected.Active,
-		Active:     newActive,
-		Generation: expected.Generation + 1,
+	view := &blockView{
+		base:       expected.base,
+		frozen:     expected.active,
+		active:     newActive,
+		generation: expected.generation + 1,
 	}
 	block.view.Store(view)
 	i.pending.Add(1)
-	i.compactions <- compactionTask{block: block, expected: view, frozen: expected.Active}
+	i.compactions <- compactionTask{block: block, expected: view, frozen: expected.active}
 }

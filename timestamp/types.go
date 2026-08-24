@@ -5,19 +5,19 @@ package timestamp
 import (
 	"errors"
 	"math"
+
+	imageidx "github.com/evanoberholster/imageIdx"
 )
 
-type ImageID uint64
+type ImageID = imageidx.ImageID
 
-type Timemarker uint32
+type timemarker uint32
 
 const TimestampShift uint8 = 24
 
 const (
-	TimestampIndexMagic   uint32 = 0x54534958 // TSIX
-	TimestampIndexVersion uint16 = 1
-	DefaultBlockSize             = 65_536
-	DefaultDeltaCapacity         = 2_048
+	DefaultBlockSize     = 65_536
+	DefaultDeltaCapacity = 2_048
 )
 
 var (
@@ -28,50 +28,28 @@ var (
 	ErrDuplicateImageID   = errors.New("timestamp: duplicate image ID")
 	ErrInvalidBase        = errors.New("timestamp: invalid base arrays")
 	ErrInvalidConfig      = errors.New("timestamp: invalid configuration")
+	ErrInvalidMutation    = errors.New("timestamp: invalid mutation")
 	ErrInvalidRange       = errors.New("timestamp: timestamp cannot be represented by this index")
-	ErrInvalidWrite       = errors.New("timestamp: invalid write operation")
-	ErrUninitializedBatch = errors.New("timestamp: write batch was not created with NewWriteBatch")
+	ErrNotPersistent      = errors.New("timestamp: index is not persistent")
+	ErrUninitializedBatch = errors.New("timestamp: write batch was not created with NewBatch")
 )
 
-func EncodeTimemarker(timestamp, offset uint64) Timemarker {
-	return Timemarker((timestamp - offset) >> TimestampShift)
+func encodeTimemarker(timestamp, offset uint64) timemarker {
+	return timemarker((timestamp - offset) >> TimestampShift)
 }
 
-func EncodeTimemarkerChecked(timestamp, offset uint64) (Timemarker, error) {
+func encodeTimemarkerChecked(timestamp, offset uint64) (timemarker, error) {
 	if timestamp < offset || ((timestamp-offset)>>TimestampShift) > math.MaxUint32 {
 		return 0, ErrInvalidRange
 	}
-	return EncodeTimemarker(timestamp, offset), nil
+	return encodeTimemarker(timestamp, offset), nil
 }
 
-func DecodeTimemarker(marker Timemarker, offset uint64) uint64 {
+func decodeTimemarker(marker timemarker, offset uint64) uint64 {
 	return offset + (uint64(marker) << TimestampShift)
 }
 
-type TimestampIndexHeader struct {
-	Magic      uint32
-	Version    uint16
-	Flags      uint16
-	Count      uint64
-	StartTime  uint64
-	EndTime    uint64
-	OffsetTime uint64
-	Shift      uint8
-	_          [7]byte
-	Generation uint64
-}
-
-func (h TimestampIndexHeader) Validate() error {
-	if h.Magic != TimestampIndexMagic || h.Version != TimestampIndexVersion || h.Shift != TimestampShift {
-		return ErrInvalidBase
-	}
-	if h.Count != 0 && h.StartTime >= h.EndTime {
-		return ErrInvalidBase
-	}
-	return nil
-}
-
-type TimestampBlockMeta struct {
+type blockMetadata struct {
 	StartTime    uint64
 	EndTime      uint64
 	MarkerOffset uint64
@@ -81,44 +59,50 @@ type TimestampBlockMeta struct {
 	Generation   uint64
 }
 
-type Record struct {
+// Entry is one canonical timestamp to index.
+type Entry struct {
 	Timestamp uint64
 	ImageID   ImageID
 }
 
-type WriteOp uint8
-
-const (
-	WriteAdd WriteOp = iota + 1
-	WriteDelete
-)
-
-type TimestampWrite struct {
-	Timestamp uint64
-	ImageID   ImageID
-	Op        WriteOp
+// Spec describes an index's stable identity, compression offset, and initial
+// entries.
+type Spec struct {
+	IndexID uint64
+	Flags   uint32
+	Offset  uint64
+	Entries []Entry
 }
 
+// Metadata is a copied summary of the current persisted/base generation.
+// BaseCount deliberately excludes pending Active and Frozen corrections.
+type Metadata struct {
+	IndexID    uint64
+	Flags      uint32
+	Generation uint64
+	Offset     uint64
+	BaseCount  uint64
+	BlockCount uint32
+}
+
+// Config controls base block sizing, fixed delta capacity, and writer queues.
+// The zero value selects the benchmarked defaults.
 type Config struct {
 	BlockSize          int
 	DeltaCapacity      int
 	WriteQueueCapacity int
 	CompactionQueue    int
-	Durability         Durability
 }
 
-type Durability uint8
+type Durability = imageidx.Durability
 
 const (
-	DurabilityOS Durability = iota
-	DurabilitySync
+	DurabilityOS   = imageidx.DurabilityOS
+	DurabilitySync = imageidx.DurabilitySync
 )
 
 func (c Config) withDefaults() (Config, error) {
 	if c.BlockSize < 0 || c.DeltaCapacity < 0 || c.WriteQueueCapacity < 0 || c.CompactionQueue < 0 {
-		return Config{}, ErrInvalidConfig
-	}
-	if c.Durability > DurabilitySync {
 		return Config{}, ErrInvalidConfig
 	}
 	if c.BlockSize == 0 {

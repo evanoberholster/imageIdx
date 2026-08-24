@@ -21,9 +21,9 @@ type bitmapWAL struct {
 }
 
 type walMutation struct {
-	key      BitmapKey
+	key      Key
 	indexID  uint64
-	mutation BitmapMutation
+	mutation Mutation
 }
 
 func openBitmapWAL(path string) (*bitmapWAL, error) {
@@ -34,20 +34,20 @@ func openBitmapWAL(path string) (*bitmapWAL, error) {
 	return &bitmapWAL{file: file}, nil
 }
 
-func (w *bitmapWAL) append(key BitmapKey, indexID uint64, mutation BitmapMutation, durability Durability) error {
-	if len(mutation.Additions) == 0 && len(mutation.Removals) == 0 {
+func (w *bitmapWAL) append(key Key, indexID uint64, mutation Mutation, durability Durability) error {
+	if len(mutation.Add) == 0 && len(mutation.Remove) == 0 {
 		return nil
 	}
-	count := len(mutation.Additions) + len(mutation.Removals)
+	count := len(mutation.Add) + len(mutation.Remove)
 	if count > int(^uint32(0))/8 {
 		return ErrInvalidIndex
 	}
 	payload := make([]byte, count*8)
-	for n, id := range mutation.Additions {
+	for n, id := range mutation.Add {
 		binary.LittleEndian.PutUint64(payload[n*8:(n+1)*8], id)
 	}
-	for n, id := range mutation.Removals {
-		position := (len(mutation.Additions) + n) * 8
+	for n, id := range mutation.Remove {
+		position := (len(mutation.Add) + n) * 8
 		binary.LittleEndian.PutUint64(payload[position:position+8], id)
 	}
 	header := make([]byte, bitmapWALHeaderSize)
@@ -56,8 +56,8 @@ func (w *bitmapWAL) append(key BitmapKey, indexID uint64, mutation BitmapMutatio
 	binary.LittleEndian.PutUint16(header[6:8], uint16(key.Type))
 	binary.LittleEndian.PutUint32(header[12:16], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(header[16:20], crc32.ChecksumIEEE(payload))
-	binary.LittleEndian.PutUint32(header[20:24], uint32(len(mutation.Additions)))
-	binary.LittleEndian.PutUint32(header[24:28], uint32(len(mutation.Removals)))
+	binary.LittleEndian.PutUint32(header[20:24], uint32(len(mutation.Add)))
+	binary.LittleEndian.PutUint32(header[24:28], uint32(len(mutation.Remove)))
 	binary.LittleEndian.PutUint64(header[32:40], indexID)
 	binary.LittleEndian.PutUint64(header[40:48], key.ValueID)
 	if err := indexutil.WriteFull(w.file, header); err != nil {
@@ -116,16 +116,16 @@ func replayBitmapWAL(path string, offset int64) ([]walMutation, error) {
 			return nil, ErrCorruptWAL
 		}
 		record := walMutation{
-			key:      BitmapKey{Type: IndexType(binary.LittleEndian.Uint16(header[6:8])), ValueID: binary.LittleEndian.Uint64(header[40:48])},
+			key:      Key{Type: IndexType(binary.LittleEndian.Uint16(header[6:8])), ValueID: binary.LittleEndian.Uint64(header[40:48])},
 			indexID:  binary.LittleEndian.Uint64(header[32:40]),
-			mutation: BitmapMutation{Additions: make([]uint64, adds), Removals: make([]uint64, removes)},
+			mutation: Mutation{Add: make([]ImageID, adds), Remove: make([]ImageID, removes)},
 		}
-		for n := range record.mutation.Additions {
-			record.mutation.Additions[n] = binary.LittleEndian.Uint64(payload[n*8 : (n+1)*8])
+		for n := range record.mutation.Add {
+			record.mutation.Add[n] = binary.LittleEndian.Uint64(payload[n*8 : (n+1)*8])
 		}
-		for n := range record.mutation.Removals {
+		for n := range record.mutation.Remove {
 			position := (int(adds) + n) * 8
-			record.mutation.Removals[n] = binary.LittleEndian.Uint64(payload[position : position+8])
+			record.mutation.Remove[n] = binary.LittleEndian.Uint64(payload[position : position+8])
 		}
 		records = append(records, record)
 	}

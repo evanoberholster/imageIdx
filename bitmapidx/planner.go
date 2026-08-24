@@ -1,19 +1,29 @@
 package bitmapidx
 
-import "sort"
+import (
+	"cmp"
+	"slices"
+)
 
-// PlanAND returns a stable copy ordered by Base cardinality. Delta sizes are
-// intentionally absent from the comparison.
-func PlanAND(indexes []*BitmapIndex) []*BitmapIndex {
-	planned := append([]*BitmapIndex(nil), indexes...)
-	sort.SliceStable(planned, func(a, b int) bool {
-		if planned[a] == nil {
-			return false
+// planIntersection returns a stable copy ordered by Base cardinality. Delta
+// sizes are intentionally absent from the comparison.
+func planIntersection(indexes []*Index) []*Index {
+	return planIntersectionInto(nil, indexes)
+}
+
+func planIntersectionInto(dst, indexes []*Index) []*Index {
+	planned := append(dst, indexes...)
+	slices.SortStableFunc(planned, func(a, b *Index) int {
+		switch {
+		case a == nil && b == nil:
+			return 0
+		case a == nil:
+			return 1
+		case b == nil:
+			return -1
+		default:
+			return cmp.Compare(a.view.Load().cardinality, b.view.Load().cardinality)
 		}
-		if planned[b] == nil {
-			return true
-		}
-		return planned[a].view.Load().Cardinality < planned[b].view.Load().Cardinality
 	})
 	return planned
 }

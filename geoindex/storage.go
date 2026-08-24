@@ -7,11 +7,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/idset"
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
-func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexView) error {
+func writeGeoGeneration(path string, storageGeneration uint64, view *indexView) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
@@ -24,36 +24,37 @@ func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexVie
 		}
 	}()
 
+	sparse, dense := flattenView(view)
 	sparseKeysOffset := uint64(geoHeaderSize)
-	sparseKeysLength := uint64(len(view.Sparse.keys)) * 8
+	sparseKeysLength := uint64(len(sparse.keys)) * 8
 	sparseValuesOffset := indexutil.Align(sparseKeysOffset+sparseKeysLength, 8)
-	sparseValuesLength := uint64(len(view.Sparse.imageIDs)) * 8
+	sparseValuesLength := uint64(len(sparse.imageIDs)) * 8
 	bitmapKeysOffset := indexutil.Align(sparseValuesOffset+sparseValuesLength, 8)
-	bitmapKeysLength := uint64(len(view.Bitmap.keys)) * 8
+	bitmapKeysLength := uint64(len(dense.keys)) * 8
 	bitmapMetaOffset := indexutil.Align(bitmapKeysOffset+bitmapKeysLength, 8)
-	bitmapMetaLength := uint64(len(view.Bitmap.keys)) * geoBitmapMetaSize
+	bitmapMetaLength := uint64(len(dense.keys)) * geoBitmapMetaSize
 	bitmapDataOffset := indexutil.Align(bitmapMetaOffset+bitmapMetaLength, geoStorageAlignment)
 	if err = file.Truncate(int64(bitmapDataOffset)); err != nil {
 		return err
 	}
 
-	sparseKeysCRC, err := writeS2KeysAt(file, sparseKeysOffset, view.Sparse.keys)
+	sparseKeysCRC, err := writeS2KeysAt(file, sparseKeysOffset, sparse.keys)
 	if err != nil {
 		return err
 	}
-	sparseValuesCRC, err := writeUint64At(file, sparseValuesOffset, view.Sparse.imageIDs)
+	sparseValuesCRC, err := writeUint64At(file, sparseValuesOffset, sparse.imageIDs)
 	if err != nil {
 		return err
 	}
-	bitmapKeysCRC, err := writeS2KeysAt(file, bitmapKeysOffset, view.Bitmap.keys)
+	bitmapKeysCRC, err := writeS2KeysAt(file, bitmapKeysOffset, dense.keys)
 	if err != nil {
 		return err
 	}
 
-	metas := make([]geoBitmapDiskMeta, len(view.Bitmap.bitmaps))
+	metas := make([]geoBitmapDiskMeta, len(dense.bitmaps))
 	dataHash := crc32.NewIEEE()
 	dataLength := uint64(0)
-	for index, bitmap := range view.Bitmap.bitmaps {
+	for index, bitmap := range dense.bitmaps {
 		aligned := indexutil.Align(dataLength, 8)
 		if padding := aligned - dataLength; padding != 0 {
 			zeros := make([]byte, padding)
@@ -74,6 +75,14 @@ func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexVie
 		metas[index] = geoBitmapDiskMeta{offset: dataLength, length: uint32(len(payload)), cardinality: bitmap.Cardinality()}
 		dataLength += uint64(len(payload))
 	}
+	if aligned := indexutil.Align(dataLength, 8); aligned != dataLength {
+		zeros := make([]byte, aligned-dataLength)
+		if _, err = file.WriteAt(zeros, int64(bitmapDataOffset+dataLength)); err != nil {
+			return err
+		}
+		_, _ = dataHash.Write(zeros)
+		dataLength = aligned
+	}
 	metaBytes := make([]byte, len(metas)*geoBitmapMetaSize)
 	for index, meta := range metas {
 		encoded := metaBytes[index*geoBitmapMetaSize : (index+1)*geoBitmapMetaSize]
@@ -89,13 +98,13 @@ func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexVie
 	binary.LittleEndian.PutUint32(header[0:4], geoStorageMagic)
 	binary.LittleEndian.PutUint16(header[4:6], geoStorageVersion)
 	binary.LittleEndian.PutUint16(header[6:8], geoHeaderSize)
-	binary.LittleEndian.PutUint32(header[8:12], view.Flags)
+	binary.LittleEndian.PutUint32(header[8:12], view.flags)
 	header[12] = GeoS2Level
-	binary.LittleEndian.PutUint64(header[16:24], view.IndexID)
-	binary.LittleEndian.PutUint64(header[24:32], view.Generation)
+	binary.LittleEndian.PutUint64(header[16:24], view.indexID)
+	binary.LittleEndian.PutUint64(header[24:32], view.generation)
 	binary.LittleEndian.PutUint64(header[32:40], storageGeneration)
-	binary.LittleEndian.PutUint64(header[40:48], uint64(len(view.Sparse.keys)))
-	binary.LittleEndian.PutUint64(header[48:56], uint64(len(view.Bitmap.keys)))
+	binary.LittleEndian.PutUint64(header[40:48], uint64(len(sparse.keys)))
+	binary.LittleEndian.PutUint64(header[48:56], uint64(len(dense.keys)))
 	binary.LittleEndian.PutUint64(header[56:64], sparseKeysOffset)
 	binary.LittleEndian.PutUint64(header[64:72], sparseValuesOffset)
 	binary.LittleEndian.PutUint64(header[72:80], bitmapKeysOffset)
@@ -121,16 +130,16 @@ func writeGeoGeneration(path string, storageGeneration uint64, view *GeoIndexVie
 	return nil
 }
 
-func readGeoGeneration(path string, config Config) (*GeoIndex, uint64, error) {
+func readGeoGeneration(path string, config Config) (*Index, uint64, error) {
 	mapping, err := mmapFile(path)
 	if err != nil {
 		return nil, 0, err
 	}
-	fail := func(err error) (*GeoIndex, uint64, error) {
+	fail := func(err error) (*Index, uint64, error) {
 		_ = unmapFile(mapping)
 		return nil, 0, err
 	}
-	if len(mapping) < geoHeaderSize {
+	if len(mapping) < geoHeaderSize || len(mapping)%8 != 0 {
 		return fail(ErrCorruptStorage)
 	}
 	header := mapping[:geoHeaderSize]
@@ -148,11 +157,15 @@ func readGeoGeneration(path string, config Config) (*GeoIndex, uint64, error) {
 	bitmapMetaOffset := binary.LittleEndian.Uint64(header[80:88])
 	bitmapDataOffset := binary.LittleEndian.Uint64(header[88:96])
 	bitmapDataLength := binary.LittleEndian.Uint64(header[96:104])
+	if sparseKeysOffset%8 != 0 || sparseValuesOffset%8 != 0 || bitmapKeysOffset%8 != 0 ||
+		bitmapMetaOffset%8 != 0 || bitmapDataOffset%8 != 0 || bitmapDataLength%8 != 0 {
+		return fail(ErrCorruptStorage)
+	}
 	sparseKeysEnd, ok := indexutil.CheckedEnd(sparseKeysOffset, sparseCount, 8, uint64(len(mapping)))
 	if !ok {
 		return fail(ErrCorruptStorage)
 	}
-	sparseValuesEnd, ok := indexutil.CheckedEnd(sparseValuesOffset, sparseCount, GeoSparseSlots*8, uint64(len(mapping)))
+	sparseValuesEnd, ok := indexutil.CheckedEnd(sparseValuesOffset, sparseCount, geoSparseSlots*8, uint64(len(mapping)))
 	if !ok {
 		return fail(ErrCorruptStorage)
 	}
@@ -191,14 +204,14 @@ func readGeoGeneration(path string, config Config) (*GeoIndex, uint64, error) {
 	if err != nil {
 		return fail(err)
 	}
-	bitmaps := make([]bitmapidx.BitmapRef, bitmapCount)
+	bitmaps := make([]idset.Ref, bitmapCount)
 	for index := range bitmaps {
 		encoded := bitmapMetaBytes[index*geoBitmapMetaSize : (index+1)*geoBitmapMetaSize]
 		offset := binary.LittleEndian.Uint64(encoded[0:8])
 		length := binary.LittleEndian.Uint32(encoded[8:12])
 		cardinality := binary.LittleEndian.Uint64(encoded[16:24])
 		end := offset + uint64(length)
-		if end < offset || end > uint64(len(bitmapData)) || offset%8 != 0 || cardinality <= GeoSparseSlots {
+		if end < offset || end > uint64(len(bitmapData)) || offset%8 != 0 || cardinality <= geoSparseSlots {
 			return fail(ErrCorruptStorage)
 		}
 		bitmap, bitmapErr := safeBitmapFromBuffer(bitmapData[offset:end])
@@ -207,39 +220,29 @@ func readGeoGeneration(path string, config Config) (*GeoIndex, uint64, error) {
 		}
 		bitmaps[index] = bitmap
 	}
-	bitmapRef := GeoBitmapRef{keys: bitmapKeys, bitmaps: bitmaps, backing: mapping}
-	if err = validateBitmapRef(bitmapRef); err != nil {
+	dense := bitmapRef{keys: bitmapKeys, bitmaps: bitmaps, backing: mapping}
+	if err = validateBitmap(dense); err != nil {
 		return fail(err)
 	}
 	if partitionsOverlap(sparseKeys, bitmapKeys) {
 		return fail(ErrCorruptStorage)
 	}
-	view := &GeoIndexView{
-		Version: GeoFormatVersion, Flags: binary.LittleEndian.Uint32(header[8:12]),
-		IndexID: binary.LittleEndian.Uint64(header[16:24]), Generation: binary.LittleEndian.Uint64(header[24:32]),
-		Sparse: GeoSparseRef{keys: sparseKeys, imageIDs: sparseValues, backing: mapping}, Bitmap: bitmapRef,
-	}
-	index, err := newGeoIndexFromView(view, config, mapping)
+	sparse := sparseRef{keys: sparseKeys, imageIDs: sparseValues, backing: mapping}
+	view := shardView(
+		binary.LittleEndian.Uint64(header[16:24]),
+		binary.LittleEndian.Uint32(header[8:12]),
+		binary.LittleEndian.Uint64(header[24:32]),
+		sparse,
+		dense,
+	)
+	index, err := newIndexFromView(view, config, mapping)
 	if err != nil {
 		return fail(err)
-	}
-	expectedIDs := len(sparseKeys) * GeoSparseSlots
-	for _, id := range sparseValues {
-		if id == 0 {
-			expectedIDs--
-		}
-	}
-	for _, bitmap := range bitmaps {
-		expectedIDs += int(bitmap.Cardinality())
-	}
-	if len(index.locations) != expectedIDs {
-		_ = index.Close()
-		return nil, 0, ErrCorruptStorage
 	}
 	return index, binary.LittleEndian.Uint64(header[32:40]), nil
 }
 
-func validateBitmapRef(ref GeoBitmapRef) error {
+func validateBitmap(ref bitmapRef) error {
 	for index, key := range ref.keys {
 		if index != 0 && key <= ref.keys[index-1] {
 			return ErrCorruptStorage
@@ -249,6 +252,57 @@ func validateBitmapRef(ref GeoBitmapRef) error {
 		}
 	}
 	return nil
+}
+
+func flattenView(view *indexView) (sparseRef, bitmapRef) {
+	sparseKeys := make([]S2Key, 0, view.sparseCellCount)
+	sparseIDs := make([]uint64, 0, view.sparseCellCount*geoSparseSlots)
+	denseKeys := make([]S2Key, 0, view.denseCellCount)
+	denseBitmaps := make([]idset.Ref, 0, view.denseCellCount)
+	for _, shard := range view.shards {
+		if shard == nil {
+			continue
+		}
+		sparseKeys = append(sparseKeys, shard.sparse.keys...)
+		sparseIDs = append(sparseIDs, shard.sparse.imageIDs...)
+		denseKeys = append(denseKeys, shard.dense.keys...)
+		denseBitmaps = append(denseBitmaps, shard.dense.bitmaps...)
+	}
+	return sparseRef{keys: sparseKeys, imageIDs: sparseIDs}, bitmapRef{keys: denseKeys, bitmaps: denseBitmaps}
+}
+
+func shardView(indexID uint64, flags uint32, generation uint64, sparse sparseRef, dense bitmapRef) *indexView {
+	view := &indexView{
+		version: geoFormatVersion, flags: flags, indexID: indexID, generation: generation,
+		sparseCellCount: uint64(len(sparse.keys)), denseCellCount: uint64(len(dense.keys)),
+	}
+	sparseStart, denseStart := 0, 0
+	for shardIndex := range view.shards {
+		sparseEnd := sparseStart
+		for sparseEnd < len(sparse.keys) && shardForKey(sparse.keys[sparseEnd]) == shardIndex {
+			sparseEnd++
+		}
+		denseEnd := denseStart
+		for denseEnd < len(dense.keys) && shardForKey(dense.keys[denseEnd]) == shardIndex {
+			denseEnd++
+		}
+		if sparseStart != sparseEnd || denseStart != denseEnd {
+			view.shards[shardIndex] = &geoShard{
+				sparse: sparseRef{
+					keys:     sparse.keys[sparseStart:sparseEnd],
+					imageIDs: sparse.imageIDs[sparseStart*geoSparseSlots : sparseEnd*geoSparseSlots],
+					backing:  sparse.backing,
+				},
+				dense: bitmapRef{
+					keys:    dense.keys[denseStart:denseEnd],
+					bitmaps: dense.bitmaps[denseStart:denseEnd],
+					backing: dense.backing,
+				},
+			}
+		}
+		sparseStart, denseStart = sparseEnd, denseEnd
+	}
+	return view
 }
 
 func partitionsOverlap(a, b []S2Key) bool {
@@ -266,13 +320,13 @@ func partitionsOverlap(a, b []S2Key) bool {
 	return false
 }
 
-func safeBitmapFromBuffer(data []byte) (result bitmapidx.BitmapRef, err error) {
+func safeBitmapFromBuffer(data []byte) (result idset.Ref, err error) {
 	defer func() {
 		if recover() != nil {
 			err = ErrCorruptStorage
 		}
 	}()
-	result = bitmapidx.BitmapRefFromBuffer(data)
+	result = idset.FromBuffer(data)
 	_ = result.Cardinality()
 	return result, nil
 }

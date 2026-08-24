@@ -63,16 +63,12 @@ func benchmarkSearchSize(b *testing.B, size int) {
 
 func BenchmarkUpdate(b *testing.B) {
 	index, _ := benchmarkIndex(b, 65_536, Config{DeltaCapacity: 4_096})
-	batch := NewWriteBatch(1)
+	batch := NewBatch(1)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for iteration := 0; iteration < b.N; iteration++ {
 		batch.Reset()
-		batch.Append(TimestampWrite{
-			Timestamp: uint64(iteration%65_536) * testQuantum,
-			ImageID:   ImageID(iteration%65_536 + 1),
-			Op:        WriteAdd,
-		})
+		batch.Append(Insert(ImageID(iteration%65_536+1), uint64(iteration%65_536)*testQuantum))
 		submitWithBackpressure(index, batch)
 	}
 }
@@ -84,16 +80,12 @@ func BenchmarkUpdateParallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		idBase := ImageID(workerID.Add(1) * 1_000_000)
-		batch := NewWriteBatch(1)
+		batch := NewBatch(1)
 		var sequence uint64
 		for pb.Next() {
 			sequence++
 			batch.Reset()
-			batch.Append(TimestampWrite{
-				Timestamp: (sequence % 65_536) * testQuantum,
-				ImageID:   idBase + ImageID(sequence%1_024),
-				Op:        WriteAdd,
-			})
+			batch.Append(Insert(idBase+ImageID(sequence%1_024), (sequence%65_536)*testQuantum))
 			submitWithBackpressure(index, batch)
 		}
 	})
@@ -103,16 +95,12 @@ func BenchmarkDeltaCapacity(b *testing.B) {
 	for _, capacity := range []int{2_048, 4_096} {
 		b.Run(fmt.Sprintf("Capacity-%d", capacity), func(b *testing.B) {
 			index, _ := benchmarkIndex(b, 65_536, Config{DeltaCapacity: capacity})
-			batch := NewWriteBatch(1)
+			batch := NewBatch(1)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
 				batch.Reset()
-				batch.Append(TimestampWrite{
-					Timestamp: uint64(iteration%65_536) * testQuantum,
-					ImageID:   ImageID(iteration%65_536 + 1),
-					Op:        WriteAdd,
-				})
+				batch.Append(Insert(ImageID(iteration%65_536+1), uint64(iteration%65_536)*testQuantum))
 				submitWithBackpressure(index, batch)
 			}
 		})
@@ -135,14 +123,14 @@ func BenchmarkBlockSize(b *testing.B) {
 
 func benchmarkIndex(b *testing.B, count int, config Config) (*Index, uint64) {
 	b.Helper()
-	records := make([]Record, count)
+	records := make([]Entry, count)
 	for index := range records {
-		records[index] = Record{
+		records[index] = Entry{
 			Timestamp: uint64(index) * testQuantum,
 			ImageID:   ImageID(index + 1),
 		}
 	}
-	idx, err := New(records, 0, config)
+	idx, err := New(Spec{Entries: records}, config)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -150,9 +138,9 @@ func benchmarkIndex(b *testing.B, count int, config Config) (*Index, uint64) {
 	return idx, uint64(count) * testQuantum
 }
 
-func submitWithBackpressure(index *Index, batch *TimestampWriteBatch) {
+func submitWithBackpressure(index *Index, batch *Batch) {
 	for {
-		err := index.Submit(batch)
+		err := index.Apply(batch)
 		if err == nil {
 			return
 		}

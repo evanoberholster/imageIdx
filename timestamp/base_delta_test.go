@@ -3,14 +3,14 @@ package timestamp
 import "testing"
 
 func TestBaseRequiresDeterministicOrdering(t *testing.T) {
-	if _, err := NewTimestampBase(
-		[]Timemarker{1, 1},
+	if _, err := newBase(
+		[]timemarker{1, 1},
 		[]ImageID{2, 1},
 	); err != ErrInvalidBase {
 		t.Fatalf("error = %v, want %v", err, ErrInvalidBase)
 	}
-	base, err := NewTimestampBase(
-		[]Timemarker{1, 1, 2},
+	base, err := newBase(
+		[]timemarker{1, 1, 2},
 		[]ImageID{1, 2, 1},
 	)
 	if err != nil {
@@ -23,7 +23,7 @@ func TestBaseRequiresDeterministicOrdering(t *testing.T) {
 }
 
 func TestDeltaIsFixedCapacityAndTracksLatestState(t *testing.T) {
-	delta := newTimestampDelta(4)
+	delta := newDelta(4)
 	if !delta.appendAdd(1, 7) || !delta.appendDelete(7) || !delta.appendAdd(3, 7) {
 		t.Fatal("append unexpectedly failed")
 	}
@@ -40,34 +40,34 @@ func TestDeltaIsFixedCapacityAndTracksLatestState(t *testing.T) {
 		t.Fatal("delta grew beyond fixed capacity")
 	}
 	delta.reset()
-	if delta.Len() != 0 || delta.remaining() != 4 || delta.hasState(7) {
+	if delta.len() != 0 || delta.remaining() != 4 || delta.hasState(7) {
 		t.Fatal("reset delta retained published state")
 	}
 }
 
 func TestCompactIsSortedAndAppliesLatestState(t *testing.T) {
-	base, err := NewTimestampBase(
-		[]Timemarker{1, 2, 3},
+	base, err := newBase(
+		[]timemarker{1, 2, 3},
 		[]ImageID{1, 2, 3},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	delta := newTimestampDelta(8)
+	delta := newDelta(8)
 	delta.appendDelete(2)
 	delta.appendAdd(5, 1)
 	delta.appendAdd(4, 4)
 	delta.appendAdd(6, 4)
 
 	got := compact(base, delta)
-	wantMarkers := []Timemarker{3, 5, 6}
+	wantMarkers := []timemarker{3, 5, 6}
 	wantIDs := []ImageID{3, 1, 4}
-	if !equalMarkers(got.Markers, wantMarkers) || !equalIDs(got.ImageIDs, wantIDs) {
-		t.Fatalf("compact = (%v, %v), want (%v, %v)", got.Markers, got.ImageIDs, wantMarkers, wantIDs)
+	if !equalMarkers(got.markers, wantMarkers) || !equalIDs(got.imageIDs, wantIDs) {
+		t.Fatalf("compact = (%v, %v), want (%v, %v)", got.markers, got.imageIDs, wantMarkers, wantIDs)
 	}
 }
 
-func equalMarkers(a, b []Timemarker) bool {
+func equalMarkers(a, b []timemarker) bool {
 	if len(a) != len(b) {
 		return false
 	}

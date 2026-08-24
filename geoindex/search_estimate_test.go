@@ -7,17 +7,10 @@ func TestEstimateRangesMatchesPublishedCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	index, err := NewFromCells(1, []GeoCellEntry{
-		{Key: key, ImageID: 1},
-		{Key: key, ImageID: 2},
-		{Key: key, ImageID: 3},
-	}, Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	index := testIndexFromCells(t, 1, map[S2Key][]ImageID{key: {1, 2, 3}})
 	defer index.Close()
 
-	ranges := []S2KeyRange{{Start: key, End: key}}
+	ranges := []Range{{Start: key, End: key}}
 	if estimate := index.EstimateRanges(ranges); estimate != uint64(len(index.SearchRanges(nil, ranges))) {
 		t.Fatalf("EstimateRanges = %d", estimate)
 	}

@@ -7,4 +7,7 @@ require (
 	github.com/golang/geo v0.0.0-20260818125358-b200a1149890
 )
 
-require github.com/pkg/errors v0.9.1 // indirect
+require (
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/weaviate/sroar v0.0.16 // indirect
+)

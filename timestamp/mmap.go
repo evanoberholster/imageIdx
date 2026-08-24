@@ -16,8 +16,8 @@ func unmapFile(data []byte) error {
 	return indexutil.UnmapFile(data)
 }
 
-func mappedMarkers(data []byte, offset uint64, count uint32) ([]Timemarker, error) {
-	result, err := indexutil.MappedSlice[Timemarker](data, offset, uint64(count))
+func mappedMarkers(data []byte, offset uint64, count uint32) ([]timemarker, error) {
+	result, err := indexutil.MappedSlice[timemarker](data, offset, uint64(count))
 	return mapMappedError(result, err)
 }
 

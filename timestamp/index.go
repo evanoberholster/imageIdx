@@ -6,23 +6,31 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 type indexedRecord struct {
-	marker    Timemarker
+	marker    timemarker
 	timestamp uint64
 	imageID   ImageID
 }
 
+// Index is one compressed timestamp candidate index. Readers search immutable
+// block views without locks; a single writer owns delta publication.
 type Index struct {
-	Header TimestampIndexHeader
+	indexID    uint64
+	flags      uint32
+	offset     uint64
+	startTime  uint64
+	endTime    uint64
+	generation atomic.Uint64
+	baseCount  atomic.Uint64
+	config     Config
+	directory  atomic.Pointer[blockDirectory]
+	readers    indexutil.ReaderTracker
 
-	offset    uint64
-	config    Config
-	directory atomic.Pointer[blockDirectory]
-	epoch     readerEpoch
-
-	writes        chan *TimestampWriteBatch
+	writes        chan *Batch
 	barriers      chan chan barrierResult
 	compactions   chan compactionTask
 	compactDone   chan compactionResult
@@ -35,26 +43,25 @@ type Index struct {
 	writerNeeds   []uint32
 	writerTouched []int
 
-	persistenceMu sync.Mutex
-	storeDir      string
-	wal           *timestampWAL
-	mappings      [][]byte
+	persistence *persistentState
 }
 
-func New(records []Record, offset uint64, config Config) (*Index, error) {
+// New constructs an in-memory index from stable metadata and canonical
+// timestamp entries.
+func New(spec Spec, config Config) (*Index, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
 	}
 
-	prepared := make([]indexedRecord, len(records))
-	seen := make(map[ImageID]struct{}, len(records))
-	for i, record := range records {
+	prepared := make([]indexedRecord, len(spec.Entries))
+	seen := make(map[ImageID]struct{}, len(spec.Entries))
+	for i, record := range spec.Entries {
 		if _, duplicate := seen[record.ImageID]; duplicate {
 			return nil, ErrDuplicateImageID
 		}
 		seen[record.ImageID] = struct{}{}
-		marker, encodeErr := EncodeTimemarkerChecked(record.Timestamp, offset)
+		marker, encodeErr := encodeTimemarkerChecked(record.Timestamp, spec.Offset)
 		if encodeErr != nil {
 			return nil, encodeErr
 		}
@@ -67,19 +74,13 @@ func New(records []Record, offset uint64, config Config) (*Index, error) {
 		return prepared[i].imageID < prepared[j].imageID
 	})
 
-	directory := buildDirectory(prepared, offset, config)
+	directory := buildDirectory(prepared, spec.Offset, config)
 	index := &Index{
-		Header: TimestampIndexHeader{
-			Magic:      TimestampIndexMagic,
-			Version:    TimestampIndexVersion,
-			Count:      uint64(len(records)),
-			OffsetTime: offset,
-			Shift:      TimestampShift,
-			Generation: 1,
-		},
-		offset:        offset,
+		indexID:       spec.IndexID,
+		flags:         spec.Flags,
+		offset:        spec.Offset,
 		config:        config,
-		writes:        make(chan *TimestampWriteBatch, config.WriteQueueCapacity),
+		writes:        make(chan *Batch, config.WriteQueueCapacity),
 		barriers:      make(chan chan barrierResult),
 		compactions:   make(chan compactionTask, max(config.CompactionQueue, len(directory.entries))),
 		compactDone:   make(chan compactionResult, max(config.CompactionQueue, len(directory.entries))),
@@ -87,21 +88,23 @@ func New(records []Record, offset uint64, config Config) (*Index, error) {
 		writerNeeds:   make([]uint32, len(directory.entries)),
 		writerTouched: make([]int, 0, 256),
 	}
+	index.generation.Store(1)
+	index.baseCount.Store(uint64(len(spec.Entries)))
 	if len(prepared) != 0 {
-		index.Header.StartTime = prepared[0].timestamp
+		index.startTime = prepared[0].timestamp
 		last := prepared[0].timestamp
 		for i := 1; i < len(prepared); i++ {
-			if prepared[i].timestamp < index.Header.StartTime {
-				index.Header.StartTime = prepared[i].timestamp
+			if prepared[i].timestamp < index.startTime {
+				index.startTime = prepared[i].timestamp
 			}
 			if prepared[i].timestamp > last {
 				last = prepared[i].timestamp
 			}
 		}
 		if last != ^uint64(0) {
-			index.Header.EndTime = last + 1
+			index.endTime = last + 1
 		} else {
-			index.Header.EndTime = last
+			index.endTime = last
 		}
 	}
 	index.directory.Store(directory)
@@ -113,16 +116,16 @@ func New(records []Record, offset uint64, config Config) (*Index, error) {
 
 func buildDirectory(records []indexedRecord, offset uint64, config Config) *blockDirectory {
 	if len(records) == 0 {
-		base, _ := NewTimestampBase(nil, nil)
+		base, _ := newBase(nil, nil)
 		return &blockDirectory{entries: []blockEntry{{
 			startMarker: 0,
 			endMarker:   markerSpaceEnd,
-			meta: TimestampBlockMeta{
+			meta: blockMetadata{
 				StartTime:  offset,
 				EndTime:    timestampForBoundary(markerSpaceEnd, offset),
 				Generation: 1,
 			},
-			block: newTimestampBlock(base, config.DeltaCapacity),
+			block: newBlock(base, config.DeltaCapacity),
 		}}}
 	}
 
@@ -154,17 +157,17 @@ func buildDirectory(records []indexedRecord, offset uint64, config Config) *bloc
 		if i+1 < len(starts) {
 			endMarker = uint64(records[end].marker)
 		}
-		markers := make([]Timemarker, end-start)
+		markers := make([]timemarker, end-start)
 		ids := make([]ImageID, end-start)
 		for j := start; j < end; j++ {
 			markers[j-start] = records[j].marker
 			ids[j-start] = records[j].imageID
 		}
-		base, _ := NewTimestampBase(markers, ids)
+		base, _ := newBase(markers, ids)
 		entries[i] = blockEntry{
 			startMarker: startMarker,
 			endMarker:   endMarker,
-			meta: TimestampBlockMeta{
+			meta: blockMetadata{
 				StartTime:    timestampForBoundary(startMarker, offset),
 				EndTime:      timestampForBoundary(endMarker, offset),
 				MarkerOffset: markerOffset * 4,
@@ -172,19 +175,25 @@ func buildDirectory(records []indexedRecord, offset uint64, config Config) *bloc
 				Count:        uint32(end - start),
 				Generation:   1,
 			},
-			block: newTimestampBlock(base, config.DeltaCapacity),
+			block: newBlock(base, config.DeltaCapacity),
 		}
 		markerOffset += uint64(end - start)
 	}
 	return &blockDirectory{entries: entries}
 }
 
-func (i *Index) OffsetTime() uint64 { return i.offset }
+// Metadata returns a copied summary of the current base generation.
+func (i *Index) Metadata() Metadata {
+	return Metadata{
+		IndexID: i.indexID, Flags: i.flags, Generation: i.generation.Load(),
+		Offset: i.offset, BaseCount: i.baseCount.Load(), BlockCount: uint32(len(i.directory.Load().entries)),
+	}
+}
 
-func (i *Index) BlockCount() int { return len(i.directory.Load().entries) }
-
+// PendingCompactions reports in-flight block compactions.
 func (i *Index) PendingCompactions() int64 { return i.pending.Load() }
 
+// WaitIdle waits until background compactions drain or ctx is cancelled.
 func (i *Index) WaitIdle(ctx context.Context) error {
 	ticker := time.NewTicker(100 * time.Microsecond)
 	defer ticker.Stop()
@@ -200,6 +209,7 @@ func (i *Index) WaitIdle(ctx context.Context) error {
 	}
 }
 
+// Close stops background workers, closes the WAL, and releases mmap regions.
 func (i *Index) Close() error {
 	var closeErr error
 	i.closeOnce.Do(func() {
@@ -208,13 +218,15 @@ func (i *Index) Close() error {
 		i.closed.Store(true)
 		close(i.stop)
 		i.workers.Wait()
-		i.epoch.synchronize()
-		if i.wal != nil {
-			closeErr = i.wal.close()
+		i.readers.WaitForPriorReaders()
+		if i.persistence != nil && i.persistence.wal != nil {
+			closeErr = i.persistence.wal.close()
 		}
-		for _, mapping := range i.mappings {
-			if err := unmapFile(mapping); err != nil && closeErr == nil {
-				closeErr = err
+		if i.persistence != nil {
+			for _, mapping := range i.persistence.mappings {
+				if err := unmapFile(mapping); err != nil && closeErr == nil {
+					closeErr = err
+				}
 			}
 		}
 	})

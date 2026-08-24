@@ -7,42 +7,45 @@ import (
 	"os"
 	"sort"
 
+	"github.com/evanoberholster/imageIdx/idset"
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
 	segmentMagic      uint32 = 0x424d5347 // BMSG
-	segmentVersion    uint16 = 1
+	segmentVersion    uint16 = 2
 	segmentHeaderSize        = 64
 	segmentEntrySize         = 64
 	segmentAlignment         = 4_096
 )
 
-type BitmapDirectoryEntry struct {
-	IndexType   IndexType
-	Version     uint16
-	Flags       Flags
-	IndexID     uint64
-	ValueID     uint64
-	Cardinality uint64
-	Offset      uint64
-	Length      uint32
-	Generation  uint64
+type segmentEntry struct {
+	indexType   IndexType
+	version     uint16
+	flags       uint32
+	indexID     uint64
+	valueID     uint64
+	cardinality uint64
+	offset      uint64
+	length      uint32
+	generation  uint64
 }
 
-type Segment struct {
-	Generation uint64
-	Entries    []BitmapDirectoryEntry
-	Directory  *BitmapDirectory
+// segment is one immutable on-disk generation of the index collection: a
+// mmap'd file holding a directory of fixed-width entries followed by
+// page-aligned serialized bitmap payloads.
+type segment struct {
+	generation uint64
+	directory  *Directory
 
 	mapping []byte
-	epoch   *Epoch
+	readers *indexutil.ReaderTracker
 }
 
-// WriteSegment writes all effective bitmap states into one ordered immutable
+// writeSegment writes all effective bitmap states into one ordered immutable
 // segment. Payloads are page-aligned for direct mmap use by sroar.
-func WriteSegment(path string, generation uint64, indexes []*BitmapIndex) error {
-	ordered := append([]*BitmapIndex(nil), indexes...)
+func writeSegment(path string, generation uint64, indexes []*Index) error {
+	ordered := append([]*Index(nil), indexes...)
 	for _, index := range ordered {
 		if index == nil {
 			return ErrInvalidIndex
@@ -50,13 +53,13 @@ func WriteSegment(path string, generation uint64, indexes []*BitmapIndex) error 
 	}
 	sort.Slice(ordered, func(i, j int) bool {
 		a, b := ordered[i].view.Load(), ordered[j].view.Load()
-		if a.IndexType != b.IndexType {
-			return a.IndexType < b.IndexType
+		if a.indexType != b.indexType {
+			return a.indexType < b.indexType
 		}
-		if a.ValueID != b.ValueID {
-			return a.ValueID < b.ValueID
+		if a.valueID != b.valueID {
+			return a.valueID < b.valueID
 		}
-		return a.IndexID < b.IndexID
+		return a.indexID < b.indexID
 	})
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
@@ -77,38 +80,45 @@ func WriteSegment(path string, generation uint64, indexes []*BitmapIndex) error 
 		return err
 	}
 
-	entries := make([]BitmapDirectoryEntry, len(ordered))
+	entries := make([]segmentEntry, len(ordered))
 	checksums := make([]uint32, len(ordered))
-	guards := enterEpochs(ordered)
+	var tokenStack [8]readToken
+	tokens := acquireReaders(tokenStack[:0], ordered)
 	for n, index := range ordered {
 		view := index.view.Load()
 		effective := view.effectiveBitmap()
 		payload := effective.MarshalBinary()
 		offset, seekErr := file.Seek(0, io.SeekEnd)
 		if seekErr != nil {
-			exitGuards(guards)
+			releaseReaders(tokens)
 			return seekErr
 		}
 		aligned := indexutil.Align(uint64(offset), segmentAlignment)
 		if padding := int64(aligned) - offset; padding > 0 {
 			if _, err = file.Write(make([]byte, padding)); err != nil {
-				exitGuards(guards)
+				releaseReaders(tokens)
 				return err
 			}
 		}
 		if _, err = file.Write(payload); err != nil {
-			exitGuards(guards)
+			releaseReaders(tokens)
 			return err
 		}
-		entries[n] = BitmapDirectoryEntry{
-			IndexType: view.IndexType, Version: view.Version, Flags: view.Flags,
-			IndexID: view.IndexID, ValueID: view.ValueID,
-			Cardinality: effective.Cardinality(),
-			Offset:      aligned, Length: uint32(len(payload)), Generation: view.Generation,
+		if padding := indexutil.Align(uint64(len(payload)), 8) - uint64(len(payload)); padding != 0 {
+			if _, err = file.Write(make([]byte, padding)); err != nil {
+				releaseReaders(tokens)
+				return err
+			}
+		}
+		entries[n] = segmentEntry{
+			indexType: view.indexType, version: view.version, flags: view.flags,
+			indexID: view.indexID, valueID: view.valueID,
+			cardinality: effective.Cardinality(),
+			offset:      aligned, length: uint32(len(payload)), generation: view.generation,
 		}
 		checksums[n] = crc32.ChecksumIEEE(payload)
 	}
-	exitGuards(guards)
+	releaseReaders(tokens)
 
 	directoryBytes := make([]byte, directorySize)
 	for n, entry := range entries {
@@ -143,7 +153,7 @@ func WriteSegment(path string, generation uint64, indexes []*BitmapIndex) error 
 	return nil
 }
 
-func OpenSegment(path string, config Config) (*Segment, error) {
+func openSegment(path string, config Config) (*segment, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -152,11 +162,11 @@ func OpenSegment(path string, config Config) (*Segment, error) {
 	if err != nil {
 		return nil, err
 	}
-	fail := func() (*Segment, error) {
+	fail := func() (*segment, error) {
 		_ = unmapFile(mapping)
 		return nil, ErrCorruptSegment
 	}
-	if len(mapping) < segmentHeaderSize {
+	if len(mapping) < segmentHeaderSize || len(mapping)%8 != 0 {
 		return fail()
 	}
 	header := mapping[:segmentHeaderSize]
@@ -170,95 +180,94 @@ func OpenSegment(path string, config Config) (*Segment, error) {
 	count := binary.LittleEndian.Uint64(header[16:24])
 	directoryOffset := binary.LittleEndian.Uint64(header[24:32])
 	directoryEnd := directoryOffset + count*segmentEntrySize
-	if directoryEnd < directoryOffset || directoryEnd > uint64(len(mapping)) {
+	if directoryOffset%8 != 0 || directoryEnd < directoryOffset || directoryEnd > uint64(len(mapping)) {
 		return fail()
 	}
 	directoryBytes := mapping[directoryOffset:directoryEnd]
 	if binary.LittleEndian.Uint32(header[48:52]) != crc32.ChecksumIEEE(directoryBytes) {
 		return fail()
 	}
-	indexes := make([]*BitmapIndex, 0, count)
-	entries := make([]BitmapDirectoryEntry, 0, count)
-	var previous BitmapKey
+	indexes := make([]*Index, 0, count)
+	readers := &indexutil.ReaderTracker{}
+	var previous Key
 	for n := uint64(0); n < count; n++ {
 		encoded := directoryBytes[n*segmentEntrySize : (n+1)*segmentEntrySize]
 		entry, checksum := decodeSegmentEntry(encoded)
-		end := entry.Offset + uint64(entry.Length)
-		if entry.Version != BitmapFormatVersion || entry.IndexType == 0 || entry.Offset%segmentAlignment != 0 ||
-			end < entry.Offset || end > uint64(len(mapping)) {
+		end := entry.offset + uint64(entry.length)
+		if entry.version != bitmapFormatVersion || entry.indexType == 0 || entry.offset%segmentAlignment != 0 ||
+			end < entry.offset || end > uint64(len(mapping)) {
 			return fail()
 		}
-		payload := mapping[entry.Offset:end]
+		payload := mapping[entry.offset:end]
 		if crc32.ChecksumIEEE(payload) != checksum {
 			return fail()
 		}
-		key := BitmapKey{Type: entry.IndexType, ValueID: entry.ValueID}
+		key := Key{Type: entry.indexType, ValueID: entry.valueID}
 		if n != 0 && (key.Type < previous.Type || key.Type == previous.Type && key.ValueID < previous.ValueID) {
 			return fail()
 		}
 		previous = key
-		base := bitmapRefFromMappedBuffer(payload)
-		if base.Cardinality() != entry.Cardinality {
+		base := idset.FromBuffer(payload)
+		if base.Cardinality() != entry.cardinality {
 			return fail()
 		}
-		index, indexErr := newBitmapIndexFromView(&BitmapIndexView{
-			Version: entry.Version, IndexType: entry.IndexType, Flags: entry.Flags,
-			IndexID: entry.IndexID, ValueID: entry.ValueID, Cardinality: entry.Cardinality,
-			Generation: entry.Generation, Base: base,
-		}, config)
+		index, indexErr := newIndexFromView(&indexView{
+			version: entry.version, indexType: entry.indexType, flags: entry.flags,
+			indexID: entry.indexID, valueID: entry.valueID, cardinality: entry.cardinality,
+			generation: entry.generation, base: base,
+		}, config, readers)
 		if indexErr != nil {
 			return fail()
 		}
 		indexes = append(indexes, index)
-		entries = append(entries, entry)
 	}
-	directory, err := NewBitmapDirectory(indexes...)
+	directory, err := NewDirectory(indexes...)
 	if err != nil {
 		_ = unmapFile(mapping)
 		return nil, err
 	}
-	return &Segment{
-		Generation: binary.LittleEndian.Uint64(header[8:16]),
-		Entries:    entries, Directory: directory, mapping: mapping, epoch: config.Epoch,
+	return &segment{
+		generation: binary.LittleEndian.Uint64(header[8:16]),
+		directory:  directory, mapping: mapping, readers: readers,
 	}, nil
 }
 
-func (s *Segment) Close() error {
+func (s *segment) close() error {
 	if s == nil || s.mapping == nil {
 		return nil
 	}
-	for _, index := range s.Directory.Indexes() {
+	for _, index := range s.directory.Indexes() {
 		index.writerMu.Lock()
 		index.closed.Store(true)
 		index.writerMu.Unlock()
 		index.workers.Wait()
 	}
-	s.epoch.Synchronize()
+	s.readers.WaitForPriorReaders()
 	err := unmapFile(s.mapping)
 	s.mapping = nil
 	return err
 }
 
-func encodeSegmentEntry(dst []byte, e BitmapDirectoryEntry, checksum uint32) {
+func encodeSegmentEntry(dst []byte, e segmentEntry, checksum uint32) {
 	clear(dst)
-	binary.LittleEndian.PutUint16(dst[0:2], uint16(e.IndexType))
-	binary.LittleEndian.PutUint16(dst[2:4], e.Version)
-	binary.LittleEndian.PutUint32(dst[4:8], uint32(e.Flags))
-	binary.LittleEndian.PutUint64(dst[8:16], e.IndexID)
-	binary.LittleEndian.PutUint64(dst[16:24], e.ValueID)
-	binary.LittleEndian.PutUint64(dst[24:32], e.Cardinality)
-	binary.LittleEndian.PutUint64(dst[32:40], e.Offset)
-	binary.LittleEndian.PutUint32(dst[40:44], e.Length)
-	binary.LittleEndian.PutUint64(dst[48:56], e.Generation)
+	binary.LittleEndian.PutUint16(dst[0:2], uint16(e.indexType))
+	binary.LittleEndian.PutUint16(dst[2:4], e.version)
+	binary.LittleEndian.PutUint32(dst[4:8], e.flags)
+	binary.LittleEndian.PutUint64(dst[8:16], e.indexID)
+	binary.LittleEndian.PutUint64(dst[16:24], e.valueID)
+	binary.LittleEndian.PutUint64(dst[24:32], e.cardinality)
+	binary.LittleEndian.PutUint64(dst[32:40], e.offset)
+	binary.LittleEndian.PutUint32(dst[40:44], e.length)
+	binary.LittleEndian.PutUint64(dst[48:56], e.generation)
 	binary.LittleEndian.PutUint32(dst[56:60], checksum)
 }
 
-func decodeSegmentEntry(src []byte) (BitmapDirectoryEntry, uint32) {
-	return BitmapDirectoryEntry{
-		IndexType: IndexType(binary.LittleEndian.Uint16(src[0:2])),
-		Version:   binary.LittleEndian.Uint16(src[2:4]), Flags: Flags(binary.LittleEndian.Uint32(src[4:8])),
-		IndexID: binary.LittleEndian.Uint64(src[8:16]), ValueID: binary.LittleEndian.Uint64(src[16:24]),
-		Cardinality: binary.LittleEndian.Uint64(src[24:32]), Offset: binary.LittleEndian.Uint64(src[32:40]),
-		Length: binary.LittleEndian.Uint32(src[40:44]), Generation: binary.LittleEndian.Uint64(src[48:56]),
+func decodeSegmentEntry(src []byte) (segmentEntry, uint32) {
+	return segmentEntry{
+		indexType: IndexType(binary.LittleEndian.Uint16(src[0:2])),
+		version:   binary.LittleEndian.Uint16(src[2:4]), flags: binary.LittleEndian.Uint32(src[4:8]),
+		indexID: binary.LittleEndian.Uint64(src[8:16]), valueID: binary.LittleEndian.Uint64(src[16:24]),
+		cardinality: binary.LittleEndian.Uint64(src[24:32]), offset: binary.LittleEndian.Uint64(src[32:40]),
+		length: binary.LittleEndian.Uint32(src[40:44]), generation: binary.LittleEndian.Uint64(src[48:56]),
 	}, binary.LittleEndian.Uint32(src[56:60])
 }

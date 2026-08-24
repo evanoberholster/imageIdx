@@ -3,18 +3,18 @@ package timestamp
 import "sort"
 
 type compactionTask struct {
-	block    *TimestampBlock
-	expected *TimestampBlockView
-	frozen   *TimestampDelta
+	block    *block
+	expected *blockView
+	frozen   *delta
 }
 
 type compactionResult struct {
-	block     *TimestampBlock
-	reclaimed *TimestampDelta
+	block     *block
+	reclaimed *delta
 }
 
 type compactRecord struct {
-	marker Timemarker
+	marker timemarker
 	id     ImageID
 }
 
@@ -32,14 +32,14 @@ func (r compactRecords) Less(i, j int) bool {
 func (i *Index) compactorLoop() {
 	defer i.workers.Done()
 	for task := range i.compactions {
-		base := compact(task.expected.Base, task.frozen)
-		replacement := &TimestampBlockView{
-			Base:       base,
-			Active:     task.expected.Active,
-			Generation: task.expected.Generation + 1,
+		base := compact(task.expected.base, task.frozen)
+		replacement := &blockView{
+			base:       base,
+			active:     task.expected.active,
+			generation: task.expected.generation + 1,
 		}
 		if task.block.view.CompareAndSwap(task.expected, replacement) {
-			i.epoch.synchronize()
+			i.readers.WaitForPriorReaders()
 			task.frozen.reset()
 			i.compactDone <- compactionResult{block: task.block, reclaimed: task.frozen}
 			continue
@@ -48,27 +48,27 @@ func (i *Index) compactorLoop() {
 	}
 }
 
-func compact(base *TimestampBase, frozen *TimestampDelta) *TimestampBase {
+func compact(base *base, frozen *delta) *base {
 	addCount := int(frozen.addCount.Load())
-	records := make(compactRecords, 0, base.Len()+addCount)
-	for index, id := range base.ImageIDs {
+	records := make(compactRecords, 0, base.len()+addCount)
+	for index, id := range base.imageIDs {
 		if !frozen.hasState(id) {
-			records = append(records, compactRecord{marker: base.Markers[index], id: id})
+			records = append(records, compactRecord{marker: base.markers[index], id: id})
 		}
 	}
 	for index := 0; index < addCount; index++ {
-		id := frozen.AddImageIDs[index]
+		id := frozen.addImageIDs[index]
 		if frozen.latestAdd(id, uint32(index)) {
-			records = append(records, compactRecord{marker: frozen.AddMarkers[index], id: id})
+			records = append(records, compactRecord{marker: frozen.addMarkers[index], id: id})
 		}
 	}
 	sort.Sort(records)
-	markers := make([]Timemarker, len(records))
+	markers := make([]timemarker, len(records))
 	ids := make([]ImageID, len(records))
 	for index, record := range records {
 		markers[index] = record.marker
 		ids[index] = record.id
 	}
-	result, _ := NewTimestampBase(markers, ids)
+	result, _ := newBase(markers, ids)
 	return result
 }

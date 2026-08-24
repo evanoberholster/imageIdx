@@ -20,9 +20,9 @@ func TestSearchExactFiltersLossyBoundaryMarkers(t *testing.T) {
 		3: offset + testQuantum + 30,
 		4: offset + 2*testQuantum + 1,
 	}
-	records := make([]Record, 0, len(timestamps))
+	records := make([]Entry, 0, len(timestamps))
 	for id, timestamp := range timestamps {
-		records = append(records, Record{Timestamp: timestamp, ImageID: id})
+		records = append(records, Entry{Timestamp: timestamp, ImageID: id})
 	}
 	index := mustNewIndex(t, records, offset, Config{})
 
@@ -42,19 +42,19 @@ func TestSearchExactFiltersLossyBoundaryMarkers(t *testing.T) {
 
 func TestAddDeleteAndRepeatedUpdateInActiveDelta(t *testing.T) {
 	const offset = uint64(1_000)
-	index := mustNewIndex(t, []Record{
+	index := mustNewIndex(t, []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 		{Timestamp: offset + 2*testQuantum, ImageID: 2},
 	}, offset, Config{DeltaCapacity: 16})
 
-	batch := NewWriteBatch(8)
-	batch.Append(TimestampWrite{Timestamp: offset + testQuantum, ImageID: 1, Op: WriteDelete})
-	batch.Append(TimestampWrite{Timestamp: offset + 4*testQuantum, ImageID: 1, Op: WriteAdd})
-	batch.Append(TimestampWrite{Timestamp: offset + 4*testQuantum, ImageID: 1, Op: WriteDelete})
-	batch.Append(TimestampWrite{Timestamp: offset + 5*testQuantum, ImageID: 1, Op: WriteAdd})
-	batch.Append(TimestampWrite{Timestamp: offset + 2*testQuantum, ImageID: 2, Op: WriteDelete})
-	batch.Append(TimestampWrite{Timestamp: offset + 3*testQuantum, ImageID: 3, Op: WriteAdd})
-	if err := index.Submit(batch); err != nil {
+	batch := NewBatch(6)
+	batch.Append(Delete(1, offset+testQuantum))
+	batch.Append(Insert(1, offset+4*testQuantum))
+	batch.Append(Delete(1, offset+4*testQuantum))
+	batch.Append(Insert(1, offset+5*testQuantum))
+	batch.Append(Delete(2, offset+2*testQuantum))
+	batch.Append(Insert(3, offset+3*testQuantum))
+	if err := index.Apply(batch); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,23 +74,23 @@ func TestAddDeleteAndRepeatedUpdateInActiveDelta(t *testing.T) {
 
 func TestRotationAndCompaction(t *testing.T) {
 	const offset = uint64(100)
-	index := mustNewIndex(t, []Record{
+	index := mustNewIndex(t, []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 		{Timestamp: offset + 2*testQuantum, ImageID: 2},
 	}, offset, Config{DeltaCapacity: 4})
 
-	batch := NewWriteBatch(4)
-	batch.Append(TimestampWrite{Timestamp: offset + testQuantum, ImageID: 1, Op: WriteDelete})
-	batch.Append(TimestampWrite{Timestamp: offset + 4*testQuantum, ImageID: 1, Op: WriteAdd})
-	batch.Append(TimestampWrite{Timestamp: offset + 3*testQuantum, ImageID: 3, Op: WriteAdd})
-	batch.Append(TimestampWrite{Timestamp: offset + 2*testQuantum, ImageID: 2, Op: WriteDelete})
-	if err := index.Submit(batch); err != nil {
+	batch := NewBatch(4)
+	batch.Append(Delete(1, offset+testQuantum))
+	batch.Append(Insert(1, offset+4*testQuantum))
+	batch.Append(Insert(3, offset+3*testQuantum))
+	batch.Append(Delete(2, offset+2*testQuantum))
+	if err := index.Apply(batch); err != nil {
 		t.Fatal(err)
 	}
 
 	batch.Reset()
-	batch.Append(TimestampWrite{Timestamp: offset + 5*testQuantum, ImageID: 4, Op: WriteAdd})
-	if err := index.Submit(batch); err != nil {
+	batch.Append(Insert(4, offset+5*testQuantum))
+	if err := index.Apply(batch); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -103,12 +103,12 @@ func TestRotationAndCompaction(t *testing.T) {
 	if !equalIDSet(all, []ImageID{1, 3, 4}) {
 		t.Fatalf("result after compaction = %v", all)
 	}
-	view := index.directory.Load().entries[0].block.LoadView()
-	if view.Frozen != nil {
+	view := index.directory.Load().entries[0].block.view.Load()
+	if view.frozen != nil {
 		t.Fatal("frozen delta remained after compaction")
 	}
-	if !equalMarkers(view.Base.Markers, []Timemarker{3, 4}) || !equalIDs(view.Base.ImageIDs, []ImageID{3, 1}) {
-		t.Fatalf("compacted base = (%v, %v)", view.Base.Markers, view.Base.ImageIDs)
+	if !equalMarkers(view.base.markers, []timemarker{3, 4}) || !equalIDs(view.base.imageIDs, []ImageID{3, 1}) {
+		t.Fatalf("compacted base = (%v, %v)", view.base.markers, view.base.imageIDs)
 	}
 }
 
@@ -116,50 +116,50 @@ func TestBackpressureDoesNotCreateThirdDelta(t *testing.T) {
 	index := mustNewIndex(t, nil, 0, Config{DeltaCapacity: 2})
 	entry := &index.directory.Load().entries[0]
 	view := entry.block.view.Load()
-	view.Active.appendAdd(1, 1)
-	view.Active.appendAdd(2, 2)
+	view.active.appendAdd(1, 1)
+	view.active.appendAdd(2, 2)
 	entry.block.spare = nil
-	entry.block.view.Store(&TimestampBlockView{
-		Base:       view.Base,
-		Frozen:     newTimestampDelta(2),
-		Active:     view.Active,
-		Generation: view.Generation + 1,
+	entry.block.view.Store(&blockView{
+		base:       view.base,
+		frozen:     newDelta(2),
+		active:     view.active,
+		generation: view.generation + 1,
 	})
 
-	batch := NewWriteBatch(1)
-	batch.Append(TimestampWrite{Timestamp: 3 * testQuantum, ImageID: 3, Op: WriteAdd})
-	if err := index.Submit(batch); err != ErrBackpressure {
+	batch := NewBatch(1)
+	batch.Append(Insert(3, 3*testQuantum))
+	if err := index.Apply(batch); err != ErrBackpressure {
 		t.Fatalf("error = %v, want %v", err, ErrBackpressure)
 	}
 	got := entry.block.view.Load()
-	if got.Frozen == nil || got.Active != view.Active {
+	if got.frozen == nil || got.active != view.active {
 		t.Fatal("backpressure changed the three-layer view")
 	}
 }
 
 func TestBlockDirectoryDoesNotSplitEqualMarkers(t *testing.T) {
 	const offset = uint64(100)
-	records := []Record{
+	records := []Entry{
 		{Timestamp: offset + testQuantum + 1, ImageID: 1},
 		{Timestamp: offset + testQuantum + 2, ImageID: 2},
 		{Timestamp: offset + testQuantum + 3, ImageID: 3},
 		{Timestamp: offset + 2*testQuantum, ImageID: 4},
 	}
 	index := mustNewIndex(t, records, offset, Config{BlockSize: 2})
-	if index.BlockCount() != 2 {
-		t.Fatalf("block count = %d, want 2", index.BlockCount())
+	if index.Metadata().BlockCount != 2 {
+		t.Fatalf("block count = %d, want 2", index.Metadata().BlockCount)
 	}
 	first := index.directory.Load().entries[0]
-	if first.block.LoadView().Base.Len() != 3 {
-		t.Fatalf("first block size = %d, want 3", first.block.LoadView().Base.Len())
+	if first.block.view.Load().base.len() != 3 {
+		t.Fatalf("first block size = %d, want 3", first.block.view.Load().base.len())
 	}
 }
 
 func TestConcurrentReadersUpdatesAndCompaction(t *testing.T) {
 	const offset = uint64(1_000)
-	records := make([]Record, 256)
+	records := make([]Entry, 256)
 	for i := range records {
-		records[i] = Record{Timestamp: offset + uint64(i)*testQuantum, ImageID: ImageID(i + 1)}
+		records[i] = Entry{Timestamp: offset + uint64(i)*testQuantum, ImageID: ImageID(i + 1)}
 	}
 	index := mustNewIndex(t, records, offset, Config{BlockSize: 64, DeltaCapacity: 32})
 
@@ -176,7 +176,7 @@ func TestConcurrentReadersUpdatesAndCompaction(t *testing.T) {
 		}()
 	}
 
-	batch := NewWriteBatch(2)
+	batch := NewBatch(1)
 	currentMarker := make([]uint64, 128)
 	for marker := range currentMarker {
 		currentMarker[marker] = uint64(marker)
@@ -187,10 +187,9 @@ func TestConcurrentReadersUpdatesAndCompaction(t *testing.T) {
 		oldMarker := currentMarker[position]
 		newMarker := uint64(256 + position)
 		batch.Reset()
-		batch.Append(TimestampWrite{Timestamp: offset + oldMarker*testQuantum, ImageID: id, Op: WriteDelete})
-		batch.Append(TimestampWrite{Timestamp: offset + newMarker*testQuantum, ImageID: id, Op: WriteAdd})
+		batch.Append(Move(id, offset+oldMarker*testQuantum, offset+newMarker*testQuantum))
 		for {
-			err := index.Submit(batch)
+			err := index.Apply(batch)
 			if err == nil {
 				break
 			}
@@ -213,9 +212,9 @@ func TestConcurrentReadersUpdatesAndCompaction(t *testing.T) {
 
 func TestSteadyStateSearchAllocations(t *testing.T) {
 	const offset = uint64(1_000)
-	records := make([]Record, 1_024)
+	records := make([]Entry, 1_024)
 	for i := range records {
-		records[i] = Record{Timestamp: offset + uint64(i)*testQuantum, ImageID: ImageID(i + 1)}
+		records[i] = Entry{Timestamp: offset + uint64(i)*testQuantum, ImageID: ImageID(i + 1)}
 	}
 	index := mustNewIndex(t, records, offset, Config{})
 	buffer := make([]ImageID, 0, len(records))
@@ -229,13 +228,13 @@ func TestSteadyStateSearchAllocations(t *testing.T) {
 
 func TestSteadyStateUpdateAllocations(t *testing.T) {
 	index := mustNewIndex(t, nil, 0, Config{DeltaCapacity: 4_096})
-	batch := NewWriteBatch(1)
+	batch := NewBatch(1)
 	var sequence uint64
 	allocations := testing.AllocsPerRun(1_000, func() {
 		sequence++
 		batch.Reset()
-		batch.Append(TimestampWrite{Timestamp: sequence << TimestampShift, ImageID: 1, Op: WriteAdd})
-		if err := index.Submit(batch); err != nil {
+		batch.Append(Insert(1, sequence<<TimestampShift))
+		if err := index.Apply(batch); err != nil {
 			panic(err)
 		}
 	})
@@ -245,15 +244,15 @@ func TestSteadyStateUpdateAllocations(t *testing.T) {
 }
 
 func TestRejectsDuplicateImageID(t *testing.T) {
-	_, err := New([]Record{{Timestamp: 1, ImageID: 1}, {Timestamp: 2, ImageID: 1}}, 0, Config{})
+	_, err := New(Spec{Entries: []Entry{{Timestamp: 1, ImageID: 1}, {Timestamp: 2, ImageID: 1}}}, Config{})
 	if err != ErrDuplicateImageID {
 		t.Fatalf("error = %v, want %v", err, ErrDuplicateImageID)
 	}
 }
 
-func mustNewIndex(t *testing.T, records []Record, offset uint64, config Config) *Index {
+func mustNewIndex(t *testing.T, records []Entry, offset uint64, config Config) *Index {
 	t.Helper()
-	index, err := New(records, offset, config)
+	index, err := New(Spec{Offset: offset, Entries: records}, config)
 	if err != nil {
 		t.Fatal(err)
 	}

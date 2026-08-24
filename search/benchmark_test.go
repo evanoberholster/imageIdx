@@ -3,6 +3,7 @@ package search
 import (
 	"testing"
 
+	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
 	"github.com/evanoberholster/imageIdx/geoindex"
 	"github.com/evanoberholster/imageIdx/timestamp"
@@ -11,10 +12,9 @@ import (
 func BenchmarkCombinedSearch(b *testing.B) {
 	const count = 10_000
 	quantum := uint64(1) << timestamp.TimestampShift
-	epoch := bitmapidx.NewEpoch()
 	bitmapIDs := make([]uint64, 0, count/2)
-	records := make([]timestamp.Record, count)
-	geoEntries := make([]geoindex.GeoCellEntry, count)
+	records := make([]timestamp.Entry, count)
+	geoEntries := make([]geoindex.Entry, count)
 	key, err := geoindex.KeyFromLatLng(37, -122)
 	if err != nil {
 		b.Fatal(err)
@@ -24,34 +24,36 @@ func BenchmarkCombinedSearch(b *testing.B) {
 		if id%2 == 0 {
 			bitmapIDs = append(bitmapIDs, id)
 		}
-		records[index] = timestamp.Record{Timestamp: id * quantum, ImageID: timestamp.ImageID(id)}
-		geoEntries[index] = geoindex.GeoCellEntry{Key: key, ImageID: id}
+		records[index] = timestamp.Entry{Timestamp: id * quantum, ImageID: imageidx.ImageID(id)}
+		geoEntries[index] = geoindex.Entry{ImageID: id, Latitude: 37, Longitude: -122}
 	}
-	bitmap, err := bitmapidx.New(bitmapidx.BitmapKey{Type: bitmapidx.IndexTypeTag, ValueID: 1}, 1, bitmapIDs, bitmapidx.Config{Epoch: epoch})
+	bitmap, err := bitmapidx.New(bitmapidx.Spec{
+		Key: bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1}, IndexID: 1, IDs: bitmapIDs,
+	}, bitmapidx.Config{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = bitmap.Close() })
-	timeIndex, err := timestamp.New(records, 0, timestamp.Config{})
+	timeIndex, err := timestamp.New(timestamp.Spec{IndexID: 3, Entries: records}, timestamp.Config{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = timeIndex.Close() })
-	geo, err := geoindex.NewFromCells(2, geoEntries, geoindex.Config{Epoch: epoch})
+	geo, err := geoindex.New(geoindex.Spec{IndexID: 2, Entries: geoEntries}, geoindex.Config{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = geo.Close() })
+	geoClause, err := WithinCells(geo, geoindex.DecodeS2Key(key))
+	if err != nil {
+		b.Fatal(err)
+	}
 
-	plan, err := (Scheduler{}).Plan(Query{
-		Bitmaps: []*bitmapidx.BitmapIndex{bitmap},
-		TimestampRanges: []TimestampRange{{
-			Index: timeIndex,
-			Start: 4_000 * quantum,
-			End:   6_000 * quantum,
-		}},
-		GeoRanges: []GeoRange{{Index: geo, Ranges: []geoindex.S2KeyRange{{Start: key, End: key}}}},
-	})
+	plan, err := Compile(
+		AllBitmaps(bitmap),
+		During(timeIndex, 4_000*quantum, 6_000*quantum),
+		geoClause,
+	)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -60,6 +62,6 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		results = plan.Execute(results[:0], workspace)
+		results = plan.Search(results[:0], workspace)
 	}
 }

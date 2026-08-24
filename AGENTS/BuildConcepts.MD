@@ -1,10 +1,10 @@
 # Build Concepts
 
 Operational guide for building, testing, and extending `imageIdx`. The
-`BitmapIdxProposal.MD`, `TimestampIdx.MD`, and `GeoIdxProposal.MD` documents are
-the design sources of truth; this document records how the implemented code is
-actually organized, the cross-package contracts, and the commands an agent must
-run before considering work complete.
+`BitmapIndex.md`, `TimestampIndex.md`, `GeoIndex.md`, `Search.md`, and
+`RoarFormat.md` describe the implemented designs. This document records the
+cross-package contracts and the commands an agent must run before considering
+work complete.
 
 ## Status
 
@@ -16,7 +16,8 @@ before scalar correctness and benchmarks are stable.
 
 - Module path: `github.com/evanoberholster/imageIdx`
 - Go: `1.27.0`
-- `github.com/dgraph-io/sroar` — roaring bitmaps (bitmapidx, geoindex)
+- `github.com/dgraph-io/sroar` — immutable roaring sets (`idset` only)
+- `github.com/weaviate/sroar` — benchmark comparison baseline for `roar`
 - `github.com/golang/geo/s2` — S2 geometry (geoindex)
 - `github.com/pkg/errors` — indirect
 
@@ -26,16 +27,17 @@ before scalar correctness and benchmarks are stable.
 go build ./...
 go test ./...
 go test -race ./...
-go run .
+go run ./cmd/imageidx
 ```
 
 Per-package benchmarks:
 
 ```sh
 go test ./timestamp  -run '^$' -bench 'Benchmark(Search|Update|DeltaCapacity|BlockSize)' -benchmem
-go test ./bitmapidx  -run '^$' -bench 'Benchmark(Contains|And4|WriteBatch1000)' -benchmem
+go test ./bitmapidx  -run '^$' -bench 'Benchmark(Contains|Intersect4|ApplyBatch1000)' -benchmem
 go test ./geoindex   -run '^$' -bench 'Benchmark(SingleCell|BoundingBox|BatchIngest1000)' -benchmem
 go test ./search     -run '^$' -bench 'BenchmarkCombinedSearch' -benchmem
+go test ./roar       -run '^$' -bench . -benchmem
 ```
 
 Set `TIMESTAMP_BENCH_LARGE=1` to enable the synthetic 10M and 100M-entry
@@ -47,26 +49,29 @@ Every change must pass `go build ./...`, `go test ./...`, and
 ## Package Layout and Dependencies
 
 ```text
-bitmapidx/   foundation: ImageID, IndexType, BitmapRef, Epoch
+./           imageidx: shared ImageID and durability domain types
+idset/       immutable roaring ID-set representation and buffer codec
+roar/        zero-copy immutable bitmap index (AGENTS/RoarFormat.md)
+bitmapidx/   logical bitmap predicates and bounded deltas
 timestamp/   standalone block-local timestamp index
-geoindex/    S2 level-16 spatial index (depends on bitmapidx)
+geoindex/    S2 level-16 spatial index (depends on idset)
 internal/indexutil/ shared non-domain mechanisms used by all three indexes
 search/      cross-index planner and conjunctive query executor
-main.go      placeholder ("imageIdx")
+cmd/imageidx/ runnable one-shot and HTTP-server combined-search example
 ```
 
-Dependency direction remains one-way: `geoindex` imports `bitmapidx`, while all
-three index packages may import `internal/indexutil`. `timestamp` remains
-independent of the other public index packages. `search` imports all three
-indexes; index packages must never import `search`. Never introduce a reverse
-dependency.
+Dependency direction remains one-way: the root `imageidx` package imports no
+subpackages; `idset` imports the root and owns the only `sroar` dependency; all
+indexes may import the root, `idset`, and `internal/indexutil` as appropriate.
+Specialized index packages remain independent of one another. `search` imports
+all three indexes; index packages must never import `search`. Never introduce a
+reverse dependency.
 
 ### Shared mechanisms live in `internal/indexutil`
 
-- `ReaderEpoch` provides the common two-slot reader-counting algorithm for
-  package-local epoch adapters. `bitmapidx.Epoch` keeps its equivalent loop
-  inline because adding an adapter branch changes its benchmark-critical query
-  path; `geoindex` already shares that public epoch.
+- `ReaderTracker` provides two-slot read-side lifetime tracking for all three
+  index packages. It is an internal mechanism, owned by an index or persistent
+  store rather than supplied through public configuration.
 - mmap/unmap, little-endian fixed-width mapped slices, alignment, and checked
   offset arithmetic are shared here.
 - exact writes and fsync/rename/directory-sync manifest publication are shared
@@ -75,23 +80,61 @@ dependency.
 - The package is internal implementation detail. It must not define database
   IDs, index metadata, format constants, or public index policy.
 
-### Shared primitives live in `bitmapidx`
+### Shared domain primitives live in `imageidx`
 
-- `bitmapidx.ImageID` (`uint64`) is the database-wide ID type.
-- `bitmapidx.BitmapRef` is the immutable roaring handle. `geoindex` reuses it for
-  dense S2 cells; it must not be copied into other packages.
-- `bitmapidx.Epoch` is the query-wide RCU reclamation primitive. `geoindex`
-  accepts one through `geoindex.Config.Epoch` so a multi-index query enters once.
+- `imageidx.ImageID` is the database-wide `uint64` alias. Every index package
+  exposes the same alias, keeping storage and batch APIs zero-conversion.
+- `imageidx.Durability` is shared by persistent index APIs; package constants
+  remain aliases for convenient migration.
 
-### `ImageID` is not one type everywhere
+### Immutable ID sets live in `idset`
 
-This is the most common cross-package trap:
+- `idset.Ref` is the immutable roaring handle shared by logical bitmap
+  predicates and dense S2 cells.
+- `idset.Builder` owns mutable replacement construction. Published `Ref` values
+  must never be mutated; notably, raw `sroar.FastAnd` consumes its first input.
+- `idset.FromBuffer` and `Ref.MarshalBinary` are the common owned/mmap buffer
+  boundary. Package-specific directories and file formats remain separate.
+- Index packages use `idset.Ref` directly; they do not expose representation
+  aliases.
 
-- `bitmapidx.ImageID` is the canonical type (`bitmapidx/types.go`).
-- `geoindex.ImageID` is an **alias**: `type ImageID = bitmapidx.ImageID`.
-- `timestamp.ImageID` is a **separate distinct type** (`timestamp/types.go`).
-  Values must be explicitly converted between `timestamp.ImageID` and the
-  `bitmapidx`/`geoindex` `ImageID`.
+### Zero-copy bitmap index lives in `roar`
+
+`roar` implements `AGENTS/RoarFormat.md`: the serialized bytes are the read
+representation.
+
+- Format: 16-byte header, sorted 16-byte `{high-48 key, offset}` entries,
+  8-byte container headers, sorted `uint16` array containers, and
+  1,024-`uint64` bitmap containers. Everything is little-endian.
+- The on-disk format is 8-byte aligned throughout: header, key table,
+  container headers, and bitmap payloads all begin on 8-byte boundaries and
+  every container occupies a multiple of 8 bytes. `Open` enforces this;
+  `TestSerializedAlignment` guards it.
+- `Open` validates untrusted bytes with the portable safe decoder;
+  `OpenTrusted` skips validation for bytes a storage layer has already
+  checked. Zero-copy access requires a little-endian host and an 8-byte
+  aligned buffer base.
+- `View` methods (`Contains`, `AndCardinality`, `AndManyCardinality`,
+  `Intersects`) allocate nothing. `AppendTo` is the fast materialization
+  path; `Iterator.Next/Value` is the compatibility API and is slower than
+  `AppendTo` because the Go inliner refuses the per-value state machine.
+- `FromSorted` is two-pass: one validation/layout pass, one write pass into a
+  single allocation. `Builder` accumulates operation results; `Compact`
+  assembles them. Thresholds (`ArrayToBitmapThreshold` 2048,
+  `linearKeySearchThreshold` 16, `arrayLinearSearchThreshold` 16) are runtime
+  policies, not format guarantees.
+- `roar` benchmarks compare against `github.com/weaviate/sroar` on
+  photo-DB-shaped distributions (geo cells, people, tags, dense time
+  buckets, favorites, mixed). Note: sroar's `And`/`Or`/`AndNot` mutate their
+  receiver, so benchmark and differential code must clone first.
+- `idset` remains on `dgraph-io/sroar`; `roar` is currently standalone.
+
+### `ImageID` is one type everywhere
+
+- `bitmapidx.ImageID`, `geoindex.ImageID`, and `timestamp.ImageID` are aliases
+  of `imageidx.ImageID`.
+- Cross-index search never converts or copies IDs solely because of package
+  type differences.
 
 `ImageID(0)` is reserved/invalid in `geoindex` only; `timestamp` and `bitmapidx`
 do not reserve zero.
@@ -105,11 +148,12 @@ Every index follows the same conceptual skeleton. New code must conform.
    `Load()`; writers build a complete replacement and `Store()` it. Nothing
    reachable from a published view is ever mutated.
 2. **No locks on the search path.** `Mutex`/`RWMutex` are forbidden in search
-   code. `bitmapidx` and `geoindex` use `Epoch`; `timestamp` uses its own
-   `readerEpoch`.
-3. **Epoch/RCU reclamation.** Atomic publication alone does not make old memory
-   reusable. Retired views, deltas, and mmap regions are only reclaimed after
-   `Synchronize()` guarantees no reader still references them.
+   code. Public read operations register and release through their index's
+   internal `ReaderTracker`; callers never create a guard.
+3. **Read-side lifetime tracking.** Atomic publication alone does not make old
+   memory reusable. Retired views, deltas, and mmap regions are only reclaimed
+   after `WaitForPriorReaders()` guarantees no earlier reader still references
+   them. `Close` performs this wait before unmapping storage.
 4. **Bounded read layers.** `Base + Frozen + Active` (bitmapidx/timestamp);
    `Sparse + Bitmap` (geoindex). Unbounded LSM-style delta chains are forbidden;
    apply backpressure or compact instead.
@@ -134,55 +178,82 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 ### bitmapidx
 
-- `New(key BitmapKey, indexID uint64, ids []uint64, config Config)` and
-  `NewBitmapIndex` are equivalent.
-- `Write(BitmapMutation)` is the canonical API; `Add`/`Remove` are wrappers.
-  A 1,000-ID `Add` publishes once, never 1,000 times.
-- If an ID appears in both `Additions` and `Removals`, removal wins.
-- `And`/`Or` materialize `effectiveBitmap()` today. A future delta-aware
+- `New(Spec, Config)` is the only constructor. `Spec` contains the stable key,
+  index ID, flags, and initial IDs.
+- `Apply(Mutation)` is the canonical mutation API. A 1,000-ID mutation
+  publishes once, never 1,000 times.
+- If an ID appears in both `Mutation.Add` and `Mutation.Remove`, removal wins.
+- `Intersect`/`Union` materialize `effectiveBitmap()` today. A future delta-aware
   correction path (Base-only ops + re-evaluating delta-touched IDs) is proposed
   but not implemented.
-- `PlanAND` orders by Base cardinality only; delta cardinalities are ignored.
-- `Store` (`NewPersistent`/`OpenPersistent`) wraps a `BitmapDirectory` and a
-  segment file; `Checkpoint`/`Vacuum` publish new generation files.
+- Intersection planning is private and orders by Base cardinality only; delta
+  cardinalities are ignored.
+- Reader-visible views, deltas, segment entries, and raw segment operations are
+  private. Public callers use `Metadata`, `Contains`, `AppendTo`, and the set
+  operations instead.
+- `Store` (`NewPersistent`/`OpenPersistent`) owns a private `Directory` and
+  segment. It forwards `Lookup`, `LookupID`, `Indexes`, and `Len` without
+  exposing internal storage fields; `Checkpoint`/`Vacuum` publish generations.
+  All indexes in one store share its private reader tracker; standalone indexes
+  own independent trackers.
 
 ### timestamp
 
-- Single write-owner goroutine fed by a bounded batch channel. `Submit` returns
-  `ErrBackpressure` when a block's delta is awaiting compaction; callers retry.
-- `TimestampDelta` is a fixed-capacity, single-writer append structure with a
+- `New(Spec, Config)` follows the same stable `IndexID`/flags pattern as the
+  other indexes. `Metadata` exposes a copied summary rather than mutable
+  persisted headers.
+- A single write-owner goroutine consumes reusable `Batch` values. Public
+  mutations are sealed values made by `Insert`, `Delete`, and `Move`; `Apply`
+  returns `ErrBackpressure` when a block's delta is awaiting compaction.
+- The private delta is a fixed-capacity, single-writer append structure with a
   lock-free hash state table for readers. It must not allocate on append.
 - `Search` is compressed-index only (zero-allocation). `SearchExact` re-verifies
   lossy boundary candidates via a caller-supplied canonical timestamp lookup.
 - Persistence is a SoA `markers.<gen>.base` + `ids.<gen>.base` + `blocks.<gen>.idx`
-  layout with an atomic manifest.
+  layout with an atomic manifest. Markers remain `uint32`; image IDs remain
+  `uint64` in a separate column.
 
 ### geoindex
 
 - One coordinate per image, normalized to S2 level 16 (`cellID >> 28`).
 - Sparse cells (1-4 IDs) use a fixed 4-slot SoA; dense cells (5+) use
-  `bitmapidx.BitmapRef`.
-- Searches load one `GeoIndexView` and never inspect writer-side mutations.
-  Visibility is threshold/timer driven; `Flush()` forces a boundary.
-- `Nearest` is currently a full scan over `All()`; the expanding-S2-cap executor
+  `idset.Ref`.
+- Searches load one private immutable `indexView` and never inspect writer-side
+  mutations. The view contains 256 independently replaceable shards;
+  visibility is threshold/timer driven and `Flush()` forces a boundary.
+- Public writes use explicit `geoindex.Mutation{ImageID, From, To}` values.
+  Zero is the absent/removal sentinel, avoiding a reverse image-to-cell map.
+- `Nearest` is currently a full scan over `AppendTo()`; the expanding-S2-cap executor
   is future work. Keep its API compatible.
-- `RangesFromCellUnion` + `NormalizeRanges` convert S2 coverage to sorted,
-  non-overlapping, inclusive `S2KeyRange`s.
+- `RangesFromCellIDs` converts valid S2 cells at levels 0-16 to sorted,
+  non-overlapping, inclusive level-16 `Range`s.
+- `CoverRegion(dst, region, options)` accepts reusable `CoverWorkspace` scratch
+  and caller-owned output. With sufficient capacities, the geoindex coverer
+  adds no allocations; a supplied `s2.Region` implementation may allocate in
+  its own methods.
 
 ### search
 
-- `Query` is conjunctive: every bitmap, timestamp range, and geo range must
-  match. An empty query is rejected rather than interpreted as every image.
-- `Scheduler.Plan` orders immutable stage descriptors by live cardinality
-  estimates. Estimates affect execution order only, never correctness.
-- Bitmap predicates remain one group so the first-stage path uses
-  `bitmapidx.And`; after another stage has produced candidates,
-  `bitmapidx.FilterInto` tests those candidates under one set of epoch guards.
-- Timestamp IDs are converted explicitly to the canonical
-  `bitmapidx.ImageID`; do not change `timestamp.ImageID` into a cross-package
-  alias.
-- Combined results are sorted and unique. A caller-owned `Workspace` reuses
-  intermediate ID buffers.
+- `Compile(clauses...)` creates a conjunctive plan: every bitmap, timestamp,
+  and geo clause must match. No clauses is rejected rather than interpreted as
+  every image.
+- Use `AllBitmaps`, `During`, and `WithinCells` to build sealed, validated
+  clause values instead of exposing a parallel-slice query struct. Geographic
+  query input is S2 cell IDs, never latitude/longitude bounds.
+- `During` accepts `ExactTimestamp`. Exact geographic verification remains in
+  the canonical-data layer rather than the candidate-index scheduler.
+- `Compile` coalesces all bitmap clauses and orders typed execution stages by
+  live cardinality estimates. Estimates affect execution order only, never
+  correctness.
+- Bitmap predicates remain one group. The first-stage path streams the
+  smallest bitmap into caller storage and filters it in place; after another
+  stage has produced candidates, `bitmapidx.FilterCandidates` tests them under
+  one registration per distinct private tracker. Timestamp exact clauses can
+  filter candidates in place; geographic clauses collect cell ranges and the
+  executor intersects.
+- Combined results are sorted and unique. A caller-owned result slice and
+  `Workspace` reuse all result/intermediate buffers, allowing zero-allocation
+  steady-state searches when capacities are sufficient.
 - Combined queries do not create a database-wide snapshot. Each stage observes
   one independently published index view, matching the existing per-index
   consistency contracts.
@@ -191,19 +262,21 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 | Package | Kind | Magic | Version |
 |---|---|---|---|
-| timestamp | index header | `0x54534958` TSIX | 1 |
-| timestamp | manifest | `0x54534d46` TSMF | 1 |
+| timestamp | manifest | `0x54534d46` TSMF | 2 |
 | timestamp | WAL | `0x5453574c` TSWL | 1 |
-| bitmapidx | format | `0x424d4958` BMIX | 1 |
-| bitmapidx | segment | `0x424d5347` BMSG | 1 |
+| bitmapidx | segment | `0x424d5347` BMSG | 2 |
 | bitmapidx | manifest | `0x424d4d46` BMMF | 1 |
 | bitmapidx | WAL | `0x424d574c` BMWL | 1 |
-| geoindex | storage generation | `0x47454f49` GEOI | 1 |
+| geoindex | storage generation | `0x47454f49` GEOI | 2 |
 | geoindex | manifest | `0x47454f4d` GEOM | 1 |
 | geoindex | WAL | `0x4745574c` GEWL | 1 |
 
 All multi-byte integers are little-endian. All payloads are CRC32/IEEE
-checksummed. Page/block alignment is 4,096 bytes.
+checksummed. Fixed records and structural boundaries are multiples of eight;
+large payload starts use the stricter 4,096-byte page alignment. Native element
+widths are unchanged: in particular, timestamp markers remain four-byte values
+in their own SoA column, with padding only between structural regions or at a
+file boundary.
 
 ## Tunable Defaults (not part of the persisted format)
 
@@ -215,7 +288,7 @@ checksummed. Page/block alignment is 4,096 bytes.
 | bitmapidx | `DefaultActiveTarget` | 2,048 |
 | bitmapidx | `DefaultHardDeltaLimit` | 4,095 |
 | geoindex | `GeoS2Level` | 16 |
-| geoindex | `GeoSparseSlots` | 4 |
+| geoindex | sparse slot count (format-private) | 4 |
 | geoindex | `DefaultPublishThreshold` | 256 |
 | geoindex | `DefaultCoverCells` | 32 |
 
@@ -223,8 +296,9 @@ These are benchmark-driven; change them only with supporting evidence.
 
 ## Conventions When Extending
 
-- Add new functionality to an existing package; do not duplicate roaring, epoch,
-  WAL, or mmap code into a new package.
+- Add new functionality to an existing package; do not duplicate roaring,
+  reader tracking, WAL, or mmap code into a new package. Roaring mechanics
+  belong only in `idset`.
 - Mirror the existing `*_test.go` split: unit tests, storage tests
   (`storage_test.go`), and benchmarks (`benchmark_test.go`). Use
   `b.ReportAllocs()` and `b.ResetTimer()` in benchmarks.

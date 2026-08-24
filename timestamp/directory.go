@@ -7,8 +7,8 @@ const markerSpaceEnd uint64 = 1 << 32
 type blockEntry struct {
 	startMarker uint64
 	endMarker   uint64
-	meta        TimestampBlockMeta
-	block       *TimestampBlock
+	meta        blockMetadata
+	block       *block
 }
 
 type blockDirectory struct {

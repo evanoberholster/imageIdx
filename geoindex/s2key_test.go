@@ -29,9 +29,28 @@ func TestS2KeyRoundTripAndLevelValidation(t *testing.T) {
 	}
 }
 
-func TestNormalizeRanges(t *testing.T) {
-	ranges := NormalizeRanges([]S2KeyRange{{Start: 9, End: 11}, {Start: 1, End: 3}, {Start: 5, End: 7}})
-	if len(ranges) != 1 || ranges[0] != (S2KeyRange{Start: 1, End: 11}) {
+func TestRangesFromCellIDsNormalizesAdjacentCells(t *testing.T) {
+	cell := s2.CellIDFromLatLng(s2.LatLngFromDegrees(37.7749, -122.4194)).Parent(GeoS2Level)
+	ranges, err := RangesFromCellIDs(nil, []uint64{uint64(cell.Next()), uint64(cell), uint64(cell.Prev())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges) != 1 || ranges[0] != (Range{Start: EncodeS2Key(uint64(cell.Prev())), End: EncodeS2Key(uint64(cell.Next()))}) {
 		t.Fatalf("ranges = %#v", ranges)
+	}
+}
+
+func TestRangesFromCoarseCell(t *testing.T) {
+	cell := s2.CellIDFromLatLng(s2.LatLngFromDegrees(37.7749, -122.4194)).Parent(12)
+	ranges, err := RangesFromCellIDs(nil, []uint64{uint64(cell)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Range{
+		Start: EncodeS2Key(uint64(cell.ChildBeginAtLevel(GeoS2Level))),
+		End:   EncodeS2Key(uint64(cell.ChildEndAtLevel(GeoS2Level).Prev())),
+	}
+	if len(ranges) != 1 || ranges[0] != want {
+		t.Fatalf("ranges = %#v, want %#v", ranges, want)
 	}
 }

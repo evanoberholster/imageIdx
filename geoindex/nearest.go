@@ -15,7 +15,7 @@ type NearestResult struct {
 // Nearest returns the exact top K among indexed images for which lookup
 // supplies canonical coordinates. V1 uses a full immutable scan; its API is
 // compatible with a future expanding-S2-cap executor.
-func (g *GeoIndex) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup CoordinateLookup) []NearestResult {
+func (g *Index) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup CoordinateLookup) []NearestResult {
 	if k <= 0 || lookup == nil {
 		return dst
 	}
@@ -23,7 +23,7 @@ func (g *GeoIndex) Nearest(dst []NearestResult, latitude, longitude float64, k i
 		return dst
 	}
 	start := len(dst)
-	for _, id := range g.All(nil) {
+	for _, id := range g.AppendTo(nil) {
 		lat, lng, ok := lookup(id)
 		if !ok {
 			continue

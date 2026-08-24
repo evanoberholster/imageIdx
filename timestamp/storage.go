@@ -8,16 +8,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
 	manifestMagic      uint32 = 0x54534d46 // TSMF
-	manifestVersion    uint16 = 1
-	manifestSize              = 72
+	manifestVersion    uint16 = 2
+	manifestSize              = 80
 	directoryEntrySize        = 64
 	storageAlignment          = 4_096
+	formatAlignment           = 8
 	walFilename               = "timestamp.wal"
 )
 
@@ -25,6 +27,7 @@ var ErrCorruptManifest = errors.New("timestamp: corrupt manifest")
 
 type diskManifest struct {
 	generation uint64
+	indexID    uint64
 	count      uint64
 	startTime  uint64
 	endTime    uint64
@@ -34,11 +37,24 @@ type diskManifest struct {
 	flags      uint32
 }
 
-func NewPersistent(storeDir string, records []Record, offset uint64, config Config) (*Index, error) {
+type persistentState struct {
+	mu         sync.Mutex
+	dir        string
+	durability Durability
+	wal        *timestampWAL
+	mappings   [][]byte
+}
+
+// NewPersistent creates a persistent index and publishes its initial
+// checkpoint.
+func NewPersistent(storeDir string, spec Spec, config Config, durability Durability) (*Index, error) {
+	if durability > DurabilitySync {
+		return nil, ErrInvalidConfig
+	}
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
 		return nil, err
 	}
-	index, err := New(records, offset, config)
+	index, err := New(spec, config)
 	if err != nil {
 		return nil, err
 	}
@@ -47,8 +63,7 @@ func NewPersistent(storeDir string, records []Record, offset uint64, config Conf
 		_ = index.Close()
 		return nil, err
 	}
-	index.storeDir = storeDir
-	index.wal = wal
+	index.persistence = &persistentState{dir: storeDir, durability: durability, wal: wal}
 	if err = index.Checkpoint(); err != nil {
 		_ = index.Close()
 		return nil, err
@@ -56,7 +71,11 @@ func NewPersistent(storeDir string, records []Record, offset uint64, config Conf
 	return index, nil
 }
 
-func OpenPersistent(storeDir string, config Config) (*Index, error) {
+// OpenPersistent maps the published base generation and replays the WAL tail.
+func OpenPersistent(storeDir string, config Config, durability Durability) (*Index, error) {
+	if durability > DurabilitySync {
+		return nil, ErrInvalidConfig
+	}
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -75,11 +94,21 @@ func OpenPersistent(storeDir string, config Config) (*Index, error) {
 		_ = unmapFile(markersMapping)
 		return nil, err
 	}
+	if len(markersMapping)%formatAlignment != 0 || len(idsMapping)%formatAlignment != 0 {
+		_ = unmapFile(markersMapping)
+		_ = unmapFile(idsMapping)
+		return nil, ErrCorruptManifest
+	}
 	directoryBytes, err := os.ReadFile(blocksPath)
 	if err != nil {
 		_ = unmapFile(markersMapping)
 		_ = unmapFile(idsMapping)
 		return nil, err
+	}
+	if len(directoryBytes)%formatAlignment != 0 {
+		_ = unmapFile(markersMapping)
+		_ = unmapFile(idsMapping)
+		return nil, ErrCorruptManifest
 	}
 	directory, err := decodeDirectory(directoryBytes, markersMapping, idsMapping, config)
 	if err != nil {
@@ -109,29 +138,26 @@ func OpenPersistent(storeDir string, config Config) (*Index, error) {
 	}
 
 	index := &Index{
-		Header: TimestampIndexHeader{
-			Magic:      TimestampIndexMagic,
-			Version:    TimestampIndexVersion,
-			Flags:      uint16(manifest.flags),
-			Count:      manifest.count,
-			StartTime:  manifest.startTime,
-			EndTime:    manifest.endTime,
-			OffsetTime: manifest.offsetTime,
-			Shift:      TimestampShift,
-			Generation: manifest.generation,
-		},
+		indexID:       manifest.indexID,
+		flags:         manifest.flags,
 		offset:        manifest.offsetTime,
+		startTime:     manifest.startTime,
+		endTime:       manifest.endTime,
 		config:        config,
-		writes:        make(chan *TimestampWriteBatch, config.WriteQueueCapacity),
+		writes:        make(chan *Batch, config.WriteQueueCapacity),
 		barriers:      make(chan chan barrierResult),
 		compactions:   make(chan compactionTask, max(config.CompactionQueue, len(directory.entries))),
 		compactDone:   make(chan compactionResult, max(config.CompactionQueue, len(directory.entries))),
 		stop:          make(chan struct{}),
 		writerNeeds:   make([]uint32, len(directory.entries)),
 		writerTouched: make([]int, 0, 256),
-		storeDir:      storeDir,
-		mappings:      [][]byte{markersMapping, idsMapping},
+		persistence: &persistentState{
+			dir: storeDir, durability: durability,
+			mappings: [][]byte{markersMapping, idsMapping},
+		},
 	}
+	index.generation.Store(manifest.generation)
+	index.baseCount.Store(manifest.count)
 	index.directory.Store(directory)
 	index.workers.Add(2)
 	go index.writerLoop()
@@ -143,12 +169,13 @@ func OpenPersistent(storeDir string, config Config) (*Index, error) {
 		return nil, err
 	}
 	if len(recovered) != 0 {
-		batch := NewWriteBatch(min(len(recovered), config.DeltaCapacity))
+		batch := NewBatch(min(len(recovered), config.DeltaCapacity))
 		for start := 0; start < len(recovered); {
 			end := min(start+config.DeltaCapacity, len(recovered))
-			batch.Writes = append(batch.Writes[:0], recovered[start:end]...)
+			batch.writes = append(batch.writes[:0], recovered[start:end]...)
+			batch.mutations = end - start
 			for {
-				err = index.Submit(batch)
+				err = index.Apply(batch)
 				if err != ErrBackpressure {
 					break
 				}
@@ -165,21 +192,22 @@ func OpenPersistent(storeDir string, config Config) (*Index, error) {
 		_ = index.Close()
 		return nil, err
 	}
-	index.wal = wal
+	index.persistence.wal = wal
 	return index, nil
 }
 
+// Checkpoint writes and atomically publishes a new base generation.
 func (i *Index) Checkpoint() error {
 	i.lifecycle.RLock()
 	defer i.lifecycle.RUnlock()
-	if i.storeDir == "" || i.wal == nil {
-		return errors.New("timestamp: index is not persistent")
+	if i.persistence == nil || i.persistence.wal == nil {
+		return ErrNotPersistent
 	}
 	if i.closed.Load() {
 		return ErrClosed
 	}
-	i.persistenceMu.Lock()
-	defer i.persistenceMu.Unlock()
+	i.persistence.mu.Lock()
+	defer i.persistence.mu.Unlock()
 
 	response := make(chan barrierResult, 1)
 	select {
@@ -191,8 +219,8 @@ func (i *Index) Checkpoint() error {
 	if barrier.err != nil {
 		return barrier.err
 	}
-	generation := i.Header.Generation + 1
-	markersPath, idsPath, blocksPath := generationPaths(i.storeDir, generation)
+	generation := i.generation.Load() + 1
+	markersPath, idsPath, blocksPath := generationPaths(i.persistence.dir, generation)
 	markerTemp, idTemp, blockTemp := markersPath+".tmp", idsPath+".tmp", blocksPath+".tmp"
 	markerFile, err := os.OpenFile(markerTemp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -204,37 +232,43 @@ func (i *Index) Checkpoint() error {
 		return err
 	}
 
-	epoch := i.epoch.enter()
+	token := i.readers.Acquire()
 	directory := i.directory.Load()
 	diskEntries := make([]blockEntry, len(directory.entries))
 	var totalCount uint64
 	for index := range directory.entries {
 		entry := &directory.entries[index]
 		base := snapshotBase(entry.block.view.Load())
-		markerOffset, alignErr := alignFile(markerFile)
+		markerOffset, alignErr := alignFile(markerFile, storageAlignment)
 		if alignErr != nil {
 			err = alignErr
 			break
 		}
-		idOffset, alignErr := alignFile(idFile)
+		idOffset, alignErr := alignFile(idFile, storageAlignment)
 		if alignErr != nil {
 			err = alignErr
 			break
 		}
-		if err = writeMarkers(markerFile, base.Markers); err != nil {
+		if err = writeMarkers(markerFile, base.markers); err != nil {
 			break
 		}
-		if err = writeImageIDs(idFile, base.ImageIDs); err != nil {
+		if err = writeImageIDs(idFile, base.imageIDs); err != nil {
+			break
+		}
+		if _, err = alignFile(markerFile, formatAlignment); err != nil {
+			break
+		}
+		if _, err = alignFile(idFile, formatAlignment); err != nil {
 			break
 		}
 		diskEntries[index] = *entry
 		diskEntries[index].meta.MarkerOffset = uint64(markerOffset)
 		diskEntries[index].meta.IDOffset = uint64(idOffset)
-		diskEntries[index].meta.Count = uint32(base.Len())
+		diskEntries[index].meta.Count = uint32(base.len())
 		diskEntries[index].meta.Generation = generation
-		totalCount += uint64(base.Len())
+		totalCount += uint64(base.len())
 	}
-	i.epoch.exit(epoch)
+	i.readers.Release(token)
 	if err == nil {
 		err = markerFile.Sync()
 	}
@@ -264,35 +298,38 @@ func (i *Index) Checkpoint() error {
 	}
 	manifest := diskManifest{
 		generation: generation,
+		indexID:    i.indexID,
 		count:      totalCount,
-		startTime:  i.Header.StartTime,
-		endTime:    i.Header.EndTime,
+		startTime:  i.startTime,
+		endTime:    i.endTime,
 		offsetTime: i.offset,
 		walOffset:  barrier.walOffset,
 		blockCount: uint64(len(diskEntries)),
-		flags:      uint32(i.Header.Flags),
+		flags:      i.flags,
 	}
-	if err = writeManifestAtomic(i.storeDir, manifest); err != nil {
+	if err = writeManifestAtomic(i.persistence.dir, manifest); err != nil {
 		return err
 	}
-	i.Header.Generation = generation
-	i.Header.Count = totalCount
+	i.generation.Store(generation)
+	i.baseCount.Store(totalCount)
 	return nil
 }
 
+// Vacuum currently publishes a checkpoint; generation retention remains a
+// storage-owner policy.
 func (i *Index) Vacuum() error { return i.Checkpoint() }
 
-func snapshotBase(view *TimestampBlockView) *TimestampBase {
+func snapshotBase(view *blockView) *base {
 	for {
-		version := view.Active.stableVersion()
-		base := view.Base
-		if view.Frozen != nil && view.Frozen.Len() != 0 {
-			base = compact(base, view.Frozen)
+		version := view.active.stableVersion()
+		base := view.base
+		if view.frozen != nil && view.frozen.len() != 0 {
+			base = compact(base, view.frozen)
 		}
-		if view.Active.Len() != 0 {
-			base = compact(base, view.Active)
+		if view.active.len() != 0 {
+			base = compact(base, view.active)
 		}
-		if view.Active.version.Load() == version {
+		if view.active.version.Load() == version {
 			return base
 		}
 	}
@@ -305,12 +342,12 @@ func generationPaths(dir string, generation uint64) (markers, ids, blocks string
 		filepath.Join(dir, "blocks."+suffix+".idx")
 }
 
-func alignFile(file *os.File) (int64, error) {
+func alignFile(file *os.File, alignment uint64) (int64, error) {
 	offset, err := file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return 0, err
 	}
-	aligned := int64(indexutil.Align(uint64(offset), storageAlignment))
+	aligned := int64(indexutil.Align(uint64(offset), alignment))
 	if padding := aligned - offset; padding != 0 {
 		zeros := make([]byte, padding)
 		if _, err = file.Write(zeros); err != nil {
@@ -320,7 +357,7 @@ func alignFile(file *os.File) (int64, error) {
 	return aligned, nil
 }
 
-func writeMarkers(file *os.File, markers []Timemarker) error {
+func writeMarkers(file *os.File, markers []timemarker) error {
 	buffer := make([]byte, 64*1024)
 	for len(markers) != 0 {
 		count := min(len(markers), len(buffer)/4)
@@ -386,7 +423,7 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 	for index := range entries {
 		position := index * directoryEntrySize
 		encoded := data[position : position+directoryEntrySize]
-		meta := TimestampBlockMeta{
+		meta := blockMetadata{
 			StartTime:    binary.LittleEndian.Uint64(encoded[16:24]),
 			EndTime:      binary.LittleEndian.Uint64(encoded[24:32]),
 			MarkerOffset: binary.LittleEndian.Uint64(encoded[32:40]),
@@ -394,6 +431,9 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 			Count:        binary.LittleEndian.Uint32(encoded[48:52]),
 			Flags:        binary.LittleEndian.Uint32(encoded[52:56]),
 			Generation:   binary.LittleEndian.Uint64(encoded[56:64]),
+		}
+		if meta.MarkerOffset%formatAlignment != 0 || meta.IDOffset%formatAlignment != 0 {
+			return nil, ErrCorruptManifest
 		}
 		markers, err := mappedMarkers(markerData, meta.MarkerOffset, meta.Count)
 		if err != nil {
@@ -403,7 +443,7 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 		if err != nil {
 			return nil, err
 		}
-		base, err := NewTimestampBase(markers, ids)
+		base, err := newBase(markers, ids)
 		if err != nil {
 			return nil, err
 		}
@@ -411,7 +451,7 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 			startMarker: binary.LittleEndian.Uint64(encoded[0:8]),
 			endMarker:   binary.LittleEndian.Uint64(encoded[8:16]),
 			meta:        meta,
-			block:       newTimestampBlock(base, config.DeltaCapacity),
+			block:       newBlock(base, config.DeltaCapacity),
 		}
 		if entries[index].startMarker >= entries[index].endMarker ||
 			(index != 0 && entries[index-1].endMarker != entries[index].startMarker) {
@@ -432,14 +472,15 @@ func encodeManifest(manifest diskManifest) []byte {
 	binary.LittleEndian.PutUint16(data[4:6], manifestVersion)
 	data[6] = TimestampShift
 	binary.LittleEndian.PutUint64(data[8:16], manifest.generation)
-	binary.LittleEndian.PutUint64(data[16:24], manifest.count)
-	binary.LittleEndian.PutUint64(data[24:32], manifest.startTime)
-	binary.LittleEndian.PutUint64(data[32:40], manifest.endTime)
-	binary.LittleEndian.PutUint64(data[40:48], manifest.offsetTime)
-	binary.LittleEndian.PutUint64(data[48:56], uint64(manifest.walOffset))
-	binary.LittleEndian.PutUint64(data[56:64], manifest.blockCount)
-	binary.LittleEndian.PutUint32(data[64:68], manifest.flags)
-	binary.LittleEndian.PutUint32(data[68:72], crc32.ChecksumIEEE(data[:68]))
+	binary.LittleEndian.PutUint64(data[16:24], manifest.indexID)
+	binary.LittleEndian.PutUint64(data[24:32], manifest.count)
+	binary.LittleEndian.PutUint64(data[32:40], manifest.startTime)
+	binary.LittleEndian.PutUint64(data[40:48], manifest.endTime)
+	binary.LittleEndian.PutUint64(data[48:56], manifest.offsetTime)
+	binary.LittleEndian.PutUint64(data[56:64], uint64(manifest.walOffset))
+	binary.LittleEndian.PutUint64(data[64:72], manifest.blockCount)
+	binary.LittleEndian.PutUint32(data[72:76], manifest.flags)
+	binary.LittleEndian.PutUint32(data[76:80], crc32.ChecksumIEEE(data[:76]))
 	return data
 }
 
@@ -450,17 +491,18 @@ func readManifest(path string) (diskManifest, error) {
 	}
 	if len(data) != manifestSize || binary.LittleEndian.Uint32(data[0:4]) != manifestMagic ||
 		binary.LittleEndian.Uint16(data[4:6]) != manifestVersion || data[6] != TimestampShift ||
-		binary.LittleEndian.Uint32(data[68:72]) != crc32.ChecksumIEEE(data[:68]) {
+		binary.LittleEndian.Uint32(data[76:80]) != crc32.ChecksumIEEE(data[:76]) {
 		return diskManifest{}, ErrCorruptManifest
 	}
 	return diskManifest{
 		generation: binary.LittleEndian.Uint64(data[8:16]),
-		count:      binary.LittleEndian.Uint64(data[16:24]),
-		startTime:  binary.LittleEndian.Uint64(data[24:32]),
-		endTime:    binary.LittleEndian.Uint64(data[32:40]),
-		offsetTime: binary.LittleEndian.Uint64(data[40:48]),
-		walOffset:  int64(binary.LittleEndian.Uint64(data[48:56])),
-		blockCount: binary.LittleEndian.Uint64(data[56:64]),
-		flags:      binary.LittleEndian.Uint32(data[64:68]),
+		indexID:    binary.LittleEndian.Uint64(data[16:24]),
+		count:      binary.LittleEndian.Uint64(data[24:32]),
+		startTime:  binary.LittleEndian.Uint64(data[32:40]),
+		endTime:    binary.LittleEndian.Uint64(data[40:48]),
+		offsetTime: binary.LittleEndian.Uint64(data[48:56]),
+		walOffset:  int64(binary.LittleEndian.Uint64(data[56:64])),
+		blockCount: binary.LittleEndian.Uint64(data[64:72]),
+		flags:      binary.LittleEndian.Uint32(data[72:76]),
 	}, nil
 }

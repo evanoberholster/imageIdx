@@ -4,10 +4,10 @@ import "sync/atomic"
 
 const deltaHashMultiplier uint64 = 0x9e3779b97f4a7c15
 
-type TimestampDelta struct {
-	AddMarkers  []Timemarker
-	AddImageIDs []ImageID
-	DeleteIDs   []ImageID
+type delta struct {
+	addMarkers  []timemarker
+	addImageIDs []ImageID
+	deleteIDs   []ImageID
 
 	addSequences    []uint32
 	deleteSequences []uint32
@@ -24,15 +24,15 @@ type TimestampDelta struct {
 	opCount  uint32 // single-writer owned
 }
 
-func newTimestampDelta(capacity int) *TimestampDelta {
+func newDelta(capacity int) *delta {
 	tableSize := 4
 	for tableSize < capacity*2 {
 		tableSize <<= 1
 	}
-	return &TimestampDelta{
-		AddMarkers:      make([]Timemarker, capacity),
-		AddImageIDs:     make([]ImageID, capacity),
-		DeleteIDs:       make([]ImageID, capacity),
+	return &delta{
+		addMarkers:      make([]timemarker, capacity),
+		addImageIDs:     make([]ImageID, capacity),
+		deleteIDs:       make([]ImageID, capacity),
 		addSequences:    make([]uint32, capacity),
 		deleteSequences: make([]uint32, capacity),
 		stateKeys:       make([]atomic.Uint64, tableSize),
@@ -43,15 +43,9 @@ func newTimestampDelta(capacity int) *TimestampDelta {
 	}
 }
 
-func (d *TimestampDelta) Capacity() int { return int(d.capacity) }
+func (d *delta) len() int { return int(d.addCount.Load() + d.deleteCount.Load()) }
 
-func (d *TimestampDelta) Len() int { return int(d.addCount.Load() + d.deleteCount.Load()) }
-
-func (d *TimestampDelta) AddLen() int { return int(d.addCount.Load()) }
-
-func (d *TimestampDelta) DeleteLen() int { return int(d.deleteCount.Load()) }
-
-func (d *TimestampDelta) remaining() uint32 { return d.capacity - d.opCount }
+func (d *delta) remaining() uint32 { return d.capacity - d.opCount }
 
 func encodeState(sequence uint32, addIndex uint32, add bool) uint64 {
 	meta := uint64(sequence)<<33 | uint64(addIndex+1)<<1
@@ -65,7 +59,7 @@ func decodeState(meta uint64) (sequence, addIndex uint32, add bool) {
 	return uint32(meta >> 33), uint32((meta >> 1) - 1), meta&1 != 0
 }
 
-func (d *TimestampDelta) stateSlot(id ImageID) (uint64, bool) {
+func (d *delta) stateSlot(id ImageID) (uint64, bool) {
 	start := (uint64(id) * deltaHashMultiplier) & d.stateMask
 	for probe := uint64(0); probe <= d.stateMask; probe++ {
 		slot := (start + probe) & d.stateMask
@@ -79,7 +73,7 @@ func (d *TimestampDelta) stateSlot(id ImageID) (uint64, bool) {
 	return 0, false
 }
 
-func (d *TimestampDelta) publishState(id ImageID, meta uint64) {
+func (d *delta) publishState(id ImageID, meta uint64) {
 	slot, found := d.stateSlot(id)
 	if found {
 		d.stateMeta[slot].Store(meta)
@@ -90,7 +84,7 @@ func (d *TimestampDelta) publishState(id ImageID, meta uint64) {
 	d.stateUsed[slot].Store(1)
 }
 
-func (d *TimestampDelta) state(id ImageID) (uint64, bool) {
+func (d *delta) state(id ImageID) (uint64, bool) {
 	slot, found := d.stateSlot(id)
 	if !found {
 		return 0, false
@@ -99,15 +93,15 @@ func (d *TimestampDelta) state(id ImageID) (uint64, bool) {
 	return meta, meta != 0
 }
 
-func (d *TimestampDelta) appendAdd(marker Timemarker, id ImageID) bool {
+func (d *delta) appendAdd(marker timemarker, id ImageID) bool {
 	if d.opCount >= d.capacity {
 		return false
 	}
 	d.version.Add(1)
 	index := d.addCount.Load()
 	sequence := d.opCount + 1
-	d.AddMarkers[index] = marker
-	d.AddImageIDs[index] = id
+	d.addMarkers[index] = marker
+	d.addImageIDs[index] = id
 	d.addSequences[index] = sequence
 	d.publishState(id, encodeState(sequence, index, true))
 	d.addCount.Store(index + 1)
@@ -116,14 +110,14 @@ func (d *TimestampDelta) appendAdd(marker Timemarker, id ImageID) bool {
 	return true
 }
 
-func (d *TimestampDelta) appendDelete(id ImageID) bool {
+func (d *delta) appendDelete(id ImageID) bool {
 	if d.opCount >= d.capacity {
 		return false
 	}
 	d.version.Add(1)
 	index := d.deleteCount.Load()
 	sequence := d.opCount + 1
-	d.DeleteIDs[index] = id
+	d.deleteIDs[index] = id
 	d.deleteSequences[index] = sequence
 	d.publishState(id, encodeState(sequence, 0, false))
 	d.deleteCount.Store(index + 1)
@@ -132,7 +126,7 @@ func (d *TimestampDelta) appendDelete(id ImageID) bool {
 	return true
 }
 
-func (d *TimestampDelta) latestAdd(id ImageID, addIndex uint32) bool {
+func (d *delta) latestAdd(id ImageID, addIndex uint32) bool {
 	meta, ok := d.state(id)
 	if !ok {
 		return false
@@ -141,12 +135,12 @@ func (d *TimestampDelta) latestAdd(id ImageID, addIndex uint32) bool {
 	return add && latestIndex == addIndex
 }
 
-func (d *TimestampDelta) hasState(id ImageID) bool {
+func (d *delta) hasState(id ImageID) bool {
 	_, ok := d.state(id)
 	return ok
 }
 
-func (d *TimestampDelta) stableVersion() uint64 {
+func (d *delta) stableVersion() uint64 {
 	for {
 		version := d.version.Load()
 		if version&1 == 0 {
@@ -155,7 +149,7 @@ func (d *TimestampDelta) stableVersion() uint64 {
 	}
 }
 
-func (d *TimestampDelta) reset() {
+func (d *delta) reset() {
 	d.version.Add(1)
 	for i := range d.stateUsed {
 		d.stateMeta[i].Store(0)

@@ -9,29 +9,29 @@ func TestTimemarkerEncoding(t *testing.T) {
 	const offset = uint64(1_700_000_000_000_000_000)
 	const lowBits = uint64(0x00ab_cdef)
 	timestamp := offset + (uint64(42) << TimestampShift) + lowBits
-	marker, err := EncodeTimemarkerChecked(timestamp, offset)
+	marker, err := encodeTimemarkerChecked(timestamp, offset)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if marker != 42 {
 		t.Fatalf("marker = %d, want 42", marker)
 	}
-	if decoded := DecodeTimemarker(marker, offset); decoded != timestamp-lowBits {
+	if decoded := decodeTimemarker(marker, offset); decoded != timestamp-lowBits {
 		t.Fatalf("decoded = %d, want %d", decoded, timestamp-lowBits)
 	}
 }
 
 func TestTimemarkerRangeValidation(t *testing.T) {
 	const offset = uint64(100)
-	if _, err := EncodeTimemarkerChecked(offset-1, offset); err != ErrInvalidRange {
+	if _, err := encodeTimemarkerChecked(offset-1, offset); err != ErrInvalidRange {
 		t.Fatalf("underflow error = %v, want %v", err, ErrInvalidRange)
 	}
 	last := offset + (uint64(math.MaxUint32) << TimestampShift) + (1<<TimestampShift - 1)
-	marker, err := EncodeTimemarkerChecked(last, offset)
-	if err != nil || marker != Timemarker(math.MaxUint32) {
+	marker, err := encodeTimemarkerChecked(last, offset)
+	if err != nil || marker != timemarker(math.MaxUint32) {
 		t.Fatalf("last representable marker = %d, err = %v", marker, err)
 	}
-	if _, err := EncodeTimemarkerChecked(last+1, offset); err != ErrInvalidRange {
+	if _, err := encodeTimemarkerChecked(last+1, offset); err != ErrInvalidRange {
 		t.Fatalf("overflow error = %v, want %v", err, ErrInvalidRange)
 	}
 }
@@ -45,21 +45,12 @@ func TestMarkerRangeUsesConservativeBoundaries(t *testing.T) {
 	}
 }
 
-func TestHeaderValidation(t *testing.T) {
-	header := TimestampIndexHeader{
-		Magic:      TimestampIndexMagic,
-		Version:    TimestampIndexVersion,
-		Count:      1,
-		StartTime:  10,
-		EndTime:    11,
-		Shift:      TimestampShift,
-		Generation: 1,
-	}
-	if err := header.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	header.Shift = TimestampShift - 1
-	if err := header.Validate(); err == nil {
-		t.Fatal("invalid shift was accepted")
+func TestMetadataCopiesStableIdentity(t *testing.T) {
+	index := mustNewIndex(t, nil, 42, Config{})
+	index.indexID = 7
+	index.flags = 3
+	metadata := index.Metadata()
+	if metadata.IndexID != 7 || metadata.Flags != 3 || metadata.Offset != 42 || metadata.Generation != 1 {
+		t.Fatalf("metadata = %+v", metadata)
 	}
 }

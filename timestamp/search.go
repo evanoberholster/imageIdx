@@ -11,9 +11,9 @@ func (i *Index) Search(dst []ImageID, start, end uint64) []ImageID {
 	if !ok {
 		return dst
 	}
-	epoch := i.epoch.enter()
+	token := i.readers.Acquire()
 	if i.closed.Load() {
-		i.epoch.exit(epoch)
+		i.readers.Release(token)
 		return dst
 	}
 	directory := i.directory.Load()
@@ -26,7 +26,7 @@ func (i *Index) Search(dst []ImageID, start, end uint64) []ImageID {
 		view := entry.block.view.Load()
 		dst = searchBlock(dst, view, lo, hi, 0, 0, nil)
 	}
-	i.epoch.exit(epoch)
+	i.readers.Release(token)
 	return dst
 }
 
@@ -40,9 +40,9 @@ func (i *Index) SearchExact(dst []ImageID, start, end uint64, lookup ExactTimest
 	if !ok {
 		return dst
 	}
-	epoch := i.epoch.enter()
+	token := i.readers.Acquire()
 	if i.closed.Load() {
-		i.epoch.exit(epoch)
+		i.readers.Release(token)
 		return dst
 	}
 	directory := i.directory.Load()
@@ -55,7 +55,7 @@ func (i *Index) SearchExact(dst []ImageID, start, end uint64, lookup ExactTimest
 		view := entry.block.view.Load()
 		dst = searchBlock(dst, view, lo, hi, start, end, lookup)
 	}
-	i.epoch.exit(epoch)
+	i.readers.Release(token)
 	return dst
 }
 
@@ -68,8 +68,8 @@ func (i *Index) EstimateRange(start, end uint64) uint64 {
 	if !ok {
 		return 0
 	}
-	epoch := i.epoch.enter()
-	defer i.epoch.exit(epoch)
+	token := i.readers.Acquire()
+	defer i.readers.Release(token)
 	if i.closed.Load() {
 		return 0
 	}
@@ -86,14 +86,14 @@ func (i *Index) EstimateRange(start, end uint64) uint64 {
 	return estimate
 }
 
-func estimateBlock(view *TimestampBlockView, lo, hi uint64) uint64 {
-	active := view.Active
+func estimateBlock(view *blockView, lo, hi uint64) uint64 {
+	active := view.active
 	for {
 		version := active.stableVersion()
-		baseStart, baseEnd := view.Base.rangeIndexes(lo, hi)
+		baseStart, baseEnd := view.base.rangeIndexes(lo, hi)
 		estimate := uint64(baseEnd - baseStart)
-		if view.Frozen != nil {
-			estimate = indexutil.SaturatingAdd(estimate, estimateDelta(view.Frozen, lo, hi))
+		if view.frozen != nil {
+			estimate = indexutil.SaturatingAdd(estimate, estimateDelta(view.frozen, lo, hi))
 		}
 		estimate = indexutil.SaturatingAdd(estimate, estimateDelta(active, lo, hi))
 		if active.version.Load() == version {
@@ -102,11 +102,11 @@ func estimateBlock(view *TimestampBlockView, lo, hi uint64) uint64 {
 	}
 }
 
-func estimateDelta(delta *TimestampDelta, lo, hi uint64) uint64 {
+func estimateDelta(delta *delta, lo, hi uint64) uint64 {
 	var estimate uint64
 	count := int(delta.addCount.Load())
 	for index := 0; index < count; index++ {
-		marker := uint64(delta.AddMarkers[index])
+		marker := uint64(delta.addMarkers[index])
 		if marker >= lo && marker < hi {
 			estimate++
 		}
@@ -116,12 +116,12 @@ func estimateDelta(delta *TimestampDelta, lo, hi uint64) uint64 {
 
 func searchBlock(
 	dst []ImageID,
-	view *TimestampBlockView,
+	view *blockView,
 	lo, hi uint64,
 	exactStart, exactEnd uint64,
 	lookup ExactTimestampFunc,
 ) []ImageID {
-	active := view.Active
+	active := view.active
 	for {
 		version := active.stableVersion()
 		startLength := len(dst)
@@ -135,43 +135,43 @@ func searchBlock(
 
 func scanBlock(
 	dst []ImageID,
-	view *TimestampBlockView,
+	view *blockView,
 	lo, hi uint64,
 	exactStart, exactEnd uint64,
 	lookup ExactTimestampFunc,
 ) []ImageID {
-	baseStart, baseEnd := view.Base.rangeIndexes(lo, hi)
+	baseStart, baseEnd := view.base.rangeIndexes(lo, hi)
 	for index := baseStart; index < baseEnd; index++ {
-		id := view.Base.ImageIDs[index]
-		if (view.Frozen != nil && view.Frozen.hasState(id)) || view.Active.hasState(id) {
+		id := view.base.imageIDs[index]
+		if (view.frozen != nil && view.frozen.hasState(id)) || view.active.hasState(id) {
 			continue
 		}
 		dst = appendIfExact(dst, id, exactStart, exactEnd, lookup)
 	}
 
-	if view.Frozen != nil {
-		count := int(view.Frozen.addCount.Load())
+	if view.frozen != nil {
+		count := int(view.frozen.addCount.Load())
 		for index := 0; index < count; index++ {
-			marker := uint64(view.Frozen.AddMarkers[index])
+			marker := uint64(view.frozen.addMarkers[index])
 			if marker < lo || marker >= hi {
 				continue
 			}
-			id := view.Frozen.AddImageIDs[index]
-			if !view.Frozen.latestAdd(id, uint32(index)) || view.Active.hasState(id) {
+			id := view.frozen.addImageIDs[index]
+			if !view.frozen.latestAdd(id, uint32(index)) || view.active.hasState(id) {
 				continue
 			}
 			dst = appendIfExact(dst, id, exactStart, exactEnd, lookup)
 		}
 	}
 
-	count := int(view.Active.addCount.Load())
+	count := int(view.active.addCount.Load())
 	for index := 0; index < count; index++ {
-		marker := uint64(view.Active.AddMarkers[index])
+		marker := uint64(view.active.addMarkers[index])
 		if marker < lo || marker >= hi {
 			continue
 		}
-		id := view.Active.AddImageIDs[index]
-		if !view.Active.latestAdd(id, uint32(index)) {
+		id := view.active.addImageIDs[index]
+		if !view.active.latestAdd(id, uint32(index)) {
 			continue
 		}
 		dst = appendIfExact(dst, id, exactStart, exactEnd, lookup)

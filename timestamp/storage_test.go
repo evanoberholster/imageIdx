@@ -1,6 +1,7 @@
 package timestamp
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,41 +11,53 @@ import (
 func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
 	const offset = uint64(1_000)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, []Record{
+	index, err := NewPersistent(directory, Spec{IndexID: 9, Flags: 3, Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 		{Timestamp: offset + 2*testQuantum, ImageID: 2},
 		{Timestamp: offset + 3*testQuantum, ImageID: 3},
-	}, offset, Config{BlockSize: 2, DeltaCapacity: 8, Durability: DurabilitySync})
+	}}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	batch := NewWriteBatch(4)
-	batch.Append(TimestampWrite{Timestamp: offset + testQuantum, ImageID: 1, Op: WriteDelete})
-	batch.Append(TimestampWrite{Timestamp: offset + 4*testQuantum, ImageID: 1, Op: WriteAdd})
-	batch.Append(TimestampWrite{Timestamp: offset + 2*testQuantum, ImageID: 2, Op: WriteDelete})
-	batch.Append(TimestampWrite{Timestamp: offset + 5*testQuantum, ImageID: 4, Op: WriteAdd})
-	if err = index.Submit(batch); err != nil {
+	batch := NewBatch(3)
+	batch.Append(Move(1, offset+testQuantum, offset+4*testQuantum))
+	batch.Append(Delete(2, offset+2*testQuantum))
+	batch.Append(Insert(4, offset+5*testQuantum))
+	if err = index.Apply(batch); err != nil {
 		t.Fatal(err)
 	}
 	if err = index.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
-	generation := index.Header.Generation
+	generation := index.Metadata().Generation
+	markersPath, idsPath, blocksPath := generationPaths(directory, generation)
+	for _, path := range []string{markersPath, idsPath, blocksPath, filepath.Join(directory, "manifest")} {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		if info.Size()%formatAlignment != 0 {
+			t.Fatalf("%s size = %d, want 8-byte alignment", filepath.Base(path), info.Size())
+		}
+	}
 	if err = index.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenPersistent(directory, Config{DeltaCapacity: 8, Durability: DurabilitySync})
+	reopened, err := OpenPersistent(directory, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	if reopened.Header.Generation != generation {
-		t.Fatalf("generation = %d, want %d", reopened.Header.Generation, generation)
+	if reopened.Metadata().Generation != generation {
+		t.Fatalf("generation = %d, want %d", reopened.Metadata().Generation, generation)
 	}
-	if len(reopened.mappings) != 2 {
-		t.Fatalf("mapping count = %d, want 2", len(reopened.mappings))
+	if reopened.Metadata().IndexID != 9 || reopened.Metadata().Flags != 3 {
+		t.Fatalf("metadata = %+v", reopened.Metadata())
+	}
+	if len(reopened.persistence.mappings) != 2 {
+		t.Fatalf("mapping count = %d, want 2", len(reopened.persistence.mappings))
 	}
 	got := reopened.Search(make([]ImageID, 0, 4), offset, offset+6*testQuantum)
 	if !equalIDSet(got, []ImageID{1, 3, 4}) {
@@ -59,32 +72,51 @@ func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
 	if err = reopened.Vacuum(); err != nil {
 		t.Fatal(err)
 	}
-	if reopened.Header.Generation != generation+1 {
-		t.Fatalf("vacuum generation = %d, want %d", reopened.Header.Generation, generation+1)
+	if reopened.Metadata().Generation != generation+1 {
+		t.Fatalf("vacuum generation = %d, want %d", reopened.Metadata().Generation, generation+1)
+	}
+}
+
+func TestPersistentStructureAlignment(t *testing.T) {
+	for name, size := range map[string]int{
+		"manifest":    manifestSize,
+		"block entry": directoryEntrySize,
+		"WAL header":  walHeaderSize,
+		"WAL write":   walWriteSize,
+		"image ID":    8,
+	} {
+		if size%formatAlignment != 0 {
+			t.Fatalf("%s size = %d, want multiple of 8", name, size)
+		}
+	}
+	if size := binary.Size(timemarker(0)); size != 4 {
+		t.Fatalf("timemarker size = %d, want uint32 structure-of-arrays column", size)
+	}
+	if storageAlignment%formatAlignment != 0 {
+		t.Fatalf("storage alignment = %d, want multiple of 8", storageAlignment)
 	}
 }
 
 func TestWALRecoversWritesAfterLastCheckpoint(t *testing.T) {
 	const offset = uint64(100)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, []Record{
+	index, err := NewPersistent(directory, Spec{Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
-	}, offset, Config{DeltaCapacity: 8, Durability: DurabilitySync})
+	}}, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch := NewWriteBatch(3)
-	batch.Append(TimestampWrite{Timestamp: offset + testQuantum, ImageID: 1, Op: WriteDelete})
-	batch.Append(TimestampWrite{Timestamp: offset + 3*testQuantum, ImageID: 1, Op: WriteAdd})
-	batch.Append(TimestampWrite{Timestamp: offset + 2*testQuantum, ImageID: 2, Op: WriteAdd})
-	if err = index.Submit(batch); err != nil {
+	batch := NewBatch(2)
+	batch.Append(Move(1, offset+testQuantum, offset+3*testQuantum))
+	batch.Append(Insert(2, offset+2*testQuantum))
+	if err = index.Apply(batch); err != nil {
 		t.Fatal(err)
 	}
 	if err = index.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	recovered, err := OpenPersistent(directory, Config{DeltaCapacity: 8, Durability: DurabilitySync})
+	recovered, err := OpenPersistent(directory, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,13 +133,13 @@ func TestWALRecoversWritesAfterLastCheckpoint(t *testing.T) {
 
 func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, nil, 0, Config{DeltaCapacity: 8, Durability: DurabilitySync})
+	index, err := NewPersistent(directory, Spec{}, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch := NewWriteBatch(1)
-	batch.Append(TimestampWrite{Timestamp: testQuantum, ImageID: 7, Op: WriteAdd})
-	if err = index.Submit(batch); err != nil {
+	batch := NewBatch(1)
+	batch.Append(Insert(7, testQuantum))
+	if err = index.Apply(batch); err != nil {
 		t.Fatal(err)
 	}
 	if err = index.Close(); err != nil {
@@ -125,7 +157,7 @@ func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := OpenPersistent(directory, Config{DeltaCapacity: 8})
+	recovered, err := OpenPersistent(directory, Config{DeltaCapacity: 8}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +170,7 @@ func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
 
 func TestManifestChecksumRejectsCorruption(t *testing.T) {
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, nil, 0, Config{})
+	index, err := NewPersistent(directory, Spec{}, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +186,7 @@ func TestManifestChecksumRejectsCorruption(t *testing.T) {
 	if err = os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err = OpenPersistent(directory, Config{})
+	_, err = OpenPersistent(directory, Config{}, DurabilityOS)
 	if !errors.Is(err, ErrCorruptManifest) {
 		t.Fatalf("error = %v, want %v", err, ErrCorruptManifest)
 	}
@@ -162,7 +194,7 @@ func TestManifestChecksumRejectsCorruption(t *testing.T) {
 
 func TestOpenIgnoresUnpublishedManifestTemporary(t *testing.T) {
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, []Record{{Timestamp: testQuantum, ImageID: 1}}, 0, Config{})
+	index, err := NewPersistent(directory, Spec{Entries: []Entry{{Timestamp: testQuantum, ImageID: 1}}}, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +204,7 @@ func TestOpenIgnoresUnpublishedManifestTemporary(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(directory, "manifest.tmp"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenPersistent(directory, Config{})
+	reopened, err := OpenPersistent(directory, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

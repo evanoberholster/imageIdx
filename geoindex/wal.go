@@ -6,14 +6,14 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"sort"
+	"slices"
 
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
 const (
 	geoWALMagic        uint32 = 0x4745574c // GEWL
-	geoWALVersion      uint16 = 1
+	geoWALVersion      uint16 = 2
 	geoWALHeaderSize          = 24
 	geoWALMutationSize        = 24
 	geoWALFilename            = "geo.wal"
@@ -29,32 +29,34 @@ func openGeoWAL(path string) (*geoWAL, error) {
 	return &geoWAL{file: file}, nil
 }
 
-func (w *geoWAL) append(mutations map[uint64]pendingMutation, durability Durability) error {
+func (w *geoWAL) append(mutations []Mutation, durability Durability) error {
 	if len(mutations) == 0 {
 		return nil
 	}
 	if len(mutations) > int(^uint32(0))/geoWALMutationSize {
 		return ErrInvalidConfig
 	}
-	ids := make([]uint64, 0, len(mutations))
-	for id := range mutations {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	payload := make([]byte, len(ids)*geoWALMutationSize)
-	for index, id := range ids {
-		position := index * geoWALMutationSize
-		mutation := mutations[id]
-		binary.LittleEndian.PutUint64(payload[position:position+8], id)
-		binary.LittleEndian.PutUint64(payload[position+8:position+16], uint64(mutation.key))
-		if mutation.remove {
-			payload[position+16] = 1
+	ordered := append([]Mutation(nil), mutations...)
+	slices.SortFunc(ordered, func(left, right Mutation) int {
+		if left.ImageID < right.ImageID {
+			return -1
 		}
+		if left.ImageID > right.ImageID {
+			return 1
+		}
+		return 0
+	})
+	payload := make([]byte, len(ordered)*geoWALMutationSize)
+	for index, mutation := range ordered {
+		position := index * geoWALMutationSize
+		binary.LittleEndian.PutUint64(payload[position:position+8], mutation.ImageID)
+		binary.LittleEndian.PutUint64(payload[position+8:position+16], uint64(mutation.From))
+		binary.LittleEndian.PutUint64(payload[position+16:position+24], uint64(mutation.To))
 	}
 	header := make([]byte, geoWALHeaderSize)
 	binary.LittleEndian.PutUint32(header[0:4], geoWALMagic)
 	binary.LittleEndian.PutUint16(header[4:6], geoWALVersion)
-	binary.LittleEndian.PutUint32(header[8:12], uint32(len(ids)))
+	binary.LittleEndian.PutUint32(header[8:12], uint32(len(ordered)))
 	binary.LittleEndian.PutUint32(header[12:16], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(header[16:20], crc32.ChecksumIEEE(payload))
 	start, err := w.offset()
@@ -81,7 +83,7 @@ func (w *geoWAL) append(mutations map[uint64]pendingMutation, durability Durabil
 func (w *geoWAL) offset() (int64, error) { return w.file.Seek(0, io.SeekEnd) }
 func (w *geoWAL) close() error           { return w.file.Close() }
 
-func replayGeoWAL(path string, offset int64) ([]map[uint64]pendingMutation, error) {
+func replayGeoWAL(path string, offset int64) ([][]Mutation, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -94,7 +96,7 @@ func replayGeoWAL(path string, offset int64) ([]map[uint64]pendingMutation, erro
 		return nil, err
 	}
 	header := make([]byte, geoWALHeaderSize)
-	var batches []map[uint64]pendingMutation
+	var batches [][]Mutation
 	for {
 		_, err = io.ReadFull(file, header)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -120,24 +122,23 @@ func replayGeoWAL(path string, offset int64) ([]map[uint64]pendingMutation, erro
 		if err != nil || crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(header[16:20]) {
 			return nil, ErrCorruptWAL
 		}
-		batch := make(map[uint64]pendingMutation, count)
+		batch := make([]Mutation, 0, count)
+		seen := make(map[ImageID]struct{}, count)
 		for index := uint32(0); index < count; index++ {
 			position := index * geoWALMutationSize
-			id := binary.LittleEndian.Uint64(payload[position : position+8])
-			key := S2Key(binary.LittleEndian.Uint64(payload[position+8 : position+16]))
-			op := payload[position+16]
-			if id == 0 || op > 1 {
+			mutation := Mutation{
+				ImageID: binary.LittleEndian.Uint64(payload[position : position+8]),
+				From:    S2Key(binary.LittleEndian.Uint64(payload[position+8 : position+16])),
+				To:      S2Key(binary.LittleEndian.Uint64(payload[position+16 : position+24])),
+			}
+			if validateMutation(mutation) != nil {
 				return nil, ErrCorruptWAL
 			}
-			if op == 0 {
-				if _, keyErr := CellIDFromS2Key(key); keyErr != nil {
-					return nil, ErrCorruptWAL
-				}
+			if _, duplicate := seen[mutation.ImageID]; duplicate {
+				return nil, ErrCorruptWAL
 			}
-			batch[id] = pendingMutation{key: key, remove: op == 1}
-		}
-		if len(batch) != int(count) {
-			return nil, ErrCorruptWAL
+			seen[mutation.ImageID] = struct{}{}
+			batch = append(batch, mutation)
 		}
 		batches = append(batches, batch)
 	}

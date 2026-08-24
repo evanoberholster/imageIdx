@@ -1,92 +1,118 @@
 package bitmapidx
 
-import "github.com/dgraph-io/sroar"
+import (
+	"github.com/evanoberholster/imageIdx/idset"
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
+)
 
-// And returns the logical intersection of the supplied immutable snapshots.
-// Each operand's Active/Frozen corrections are applied before intersection.
-func And(indexes ...*BitmapIndex) BitmapRef {
-	if len(indexes) == 0 {
-		return EmptyBitmap()
-	}
-	guards := enterEpochs(indexes)
-	defer exitGuards(guards)
-
-	planned := PlanAND(indexes)
-	bitmaps := make([]*sroar.Bitmap, 0, len(planned))
-	for _, index := range planned {
-		if index == nil || index.closed.Load() {
-			return EmptyBitmap()
-		}
-		bitmaps = append(bitmaps, index.view.Load().effectiveBitmap().bitmap)
-	}
-	if len(bitmaps) == 1 {
-		return BitmapRef{bitmap: bitmaps[0]}
-	}
-	return BitmapRef{bitmap: sroar.FastAnd(bitmaps...)}
+type readToken struct {
+	readers *indexutil.ReaderTracker
+	token   uint32
 }
 
-// Or returns the logical union. Removals remain operand-aware because each
-// operand is corrected independently before the union is evaluated.
-func Or(indexes ...*BitmapIndex) BitmapRef {
+// Intersect returns the logical intersection of the supplied immutable
+// snapshots. Each operand's Active/Frozen corrections are applied first.
+// When no operand carries deltas the intersection runs directly over the raw
+// bases with a single clone.
+func Intersect(indexes ...*Index) idset.Ref {
 	if len(indexes) == 0 {
-		return EmptyBitmap()
+		return idset.Empty()
 	}
-	guards := enterEpochs(indexes)
-	defer exitGuards(guards)
+	var tokenStack [8]readToken
+	tokens := acquireReaders(tokenStack[:0], indexes)
+	defer releaseReaders(tokens)
 
-	bitmaps := make([]*sroar.Bitmap, 0, len(indexes))
+	planned := planIntersection(indexes)
+	if allDeltaFree(planned) {
+		operands := idset.NewOperands(len(planned))
+		for _, index := range planned {
+			if index == nil || index.closed.Load() {
+				return idset.Empty()
+			}
+			operands.Add(index.view.Load().base)
+		}
+		return operands.And()
+	}
+
+	var result idset.Builder
+	for position, index := range planned {
+		if index == nil || index.closed.Load() {
+			return idset.Empty()
+		}
+		operand := index.view.Load().effectiveBuilder()
+		if position == 0 {
+			result = operand
+			continue
+		}
+		result.And(operand.Freeze())
+	}
+	result.Cleanup()
+	return result.Freeze()
+}
+
+// Union returns the logical union. Removals remain operand-aware because each
+// operand is corrected independently before the union is evaluated. Delta-free
+// operands are added without cloning their base.
+func Union(indexes ...*Index) idset.Ref {
+	if len(indexes) == 0 {
+		return idset.Empty()
+	}
+	var tokenStack [8]readToken
+	tokens := acquireReaders(tokenStack[:0], indexes)
+	defer releaseReaders(tokens)
+
+	operands := idset.NewOperands(len(indexes))
 	for _, index := range indexes {
 		if index == nil || index.closed.Load() {
 			continue
 		}
-		bitmaps = append(bitmaps, index.view.Load().effectiveBitmap().bitmap)
+		view := index.view.Load()
+		if view.hasDeltas() {
+			operands.Add(view.effectiveBitmap())
+		} else {
+			operands.Add(view.base)
+		}
 	}
-	if len(bitmaps) == 0 {
-		return EmptyBitmap()
-	}
-	if len(bitmaps) == 1 {
-		return BitmapRef{bitmap: bitmaps[0]}
-	}
-	return BitmapRef{bitmap: sroar.FastOr(bitmaps...)}
+	return operands.Or()
 }
 
-func IntersectInto(dst []ImageID, indexes ...*BitmapIndex) []ImageID {
-	for _, id := range And(indexes...).ToArray() {
-		dst = append(dst, ImageID(id))
-	}
-	return dst
-}
-
-func UnionInto(dst []ImageID, indexes ...*BitmapIndex) []ImageID {
-	for _, id := range Or(indexes...).ToArray() {
-		dst = append(dst, ImageID(id))
-	}
-	return dst
-}
-
-// FilterInto appends candidates present in every index to dst. It enters each
-// distinct reader epoch once and supports dst reusing candidates' backing
-// storage, allowing a scheduler to filter an existing candidate slice in
-// place.
-func FilterInto(dst, candidates []ImageID, indexes ...*BitmapIndex) []ImageID {
+// FilterCandidates appends candidates present in every index to dst. It enters
+// each distinct internal reader tracker once and supports dst reusing
+// candidates' backing storage, allowing a scheduler to filter an existing
+// candidate slice in place.
+func FilterCandidates(dst, candidates []ImageID, indexes ...*Index) []ImageID {
 	if len(indexes) == 0 {
 		return append(dst, candidates...)
 	}
-	guards := enterEpochs(indexes)
-	defer exitGuards(guards)
+	var tokenStack [8]readToken
+	tokens := acquireReaders(tokenStack[:0], indexes)
+	result := filterCandidatesGuarded(dst, candidates, indexes)
+	releaseReaders(tokens)
+	return result
+}
 
-	planned := PlanAND(indexes)
-	views := make([]*BitmapIndexView, len(planned))
-	for index, bitmap := range planned {
-		if bitmap == nil || bitmap.closed.Load() {
+func filterCandidatesGuarded(dst, candidates []ImageID, indexes []*Index) []ImageID {
+	var plannedStack [8]*Index
+	planned := plannedStack[:0]
+	if len(indexes) > len(plannedStack) {
+		planned = make([]*Index, 0, len(indexes))
+	}
+	planned = planIntersectionInto(planned, indexes)
+	var viewStack [8]*indexView
+	views := viewStack[:0]
+	if len(planned) > len(viewStack) {
+		views = make([]*indexView, 0, len(planned))
+	}
+	for _, index := range planned {
+		if index == nil || index.closed.Load() {
 			return dst
 		}
-		views[index] = bitmap.view.Load()
+		views = append(views, index.view.Load())
 	}
 	for _, id := range candidates {
 		present := true
 		for _, view := range views {
-			if !view.Contains(uint64(id)) {
+			if !view.contains(id) {
 				present = false
 				break
 			}
@@ -98,24 +124,45 @@ func FilterInto(dst, candidates []ImageID, indexes ...*BitmapIndex) []ImageID {
 	return dst
 }
 
-func enterEpochs(indexes []*BitmapIndex) []ReadGuard {
-	seen := make(map[*Epoch]struct{}, len(indexes))
-	guards := make([]ReadGuard, 0, 1)
+// allDeltaFree reports whether every index currently publishes a view with no
+// correction layers, which lets Intersect operate on the raw Bases directly.
+func allDeltaFree(indexes []*Index) bool {
 	for _, index := range indexes {
-		if index == nil || index.config.Epoch == nil {
-			continue
+		if index == nil {
+			return false
 		}
-		if _, exists := seen[index.config.Epoch]; exists {
-			continue
+		if index.view.Load().hasDeltas() {
+			return false
 		}
-		seen[index.config.Epoch] = struct{}{}
-		guards = append(guards, index.config.Epoch.Enter())
 	}
-	return guards
+	return true
 }
 
-func exitGuards(guards []ReadGuard) {
-	for i := len(guards) - 1; i >= 0; i-- {
-		guards[i].Exit()
+// acquireReaders registers with each distinct tracker, deduplicating privately
+// shared store trackers without allocating for up to eight indexes.
+func acquireReaders(dst []readToken, indexes []*Index) []readToken {
+	for _, index := range indexes {
+		if index == nil || index.readers == nil {
+			continue
+		}
+		seen := false
+		for _, acquired := range dst {
+			if acquired.readers == index.readers {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		dst = append(dst, readToken{readers: index.readers, token: index.readers.Acquire()})
+	}
+	return dst
+}
+
+// releaseReaders unregisters in reverse acquisition order.
+func releaseReaders(tokens []readToken) {
+	for i := len(tokens) - 1; i >= 0; i-- {
+		tokens[i].readers.Release(tokens[i].token)
 	}
 }

@@ -6,40 +6,41 @@ import (
 	"errors"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/bitmapidx"
+	imageidx "github.com/evanoberholster/imageIdx"
 )
 
-type ImageID = bitmapidx.ImageID
+type ImageID = imageidx.ImageID
 type S2Key uint64
 
 const (
 	GeoS2Level                     = 16
-	GeoSparseSlots                 = 4
-	GeoFormatVersion        uint16 = 1
 	DefaultPublishThreshold        = 256
 	DefaultCoverCells              = 32
+	geoFormatVersion        uint16 = 1
+	geoSparseSlots                 = 4
 )
 
 var (
-	ErrClosed            = errors.New("geoindex: index is closed")
-	ErrCorruptManifest   = errors.New("geoindex: corrupt manifest")
-	ErrCorruptStorage    = errors.New("geoindex: corrupt storage generation")
-	ErrCorruptWAL        = errors.New("geoindex: corrupt write-ahead log")
-	ErrDuplicateImageID  = errors.New("geoindex: duplicate image ID")
-	ErrImageNotFound     = errors.New("geoindex: image ID is not indexed")
-	ErrInvalidConfig     = errors.New("geoindex: invalid configuration")
-	ErrInvalidCoordinate = errors.New("geoindex: invalid geographic coordinate")
-	ErrInvalidImageID    = errors.New("geoindex: image ID zero is reserved")
-	ErrInvalidS2Cell     = errors.New("geoindex: invalid S2 cell")
-	ErrInvalidS2Level    = errors.New("geoindex: S2 cell must be level 16")
-	ErrNotPersistent     = errors.New("geoindex: index is not persistent")
+	ErrClosed             = errors.New("geoindex: index is closed")
+	ErrCorruptManifest    = errors.New("geoindex: corrupt manifest")
+	ErrCorruptStorage     = errors.New("geoindex: corrupt storage generation")
+	ErrCorruptWAL         = errors.New("geoindex: corrupt write-ahead log")
+	ErrDuplicateImageID   = errors.New("geoindex: duplicate image ID")
+	ErrInvalidConfig      = errors.New("geoindex: invalid configuration")
+	ErrInvalidCoordinate  = errors.New("geoindex: invalid geographic coordinate")
+	ErrInvalidImageID     = errors.New("geoindex: image ID zero is reserved")
+	ErrInvalidMutation    = errors.New("geoindex: mutation does not match published or pending state")
+	ErrInvalidS2Cell      = errors.New("geoindex: invalid S2 cell")
+	ErrInvalidS2Level     = errors.New("geoindex: unsupported S2 cell level")
+	ErrNotPersistent      = errors.New("geoindex: index is not persistent")
+	ErrCoverWorkspaceFull = errors.New("geoindex: cover workspace capacity is insufficient")
+	ErrCoverBufferFull    = errors.New("geoindex: cover destination capacity is insufficient")
 )
 
 type Config struct {
 	PublishThreshold int
 	PublishInterval  time.Duration
 	MaxCoverCells    int
-	Epoch            *bitmapidx.Epoch
 }
 
 func (c Config) withDefaults() (Config, error) {
@@ -58,54 +59,46 @@ func (c Config) withDefaults() (Config, error) {
 	if c.PublishThreshold < 1 || c.MaxCoverCells < 1 {
 		return Config{}, ErrInvalidConfig
 	}
-	if c.Epoch == nil {
-		c.Epoch = bitmapidx.NewEpoch()
-	}
 	return c, nil
 }
 
-type GeoEntry struct {
-	ImageID   uint64
+// Entry is one canonical coordinate to index.
+type Entry struct {
+	ImageID   ImageID
 	Latitude  float64
 	Longitude float64
 }
 
-type GeoUpdate = GeoEntry
-
-type GeoCellEntry struct {
-	Key     S2Key
-	ImageID uint64
+// Spec describes an index's stable identity and initial coordinates.
+type Spec struct {
+	IndexID uint64
+	Flags   uint32
+	Entries []Entry
 }
 
-type GeoOp uint8
+// Mutation moves an image between fixed-level S2 cells. S2Key zero means the
+// image was absent (From) or is being removed (To). Supplying both cells makes
+// coordinate moves explicit and avoids a database-sized reverse-location map.
+type Mutation struct {
+	ImageID ImageID
+	From    S2Key
+	To      S2Key
+}
 
-const (
-	GeoAdd GeoOp = iota + 1
-	GeoRemove
-)
-
-type GeoCellMutation struct {
-	Key     S2Key
-	ImageID uint64
-	Op      GeoOp
+// Metadata is a copied summary of the current immutable generation.
+type Metadata struct {
+	IndexID         uint64
+	Flags           uint32
+	Generation      uint64
+	SparseCellCount uint64
+	DenseCellCount  uint64
 }
 
 type CoordinateLookup func(ImageID) (latitude, longitude float64, ok bool)
 
-type Durability uint8
+type Durability = imageidx.Durability
 
 const (
-	DurabilityOS Durability = iota
-	DurabilitySync
+	DurabilityOS   = imageidx.DurabilityOS
+	DurabilitySync = imageidx.DurabilitySync
 )
-
-type GeoIndexHeader struct {
-	Version         uint16
-	Flags           uint16
-	IndexID         uint64
-	S2Level         uint8
-	_               [7]byte
-	SparseCellCount uint64
-	BitmapCellCount uint64
-	Generation      uint64
-}

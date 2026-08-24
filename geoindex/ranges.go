@@ -1,24 +1,30 @@
 package geoindex
 
 import (
+	"cmp"
+	"slices"
 	"sort"
 
 	"github.com/golang/geo/s2"
 )
 
-type S2KeyRange struct {
+// Range is an inclusive interval of fixed-level S2 keys.
+type Range struct {
 	Start S2Key
 	End   S2Key // inclusive
 }
 
-func RangesFromCellUnion(cells s2.CellUnion) ([]S2KeyRange, error) {
-	ranges := make([]S2KeyRange, 0, len(cells))
-	for _, cell := range cells {
+// RangesFromCellIDs appends normalized level-16 descendant ranges for cells.
+// Cells may be at any valid level up to GeoS2Level.
+func RangesFromCellIDs(dst []Range, cellIDs []uint64) ([]Range, error) {
+	start := len(dst)
+	for _, value := range cellIDs {
+		cell := s2.CellID(value)
 		if !cell.IsValid() {
-			return nil, ErrInvalidS2Cell
+			return dst[:start], ErrInvalidS2Cell
 		}
 		if cell.Level() > GeoS2Level {
-			cell = cell.Parent(GeoS2Level)
+			return dst[:start], ErrInvalidS2Level
 		}
 		var first, last s2.CellID
 		if cell.Level() == GeoS2Level {
@@ -27,48 +33,49 @@ func RangesFromCellUnion(cells s2.CellUnion) ([]S2KeyRange, error) {
 			first = cell.ChildBeginAtLevel(GeoS2Level)
 			last = cell.ChildEndAtLevel(GeoS2Level).Prev()
 		}
-		ranges = append(ranges, S2KeyRange{Start: EncodeS2Key(uint64(first)), End: EncodeS2Key(uint64(last))})
+		dst = append(dst, Range{Start: EncodeS2Key(uint64(first)), End: EncodeS2Key(uint64(last))})
 	}
-	return NormalizeRanges(ranges), nil
+	return normalizeRanges(dst, start), nil
 }
 
-func NormalizeRanges(ranges []S2KeyRange) []S2KeyRange {
+func normalizeRanges(ranges []Range, start int) []Range {
+	prefix := ranges[:start]
+	ranges = ranges[start:]
 	if len(ranges) == 0 {
-		return nil
+		return prefix
 	}
 	if rangesNormalized(ranges) {
-		return ranges
+		return append(prefix, ranges...)
 	}
-	result := append([]S2KeyRange(nil), ranges...)
-	for i := range result {
-		if result[i].End < result[i].Start {
-			result[i].Start, result[i].End = result[i].End, result[i].Start
+	for i := range ranges {
+		if ranges[i].End < ranges[i].Start {
+			ranges[i].Start, ranges[i].End = ranges[i].End, ranges[i].Start
 		}
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Start != result[j].Start {
-			return result[i].Start < result[j].Start
+	slices.SortFunc(ranges, func(left, right Range) int {
+		if order := cmp.Compare(left.Start, right.Start); order != 0 {
+			return order
 		}
-		return result[i].End < result[j].End
+		return cmp.Compare(left.End, right.End)
 	})
 	out := 1
-	for i := 1; i < len(result); i++ {
-		previous := &result[out-1]
+	for i := 1; i < len(ranges); i++ {
+		previous := &ranges[out-1]
 		// Valid level-16 keys differ by two. Joining an adjacent Hilbert
 		// interval therefore allows one unused integer between ranges.
-		if result[i].Start <= previous.End || previous.End <= ^S2Key(0)-2 && result[i].Start <= previous.End+2 {
-			if result[i].End > previous.End {
-				previous.End = result[i].End
+		if ranges[i].Start <= previous.End || previous.End <= ^S2Key(0)-2 && ranges[i].Start <= previous.End+2 {
+			if ranges[i].End > previous.End {
+				previous.End = ranges[i].End
 			}
 			continue
 		}
-		result[out] = result[i]
+		ranges[out] = ranges[i]
 		out++
 	}
-	return result[:out]
+	return append(prefix, ranges[:out]...)
 }
 
-func rangesNormalized(ranges []S2KeyRange) bool {
+func rangesNormalized(ranges []Range) bool {
 	for index, current := range ranges {
 		if current.End < current.Start {
 			return false

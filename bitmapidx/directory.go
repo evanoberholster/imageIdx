@@ -6,23 +6,30 @@ import (
 	"sync/atomic"
 )
 
+// directorySnapshot is one immutable generation of the lookup maps. Reads load
+// the snapshot once and access the maps without locking; writes build a new
+// snapshot and publish it atomically.
 type directorySnapshot struct {
-	byKey map[BitmapKey]*BitmapIndex
-	byID  map[uint64]*BitmapIndex
-	order []*BitmapIndex
+	byKey map[Key]*Index
+	byID  map[uint64]*Index
+	order []*Index
 }
 
-// BitmapDirectory publishes immutable lookup maps, keeping reads lock-free.
-type BitmapDirectory struct {
+// Directory maps predicate Keys and stable IndexIDs to Indexes. Lookups are
+// lock-free: they load one atomically published snapshot and read an immutable
+// map. Only Register takes the writer lock.
+type Directory struct {
 	view     atomic.Pointer[directorySnapshot]
 	writerMu sync.Mutex
 }
 
-func NewBitmapDirectory(indexes ...*BitmapIndex) (*BitmapDirectory, error) {
-	directory := &BitmapDirectory{}
+// NewDirectory constructs an empty lock-free lookup directory, optionally
+// pre-populated with indexes.
+func NewDirectory(indexes ...*Index) (*Directory, error) {
+	directory := &Directory{}
 	directory.view.Store(&directorySnapshot{
-		byKey: make(map[BitmapKey]*BitmapIndex),
-		byID:  make(map[uint64]*BitmapIndex),
+		byKey: make(map[Key]*Index),
+		byID:  make(map[uint64]*Index),
 	})
 	if len(indexes) != 0 {
 		if err := directory.Register(indexes...); err != nil {
@@ -32,31 +39,38 @@ func NewBitmapDirectory(indexes ...*BitmapIndex) (*BitmapDirectory, error) {
 	return directory, nil
 }
 
-func (d *BitmapDirectory) Lookup(key BitmapKey) (*BitmapIndex, bool) {
+// Lookup returns the index registered under key.
+func (d *Directory) Lookup(key Key) (*Index, bool) {
 	index, ok := d.view.Load().byKey[key]
 	return index, ok
 }
 
-func (d *BitmapDirectory) LookupID(indexID uint64) (*BitmapIndex, bool) {
+// LookupID returns the index registered under a stable numeric identifier.
+func (d *Directory) LookupID(indexID uint64) (*Index, bool) {
 	index, ok := d.view.Load().byID[indexID]
 	return index, ok
 }
 
-func (d *BitmapDirectory) Len() int { return len(d.view.Load().order) }
+// Len returns the number of registered indexes.
+func (d *Directory) Len() int { return len(d.view.Load().order) }
 
-// Indexes returns indexes in physical storage order: IndexType, ValueID.
-func (d *BitmapDirectory) Indexes() []*BitmapIndex {
-	return append([]*BitmapIndex(nil), d.view.Load().order...)
+// Indexes returns a copy of the indexes in physical storage order:
+// IndexType, ValueID.
+func (d *Directory) Indexes() []*Index {
+	return append([]*Index(nil), d.view.Load().order...)
 }
 
-func (d *BitmapDirectory) Register(indexes ...*BitmapIndex) error {
+// Register adds indexes to the directory. It copy-on-writes the snapshot maps,
+// so concurrent readers keep using the previous generation until the new one
+// is published atomically.
+func (d *Directory) Register(indexes ...*Index) error {
 	d.writerMu.Lock()
 	defer d.writerMu.Unlock()
 	old := d.view.Load()
 	next := &directorySnapshot{
-		byKey: make(map[BitmapKey]*BitmapIndex, len(old.byKey)+len(indexes)),
-		byID:  make(map[uint64]*BitmapIndex, len(old.byID)+len(indexes)),
-		order: append([]*BitmapIndex(nil), old.order...),
+		byKey: make(map[Key]*Index, len(old.byKey)+len(indexes)),
+		byID:  make(map[uint64]*Index, len(old.byID)+len(indexes)),
+		order: append([]*Index(nil), old.order...),
 	}
 	for key, index := range old.byKey {
 		next.byKey[key] = index
@@ -69,26 +83,26 @@ func (d *BitmapDirectory) Register(indexes ...*BitmapIndex) error {
 			return ErrInvalidIndex
 		}
 		view := index.view.Load()
-		key := BitmapKey{Type: view.IndexType, ValueID: view.ValueID}
+		key := Key{Type: view.indexType, ValueID: view.valueID}
 		if _, exists := next.byKey[key]; exists {
 			return ErrDuplicateKey
 		}
-		if _, exists := next.byID[view.IndexID]; exists {
+		if _, exists := next.byID[view.indexID]; exists {
 			return ErrDuplicateID
 		}
 		next.byKey[key] = index
-		next.byID[view.IndexID] = index
+		next.byID[view.indexID] = index
 		next.order = append(next.order, index)
 	}
 	sort.Slice(next.order, func(i, j int) bool {
 		a, b := next.order[i].view.Load(), next.order[j].view.Load()
-		if a.IndexType != b.IndexType {
-			return a.IndexType < b.IndexType
+		if a.indexType != b.indexType {
+			return a.indexType < b.indexType
 		}
-		if a.ValueID != b.ValueID {
-			return a.ValueID < b.ValueID
+		if a.valueID != b.valueID {
+			return a.valueID < b.valueID
 		}
-		return a.IndexID < b.IndexID
+		return a.indexID < b.indexID
 	})
 	d.view.Store(next)
 	return nil

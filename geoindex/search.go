@@ -1,87 +1,89 @@
 package geoindex
 
-import (
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/golang/geo/s2"
-)
+import "github.com/evanoberholster/imageIdx/internal/indexutil"
 
-func (g *GeoIndex) CoverRegion(region s2.Region) ([]S2KeyRange, error) {
-	if region == nil {
-		return nil, ErrInvalidCoordinate
-	}
-	coverer := &s2.RegionCoverer{MinLevel: 0, MaxLevel: GeoS2Level, LevelMod: 1, MaxCells: g.config.MaxCoverCells}
-	return RangesFromCellUnion(coverer.Covering(region))
-}
-
-func (g *GeoIndex) SearchRegion(dst []ImageID, region s2.Region, lookup CoordinateLookup) []ImageID {
-	ranges, err := g.CoverRegion(region)
-	if err != nil {
-		return dst
-	}
-	start := len(dst)
-	dst = g.SearchRanges(dst, ranges)
-	if lookup == nil {
-		return dst
-	}
-	out := start
-	for _, id := range dst[start:] {
-		lat, lng, ok := lookup(id)
-		if !ok {
-			continue
-		}
-		ll := s2.LatLngFromDegrees(lat, lng)
-		if ll.IsValid() && region.ContainsPoint(s2.PointFromLatLng(ll)) {
-			dst[out] = id
-			out++
-		}
-	}
-	return dst[:out]
-}
-
-func (g *GeoIndex) SearchBounds(dst []ImageID, minLat, minLng, maxLat, maxLng float64, lookup CoordinateLookup) []ImageID {
-	lo := s2.LatLngFromDegrees(minLat, minLng)
-	hi := s2.LatLngFromDegrees(maxLat, maxLng)
-	if !lo.IsValid() || !hi.IsValid() || minLat > maxLat {
-		return dst
-	}
-	rect := s2.RectFromLatLng(lo).AddPoint(hi)
-	return g.SearchRegion(dst, rect, lookup)
-}
-
-func (g *GeoIndex) SearchCell(dst []ImageID, cellID uint64) []ImageID {
-	key, err := S2KeyFromCellID(cellID)
-	if err != nil {
-		return dst
-	}
-	return g.SearchRanges(dst, []S2KeyRange{{Start: key, End: key}})
-}
-
-func (g *GeoIndex) SearchRanges(dst []ImageID, ranges []S2KeyRange) []ImageID {
-	ranges = NormalizeRanges(ranges)
-	guard := g.config.Epoch.Enter()
+// SearchRanges appends candidates from sorted, normalized key ranges. Covers
+// produced by CoverRegion and RangesFromCellIDs satisfy this contract. Search
+// allocates only if dst lacks result capacity.
+func (g *Index) SearchRanges(dst []ImageID, ranges []Range) []ImageID {
+	token := g.readers.Acquire()
 	if !g.closed.Load() {
 		view := g.view.Load()
-		dst = view.Sparse.SearchRanges(dst, ranges)
-		dst = view.Bitmap.SearchRanges(dst, ranges)
+		for rangeIndex := range ranges {
+			keyRange := ranges[rangeIndex : rangeIndex+1]
+			if keyRange[0].End < keyRange[0].Start {
+				continue
+			}
+			first := shardForKey(keyRange[0].Start)
+			if first >= geoShardCount {
+				continue
+			}
+			last := shardForKey(keyRange[0].End)
+			if last >= geoShardCount {
+				last = geoShardCount - 1
+			}
+			for shardIndex := first; shardIndex <= last; shardIndex++ {
+				shard := view.shards[shardIndex]
+				if shard == nil {
+					continue
+				}
+				dst = shard.sparse.searchRanges(dst, keyRange)
+				dst = shard.dense.searchRanges(dst, keyRange)
+			}
+		}
 	}
-	guard.Exit()
+	g.readers.Release(token)
 	return dst
 }
 
-// EstimateRanges returns the number of candidates in the currently published
-// sparse and bitmap partitions for ranges. It reads cardinalities only and is
-// intended for cross-index query planning.
-func (g *GeoIndex) EstimateRanges(ranges []S2KeyRange) uint64 {
-	ranges = NormalizeRanges(ranges)
-	guard := g.config.Epoch.Enter()
-	defer guard.Exit()
+// EstimateRanges returns the current candidate count for normalized ranges.
+func (g *Index) EstimateRanges(ranges []Range) uint64 {
+	token := g.readers.Acquire()
+	defer g.readers.Release(token)
 	if g.closed.Load() {
 		return 0
 	}
 	view := g.view.Load()
-	return indexutil.SaturatingAdd(view.Sparse.estimateRanges(ranges), view.Bitmap.estimateRanges(ranges))
+	var estimate uint64
+	for rangeIndex := range ranges {
+		keyRange := ranges[rangeIndex : rangeIndex+1]
+		if keyRange[0].End < keyRange[0].Start {
+			continue
+		}
+		first := shardForKey(keyRange[0].Start)
+		if first >= geoShardCount {
+			continue
+		}
+		last := shardForKey(keyRange[0].End)
+		if last >= geoShardCount {
+			last = geoShardCount - 1
+		}
+		for shardIndex := first; shardIndex <= last; shardIndex++ {
+			shard := view.shards[shardIndex]
+			if shard == nil {
+				continue
+			}
+			estimate = indexutil.SaturatingAdd(estimate, shard.sparse.estimateRanges(keyRange))
+			estimate = indexutil.SaturatingAdd(estimate, shard.dense.estimateRanges(keyRange))
+		}
+	}
+	return estimate
 }
 
-func (g *GeoIndex) All(dst []ImageID) []ImageID {
-	return g.SearchRanges(dst, []S2KeyRange{{Start: 0, End: ^S2Key(0)}})
+// AppendTo appends every indexed image ID. It is intended for diagnostics and
+// the current full-scan Nearest implementation.
+func (g *Index) AppendTo(dst []ImageID) []ImageID {
+	token := g.readers.Acquire()
+	if !g.closed.Load() {
+		view := g.view.Load()
+		for _, shard := range view.shards {
+			if shard == nil {
+				continue
+			}
+			dst = shard.sparse.searchRanges(dst, []Range{{Start: 0, End: ^S2Key(0)}})
+			dst = shard.dense.searchRanges(dst, []Range{{Start: 0, End: ^S2Key(0)}})
+		}
+	}
+	g.readers.Release(token)
+	return dst
 }

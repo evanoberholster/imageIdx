@@ -5,128 +5,146 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
-type GeoIndexView struct {
-	Version    uint16
-	Flags      uint32
-	IndexID    uint64
-	Generation uint64
-	Sparse     GeoSparseRef
-	Bitmap     GeoBitmapRef
+const (
+	geoShardBits  = 8
+	geoShardCount = 1 << geoShardBits
+	geoKeyBits    = 36
+)
+
+type geoShard struct {
+	sparse sparseRef
+	dense  bitmapRef
 }
 
-func (v *GeoIndexView) Header() GeoIndexHeader {
-	if v == nil {
-		return GeoIndexHeader{}
-	}
-	return GeoIndexHeader{
-		Version: v.Version, Flags: uint16(v.Flags), IndexID: v.IndexID, S2Level: GeoS2Level,
-		SparseCellCount: uint64(v.Sparse.CellCount()), BitmapCellCount: uint64(v.Bitmap.CellCount()),
-		Generation: v.Generation,
-	}
-}
-
-type pendingMutation struct {
-	key    S2Key
-	remove bool
-}
-
-type GeoIndex struct {
-	view   atomic.Pointer[GeoIndexView]
-	config Config
-
-	writerMu  sync.Mutex
-	pending   map[uint64]pendingMutation
-	locations map[uint64]S2Key
-	closed    atomic.Bool
-	stop      chan struct{}
-	workers   sync.WaitGroup
-
-	storeDir        string
-	durability      Durability
-	wal             *geoWAL
-	mappings        [][]byte
+type indexView struct {
+	version         uint16
+	flags           uint32
+	indexID         uint64
 	generation      uint64
-	storeGeneration uint64
-	persistenceMu   sync.Mutex
+	sparseCellCount uint64
+	denseCellCount  uint64
+	shards          [geoShardCount]*geoShard
 }
 
-func New(indexID uint64, entries []GeoEntry, config Config) (*GeoIndex, error) {
+// Index is one fixed-level geographic candidate index. Readers load one
+// immutable view and never inspect writer-side mutations.
+type Index struct {
+	view    atomic.Pointer[indexView]
+	config  Config
+	readers indexutil.ReaderTracker
+
+	writerMu sync.Mutex
+	pending  map[ImageID]Mutation
+	closed   atomic.Bool
+	stop     chan struct{}
+	publish  chan struct{}
+	workers  sync.WaitGroup
+
+	persistence *persistentState
+	mapping     []byte
+}
+
+// New constructs an index from canonical coordinates.
+func New(spec Spec, config Config) (*Index, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
 	}
-	locations := make(map[uint64]S2Key, len(entries))
-	for _, entry := range entries {
+	cells := make(map[S2Key][]ImageID)
+	seen := make(map[ImageID]struct{}, len(spec.Entries))
+	for _, entry := range spec.Entries {
 		if entry.ImageID == 0 {
 			return nil, ErrInvalidImageID
 		}
-		if _, exists := locations[entry.ImageID]; exists {
+		if _, exists := seen[entry.ImageID]; exists {
 			return nil, ErrDuplicateImageID
 		}
 		key, keyErr := KeyFromLatLng(entry.Latitude, entry.Longitude)
 		if keyErr != nil {
 			return nil, keyErr
 		}
-		locations[entry.ImageID] = key
+		seen[entry.ImageID] = struct{}{}
+		cells[key] = append(cells[key], entry.ImageID)
 	}
-	return newGeoIndex(indexID, 0, 1, locations, config), nil
+	return newIndex(spec.IndexID, spec.Flags, 1, cells, config), nil
 }
 
-func NewFromCells(indexID uint64, entries []GeoCellEntry, config Config) (*GeoIndex, error) {
-	config, err := config.withDefaults()
-	if err != nil {
-		return nil, err
+func newIndex(indexID uint64, flags uint32, generation uint64, cells map[S2Key][]ImageID, config Config) *Index {
+	index := &Index{
+		config:  config,
+		pending: make(map[ImageID]Mutation),
+		stop:    make(chan struct{}),
+		publish: make(chan struct{}, 1),
 	}
-	locations := make(map[uint64]S2Key, len(entries))
-	for _, entry := range entries {
-		if entry.ImageID == 0 {
-			return nil, ErrInvalidImageID
-		}
-		if _, exists := locations[entry.ImageID]; exists {
-			return nil, ErrDuplicateImageID
-		}
-		if _, cellErr := CellIDFromS2Key(entry.Key); cellErr != nil {
-			return nil, cellErr
-		}
-		locations[entry.ImageID] = entry.Key
-	}
-	return newGeoIndex(indexID, 0, 1, locations, config), nil
-}
-
-func newGeoIndex(indexID uint64, flags uint32, generation uint64, locations map[uint64]S2Key, config Config) *GeoIndex {
-	cells := cellsFromLocations(locations)
-	index := &GeoIndex{
-		config: config, pending: make(map[uint64]pendingMutation), locations: locations,
-		stop: make(chan struct{}), generation: generation,
-	}
-	index.view.Store(&GeoIndexView{
-		Version: GeoFormatVersion, Flags: flags, IndexID: indexID, Generation: generation,
-		Sparse: buildSparse(cells), Bitmap: buildBitmap(cells),
-	})
+	index.view.Store(buildView(indexID, flags, generation, cells))
 	index.startPublisher()
 	return index
 }
 
-func newGeoIndexFromView(view *GeoIndexView, config Config, mapping []byte) (*GeoIndex, error) {
-	if view == nil || view.Version != GeoFormatVersion {
+func newIndexFromView(view *indexView, config Config, mapping []byte) (*Index, error) {
+	if view == nil || view.version != geoFormatVersion {
 		return nil, ErrCorruptStorage
 	}
-	locations := locationsFromView(view)
-	index := &GeoIndex{
-		config: config, pending: make(map[uint64]pendingMutation), locations: locations,
-		stop: make(chan struct{}), generation: view.Generation,
-	}
-	if mapping != nil {
-		index.mappings = [][]byte{mapping}
+	index := &Index{
+		config:  config,
+		pending: make(map[ImageID]Mutation),
+		stop:    make(chan struct{}),
+		publish: make(chan struct{}, 1),
+		mapping: mapping,
 	}
 	index.view.Store(view)
 	index.startPublisher()
 	return index, nil
 }
 
-func (g *GeoIndex) startPublisher() {
+func buildView(indexID uint64, flags uint32, generation uint64, cells map[S2Key][]ImageID) *indexView {
+	view := &indexView{version: geoFormatVersion, flags: flags, indexID: indexID, generation: generation}
+	grouped := make(map[int]map[S2Key][]ImageID)
+	for key, ids := range cells {
+		if len(ids) == 0 {
+			continue
+		}
+		shardIndex := shardForKey(key)
+		if grouped[shardIndex] == nil {
+			grouped[shardIndex] = make(map[S2Key][]ImageID)
+		}
+		grouped[shardIndex][key] = ids
+	}
+	for shardIndex, shardCells := range grouped {
+		shard := &geoShard{sparse: buildSparse(shardCells), dense: buildBitmap(shardCells)}
+		view.shards[shardIndex] = shard
+		view.sparseCellCount += uint64(shard.sparse.cellCount())
+		view.denseCellCount += uint64(shard.dense.cellCount())
+	}
+	return view
+}
+
+func shardForKey(key S2Key) int {
+	return int(uint64(key) >> (geoKeyBits - geoShardBits))
+}
+
+func (v *indexView) containsAt(key S2Key, id ImageID) bool {
+	if v == nil || key == 0 {
+		return false
+	}
+	shard := v.shards[shardForKey(key)]
+	if shard == nil {
+		return false
+	}
+	for _, value := range shard.sparse.lookup(key, nil) {
+		if value == id {
+			return true
+		}
+	}
+	bitmap, ok := shard.dense.lookup(key)
+	return ok && bitmap.Contains(id)
+}
+
+func (g *Index) startPublisher() {
 	g.workers.Add(1)
 	go func() {
 		defer g.workers.Done()
@@ -136,6 +154,8 @@ func (g *GeoIndex) startPublisher() {
 			select {
 			case <-ticker.C:
 				_ = g.Flush()
+			case <-g.publish:
+				_ = g.Flush()
 			case <-g.stop:
 				return
 			}
@@ -143,16 +163,23 @@ func (g *GeoIndex) startPublisher() {
 	}()
 }
 
-func (g *GeoIndex) LoadView() *GeoIndexView { return g.view.Load() }
-func (g *GeoIndex) IndexID() uint64         { return g.view.Load().IndexID }
-func (g *GeoIndex) Generation() uint64      { return g.view.Load().Generation }
-func (g *GeoIndex) Pending() int {
+// Metadata returns a copied summary of the current generation.
+func (g *Index) Metadata() Metadata {
+	view := g.view.Load()
+	return Metadata{
+		IndexID: view.indexID, Flags: view.flags, Generation: view.generation,
+		SparseCellCount: view.sparseCellCount, DenseCellCount: view.denseCellCount,
+	}
+}
+
+// Pending returns the number of unpublished image mutations.
+func (g *Index) Pending() int {
 	g.writerMu.Lock()
 	defer g.writerMu.Unlock()
 	return len(g.pending)
 }
 
-func (g *GeoIndex) WaitIdle(ctx context.Context) error {
+func (g *Index) WaitIdle(ctx context.Context) error {
 	ticker := time.NewTicker(100 * time.Microsecond)
 	defer ticker.Stop()
 	for {
@@ -167,34 +194,11 @@ func (g *GeoIndex) WaitIdle(ctx context.Context) error {
 	}
 }
 
-func cellsFromLocations(locations map[uint64]S2Key) map[S2Key][]uint64 {
-	cells := make(map[S2Key][]uint64)
-	for id, key := range locations {
-		cells[key] = append(cells[key], id)
+func (g *Index) Close() error {
+	if g.persistence != nil {
+		g.persistence.mu.Lock()
+		defer g.persistence.mu.Unlock()
 	}
-	return cells
-}
-
-func locationsFromView(view *GeoIndexView) map[uint64]S2Key {
-	locations := make(map[uint64]S2Key)
-	for keyIndex, key := range view.Sparse.keys {
-		offset := keyIndex * GeoSparseSlots
-		for _, id := range view.Sparse.imageIDs[offset : offset+GeoSparseSlots] {
-			if id == 0 {
-				break
-			}
-			locations[id] = key
-		}
-	}
-	for keyIndex, key := range view.Bitmap.keys {
-		for _, id := range view.Bitmap.bitmaps[keyIndex].ToArray() {
-			locations[id] = key
-		}
-	}
-	return locations
-}
-
-func (g *GeoIndex) Close() error {
 	g.writerMu.Lock()
 	if g.closed.Load() {
 		g.writerMu.Unlock()
@@ -204,17 +208,17 @@ func (g *GeoIndex) Close() error {
 	g.closed.Store(true)
 	close(g.stop)
 	var result error
-	if g.wal != nil {
-		result = g.wal.close()
+	if g.persistence != nil && g.persistence.wal != nil {
+		result = g.persistence.wal.close()
 	}
 	g.writerMu.Unlock()
 	g.workers.Wait()
-	g.config.Epoch.Synchronize()
-	for _, mapping := range g.mappings {
-		if err := unmapFile(mapping); err != nil && result == nil {
+	g.readers.WaitForPriorReaders()
+	if g.mapping != nil {
+		if err := unmapFile(g.mapping); err != nil && result == nil {
 			result = err
 		}
+		g.mapping = nil
 	}
-	g.mappings = nil
 	return result
 }

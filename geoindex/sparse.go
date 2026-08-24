@@ -6,51 +6,38 @@ import (
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
-type GeoSparseRef struct {
+type sparseRef struct {
 	keys     []S2Key
 	imageIDs []uint64
 	backing  []byte
 }
 
-func NewGeoSparseRef(keys []S2Key, imageIDs []uint64) (GeoSparseRef, error) {
-	if len(imageIDs) != len(keys)*GeoSparseSlots {
-		return GeoSparseRef{}, ErrCorruptStorage
-	}
-	keyCopy := append([]S2Key(nil), keys...)
-	idCopy := append([]uint64(nil), imageIDs...)
-	if err := validateSparse(keyCopy, idCopy); err != nil {
-		return GeoSparseRef{}, err
-	}
-	return GeoSparseRef{keys: keyCopy, imageIDs: idCopy}, nil
-}
+func (s sparseRef) cellCount() int { return len(s.keys) }
 
-func (s GeoSparseRef) CellCount() int { return len(s.keys) }
-func (s GeoSparseRef) Keys() []S2Key  { return append([]S2Key(nil), s.keys...) }
-
-func (s GeoSparseRef) Lookup(key S2Key, dst []ImageID) []ImageID {
+func (s sparseRef) lookup(key S2Key, dst []ImageID) []ImageID {
 	index := lowerBound(s.keys, key)
 	if index == len(s.keys) || s.keys[index] != key {
 		return dst
 	}
-	return appendSparseIDs(dst, s.imageIDs[index*GeoSparseSlots:(index+1)*GeoSparseSlots])
+	return appendSparseIDs(dst, s.imageIDs[index*geoSparseSlots:(index+1)*geoSparseSlots])
 }
 
-func (s GeoSparseRef) SearchRanges(dst []ImageID, ranges []S2KeyRange) []ImageID {
+func (s sparseRef) searchRanges(dst []ImageID, ranges []Range) []ImageID {
 	keyIndex := 0
 	for _, keyRange := range ranges {
 		if keyIndex < len(s.keys) && s.keys[keyIndex] < keyRange.Start {
 			keyIndex += lowerBound(s.keys[keyIndex:], keyRange.Start)
 		}
 		for keyIndex < len(s.keys) && s.keys[keyIndex] <= keyRange.End {
-			offset := keyIndex * GeoSparseSlots
-			dst = appendSparseIDs(dst, s.imageIDs[offset:offset+GeoSparseSlots])
+			offset := keyIndex * geoSparseSlots
+			dst = appendSparseIDs(dst, s.imageIDs[offset:offset+geoSparseSlots])
 			keyIndex++
 		}
 	}
 	return dst
 }
 
-func (s GeoSparseRef) estimateRanges(ranges []S2KeyRange) uint64 {
+func (s sparseRef) estimateRanges(ranges []Range) uint64 {
 	var count uint64
 	keyIndex := 0
 	for _, keyRange := range ranges {
@@ -58,8 +45,8 @@ func (s GeoSparseRef) estimateRanges(ranges []S2KeyRange) uint64 {
 			keyIndex += lowerBound(s.keys[keyIndex:], keyRange.Start)
 		}
 		for keyIndex < len(s.keys) && s.keys[keyIndex] <= keyRange.End {
-			offset := keyIndex * GeoSparseSlots
-			for _, id := range s.imageIDs[offset : offset+GeoSparseSlots] {
+			offset := keyIndex * geoSparseSlots
+			for _, id := range s.imageIDs[offset : offset+geoSparseSlots] {
 				if id == 0 {
 					break
 				}
@@ -89,7 +76,7 @@ func validateSparse(keys []S2Key, ids []uint64) error {
 		if _, err := CellIDFromS2Key(key); err != nil {
 			return err
 		}
-		values := ids[index*GeoSparseSlots : (index+1)*GeoSparseSlots]
+		values := ids[index*geoSparseSlots : (index+1)*geoSparseSlots]
 		seenZero := false
 		previous := uint64(0)
 		for _, id := range values {
@@ -106,19 +93,19 @@ func validateSparse(keys []S2Key, ids []uint64) error {
 	return nil
 }
 
-func buildSparse(cells map[S2Key][]uint64) GeoSparseRef {
+func buildSparse(cells map[S2Key][]ImageID) sparseRef {
 	keys := make([]S2Key, 0, len(cells))
 	for key, ids := range cells {
-		if len(ids) > 0 && len(ids) <= GeoSparseSlots {
+		if len(ids) > 0 && len(ids) <= geoSparseSlots {
 			keys = append(keys, key)
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	values := make([]uint64, len(keys)*GeoSparseSlots)
+	values := make([]uint64, len(keys)*geoSparseSlots)
 	for index, key := range keys {
 		ids := cells[key]
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		copy(values[index*GeoSparseSlots:], ids)
+		copy(values[index*geoSparseSlots:], ids)
 	}
-	return GeoSparseRef{keys: keys, imageIDs: values}
+	return sparseRef{keys: keys, imageIDs: values}
 }

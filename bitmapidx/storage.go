@@ -19,14 +19,21 @@ const (
 	bitmapWALFilename            = "bitmap.wal"
 )
 
+// Store owns a persistent collection of bitmap indexes backed by a directory.
+//
+// Durability model: Apply appends a WAL record and publishes to the in-memory
+// index; Checkpoint serializes the current effective state into a new
+// immutable segment file and atomically publishes a manifest pointing at it;
+// OpenPersistent loads that segment and replays the WAL tail on top. Vacuum
+// checkpoints and removes obsolete segment generations.
 type Store struct {
-	Directory *BitmapDirectory
-
+	directory  *Directory
 	dir        string
 	config     Config
 	durability Durability
 	wal        *bitmapWAL
-	segment    *Segment
+	segment    *segment
+	readers    *indexutil.ReaderTracker
 	generation uint64
 	writeMu    sync.Mutex
 	closed     atomic.Bool
@@ -38,7 +45,8 @@ type bitmapManifest struct {
 	count      uint64
 }
 
-func NewPersistent(dir string, specs []IndexSpec, config Config, durability Durability) (*Store, error) {
+// NewPersistent creates and checkpoints a persistent bitmap store.
+func NewPersistent(dir string, specs []Spec, config Config, durability Durability) (*Store, error) {
 	config, err := config.withDefaults()
 	if err != nil || durability > DurabilitySync {
 		if err != nil {
@@ -49,21 +57,16 @@ func NewPersistent(dir string, specs []IndexSpec, config Config, durability Dura
 	if err = os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	indexes := make([]*BitmapIndex, 0, len(specs))
+	readers := &indexutil.ReaderTracker{}
+	indexes := make([]*Index, 0, len(specs))
 	for _, spec := range specs {
-		index, indexErr := NewBitmapIndex(spec.Key, spec.IndexID, spec.ImageIDs, config)
+		index, indexErr := newIndex(spec, config, readers)
 		if indexErr != nil {
 			return nil, indexErr
 		}
-		view := index.view.Load()
-		index.view.Store(&BitmapIndexView{
-			Version: view.Version, IndexType: view.IndexType, Flags: spec.Flags,
-			IndexID: view.IndexID, ValueID: view.ValueID, Cardinality: view.Cardinality,
-			Generation: view.Generation, Base: view.Base,
-		})
 		indexes = append(indexes, index)
 	}
-	directory, err := NewBitmapDirectory(indexes...)
+	directory, err := NewDirectory(indexes...)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +74,10 @@ func NewPersistent(dir string, specs []IndexSpec, config Config, durability Dura
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{Directory: directory, dir: dir, config: config, durability: durability, wal: wal}
+	store := &Store{
+		directory: directory, dir: dir, config: config, durability: durability,
+		wal: wal, readers: readers,
+	}
 	if err = store.Checkpoint(); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -79,6 +85,7 @@ func NewPersistent(dir string, specs []IndexSpec, config Config, durability Dura
 	return store, nil
 }
 
+// OpenPersistent opens a checkpoint and replays its WAL tail.
 func OpenPersistent(dir string, config Config, durability Durability) (*Store, error) {
 	config, err := config.withDefaults()
 	if err != nil || durability > DurabilitySync {
@@ -91,63 +98,76 @@ func OpenPersistent(dir string, config Config, durability Durability) (*Store, e
 	if err != nil {
 		return nil, err
 	}
-	segment, err := OpenSegment(segmentPath(dir, manifest.generation), config)
+	segment, err := openSegment(segmentPath(dir, manifest.generation), config)
 	if err != nil {
 		return nil, err
 	}
-	if uint64(segment.Directory.Len()) != manifest.count || segment.Generation != manifest.generation {
-		_ = segment.Close()
+	if uint64(segment.directory.Len()) != manifest.count || segment.generation != manifest.generation {
+		_ = segment.close()
 		return nil, ErrCorruptManifest
 	}
 	recovered, err := replayBitmapWAL(filepath.Join(dir, bitmapWALFilename), manifest.walOffset)
 	if err != nil {
-		_ = segment.Close()
+		_ = segment.close()
 		return nil, err
 	}
 	for _, record := range recovered {
-		index, ok := segment.Directory.Lookup(record.key)
-		if !ok || index.IndexID() != record.indexID {
-			_ = segment.Close()
+		index, ok := segment.directory.Lookup(record.key)
+		if !ok || index.Metadata().IndexID != record.indexID {
+			_ = segment.close()
 			return nil, ErrCorruptWAL
 		}
-		if err = index.Write(record.mutation); err != nil {
-			_ = segment.Close()
+		if err = index.Apply(record.mutation); err != nil {
+			_ = segment.close()
 			return nil, err
 		}
 	}
 	wal, err := openBitmapWAL(filepath.Join(dir, bitmapWALFilename))
 	if err != nil {
-		_ = segment.Close()
+		_ = segment.close()
 		return nil, err
 	}
 	return &Store{
-		Directory: segment.Directory, dir: dir, config: config, durability: durability,
-		wal: wal, segment: segment, generation: manifest.generation,
+		directory: segment.directory, dir: dir, config: config, durability: durability,
+		wal: wal, segment: segment, readers: segment.readers, generation: manifest.generation,
 	}, nil
 }
 
-func (s *Store) Write(key BitmapKey, mutation BitmapMutation) error {
+// Lookup returns an index by logical predicate key.
+func (s *Store) Lookup(key Key) (*Index, bool) { return s.directory.Lookup(key) }
+
+// LookupID returns an index by its stable numeric identifier.
+func (s *Store) LookupID(indexID uint64) (*Index, bool) { return s.directory.LookupID(indexID) }
+
+// Indexes returns indexes in physical storage order.
+func (s *Store) Indexes() []*Index { return s.directory.Indexes() }
+
+// Len returns the number of indexes in the store.
+func (s *Store) Len() int { return s.directory.Len() }
+
+// Apply appends a mutation to the WAL and publishes it to the selected index.
+func (s *Store) Apply(key Key, mutation Mutation) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return ErrClosed
 	}
-	index, ok := s.Directory.Lookup(key)
+	index, ok := s.directory.Lookup(key)
 	if !ok {
 		return ErrInvalidIndex
 	}
-	if err := s.wal.append(key, index.IndexID(), mutation, s.durability); err != nil {
+	if err := s.wal.append(key, index.Metadata().IndexID, mutation, s.durability); err != nil {
 		return err
 	}
-	return index.Write(mutation)
+	return index.Apply(mutation)
 }
 
-func (s *Store) Add(key BitmapKey, ids []uint64) error {
-	return s.Write(key, BitmapMutation{Additions: ids})
+func (s *Store) Add(key Key, ids []ImageID) error {
+	return s.Apply(key, Mutation{Add: ids})
 }
 
-func (s *Store) Remove(key BitmapKey, ids []uint64) error {
-	return s.Write(key, BitmapMutation{Removals: ids})
+func (s *Store) Remove(key Key, ids []ImageID) error {
+	return s.Apply(key, Mutation{Remove: ids})
 }
 
 func (s *Store) Checkpoint() error {
@@ -166,13 +186,13 @@ func (s *Store) Checkpoint() error {
 	generation := s.generation + 1
 	finalPath := segmentPath(s.dir, generation)
 	temporary := finalPath + ".tmp"
-	if err = WriteSegment(temporary, generation, s.Directory.Indexes()); err != nil {
+	if err = writeSegment(temporary, generation, s.directory.Indexes()); err != nil {
 		return err
 	}
 	if err = os.Rename(temporary, finalPath); err != nil {
 		return err
 	}
-	manifest := bitmapManifest{generation: generation, walOffset: offset, count: uint64(s.Directory.Len())}
+	manifest := bitmapManifest{generation: generation, walOffset: offset, count: uint64(s.directory.Len())}
 	if err = writeBitmapManifest(s.dir, manifest); err != nil {
 		return err
 	}
@@ -186,7 +206,7 @@ func (s *Store) Vacuum() error {
 	if err := s.Checkpoint(); err != nil {
 		return err
 	}
-	s.config.Epoch.Synchronize()
+	s.readers.WaitForPriorReaders()
 	paths, err := filepath.Glob(filepath.Join(s.dir, "segment-*.idx"))
 	if err != nil {
 		return err
@@ -214,11 +234,11 @@ func (s *Store) Close() error {
 	}
 	s.writeMu.Unlock()
 	if s.segment != nil {
-		if err := s.segment.Close(); result == nil {
+		if err := s.segment.close(); result == nil {
 			result = err
 		}
 	} else {
-		for _, index := range s.Directory.Indexes() {
+		for _, index := range s.directory.Indexes() {
 			_ = index.Close()
 		}
 	}
