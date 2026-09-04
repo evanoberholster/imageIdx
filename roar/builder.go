@@ -35,13 +35,12 @@ func NewBuilder(capacity int) *Builder {
 	}
 }
 
-// Reset clears accumulated containers and scratch state while retaining
-// allocated capacity.
+// Reset clears accumulated containers while retaining allocated capacity.
+// Scratch storage is reinitialized by the operation that next uses it.
 func (b *Builder) Reset() {
 	b.keys = b.keys[:0]
 	b.offsets = b.offsets[:0]
 	b.data = b.data[:0]
-	clear(b.scratchWords)
 	b.scratchValues = b.scratchValues[:0]
 }
 

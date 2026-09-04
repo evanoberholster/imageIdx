@@ -1,6 +1,6 @@
 // Package roar implements an immutable, offset-based bitmap index over
 // database-wide uint64 image IDs. The serialized byte region is the read
-// representation: a View operates directly over mmap-backed bytes without
+// representation: a Bitmap operates directly over mmap-backed bytes without
 // decoding container objects.
 //
 // IDs are split into an upper 48-bit container key and a lower 16-bit value.
@@ -12,7 +12,7 @@ import "errors"
 
 const (
 	// Magic is the version-1 byte signature "ROAR".
-	Magic   uint32 = 0x524F4152
+	Magic   uint32 = 0x52414F52
 	Version uint16 = 1
 
 	// Alignment is the required byte alignment of every structural boundary
@@ -35,6 +35,11 @@ const (
 	ArrayToBitmapThreshold = 2048
 )
 
+// legacyMagic is the transposed "RAOR" signature emitted before Magic was
+// corrected. Open accepts it so existing version-1 images remain readable;
+// constructors always emit Magic.
+const legacyMagic uint32 = 0x524F4152
+
 const (
 	FlagCompact uint16 = 1 << iota
 	FlagStoredCardinality
@@ -44,13 +49,14 @@ const (
 const InvalidImageID uint64 = 0
 
 var (
-	ErrInvalidBitmap      = errors.New("roar: invalid bitmap")
-	ErrInvalidMagic       = errors.New("roar: invalid magic")
-	ErrUnsupportedVersion = errors.New("roar: unsupported version")
-	ErrInvalidImageID     = errors.New("roar: invalid image id")
-	ErrCorruptContainer   = errors.New("roar: corrupt container")
-	ErrUnsupportedEndian  = errors.New("roar: serialized format requires a little-endian host")
-	ErrUnsortedIDs        = errors.New("roar: image ids must be strictly increasing")
+	ErrInvalidBitmap         = errors.New("roar: invalid bitmap")
+	ErrInvalidMagic          = errors.New("roar: invalid magic")
+	ErrUnsupportedVersion    = errors.New("roar: unsupported version")
+	ErrInvalidImageID        = errors.New("roar: invalid image id")
+	ErrCorruptContainer      = errors.New("roar: corrupt container")
+	ErrUnsupportedEndian     = errors.New("roar: serialized format requires a little-endian host")
+	ErrUnsortedIDs           = errors.New("roar: image ids must be strictly increasing")
+	ErrSortedBuilderFinished = errors.New("roar: sorted builder is finished; call Reset before Add")
 )
 
 // ContainerType identifies the payload kind stored after the container

@@ -3,7 +3,7 @@ package roar
 import "math/bits"
 
 // OrInto appends the union of a and b to dst.
-func OrInto(dst *Builder, a, b View) {
+func OrInto(dst *Builder, a, b Bitmap) {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	i, j := 0, 0
 	for i < len(aEntries) || j < len(bEntries) {

@@ -2,7 +2,7 @@ package roar
 
 // AndCardinality counts the intersection of a and b without materializing
 // it. It allocates nothing.
-func AndCardinality(a, b View) uint64 {
+func AndCardinality(a, b Bitmap) uint64 {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	i, j := 0, 0
 	var total uint64
@@ -23,7 +23,7 @@ func AndCardinality(a, b View) uint64 {
 
 // OrCardinality counts the union of a and b without materializing it. It
 // allocates nothing.
-func OrCardinality(a, b View) uint64 {
+func OrCardinality(a, b Bitmap) uint64 {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	i, j := 0, 0
 	var total uint64
@@ -46,7 +46,7 @@ func OrCardinality(a, b View) uint64 {
 
 // AndNotCardinality counts a minus b without materializing it. It allocates
 // nothing.
-func AndNotCardinality(a, b View) uint64 {
+func AndNotCardinality(a, b Bitmap) uint64 {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	i, j := 0, 0
 	var total uint64
@@ -69,7 +69,7 @@ func AndNotCardinality(a, b View) uint64 {
 
 // Intersects reports whether a and b share any ID, exiting at the first
 // matching container or bit. It allocates nothing.
-func Intersects(a, b View) bool {
+func Intersects(a, b Bitmap) bool {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	i, j := 0, 0
 	for i < len(aEntries) && j < len(bEntries) {

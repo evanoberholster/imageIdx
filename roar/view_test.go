@@ -111,3 +111,79 @@ func TestOpenValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAcceptsLegacyMagic(t *testing.T) {
+	data, err := FromSorted([]uint64{1, 2, 1<<16 + 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint32(data[:4], legacyMagic)
+
+	bitmap, err := Open(data)
+	if err != nil {
+		t.Fatalf("Open legacy image: %v", err)
+	}
+	want := []uint64{1, 2, 1<<16 + 3}
+	if got := bitmap.AppendTo(nil); !slices.Equal(got, want) {
+		t.Fatalf("legacy image values = %v, want %v", got, want)
+	}
+}
+
+func TestValidateRejectsOverflowingContainerOffset(t *testing.T) {
+	data, err := FromSorted([]uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := binary.LittleEndian.Uint32(data[8:12])
+	binary.LittleEndian.PutUint64(data[entry+8:], ^uint64(0)-7)
+
+	if err := Validate(data); err != ErrInvalidBitmap {
+		t.Fatalf("Validate error = %v, want %v", err, ErrInvalidBitmap)
+	}
+}
+
+func TestValidateRejectsReservedImageID(t *testing.T) {
+	denseIDs := make([]uint64, ArrayToBitmapThreshold+1)
+	for index := range denseIDs {
+		denseIDs[index] = uint64(index + 1)
+	}
+
+	tests := []struct {
+		name   string
+		ids    []uint64
+		mutate func([]byte, uint64)
+	}{
+		{
+			name: "array",
+			ids:  []uint64{1},
+			mutate: func(data []byte, offset uint64) {
+				binary.LittleEndian.PutUint16(data[offset+ContainerHeaderSize:], 0)
+			},
+		},
+		{
+			name: "bitmap",
+			ids:  denseIDs,
+			mutate: func(data []byte, offset uint64) {
+				wordOffset := offset + ContainerHeaderSize
+				word := binary.LittleEndian.Uint64(data[wordOffset:])
+				word = word&^uint64(1<<1) | 1
+				binary.LittleEndian.PutUint64(data[wordOffset:], word)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := FromSorted(test.ids)
+			if err != nil {
+				t.Fatal(err)
+			}
+			offset := binary.LittleEndian.Uint64(data[24:32])
+			test.mutate(data, offset)
+
+			if err := Validate(data); err != ErrInvalidImageID {
+				t.Fatalf("Validate error = %v, want %v", err, ErrInvalidImageID)
+			}
+		})
+	}
+}

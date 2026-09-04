@@ -31,7 +31,7 @@ type benchFamily struct {
 }
 
 type benchViews struct {
-	views   [4]View
+	views   [4]Bitmap
 	bitmaps [4]*sroar.Bitmap
 }
 

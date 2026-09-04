@@ -4,7 +4,7 @@ import "math/bits"
 
 // AndInto appends the intersection of a and b to dst. The two key tables
 // are merge-walked in order; only matching containers are combined.
-func AndInto(dst *Builder, a, b View) {
+func AndInto(dst *Builder, a, b Bitmap) {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	i, j := 0, 0
 	for i < len(aEntries) && j < len(bEntries) {
@@ -86,7 +86,7 @@ func copyContainerInto(dst *Builder, key uint64, container []byte) {
 }
 
 // copyAllInto appends a complete copy of src to dst.
-func copyAllInto(dst *Builder, src View) {
+func copyAllInto(dst *Builder, src Bitmap) {
 	for _, entry := range src.keyEntries() {
 		copyContainerInto(dst, entry.Key, src.data[entry.Offset:])
 	}

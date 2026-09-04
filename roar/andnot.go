@@ -3,7 +3,7 @@ package roar
 import "math/bits"
 
 // AndNotInto appends a minus b to dst.
-func AndNotInto(dst *Builder, a, b View) {
+func AndNotInto(dst *Builder, a, b Bitmap) {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	i, j := 0, 0
 	for i < len(aEntries) {

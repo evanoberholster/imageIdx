@@ -20,7 +20,7 @@ func TestDifferentialAgainstSroar(t *testing.T) {
 			randomSetOver(rng, pool),
 			randomSetOver(rng, pool),
 		}
-		views := make([]View, len(sets))
+		views := make([]Bitmap, len(sets))
 		bitmaps := make([]*sroar.Bitmap, len(sets))
 		for index, ids := range sets {
 			data, err := FromSorted(ids)
@@ -66,7 +66,7 @@ func TestDifferentialAgainstSroar(t *testing.T) {
 	}
 }
 
-func checkAnd(t *testing.T, round, left, right int, a, b View, sa, sb *sroar.Bitmap) {
+func checkAnd(t *testing.T, round, left, right int, a, b Bitmap, sa, sb *sroar.Bitmap) {
 	t.Helper()
 	// sroar's And/Or/AndNot mutate their receiver, so clone before combining.
 	wantCard := uint64(sa.Clone().And(sb).GetCardinality())
@@ -82,7 +82,7 @@ func checkAnd(t *testing.T, round, left, right int, a, b View, sa, sb *sroar.Bit
 	}
 }
 
-func checkOr(t *testing.T, round, left, right int, a, b View, sa, sb *sroar.Bitmap) {
+func checkOr(t *testing.T, round, left, right int, a, b Bitmap, sa, sb *sroar.Bitmap) {
 	t.Helper()
 	wantCard := uint64(sa.Clone().Or(sb).GetCardinality())
 	if got := OrCardinality(a, b); got != wantCard {
@@ -97,7 +97,7 @@ func checkOr(t *testing.T, round, left, right int, a, b View, sa, sb *sroar.Bitm
 	}
 }
 
-func checkAndNot(t *testing.T, round, left, right int, a, b View, sa, sb *sroar.Bitmap) {
+func checkAndNot(t *testing.T, round, left, right int, a, b Bitmap, sa, sb *sroar.Bitmap) {
 	t.Helper()
 	wantCard := uint64(sa.Clone().AndNot(sb).GetCardinality())
 	if got := AndNotCardinality(a, b); got != wantCard {
@@ -112,7 +112,7 @@ func checkAndNot(t *testing.T, round, left, right int, a, b View, sa, sb *sroar.
 	}
 }
 
-func checkAndMany(t *testing.T, round int, views []View, bitmaps []*sroar.Bitmap) {
+func checkAndMany(t *testing.T, round int, views []Bitmap, bitmaps []*sroar.Bitmap) {
 	t.Helper()
 	// sroar.FastAnd consumes its first argument; clone before combining.
 	clones := make([]*sroar.Bitmap, len(bitmaps))
@@ -151,7 +151,7 @@ func sampleQueries(rng *rand.Rand, sets [][]uint64) []uint64 {
 	return queries
 }
 
-func collect(view View) []uint64 {
+func collect(view Bitmap) []uint64 {
 	ids := make([]uint64, 0, view.Cardinality())
 	for iterator := view.Iterator(); iterator.Next(); {
 		ids = append(ids, iterator.Value())

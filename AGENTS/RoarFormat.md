@@ -20,16 +20,20 @@ alignment never implies widening each value.
 `Open` validates magic, version, lengths, key ordering, offsets, container
 ordering/cardinality, little-endian support, and buffer-base alignment.
 `OpenTrusted` skips validation only for already-verified storage bytes.
+Constructors emit the corrected `ROAR` signature. `Open` does not need to accept the
+legacy version-1 `RAOR`.
 
 ## Construction and Operations
 
-`FromSorted` validates and lays out the complete encoding in two passes and one
-allocation. `Builder` is reusable output storage for `AndInto`, `OrInto`, and
-`AndNotInto`; `Compact` returns its serialized bytes.
+`FromSortedList` validates and constructs an immutable `Bitmap` in two passes
+and one allocation. `FromSorted` returns the same compact encoding directly.
+`Builder` is reusable output storage for `AndInto`, `OrInto`, and `AndNotInto`;
+`Compact` returns its serialized bytes.
 
-`View` provides zero-allocation `Contains`, fused cardinality operations, and
-intersection tests. `AppendTo` is the preferred ascending materialization
-path. The iterator exists for incremental compatibility.
+`Bitmap` provides zero-allocation `Contains`, fused cardinality operations, and
+intersection tests. `View` is a deprecated compatibility alias. `AppendTo` is
+the preferred ascending materialization path. The iterator exists for
+incremental compatibility.
 
 Container choice and linear-search thresholds are runtime policies and are not
 format guarantees. SIMD is not implemented; scalar behavior and benchmarks

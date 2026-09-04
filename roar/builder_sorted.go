@@ -19,6 +19,7 @@ type SortedBuilder struct {
 	bitmapCard    uint32
 	isBitmap      bool
 	hasCurrent    bool
+	finished      bool
 	last          uint64
 }
 
@@ -33,21 +34,30 @@ func NewSortedBuilder(capacity int) *SortedBuilder {
 	}
 }
 
-// Reset clears the builder while retaining allocated capacity.
+// Reset clears the builder while retaining allocated capacity. It must be
+// called before adding IDs after Finish.
 func (b *SortedBuilder) Reset() {
 	b.keys = b.keys[:0]
 	b.offsets = b.offsets[:0]
 	b.data = b.data[:0]
 	b.currentValues = b.currentValues[:0]
+	if b.isBitmap {
+		clear(b.currentBitmap)
+	}
 	b.bitmapCard = 0
 	b.isBitmap = false
 	b.hasCurrent = false
+	b.finished = false
 	b.last = 0
 }
 
 // Add appends one ImageID. IDs must be strictly increasing; zero is
-// rejected.
+// rejected. After Finish, Add returns ErrSortedBuilderFinished until Reset
+// is called.
 func (b *SortedBuilder) Add(id uint64) error {
+	if b.finished {
+		return ErrSortedBuilderFinished
+	}
 	if id == InvalidImageID {
 		return ErrInvalidImageID
 	}
@@ -121,10 +131,11 @@ func (b *SortedBuilder) finishCurrent() {
 	b.hasCurrent = false
 }
 
-// Finish assembles the serialized bitmap. The builder may be reused after a
-// Reset.
+// Finish assembles the serialized bitmap. Finish may be called repeatedly,
+// but Reset must be called before adding more IDs.
 func (b *SortedBuilder) Finish() ([]byte, error) {
 	b.finishCurrent()
+	b.finished = true
 	return assemble(b.keys, b.offsets, b.data), nil
 }
 
@@ -135,8 +146,19 @@ func (b *SortedBuilder) extend(size int) []byte {
 	return b.data[start:]
 }
 
-// FromSorted constructs a compact serialized bitmap from strictly
-// increasing ImageIDs. ImageID zero is rejected.
+// FromSortedList constructs an immutable Bitmap from strictly increasing
+// ImageIDs. ImageID zero and duplicate IDs are rejected.
+func FromSortedList(ids []uint64) (Bitmap, error) {
+	data, err := FromSorted(ids)
+	if err != nil {
+		return Bitmap{}, err
+	}
+	return Bitmap{data: data}, nil
+}
+
+// FromSorted constructs the compact serialized representation of strictly
+// increasing ImageIDs. ImageID zero and duplicate IDs are rejected. Use
+// FromSortedList when an immediately queryable Bitmap is wanted.
 //
 // Construction is two-pass: the first pass validates the input and computes
 // the exact layout, and the second writes into one preallocated buffer. It

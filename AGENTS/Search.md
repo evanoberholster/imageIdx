@@ -17,7 +17,7 @@ Empty queries return `ErrEmptyQuery`; nil or empty clauses return
 
 ## Planning and Execution
 
-`Compile` coalesces all bitmap clauses, captures live upper-bound estimates,
+`Compile` coalesces all bitmap clauses, captures live planning estimates,
 and stably sorts stages by estimate. Ordering affects work only, never result
 semantics. A bitmap stage can filter candidates in place. An exact timestamp
 stage can also filter in place. Other stages collect into workspace scratch

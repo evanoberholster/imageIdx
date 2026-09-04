@@ -14,26 +14,24 @@ for sparse ranges, and 1,024-`uint64` bitmap containers for dense ranges.
 Reads operate directly on mmap-friendly bytes without decoding objects.
 
 ```go
-data, err := roar.FromSorted([]uint64{1<<48 + 1, 1<<48 + 2, 2<<48 + 9})
-if err != nil {
-	log.Fatal(err)
-}
-view, err := roar.Open(data)
+bitmap, err := roar.FromSortedList([]uint64{1<<48 + 1, 1<<48 + 2, 2<<48 + 9})
 if err != nil {
 	log.Fatal(err)
 }
 
-view.Contains(1<<48 + 2)                  // true, zero allocation
-n := roar.AndCardinality(view, other)     // fused count, no result bitmap
+bitmap.Contains(1<<48 + 2)                // true, zero allocation
+n := roar.AndCardinality(bitmap, other)   // fused count, no result bitmap
 
 results := make([]uint64, 0, 256)
-results = view.AppendTo(results)          // fast ascending materialization
+results = bitmap.AppendTo(results)        // fast ascending materialization
 ```
 
 `AndInto`/`OrInto`/`AndNotInto` write into a reusable `Builder`, and
 `AndManyCardinality` counts N-way intersections without intermediate
-bitmaps. `OpenTrusted` skips validation for already-verified bytes; the
-serialized format is 8-byte aligned throughout. Benchmarks in
+bitmaps. `FromSorted` returns the encoded representation directly when a
+queryable `Bitmap` is not needed. `Open` validates stored or mmap-backed bytes;
+`OpenTrusted` skips validation for already-verified bytes. The serialized
+format is 8-byte aligned throughout. Benchmarks in
 `roar/benchmark_test.go` compare against `weaviate/sroar` using
 photo-database-shaped distributions.
 

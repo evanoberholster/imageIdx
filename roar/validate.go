@@ -8,15 +8,15 @@ import (
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
-// Open validates data and returns an immutable View over it. Validation
+// Open validates data and returns an immutable Bitmap over it. Validation
 // covers the header, key table, container bounds, container types, sorted
 // array payloads, bitmap payload cardinalities, and the alignment required
 // by zero-copy access.
-func Open(data []byte) (View, error) {
+func Open(data []byte) (Bitmap, error) {
 	if err := Validate(data); err != nil {
-		return View{}, err
+		return Bitmap{}, err
 	}
-	return View{data: data}, nil
+	return Bitmap{data: data}, nil
 }
 
 // Validate checks that data forms a well-formed version-1 bitmap. It uses
@@ -26,7 +26,8 @@ func Validate(data []byte) error {
 	if len(data) < HeaderSize {
 		return ErrInvalidBitmap
 	}
-	if binary.LittleEndian.Uint32(data[0:4]) != Magic {
+	magic := binary.LittleEndian.Uint32(data[0:4])
+	if magic != Magic && magic != legacyMagic {
 		return ErrInvalidMagic
 	}
 	if binary.LittleEndian.Uint16(data[4:6]) != Version {
@@ -59,17 +60,20 @@ func Validate(data []byte) error {
 			return ErrInvalidBitmap
 		}
 		previous = key
-		if offset < tableEnd || offset%Alignment != 0 || offset+ContainerHeaderSize > uint64(len(data)) {
+		if offset < tableEnd || offset%Alignment != 0 {
 			return ErrInvalidBitmap
 		}
-		if err := validateContainer(data[offset:]); err != nil {
+		if _, ok := indexutil.CheckedEnd(offset, 1, ContainerHeaderSize, uint64(len(data))); !ok {
+			return ErrInvalidBitmap
+		}
+		if err := validateContainer(data[offset:], key); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateContainer(container []byte) error {
+func validateContainer(container []byte, key uint64) error {
 	if len(container) < ContainerHeaderSize {
 		return ErrCorruptContainer
 	}
@@ -89,6 +93,9 @@ func validateContainer(container []byte) error {
 		var previous uint16
 		for index := uint32(0); index < card; index++ {
 			value := binary.LittleEndian.Uint16(container[ContainerHeaderSize+uint64(index)*2:])
+			if key == 0 && value == 0 {
+				return ErrInvalidImageID
+			}
 			if index != 0 && value <= previous {
 				return ErrCorruptContainer
 			}
@@ -101,6 +108,9 @@ func validateContainer(container []byte) error {
 		var count uint32
 		for wordIndex := 0; wordIndex < BitmapWords; wordIndex++ {
 			word := binary.LittleEndian.Uint64(container[ContainerHeaderSize+uint64(wordIndex)*8:])
+			if key == 0 && wordIndex == 0 && word&1 != 0 {
+				return ErrInvalidImageID
+			}
 			count += uint32(bits.OnesCount64(word))
 		}
 		if count != card {

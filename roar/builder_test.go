@@ -2,6 +2,7 @@ package roar
 
 import (
 	"encoding/binary"
+	"slices"
 	"testing"
 )
 
@@ -40,8 +41,8 @@ func TestSortedBuilder(t *testing.T) {
 		t.Fatalf("Cardinality = %d", view.Cardinality())
 	}
 
-	if err := builder.Add(1<<48 + 3); err != nil {
-		t.Fatalf("reuse without Reset = %v", err)
+	if err := builder.Add(1<<48 + 3); !is(err, ErrSortedBuilderFinished) {
+		t.Fatalf("Add after Finish error = %v", err)
 	}
 	builder.Reset()
 	if err := builder.Add(1 << 48); err != nil {
@@ -53,6 +54,62 @@ func TestSortedBuilder(t *testing.T) {
 	}
 	if OpenTrusted(again).Cardinality() != 1 {
 		t.Fatalf("reused builder Cardinality = %d", OpenTrusted(again).Cardinality())
+	}
+}
+
+func TestSortedBuilderResetClearsUnfinishedBitmap(t *testing.T) {
+	builder := NewSortedBuilder(1)
+	for value := uint64(1); value <= ArrayToBitmapThreshold+1; value++ {
+		if err := builder.Add(1<<48 | value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	builder.Reset()
+	want := make([]uint64, ArrayToBitmapThreshold+1)
+	for index := range want {
+		want[index] = 2<<48 | uint64(10_000+index)
+		if err := builder.Add(want[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	data, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := Open(data)
+	if err != nil {
+		t.Fatalf("Open after Reset = %v", err)
+	}
+	got := view.AppendTo(nil)
+	if !slices.Equal(got, want) {
+		t.Fatalf("IDs after Reset = %v, want %v", got, want)
+	}
+}
+
+func TestSortedBuilderAddAfterFinishRequiresReset(t *testing.T) {
+	builder := NewSortedBuilder(1)
+	if err := builder.Add(1<<48 + 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builder.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Add(2<<48 + 1); !is(err, ErrSortedBuilderFinished) {
+		t.Fatalf("Add after Finish error = %v", err)
+	}
+
+	builder.Reset()
+	if err := builder.Add(2<<48 + 1); err != nil {
+		t.Fatalf("Add after Reset = %v", err)
+	}
+	data, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := OpenTrusted(data).AppendTo(nil); !slices.Equal(got, []uint64{2<<48 + 1}) {
+		t.Fatalf("IDs after Reset = %v", got)
 	}
 }
 
@@ -114,6 +171,43 @@ func TestBuilderCompactAndReset(t *testing.T) {
 	AndInto(builder, OpenTrusted(right), OpenTrusted(left))
 	if OpenTrusted(builder.Compact()).Cardinality() != 2 {
 		t.Fatal("reused builder produced wrong result")
+	}
+}
+
+func TestBuilderResetReinitializesScratchWhenNeeded(t *testing.T) {
+	dense := make([]uint64, ArrayToBitmapThreshold+1)
+	for index := range dense {
+		dense[index] = 1<<48 | uint64(index+1)
+	}
+	denseData, err := FromSorted(dense)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	left := make([]uint64, 1500)
+	right := make([]uint64, 1500)
+	for index := range left {
+		left[index] = 2<<48 | uint64(index+1)
+		right[index] = 2<<48 | uint64(index+3001)
+	}
+	leftData, err := FromSorted(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightData, err := FromSorted(right)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	builder := NewBuilder(1)
+	OrInto(builder, OpenTrusted(denseData), OpenTrusted(denseData))
+	builder.Reset()
+	OrInto(builder, OpenTrusted(leftData), OpenTrusted(rightData))
+
+	want := append(slices.Clone(left), right...)
+	got := OpenTrusted(builder.Compact()).AppendTo(nil)
+	if !slices.Equal(got, want) {
+		t.Fatalf("IDs after Reset = %v, want %v", got, want)
 	}
 }
 

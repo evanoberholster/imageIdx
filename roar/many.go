@@ -9,7 +9,7 @@ const maxStackViews = 8
 // materializing intermediate bitmaps. Common keys are located with one
 // merge pass; each matching container set is combined using the smallest
 // container as the driver.
-func AndManyInto(dst *Builder, views ...View) {
+func AndManyInto(dst *Builder, views ...Bitmap) {
 	if len(views) == 0 {
 		return
 	}
@@ -143,7 +143,7 @@ func valuePresentInAll(value uint16, driver int, containers [][]byte) bool {
 
 // AndManyCardinality counts the N-way intersection of views without
 // materializing it. It allocates nothing for up to maxStackViews inputs.
-func AndManyCardinality(views ...View) uint64 {
+func AndManyCardinality(views ...Bitmap) uint64 {
 	if len(views) < 2 {
 		if len(views) == 1 {
 			return views[0].Cardinality()

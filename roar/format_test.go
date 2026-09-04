@@ -40,7 +40,7 @@ func TestSerializedAlignment(t *testing.T) {
 		datasets = append(datasets, denseSortedIDs(rng, 8))
 	}
 
-	views := make([]View, len(datasets))
+	views := make([]Bitmap, len(datasets))
 	for index, ids := range datasets {
 		data, err := FromSorted(ids)
 		if err != nil {
@@ -66,7 +66,7 @@ func TestSerializedAlignment(t *testing.T) {
 		}
 	}
 	for round := 0; round < 10; round++ {
-		group := []View{
+		group := []Bitmap{
 			views[rng.IntN(len(views))],
 			views[rng.IntN(len(views))],
 			views[rng.IntN(len(views))],
@@ -122,7 +122,7 @@ func TestGoldenBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantEmpty := []byte{
-		0x52, 0x41, 0x4F, 0x52, // "ROAR" little-endian
+		0x52, 0x4F, 0x41, 0x52, // "ROAR"
 		0x01, 0x00, // version 1
 		0x01, 0x00, // FlagCompact
 		0x10, 0x00, 0x00, 0x00, // HeaderBytes 16
@@ -137,7 +137,7 @@ func TestGoldenBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantOne := []byte{
-		0x52, 0x41, 0x4F, 0x52,
+		0x52, 0x4F, 0x41, 0x52,
 		0x01, 0x00,
 		0x01, 0x00,
 		0x10, 0x00, 0x00, 0x00,

@@ -79,7 +79,7 @@ case.
 
 A persistent store contains (segment format version 2):
 
-- `segment.<generation>.base`: a 64-byte header, sorted 64-byte directory
+- `segment-<generation>.idx`: a 64-byte header, sorted 64-byte directory
   entries, and page-aligned serialized `idset` payloads;
 - `bitmap.wal`: 48-byte batch headers followed by `uint64` ID columns;
 - `manifest`: a 48-byte atomic generation pointer and WAL offset.

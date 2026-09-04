@@ -114,13 +114,14 @@ representation.
   `OpenTrusted` skips validation for bytes a storage layer has already
   checked. Zero-copy access requires a little-endian host and an 8-byte
   aligned buffer base.
-- `View` methods (`Contains`, `AndCardinality`, `AndManyCardinality`,
+- `Bitmap` methods (`Contains`, `AndCardinality`, `AndManyCardinality`,
   `Intersects`) allocate nothing. `AppendTo` is the fast materialization
   path; `Iterator.Next/Value` is the compatibility API and is slower than
   `AppendTo` because the Go inliner refuses the per-value state machine.
-- `FromSorted` is two-pass: one validation/layout pass, one write pass into a
-  single allocation. `Builder` accumulates operation results; `Compact`
-  assembles them. Thresholds (`ArrayToBitmapThreshold` 2048,
+- `FromSortedList` returns an immutable `Bitmap`; `FromSorted` exposes its raw
+  encoding. Construction is two-pass: one validation/layout pass, one write
+  pass into a single allocation. `Builder` accumulates operation results;
+  `Compact` assembles them. Thresholds (`ArrayToBitmapThreshold` 2048,
   `linearKeySearchThreshold` 16, `arrayLinearSearchThreshold` 16) are runtime
   policies, not format guarantees.
 - `roar` benchmarks compare against `github.com/weaviate/sroar` on
@@ -296,9 +297,11 @@ These are benchmark-driven; change them only with supporting evidence.
 
 ## Conventions When Extending
 
-- Add new functionality to an existing package; do not duplicate roaring,
-  reader tracking, WAL, or mmap code into a new package. Roaring mechanics
-  belong only in `idset`.
+- Add new functionality to an existing package; do not duplicate reader
+  tracking, WAL, or mmap code into a new package. Specialized indexes depend
+  on the `idset` representation boundary, not directly on competing roaring
+  implementations; `roar` remains a candidate backend until a measured
+  migration replaces the current `sroar` implementation behind `idset`.
 - Mirror the existing `*_test.go` split: unit tests, storage tests
   (`storage_test.go`), and benchmarks (`benchmark_test.go`). Use
   `b.ReportAllocs()` and `b.ResetTimer()` in benchmarks.

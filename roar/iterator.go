@@ -29,9 +29,9 @@ type Iterator struct {
 }
 
 // Iterator returns an iterator over the bitmap's ascending IDs. The
-// returned iterator must not outlive the View's backing bytes. The first
+// returned iterator must not outlive the Bitmap's backing bytes. The first
 // container is loaded lazily so the constructor stays trivial.
-func (v View) Iterator() Iterator {
+func (v Bitmap) Iterator() Iterator {
 	return Iterator{data: v.data, entries: v.keyEntries(), keyPos: -1}
 }
 
@@ -116,7 +116,7 @@ func (it *Iterator) Value() uint64 {
 // AppendTo appends all IDs in ascending order to dst. The walk runs in one
 // tight loop without per-value calls and allocates nothing; prefer it over
 // Next/Value when materializing results.
-func (v View) AppendTo(dst []uint64) []uint64 {
+func (v Bitmap) AppendTo(dst []uint64) []uint64 {
 	for _, entry := range v.keyEntries() {
 		container := v.data[entry.Offset:]
 		h := (*containerHeader)(unsafe.Pointer(unsafe.SliceData(container)))
