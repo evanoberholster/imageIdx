@@ -1,0 +1,585 @@
+//go:build goexperiment.simd && arm64
+
+#include "textflag.h"
+
+// andNEONFixedAsm is the fixed 1,024-word dense-container fast path. It
+// processes four 128-bit vectors per iteration, so the loop branch runs only
+// 128 times and no length or tail checks are needed in the hot loop.
+// func andNEONFixedAsm(dst, a, b []uint64) uint32
+TEXT ·andNEONFixedAsm(SB), NOSPLIT, $0-76
+	MOVD dst_base+0(FP), R0
+	MOVD a_base+24(FP), R1
+	MOVD b_base+48(FP), R2
+	MOVD $128, R3
+	MOVD $0, R4
+and_fixed_loop:
+	VLD1.P 16(R1), [V0.B16]
+	VLD1.P 16(R2), [V1.B16]
+	VAND V0.B16, V1.B16, V2.B16
+	VST1.P [V2.B16], 16(R0)
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V3.B16]
+	VLD1.P 16(R2), [V4.B16]
+	VAND V3.B16, V4.B16, V5.B16
+	VST1.P [V5.B16], 16(R0)
+	VCNT V5.B16, V5.B16
+	VUADDLV V5.B16, V5
+	VMOV V5.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V6.B16]
+	VLD1.P 16(R2), [V7.B16]
+	VAND V6.B16, V7.B16, V8.B16
+	VST1.P [V8.B16], 16(R0)
+	VCNT V8.B16, V8.B16
+	VUADDLV V8.B16, V8
+	VMOV V8.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V9.B16]
+	VLD1.P 16(R2), [V10.B16]
+	VAND V9.B16, V10.B16, V11.B16
+	VST1.P [V11.B16], 16(R0)
+	VCNT V11.B16, V11.B16
+	VUADDLV V11.B16, V11
+	VMOV V11.H[0], R5
+	ADD R4, R5, R4
+
+	SUB $1, R3, R3
+	CBNZ R3, and_fixed_loop
+	MOVW R4, ret+72(FP)
+	RET
+
+// func orNEONFixedAsm(dst, a, b []uint64) uint32
+TEXT ·orNEONFixedAsm(SB), NOSPLIT, $0-76
+	MOVD dst_base+0(FP), R0
+	MOVD a_base+24(FP), R1
+	MOVD b_base+48(FP), R2
+	MOVD $128, R3
+	MOVD $0, R4
+or_fixed_loop:
+	VLD1.P 16(R1), [V0.B16]
+	VLD1.P 16(R2), [V1.B16]
+	VORR V0.B16, V1.B16, V2.B16
+	VST1.P [V2.B16], 16(R0)
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V3.B16]
+	VLD1.P 16(R2), [V4.B16]
+	VORR V3.B16, V4.B16, V5.B16
+	VST1.P [V5.B16], 16(R0)
+	VCNT V5.B16, V5.B16
+	VUADDLV V5.B16, V5
+	VMOV V5.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V6.B16]
+	VLD1.P 16(R2), [V7.B16]
+	VORR V6.B16, V7.B16, V8.B16
+	VST1.P [V8.B16], 16(R0)
+	VCNT V8.B16, V8.B16
+	VUADDLV V8.B16, V8
+	VMOV V8.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V9.B16]
+	VLD1.P 16(R2), [V10.B16]
+	VORR V9.B16, V10.B16, V11.B16
+	VST1.P [V11.B16], 16(R0)
+	VCNT V11.B16, V11.B16
+	VUADDLV V11.B16, V11
+	VMOV V11.H[0], R5
+	ADD R4, R5, R4
+
+	SUB $1, R3, R3
+	CBNZ R3, or_fixed_loop
+	MOVW R4, ret+72(FP)
+	RET
+
+// func andNotNEONFixedAsm(dst, a, b []uint64) uint32
+TEXT ·andNotNEONFixedAsm(SB), NOSPLIT, $0-76
+	MOVD dst_base+0(FP), R0
+	MOVD a_base+24(FP), R1
+	MOVD b_base+48(FP), R2
+	MOVD $128, R3
+	MOVD $0, R4
+andnot_fixed_loop:
+	VLD1.P 16(R1), [V0.B16]
+	VLD1.P 16(R2), [V1.B16]
+	VBIC V1.B16, V0.B16, V2.B16
+	VST1.P [V2.B16], 16(R0)
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V3.B16]
+	VLD1.P 16(R2), [V4.B16]
+	VBIC V4.B16, V3.B16, V5.B16
+	VST1.P [V5.B16], 16(R0)
+	VCNT V5.B16, V5.B16
+	VUADDLV V5.B16, V5
+	VMOV V5.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V6.B16]
+	VLD1.P 16(R2), [V7.B16]
+	VBIC V7.B16, V6.B16, V8.B16
+	VST1.P [V8.B16], 16(R0)
+	VCNT V8.B16, V8.B16
+	VUADDLV V8.B16, V8
+	VMOV V8.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R1), [V9.B16]
+	VLD1.P 16(R2), [V10.B16]
+	VBIC V10.B16, V9.B16, V11.B16
+	VST1.P [V11.B16], 16(R0)
+	VCNT V11.B16, V11.B16
+	VUADDLV V11.B16, V11
+	VMOV V11.H[0], R5
+	ADD R4, R5, R4
+
+	SUB $1, R3, R3
+	CBNZ R3, andnot_fixed_loop
+	MOVW R4, ret+72(FP)
+	RET
+
+// func applyNEONFixedAsm(dst, base, add, remove []uint64) uint32
+TEXT ·applyNEONFixedAsm(SB), NOSPLIT, $0-100
+	MOVD dst_base+0(FP), R0
+	MOVD base_base+24(FP), R1
+	MOVD add_base+48(FP), R2
+	MOVD remove_base+72(FP), R3
+	MOVD $128, R4
+	MOVD $0, R5
+apply_fixed_loop:
+	VLD1.P 16(R1), [V0.B16]
+	VLD1.P 16(R2), [V1.B16]
+	VORR V0.B16, V1.B16, V0.B16
+	VLD1.P 16(R3), [V2.B16]
+	VBIC V2.B16, V0.B16, V0.B16
+	VST1.P [V0.B16], 16(R0)
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R1), [V3.B16]
+	VLD1.P 16(R2), [V4.B16]
+	VORR V3.B16, V4.B16, V3.B16
+	VLD1.P 16(R3), [V5.B16]
+	VBIC V5.B16, V3.B16, V3.B16
+	VST1.P [V3.B16], 16(R0)
+	VCNT V3.B16, V3.B16
+	VUADDLV V3.B16, V3
+	VMOV V3.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R1), [V6.B16]
+	VLD1.P 16(R2), [V7.B16]
+	VORR V6.B16, V7.B16, V6.B16
+	VLD1.P 16(R3), [V8.B16]
+	VBIC V8.B16, V6.B16, V6.B16
+	VST1.P [V6.B16], 16(R0)
+	VCNT V6.B16, V6.B16
+	VUADDLV V6.B16, V6
+	VMOV V6.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R1), [V9.B16]
+	VLD1.P 16(R2), [V10.B16]
+	VORR V9.B16, V10.B16, V9.B16
+	VLD1.P 16(R3), [V11.B16]
+	VBIC V11.B16, V9.B16, V9.B16
+	VST1.P [V9.B16], 16(R0)
+	VCNT V9.B16, V9.B16
+	VUADDLV V9.B16, V9
+	VMOV V9.H[0], R6
+	ADD R5, R6, R5
+
+	SUB $1, R4, R4
+	CBNZ R4, apply_fixed_loop
+	MOVW R5, ret+96(FP)
+	RET
+
+// func intersectsNEONFixedAsm(a, b []uint64) bool
+TEXT ·intersectsNEONFixedAsm(SB), NOSPLIT, $0-49
+	MOVD a_base+0(FP), R0
+	MOVD b_base+24(FP), R1
+	MOVD $0, R3
+	MOVD 0(R0), R4
+	MOVD 0(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	MOVD 8(R0), R4
+	MOVD 8(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	MOVD 16(R0), R4
+	MOVD 16(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	MOVD 24(R0), R4
+	MOVD 24(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	MOVD 32(R0), R4
+	MOVD 32(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	MOVD 40(R0), R4
+	MOVD 40(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	MOVD 48(R0), R4
+	MOVD 48(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	MOVD 56(R0), R4
+	MOVD 56(R1), R5
+	AND R5, R4, R4
+	CBNZ R4, intersects_fixed_found
+	ADD $64, R0, R0
+	ADD $64, R1, R1
+	MOVD $127, R2
+intersects_fixed_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VLD1.P 16(R1), [V1.B16]
+	VAND V0.B16, V1.B16, V0.B16
+	VMOV V0.D[0], R4
+	VMOV V0.D[1], R5
+	ORR R4, R5, R4
+	CBNZ R4, intersects_fixed_found
+
+	VLD1.P 16(R0), [V2.B16]
+	VLD1.P 16(R1), [V3.B16]
+	VAND V2.B16, V3.B16, V2.B16
+	VMOV V2.D[0], R4
+	VMOV V2.D[1], R5
+	ORR R4, R5, R4
+	CBNZ R4, intersects_fixed_found
+
+	VLD1.P 16(R0), [V4.B16]
+	VLD1.P 16(R1), [V5.B16]
+	VAND V4.B16, V5.B16, V4.B16
+	VMOV V4.D[0], R4
+	VMOV V4.D[1], R5
+	ORR R4, R5, R4
+	CBNZ R4, intersects_fixed_found
+
+	VLD1.P 16(R0), [V6.B16]
+	VLD1.P 16(R1), [V7.B16]
+	VAND V6.B16, V7.B16, V6.B16
+	VMOV V6.D[0], R4
+	VMOV V6.D[1], R5
+	ORR R4, R5, R4
+	CBNZ R4, intersects_fixed_found
+
+	SUB $1, R2, R2
+	CBNZ R2, intersects_fixed_loop
+	MOVB R3, ret+48(FP)
+	RET
+intersects_fixed_found:
+	MOVD $1, R3
+	MOVB R3, ret+48(FP)
+	RET
+
+// func andCardinalityNEONFixedAsm(a, b []uint64) uint64
+TEXT ·andCardinalityNEONFixedAsm(SB), NOSPLIT, $0-56
+	MOVD a_base+0(FP), R0
+	MOVD b_base+24(FP), R1
+	MOVD $128, R2
+	MOVD $0, R3
+and_card_fixed_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VLD1.P 16(R1), [V1.B16]
+	VAND V0.B16, V1.B16, V0.B16
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V2.B16]
+	VLD1.P 16(R1), [V3.B16]
+	VAND V2.B16, V3.B16, V2.B16
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V4.B16]
+	VLD1.P 16(R1), [V5.B16]
+	VAND V4.B16, V5.B16, V4.B16
+	VCNT V4.B16, V4.B16
+	VUADDLV V4.B16, V4
+	VMOV V4.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V6.B16]
+	VLD1.P 16(R1), [V7.B16]
+	VAND V6.B16, V7.B16, V6.B16
+	VCNT V6.B16, V6.B16
+	VUADDLV V6.B16, V6
+	VMOV V6.H[0], R4
+	ADD R3, R4, R3
+
+	SUB $1, R2, R2
+	CBNZ R2, and_card_fixed_loop
+	MOVD R3, ret+48(FP)
+	RET
+
+// func orCardinalityNEONFixedAsm(a, b []uint64) uint64
+TEXT ·orCardinalityNEONFixedAsm(SB), NOSPLIT, $0-56
+	MOVD a_base+0(FP), R0
+	MOVD b_base+24(FP), R1
+	MOVD $128, R2
+	MOVD $0, R3
+or_card_fixed_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VLD1.P 16(R1), [V1.B16]
+	VORR V0.B16, V1.B16, V0.B16
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V2.B16]
+	VLD1.P 16(R1), [V3.B16]
+	VORR V2.B16, V3.B16, V2.B16
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V4.B16]
+	VLD1.P 16(R1), [V5.B16]
+	VORR V4.B16, V5.B16, V4.B16
+	VCNT V4.B16, V4.B16
+	VUADDLV V4.B16, V4
+	VMOV V4.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V6.B16]
+	VLD1.P 16(R1), [V7.B16]
+	VORR V6.B16, V7.B16, V6.B16
+	VCNT V6.B16, V6.B16
+	VUADDLV V6.B16, V6
+	VMOV V6.H[0], R4
+	ADD R3, R4, R3
+
+	SUB $1, R2, R2
+	CBNZ R2, or_card_fixed_loop
+	MOVD R3, ret+48(FP)
+	RET
+
+// func andNotCardinalityNEONFixedAsm(a, b []uint64) uint64
+TEXT ·andNotCardinalityNEONFixedAsm(SB), NOSPLIT, $0-56
+	MOVD a_base+0(FP), R0
+	MOVD b_base+24(FP), R1
+	MOVD $128, R2
+	MOVD $0, R3
+andnot_card_fixed_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VLD1.P 16(R1), [V1.B16]
+	VBIC V1.B16, V0.B16, V0.B16
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V2.B16]
+	VLD1.P 16(R1), [V3.B16]
+	VBIC V3.B16, V2.B16, V2.B16
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V4.B16]
+	VLD1.P 16(R1), [V5.B16]
+	VBIC V5.B16, V4.B16, V4.B16
+	VCNT V4.B16, V4.B16
+	VUADDLV V4.B16, V4
+	VMOV V4.H[0], R4
+	ADD R3, R4, R3
+
+	VLD1.P 16(R0), [V6.B16]
+	VLD1.P 16(R1), [V7.B16]
+	VBIC V7.B16, V6.B16, V6.B16
+	VCNT V6.B16, V6.B16
+	VUADDLV V6.B16, V6
+	VMOV V6.H[0], R4
+	ADD R3, R4, R3
+
+	SUB $1, R2, R2
+	CBNZ R2, andnot_card_fixed_loop
+	MOVD R3, ret+48(FP)
+	RET
+
+// func cardinalityNEONFixedAsm(words []uint64) uint64
+TEXT ·cardinalityNEONFixedAsm(SB), NOSPLIT, $0-32
+	MOVD words_base+0(FP), R0
+	MOVD $128, R1
+	MOVD $0, R2
+cardinality_fixed_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R3
+	ADD R2, R3, R2
+
+	VLD1.P 16(R0), [V1.B16]
+	VCNT V1.B16, V1.B16
+	VUADDLV V1.B16, V1
+	VMOV V1.H[0], R3
+	ADD R2, R3, R2
+
+	VLD1.P 16(R0), [V2.B16]
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R3
+	ADD R2, R3, R2
+
+	VLD1.P 16(R0), [V3.B16]
+	VCNT V3.B16, V3.B16
+	VUADDLV V3.B16, V3
+	VMOV V3.H[0], R3
+	ADD R2, R3, R2
+
+	SUB $1, R1, R1
+	CBNZ R1, cardinality_fixed_loop
+	MOVD R2, ret+24(FP)
+	RET
+
+// func andMany3NEONFixedAsm(dst, a, b, c []uint64) uint32
+TEXT ·andMany3NEONFixedAsm(SB), NOSPLIT, $0-100
+	MOVD dst_base+0(FP), R0
+	MOVD a_base+24(FP), R1
+	MOVD b_base+48(FP), R2
+	MOVD c_base+72(FP), R3
+	MOVD $128, R4
+	MOVD $0, R5
+and_many3_fixed_loop:
+	VLD1.P 16(R1), [V0.B16]
+	VLD1.P 16(R2), [V1.B16]
+	VAND V1.B16, V0.B16, V0.B16
+	VLD1.P 16(R3), [V2.B16]
+	VAND V2.B16, V0.B16, V0.B16
+	VST1.P [V0.B16], 16(R0)
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R1), [V3.B16]
+	VLD1.P 16(R2), [V4.B16]
+	VAND V4.B16, V3.B16, V3.B16
+	VLD1.P 16(R3), [V5.B16]
+	VAND V5.B16, V3.B16, V3.B16
+	VST1.P [V3.B16], 16(R0)
+	VCNT V3.B16, V3.B16
+	VUADDLV V3.B16, V3
+	VMOV V3.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R1), [V6.B16]
+	VLD1.P 16(R2), [V7.B16]
+	VAND V7.B16, V6.B16, V6.B16
+	VLD1.P 16(R3), [V8.B16]
+	VAND V8.B16, V6.B16, V6.B16
+	VST1.P [V6.B16], 16(R0)
+	VCNT V6.B16, V6.B16
+	VUADDLV V6.B16, V6
+	VMOV V6.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R1), [V9.B16]
+	VLD1.P 16(R2), [V10.B16]
+	VAND V10.B16, V9.B16, V9.B16
+	VLD1.P 16(R3), [V11.B16]
+	VAND V11.B16, V9.B16, V9.B16
+	VST1.P [V9.B16], 16(R0)
+	VCNT V9.B16, V9.B16
+	VUADDLV V9.B16, V9
+	VMOV V9.H[0], R6
+	ADD R5, R6, R5
+
+	SUB $1, R4, R4
+	CBNZ R4, and_many3_fixed_loop
+	MOVW R5, ret+96(FP)
+	RET
+
+// func andMany4NEONFixedAsm(dst, a, b, c, d []uint64) uint32
+TEXT ·andMany4NEONFixedAsm(SB), NOSPLIT, $0-124
+	MOVD dst_base+0(FP), R0
+	MOVD a_base+24(FP), R1
+	MOVD b_base+48(FP), R2
+	MOVD c_base+72(FP), R3
+	MOVD d_base+96(FP), R4
+	MOVD $128, R5
+	MOVD $0, R6
+and_many4_fixed_loop:
+	VLD1.P 16(R1), [V0.B16]
+	VLD1.P 16(R2), [V1.B16]
+	VAND V1.B16, V0.B16, V0.B16
+	VLD1.P 16(R3), [V2.B16]
+	VAND V2.B16, V0.B16, V0.B16
+	VLD1.P 16(R4), [V3.B16]
+	VAND V3.B16, V0.B16, V0.B16
+	VST1.P [V0.B16], 16(R0)
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R7
+	ADD R6, R7, R6
+
+	VLD1.P 16(R1), [V4.B16]
+	VLD1.P 16(R2), [V5.B16]
+	VAND V5.B16, V4.B16, V4.B16
+	VLD1.P 16(R3), [V6.B16]
+	VAND V6.B16, V4.B16, V4.B16
+	VLD1.P 16(R4), [V7.B16]
+	VAND V7.B16, V4.B16, V4.B16
+	VST1.P [V4.B16], 16(R0)
+	VCNT V4.B16, V4.B16
+	VUADDLV V4.B16, V4
+	VMOV V4.H[0], R7
+	ADD R6, R7, R6
+
+	VLD1.P 16(R1), [V8.B16]
+	VLD1.P 16(R2), [V9.B16]
+	VAND V9.B16, V8.B16, V8.B16
+	VLD1.P 16(R3), [V10.B16]
+	VAND V10.B16, V8.B16, V8.B16
+	VLD1.P 16(R4), [V11.B16]
+	VAND V11.B16, V8.B16, V8.B16
+	VST1.P [V8.B16], 16(R0)
+	VCNT V8.B16, V8.B16
+	VUADDLV V8.B16, V8
+	VMOV V8.H[0], R7
+	ADD R6, R7, R6
+
+	VLD1.P 16(R1), [V12.B16]
+	VLD1.P 16(R2), [V13.B16]
+	VAND V13.B16, V12.B16, V12.B16
+	VLD1.P 16(R3), [V14.B16]
+	VAND V14.B16, V12.B16, V12.B16
+	VLD1.P 16(R4), [V15.B16]
+	VAND V15.B16, V12.B16, V12.B16
+	VST1.P [V12.B16], 16(R0)
+	VCNT V12.B16, V12.B16
+	VUADDLV V12.B16, V12
+	VMOV V12.H[0], R7
+	ADD R6, R7, R6
+
+	SUB $1, R5, R5
+	CBNZ R5, and_many4_fixed_loop
+	MOVW R6, ret+120(FP)
+	RET

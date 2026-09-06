@@ -24,13 +24,20 @@ const inlineDeltaCapacity = 64
 // Set operations (Or, And, AndNot) flush pending additions/removals first and
 // then combine with the current bitmap, preserving sequential semantics.
 //
-// DeltaBuilder is not safe for concurrent use.
+// Whole-set combinations reuse an embedded result Builder, mirroring
+// MutableBitmap's scratch policy. Final bitmaps are always freshly assembled
+// so Freeze stays independent of later reuse.
+//
+// DeltaBuilder is not safe for concurrent use. Do not copy a DeltaBuilder
+// after first use: pending slices and Builder scratch may alias its own
+// inline buffers.
 type DeltaBuilder struct {
 	bitmap    Bitmap
 	adds      []uint64
 	removes   []uint64
 	addBuf    [inlineDeltaCapacity]uint64
 	removeBuf [inlineDeltaCapacity]uint64
+	fold      Builder
 	dirty     bool
 }
 
@@ -39,6 +46,7 @@ func NewDeltaBuilder() *DeltaBuilder {
 	m := &DeltaBuilder{}
 	m.adds = m.addBuf[:0]
 	m.removes = m.removeBuf[:0]
+	m.fold.scratchValues = m.fold.valuesBuf[:0]
 	return m
 }
 
@@ -48,6 +56,7 @@ func NewDeltaBuilderFrom(b Bitmap) *DeltaBuilder {
 	m := &DeltaBuilder{bitmap: b}
 	m.adds = m.addBuf[:0]
 	m.removes = m.removeBuf[:0]
+	m.fold.scratchValues = m.fold.valuesBuf[:0]
 	return m
 }
 
@@ -72,20 +81,27 @@ func (m *DeltaBuilder) Remove(id uint64) {
 
 // Or unions b into the builder's current bitmap.
 func (m *DeltaBuilder) Or(b Bitmap) {
-	m.flush()
-	m.bitmap = Or(m.bitmap, b)
+	m.foldSet(b, m.bitmap.KeyCount()+b.KeyCount(), m.bitmap.LenInBytes()+b.LenInBytes(), OrInto)
 }
 
 // And intersects b with the builder's current bitmap.
 func (m *DeltaBuilder) And(b Bitmap) {
-	m.flush()
-	m.bitmap = And(m.bitmap, b)
+	m.foldSet(b, min(m.bitmap.KeyCount(), b.KeyCount()), min(m.bitmap.LenInBytes(), b.LenInBytes()), AndInto)
 }
 
 // AndNot subtracts b from the builder's current bitmap.
 func (m *DeltaBuilder) AndNot(b Bitmap) {
+	m.foldSet(b, m.bitmap.KeyCount(), m.bitmap.LenInBytes(), AndNotInto)
+}
+
+// foldSet applies one whole-set operation with the shared result Builder. The
+// result is freshly assembled, so a bitmap returned by Freeze stays
+// independent of later reuse.
+func (m *DeltaBuilder) foldSet(operand Bitmap, keyCount, dataBytes int, op func(dst *Builder, a, b Bitmap)) {
 	m.flush()
-	m.bitmap = AndNot(m.bitmap, b)
+	m.fold.prepareResult(keyCount, dataBytes)
+	op(&m.fold, m.bitmap, operand)
+	m.bitmap = Bitmap{data: m.fold.Compact()}
 }
 
 // Reset clears the builder and returns its pending slices to the inline
@@ -94,6 +110,7 @@ func (m *DeltaBuilder) Reset() {
 	m.bitmap = Bitmap{}
 	m.adds = m.addBuf[:0]
 	m.removes = m.removeBuf[:0]
+	m.fold.Reset()
 	m.dirty = false
 }
 
@@ -119,10 +136,9 @@ func (m *DeltaBuilder) flush() {
 	if add.IsEmpty() && remove.IsEmpty() {
 		return
 	}
-	builder := NewBuilder(m.bitmap.KeyCount() + add.KeyCount())
-	builder.reserveData(m.bitmap.LenInBytes() + add.LenInBytes())
-	applyInto(builder, m.bitmap, add, remove)
-	m.bitmap = Bitmap{data: builder.Compact()}
+	m.fold.prepareResult(m.bitmap.KeyCount()+add.KeyCount(), m.bitmap.LenInBytes()+add.LenInBytes())
+	applyInto(&m.fold, m.bitmap, add, remove)
+	m.bitmap = Bitmap{data: m.fold.Compact()}
 }
 
 // bitmapFromUnique sorts ids in place, removes duplicates and the reserved

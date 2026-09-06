@@ -23,3 +23,30 @@ func (workspace *Workspace) Reset() {
 		workspace.scratch = workspace.scratch[:0]
 	}
 }
+
+// Len returns the number of buffered intermediate IDs.
+func (workspace *Workspace) Len() int {
+	if workspace == nil {
+		return 0
+	}
+	return len(workspace.scratch)
+}
+
+// Cap returns the scratch buffer capacity.
+func (workspace *Workspace) Cap() int {
+	if workspace == nil {
+		return 0
+	}
+	return cap(workspace.scratch)
+}
+
+// EnsureCapacity grows scratch to hold at least n IDs without losing
+// retained capacity. It allocates at most once.
+func (workspace *Workspace) EnsureCapacity(n int) {
+	if workspace == nil || n <= cap(workspace.scratch) {
+		return
+	}
+	grown := make([]ImageID, len(workspace.scratch), n)
+	copy(grown, workspace.scratch)
+	workspace.scratch = grown
+}

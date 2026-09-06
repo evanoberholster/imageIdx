@@ -109,9 +109,56 @@ func BenchmarkAndMany(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
-				_ = AndMany(dst, a, bb, c)
+				_ = AndMany3(dst, a, bb, c)
 			}
 		})
+	}
+}
+
+func BenchmarkAndMany4(b *testing.B) {
+	rng := rand.New(rand.NewPCG(15, 16))
+	for _, dense := range []bool{false, true} {
+		name := "sparse"
+		if dense {
+			name = "dense"
+		}
+		a, bb, c, dst := benchContainers(rng, dense)
+		d := make([]uint64, testWords)
+		for i := range d {
+			if dense {
+				d[i] = rng.Uint64()
+			} else if rng.IntN(64) == 0 {
+				d[i] = uint64(1) << rng.IntN(64)
+			}
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = AndMany4(dst, a, bb, c, d)
+			}
+		})
+	}
+}
+
+func BenchmarkAndManyVariadic4(b *testing.B) {
+	rng := rand.New(rand.NewPCG(17, 18))
+	a, bb, c, dst := benchContainers(rng, true)
+	d := make([]uint64, testWords)
+	for i := range d {
+		d[i] = rng.Uint64()
+	}
+	b.ReportAllocs()
+	for range b.N {
+		_ = AndMany(dst, a, bb, c, d)
+	}
+}
+
+func BenchmarkAndManyVariadic3(b *testing.B) {
+	rng := rand.New(rand.NewPCG(19, 20))
+	a, bb, c, dst := benchContainers(rng, true)
+	b.ReportAllocs()
+	for range b.N {
+		_ = AndMany(dst, a, bb, c)
 	}
 }
 

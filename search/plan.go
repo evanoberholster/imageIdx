@@ -35,111 +35,192 @@ type Stage struct {
 	Estimate uint64
 }
 
-type executableStage interface {
-	metadata() Stage
-	collect([]ImageID) []ImageID
-}
-
-type filteringStage interface {
-	executableStage
-	// canFilter reports whether filter can verify an existing candidate set
-	// without re-collecting the stage's own candidates.
-	canFilter() bool
-	filter(dst, candidates []ImageID) []ImageID
-}
-
-type bitmapStage struct {
-	indexes  []*bitmapidx.Index
+// stage is the unified compiled unit. Estimates are cached at Compile time
+// so ordering never re-queries live indexes. Value semantics avoid interface
+// boxing and pointer/value receiver mix.
+type stage struct {
+	kind     StageKind
 	estimate uint64
+
+	bitmaps []*bitmapidx.Index
+
+	tsIndex *timestamp.Index
+	tsStart uint64
+	tsEnd   uint64
+	tsExact timestamp.ExactTimestampFunc
+
+	geoIndex  *geoindex.Index
+	geoRanges []geoindex.Range
 }
 
-func (stage *bitmapStage) metadata() Stage {
-	return Stage{Kind: StageBitmap, Estimate: stage.estimate}
+func (s *stage) metadata() Stage {
+	return Stage{Kind: s.kind, Estimate: s.estimate}
 }
 
-func (stage *bitmapStage) collect(dst []ImageID) []ImageID {
-	if len(stage.indexes) == 0 {
+// canFilter reports whether filter can verify candidates without collecting.
+// Bitmap stages always filter via FilterCandidates. Timestamp stages filter
+// only with an exact canonical lookup. Geo stages never filter: geoindex has
+// no reverse ID->cell map, so verification requires a range collect.
+func (s *stage) canFilter() bool {
+	switch s.kind {
+	case StageBitmap:
+		return true
+	case StageTimestamp:
+		return s.tsExact != nil
+	default:
+		return false
+	}
+}
+
+func (s *stage) collect(dst []ImageID) []ImageID {
+	switch s.kind {
+	case StageBitmap:
+		return collectBitmaps(dst, s.bitmaps)
+	case StageTimestamp:
+		if s.tsExact != nil {
+			return s.tsIndex.SearchExact(dst, s.tsStart, s.tsEnd, s.tsExact)
+		}
+		return s.tsIndex.Search(dst, s.tsStart, s.tsEnd)
+	case StageGeo:
+		return s.geoIndex.SearchRanges(dst, s.geoRanges)
+	default:
 		return dst
 	}
-	smallest := stage.indexes[0]
-	for _, index := range stage.indexes[1:] {
-		if index.Metadata().BaseCardinality < smallest.Metadata().BaseCardinality {
-			smallest = index
+}
+
+func (s *stage) filter(dst, candidates []ImageID) []ImageID {
+	switch s.kind {
+	case StageBitmap:
+		return bitmapidx.FilterCandidates(dst, candidates, s.bitmaps...)
+	case StageTimestamp:
+		if s.tsExact == nil {
+			return append(dst, candidates...)
+		}
+		for _, id := range candidates {
+			value, ok := s.tsExact(id)
+			if ok && value >= s.tsStart && value < s.tsEnd {
+				dst = append(dst, id)
+			}
+		}
+		return dst
+	default:
+		return append(dst, candidates...)
+	}
+}
+
+func smallestBitmap(indexes []*bitmapidx.Index) *bitmapidx.Index {
+	smallest := indexes[0]
+	smallestCard := smallest.Metadata().BaseCardinality
+	for _, index := range indexes[1:] {
+		if card := index.Metadata().BaseCardinality; card < smallestCard {
+			smallest, smallestCard = index, card
 		}
 	}
+	return smallest
+}
+
+func collectBitmaps(dst []ImageID, indexes []*bitmapidx.Index) []ImageID {
+	if len(indexes) == 0 {
+		return dst
+	}
+	if len(indexes) == 1 {
+		return indexes[0].AppendTo(dst)
+	}
+	smallest := smallestBitmap(indexes)
 	start := len(dst)
 	dst = smallest.AppendTo(dst)
 	candidates := dst[start:]
-	filtered := bitmapidx.FilterCandidates(candidates[:0], candidates, stage.indexes...)
+	filtered := bitmapidx.FilterCandidates(candidates[:0], candidates, indexes...)
 	return dst[:start+len(filtered)]
 }
 
-func (stage *bitmapStage) canFilter() bool { return true }
-
-func (stage *bitmapStage) filter(dst, candidates []ImageID) []ImageID {
-	return bitmapidx.FilterCandidates(dst, candidates, stage.indexes...)
-}
-
-type timestampStage struct {
-	index    *timestamp.Index
-	start    uint64
-	end      uint64
-	exact    timestamp.ExactTimestampFunc
-	estimate uint64
-}
-
-func (stage timestampStage) metadata() Stage {
-	return Stage{Kind: StageTimestamp, Estimate: stage.estimate}
-}
-
-func (stage timestampStage) collect(dst []ImageID) []ImageID {
-	if stage.exact != nil {
-		return stage.index.SearchExact(dst, stage.start, stage.end, stage.exact)
-	}
-	return stage.index.Search(dst, stage.start, stage.end)
-}
-
-func (stage timestampStage) canFilter() bool { return stage.exact != nil }
-
-func (stage timestampStage) filter(dst, candidates []ImageID) []ImageID {
-	for _, id := range candidates {
-		value, ok := stage.exact(id)
-		if ok && value >= stage.start && value < stage.end {
-			dst = append(dst, id)
+func bitmapEstimate(indexes []*bitmapidx.Index) uint64 {
+	estimate := ^uint64(0)
+	for _, index := range indexes {
+		if card := index.Metadata().BaseCardinality; card < estimate {
+			estimate = card
 		}
 	}
-	return dst
-}
-
-type geoStage struct {
-	index    *geoindex.Index
-	ranges   []geoindex.Range
-	estimate uint64
-}
-
-func (stage geoStage) metadata() Stage {
-	return Stage{Kind: StageGeo, Estimate: stage.estimate}
-}
-
-func (stage geoStage) collect(dst []ImageID) []ImageID {
-	return stage.index.SearchRanges(dst, stage.ranges)
+	return estimate
 }
 
 // Plan is a reusable, cardinality-ordered cross-index query.
 type Plan struct {
-	stages []executableStage
+	stages []stage
+	// empty marks a valid plan that matches nothing (e.g. intersected
+	// timestamp ranges with start >= end). Execution returns dst unchanged.
+	empty bool
 }
 
-// Compile validates clauses, combines bitmap restrictions, and orders the
-// resulting stages by their current cardinality estimates.
+// IsEmpty reports whether the plan is valid but matches nothing.
+func (plan Plan) IsEmpty() bool {
+	return plan.empty || len(plan.stages) == 0
+}
+
+// Len returns the number of compiled stages.
+func (plan Plan) Len() int {
+	return len(plan.stages)
+}
+
+// Estimate returns the smallest stage estimate, or 0 for empty plans.
+// Useful for pre-sizing destination and workspace buffers.
+func (plan Plan) Estimate() uint64 {
+	if plan.empty || len(plan.stages) == 0 {
+		return 0
+	}
+	min := plan.stages[0].estimate
+	for _, s := range plan.stages[1:] {
+		if s.estimate < min {
+			min = s.estimate
+		}
+	}
+	return min
+}
+
+// timestampRange is a coalesced lossy-only range for one index.
+type timestampRange struct {
+	start uint64
+	end   uint64
+	order int
+}
+
+// Compile validates clauses, combines bitmap restrictions, coalesces
+// lossy-only timestamp ranges on the same index by intersection, and orders
+// the resulting stages by their current cardinality estimates. Ties keep
+// clause order: the bitmap group takes the position of its first clause.
 func Compile(clauses ...Clause) (Plan, error) {
 	if len(clauses) == 0 {
 		return Plan{}, ErrEmptyQuery
 	}
 
-	stages := make([]executableStage, 0, len(clauses))
-	var bitmaps *bitmapStage
-	for _, clause := range clauses {
+	var bitmaps []*bitmapidx.Index
+	bitmapOrder := -1
+	lossyRanges := make(map[*timestamp.Index]*timestampRange)
+	type orderedStage struct {
+		s     stage
+		order int
+	}
+	var ordered []orderedStage
+
+	flushLossy := func() {
+		for index, r := range lossyRanges {
+			ordered = append(ordered, orderedStage{
+				s: stage{
+					kind:     StageTimestamp,
+					estimate: index.EstimateRange(r.start, r.end),
+					tsIndex:  index,
+					tsStart:  r.start,
+					tsEnd:    r.end,
+				},
+				order: r.order,
+			})
+		}
+		for k := range lossyRanges {
+			delete(lossyRanges, k)
+		}
+	}
+
+	for clauseIndex, clause := range clauses {
 		switch value := clause.(type) {
 		case bitmapClause:
 			if len(value.indexes) == 0 {
@@ -150,51 +231,113 @@ func Compile(clauses ...Clause) (Plan, error) {
 					return Plan{}, ErrInvalidClause
 				}
 			}
-			if bitmaps == nil {
-				bitmaps = &bitmapStage{}
-				stages = append(stages, bitmaps)
+			if bitmapOrder == -1 {
+				bitmapOrder = clauseIndex
 			}
-			bitmaps.indexes = append(bitmaps.indexes, value.indexes...)
+			bitmaps = append(bitmaps, value.indexes...)
 		case timestampClause:
 			if value.index == nil {
 				return Plan{}, ErrInvalidClause
 			}
-			stages = append(stages, timestampStage{
-				index: value.index, start: value.start, end: value.end, exact: value.exact,
-				estimate: value.index.EstimateRange(value.start, value.end),
+			if value.start >= value.end {
+				// Valid but empty: short-circuit without touching indexes.
+				return Plan{empty: true}, nil
+			}
+			if value.exact == nil {
+				if existing, ok := lossyRanges[value.index]; ok {
+					if value.start > existing.start {
+						existing.start = value.start
+					}
+					if value.end < existing.end {
+						existing.end = value.end
+					}
+					if clauseIndex < existing.order {
+						existing.order = clauseIndex
+					}
+					if existing.start >= existing.end {
+						return Plan{empty: true}, nil
+					}
+				} else {
+					lossyRanges[value.index] = &timestampRange{start: value.start, end: value.end, order: clauseIndex}
+				}
+				continue
+			}
+			ordered = append(ordered, orderedStage{
+				s: stage{
+					kind:     StageTimestamp,
+					estimate: value.index.EstimateRange(value.start, value.end),
+					tsIndex:  value.index,
+					tsStart:  value.start,
+					tsEnd:    value.end,
+					tsExact:  value.exact,
+				},
+				order: clauseIndex,
 			})
 		case geoClause:
 			if value.index == nil || len(value.ranges) == 0 {
 				return Plan{}, ErrInvalidClause
 			}
-			stages = append(stages, geoStage{
-				index: value.index, ranges: value.ranges,
-				estimate: value.index.EstimateRanges(value.ranges),
+			ordered = append(ordered, orderedStage{
+				s: stage{
+					kind:      StageGeo,
+					estimate:  value.index.EstimateRanges(value.ranges),
+					geoIndex:  value.index,
+					geoRanges: value.ranges,
+				},
+				order: clauseIndex,
 			})
 		default:
 			return Plan{}, ErrInvalidClause
 		}
 	}
+	flushLossy()
 
 	if bitmaps != nil {
-		bitmaps.estimate = ^uint64(0)
-		for _, index := range bitmaps.indexes {
-			if cardinality := index.Metadata().BaseCardinality; cardinality < bitmaps.estimate {
-				bitmaps.estimate = cardinality
-			}
-		}
+		ordered = append(ordered, orderedStage{
+			s: stage{
+				kind:     StageBitmap,
+				estimate: bitmapEstimate(bitmaps),
+				bitmaps:  bitmaps,
+			},
+			order: bitmapOrder,
+		})
 	}
-	sort.SliceStable(stages, func(left, right int) bool {
-		return stages[left].metadata().Estimate < stages[right].metadata().Estimate
+
+	// Fast path: any zero estimate means the intersection is empty, but
+	// estimates are upper bounds and may be stale, so do not mark empty here.
+	// Execution still short-circuits once candidates hit zero.
+	sort.SliceStable(ordered, func(left, right int) bool {
+		if ordered[left].s.estimate != ordered[right].s.estimate {
+			return ordered[left].s.estimate < ordered[right].s.estimate
+		}
+		return ordered[left].order < ordered[right].order
 	})
+	stages := make([]stage, len(ordered))
+	for i := range ordered {
+		stages[i] = ordered[i].s
+	}
 	return Plan{stages: stages}, nil
+}
+
+// MustCompile is like Compile but panics on error.
+func MustCompile(clauses ...Clause) Plan {
+	plan, err := Compile(clauses...)
+	if err != nil {
+		panic(err)
+	}
+	return plan
 }
 
 // Stages returns a copy of plan metadata in execution order.
 func (plan Plan) Stages() []Stage {
 	result := make([]Stage, len(plan.stages))
-	for index, stage := range plan.stages {
-		result[index] = stage.metadata()
+	for index := range plan.stages {
+		result[index] = plan.stages[index].metadata()
 	}
 	return result
+}
+
+// Explain returns human-readable stage metadata in execution order.
+func (plan Plan) Explain() []Stage {
+	return plan.Stages()
 }

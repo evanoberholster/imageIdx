@@ -160,10 +160,15 @@ func TestFusedKernelsAgainstReference(t *testing.T) {
 		}
 
 		// AndMany: base & c & d.
-		gotCard = AndMany(got, base, c, d)
+		gotCard = AndMany3(got, base, c, d)
 		wantCard = refAnd(want, refAndInto(base, c), d)
 		if gotCard != wantCard || !slices.Equal(got, want) {
-			t.Fatalf("AndMany round %d mismatch", round)
+			t.Fatalf("AndMany3 round %d mismatch", round)
+		}
+		gotCard = AndMany4(got, base, c, d, remove)
+		wantCard = refAnd(want, refAndInto(refAndInto(base, c), d), remove)
+		if gotCard != wantCard || !slices.Equal(got, want) {
+			t.Fatalf("AndMany4 round %d mismatch", round)
 		}
 	}
 }

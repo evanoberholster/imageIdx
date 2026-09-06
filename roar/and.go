@@ -1,7 +1,7 @@
 package roar
 
 import (
-	"github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+	"github.com/evanoberholster/imageIdx/roar/internal/bitmapkernel"
 )
 
 // AndInto appends the intersection of a and b to dst. The two key tables

@@ -58,6 +58,8 @@ func ExactTimestamp(lookup timestamp.ExactTimestampFunc) TimestampOption {
 }
 
 // During restricts images to the half-open timestamp range [start, end).
+// An empty range (start >= end) is valid and compiles to an empty plan;
+// a nil index is rejected at Compile time with ErrInvalidClause.
 func During(index *timestamp.Index, start, end uint64, options ...TimestampOption) Clause {
 	clause := timestampClause{index: index, start: start, end: end}
 	for _, option := range options {
@@ -78,13 +80,14 @@ func (geoClause) searchClause() {}
 // WithinCells restricts images to the union of the supplied S2 cells. Cells
 // may be at any valid level up to geoindex.GeoS2Level; coarser cells are
 // converted to level-16 descendant ranges when the clause is created.
+// Invalid cell IDs join ErrInvalidClause with the underlying cause.
 func WithinCells(index *geoindex.Index, cellIDs ...uint64) (Clause, error) {
 	if index == nil || len(cellIDs) == 0 {
 		return nil, ErrInvalidClause
 	}
 	ranges, err := geoindex.RangesFromCellIDs(make([]geoindex.Range, 0, len(cellIDs)), cellIDs)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(ErrInvalidClause, err)
 	}
 	return geoClause{index: index, ranges: ranges}, nil
 }

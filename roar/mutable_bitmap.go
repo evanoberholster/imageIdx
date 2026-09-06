@@ -10,7 +10,9 @@ package roar
 // the canonical format, so Freeze is zero-copy.
 //
 // A MutableBitmap is not safe for concurrent reads during mutation; use it to
-// build a result that will be shared only after Freeze.
+// build a result that will be shared only after Freeze. Do not copy a
+// MutableBitmap after first use: its Builder scratch may alias its own
+// inline buffer.
 type MutableBitmap struct {
 	bitmap  Bitmap
 	builder Builder
@@ -22,7 +24,9 @@ type MutableBitmap struct {
 
 // NewMutableBitmap returns an empty MutableBitmap.
 func NewMutableBitmap() *MutableBitmap {
-	return &MutableBitmap{builder: *NewBuilder(0)}
+	m := &MutableBitmap{}
+	m.builder.scratchValues = m.builder.valuesBuf[:0]
+	return m
 }
 
 // NewMutableBitmapFrom returns a MutableBitmap seeded with b. The seed is
@@ -48,27 +52,21 @@ func (m *MutableBitmap) FromSortedList(ids []uint64) error {
 
 // Or unions b into the bitmap in place.
 func (m *MutableBitmap) Or(b Bitmap) {
-	m.builder.Reset()
-	m.builder.reserveKeys(m.bitmap.KeyCount() + b.KeyCount())
-	m.builder.reserveData(m.bitmap.LenInBytes() + b.LenInBytes())
+	m.builder.prepareResult(m.bitmap.KeyCount()+b.KeyCount(), m.bitmap.LenInBytes()+b.LenInBytes())
 	OrInto(&m.builder, m.bitmap, b)
 	m.commit()
 }
 
 // And intersects b with the bitmap in place.
 func (m *MutableBitmap) And(b Bitmap) {
-	m.builder.Reset()
-	m.builder.reserveKeys(min(m.bitmap.KeyCount(), b.KeyCount()))
-	m.builder.reserveData(min(m.bitmap.LenInBytes(), b.LenInBytes()))
+	m.builder.prepareResult(min(m.bitmap.KeyCount(), b.KeyCount()), min(m.bitmap.LenInBytes(), b.LenInBytes()))
 	AndInto(&m.builder, m.bitmap, b)
 	m.commit()
 }
 
 // AndNot subtracts b from the bitmap in place.
 func (m *MutableBitmap) AndNot(b Bitmap) {
-	m.builder.Reset()
-	m.builder.reserveKeys(m.bitmap.KeyCount())
-	m.builder.reserveData(m.bitmap.LenInBytes())
+	m.builder.prepareResult(m.bitmap.KeyCount(), m.bitmap.LenInBytes())
 	AndNotInto(&m.builder, m.bitmap, b)
 	m.commit()
 }

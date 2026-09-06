@@ -92,6 +92,26 @@ func andManyScalar(dst []uint64, inputs ...[]uint64) uint32 {
 	return uint32(cardinalityScalar(dst))
 }
 
+func andMany3Scalar(dst, a, b, c []uint64) uint32 {
+	var card uint32
+	for i := range dst {
+		w := a[i] & b[i] & c[i]
+		dst[i] = w
+		card += uint32(bits.OnesCount64(w))
+	}
+	return card
+}
+
+func andMany4Scalar(dst, a, b, c, d []uint64) uint32 {
+	var card uint32
+	for i := range dst {
+		w := a[i] & b[i] & c[i] & d[i]
+		dst[i] = w
+		card += uint32(bits.OnesCount64(w))
+	}
+	return card
+}
+
 func applyScalar(dst, base, add, remove []uint64) uint32 {
 	var card uint32
 	for i := range dst {

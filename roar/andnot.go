@@ -1,6 +1,6 @@
 package roar
 
-import "github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+import "github.com/evanoberholster/imageIdx/roar/internal/bitmapkernel"
 
 // AndNotInto appends a minus b to dst.
 func AndNotInto(dst *Builder, a, b Bitmap) {

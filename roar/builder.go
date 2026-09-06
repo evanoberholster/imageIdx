@@ -13,7 +13,8 @@ import (
 const valueScratchCap = 64
 
 // Builder accumulates result containers in key order for materializing
-// operations such as AndInto. It is not safe for concurrent use.
+// operations such as AndInto. It is not safe for concurrent use. Do not copy
+// a Builder after first use: scratchValues may alias valuesBuf.
 //
 // Scratch storage belongs to the Builder. The dense word buffer is allocated
 // lazily on first use, and the sparse value buffer starts as a small inline
@@ -82,6 +83,15 @@ func (b *Builder) reserveKeys(n int) {
 		b.keys = make([]uint64, 0, n)
 		b.offsets = make([]uint64, 0, n)
 	}
+}
+
+// prepareResult readies the Builder for one result with at most keyCount
+// containers and dataBytes payload bytes. It retains scratch capacity across
+// calls.
+func (b *Builder) prepareResult(keyCount, dataBytes int) {
+	b.Reset()
+	b.reserveKeys(keyCount)
+	b.reserveData(dataBytes)
 }
 
 // extend grows the container region by size zeroed bytes and returns the

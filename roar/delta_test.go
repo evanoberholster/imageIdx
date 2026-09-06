@@ -91,6 +91,25 @@ func TestDeltaBuilderReset(t *testing.T) {
 	}
 }
 
+func TestDeltaBuilderFreezeReuseKeepsReturnedBitmapIndependent(t *testing.T) {
+	base, err := FromSorted([]uint64{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := NewDeltaBuilderFrom(base)
+	builder.AddMany([]uint64{4, 5})
+	first := builder.Freeze()
+	builder.AddMany([]uint64{6})
+	builder.Remove(2)
+	second := builder.Freeze()
+	if got, want := first.AppendTo(nil), []uint64{1, 2, 3, 4, 5}; !slices.Equal(got, want) {
+		t.Fatalf("first Freeze = %v, want %v", got, want)
+	}
+	if got, want := second.AppendTo(nil), []uint64{1, 3, 4, 5, 6}; !slices.Equal(got, want) {
+		t.Fatalf("second Freeze = %v, want %v", got, want)
+	}
+}
+
 func TestDeltaBuilderIgnoresZero(t *testing.T) {
 	builder := NewDeltaBuilder()
 	builder.AddMany([]uint64{0, 1, 2})

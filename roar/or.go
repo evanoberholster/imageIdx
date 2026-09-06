@@ -1,6 +1,6 @@
 package roar
 
-import "github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+import "github.com/evanoberholster/imageIdx/roar/internal/bitmapkernel"
 
 // OrInto appends the union of a and b to dst.
 func OrInto(dst *Builder, a, b Bitmap) {

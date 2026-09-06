@@ -1,6 +1,6 @@
 package roar
 
-import "github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+import "github.com/evanoberholster/imageIdx/roar/internal/bitmapkernel"
 
 // applyInto appends (base ∪ add) ∖ remove to dst in one pass over the three
 // key tables, so the intermediate union is never materialized as a separate

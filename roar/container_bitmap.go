@@ -3,7 +3,7 @@ package roar
 import (
 	"math/bits"
 
-	"github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+	"github.com/evanoberholster/imageIdx/roar/internal/bitmapkernel"
 )
 
 // bitmapContains reports whether a bitmap container contains value x.
