@@ -1,6 +1,6 @@
 package roar
 
-import "math/bits"
+import "github.com/evanoberholster/imageIdx/internal/bitmapkernel"
 
 // AndNotInto appends a minus b to dst.
 func AndNotInto(dst *Builder, a, b Bitmap) {
@@ -26,10 +26,10 @@ func andNotContainerInto(dst *Builder, key uint64, a, b []byte) {
 	ha, hb := containerHeaderAt(a), containerHeaderAt(b)
 	switch {
 	case ha.Type == uint16(ContainerArray) && hb.Type == uint16(ContainerArray):
-		dst.scratchValues = differenceArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
+		differenceArrays(&dst.scratchValues, arrayValuesAt(a), arrayValuesAt(b))
 		dst.appendArray(key, dst.scratchValues)
 	case ha.Type == uint16(ContainerArray):
-		dst.scratchValues = filterArrayNotInBitmap(dst.scratchValues[:0], arrayValuesAt(a), bitmapWordsAt(b))
+		filterArrayNotInBitmap(&dst.scratchValues, arrayValuesAt(a), bitmapWordsAt(b))
 		dst.appendArray(key, dst.scratchValues)
 	case hb.Type == uint16(ContainerArray):
 		card := andNotWordsArray(dst.wordsScratch(), bitmapWordsAt(a), arrayValuesAt(b))
@@ -53,11 +53,5 @@ func andNotWordsArray(dst, words []uint64, values []uint16) uint32 {
 // andNotWords writes the wordwise difference into dst and returns its
 // cardinality.
 func andNotWords(dst, a, b []uint64) uint32 {
-	var card uint32
-	for index := 0; index < BitmapWords; index++ {
-		word := a[index] &^ b[index]
-		dst[index] = word
-		card += uint32(bits.OnesCount64(word))
-	}
-	return card
+	return bitmapkernel.AndNot(dst, a, b)
 }

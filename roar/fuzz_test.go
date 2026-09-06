@@ -65,9 +65,9 @@ func FuzzFromSorted(f *testing.F) {
 	})
 }
 
-// FuzzMutableBuilder verifies that the lazy mutation path matches the
+// FuzzDeltaBuilder verifies that the lazy mutation path matches the
 // reference (base ∪ add) ∖ remove for arbitrary inputs.
-func FuzzMutableBuilder(f *testing.F) {
+func FuzzDeltaBuilder(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0})
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -89,7 +89,7 @@ func FuzzMutableBuilder(f *testing.F) {
 			t.Fatal(err)
 		}
 
-		builder := NewMutableBuilderFrom(baseBm)
+		builder := NewDeltaBuilderFrom(baseBm)
 		builder.AddMany(adds)
 		for _, id := range removes {
 			builder.Remove(id)

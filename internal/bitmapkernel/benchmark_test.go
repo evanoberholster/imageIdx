@@ -1,0 +1,144 @@
+package bitmapkernel
+
+import (
+	"math/rand/v2"
+	"testing"
+)
+
+func benchContainers(rng *rand.Rand, dense bool) (a, b, c, dst []uint64) {
+	a = make([]uint64, testWords)
+	b = make([]uint64, testWords)
+	c = make([]uint64, testWords)
+	dst = make([]uint64, testWords)
+	for i := range a {
+		if dense {
+			a[i] = rng.Uint64()
+			b[i] = rng.Uint64()
+			c[i] = rng.Uint64()
+		} else {
+			if rng.IntN(64) == 0 {
+				a[i] = uint64(1) << rng.IntN(64)
+			}
+			if rng.IntN(64) == 0 {
+				b[i] = uint64(1) << rng.IntN(64)
+			}
+			if rng.IntN(64) == 0 {
+				c[i] = uint64(1) << rng.IntN(64)
+			}
+		}
+	}
+	return a, b, c, dst
+}
+
+func BenchmarkAnd(b *testing.B) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for _, dense := range []bool{false, true} {
+		name := "sparse"
+		if dense {
+			name = "dense"
+		}
+		a, bb, _, dst := benchContainers(rng, dense)
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = And(dst, a, bb)
+			}
+		})
+	}
+}
+
+func BenchmarkOr(b *testing.B) {
+	rng := rand.New(rand.NewPCG(2, 3))
+	for _, dense := range []bool{false, true} {
+		name := "sparse"
+		if dense {
+			name = "dense"
+		}
+		a, bb, _, dst := benchContainers(rng, dense)
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = Or(dst, a, bb)
+			}
+		})
+	}
+}
+
+func BenchmarkAndNot(b *testing.B) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	for _, dense := range []bool{false, true} {
+		name := "sparse"
+		if dense {
+			name = "dense"
+		}
+		a, bb, _, dst := benchContainers(rng, dense)
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = AndNot(dst, a, bb)
+			}
+		})
+	}
+}
+
+func BenchmarkIntersects(b *testing.B) {
+	rng := rand.New(rand.NewPCG(4, 5))
+	for _, dense := range []bool{false, true} {
+		name := "sparse"
+		if dense {
+			name = "dense"
+		}
+		a, bb, _, _ := benchContainers(rng, dense)
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = Intersects(a, bb)
+			}
+		})
+	}
+}
+
+func BenchmarkAndMany(b *testing.B) {
+	rng := rand.New(rand.NewPCG(5, 6))
+	for _, dense := range []bool{false, true} {
+		name := "sparse"
+		if dense {
+			name = "dense"
+		}
+		a, bb, c, dst := benchContainers(rng, dense)
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = AndMany(dst, a, bb, c)
+			}
+		})
+	}
+}
+
+func BenchmarkApply(b *testing.B) {
+	rng := rand.New(rand.NewPCG(6, 7))
+	for _, dense := range []bool{false, true} {
+		name := "sparse"
+		if dense {
+			name = "dense"
+		}
+		a, bb, c, dst := benchContainers(rng, dense)
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = Apply(dst, a, bb, c)
+			}
+		})
+	}
+}
+
+// BenchmarkScalarBaseline measures the scalar backend directly, for comparing
+// against the active backend in a SIMD build.
+func BenchmarkScalarBaseline(b *testing.B) {
+	rng := rand.New(rand.NewPCG(9, 9))
+	a, bb, _, dst := benchContainers(rng, true)
+	b.ReportAllocs()
+	for range b.N {
+		_ = andScalar(dst, a, bb)
+	}
+}

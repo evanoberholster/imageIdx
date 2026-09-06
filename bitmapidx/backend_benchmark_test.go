@@ -164,7 +164,7 @@ func benchBackendApply(b *testing.B, base, adds, removes []uint64) {
 	b.Run("roar", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			builder := roar.NewMutableBuilderFrom(baseBitmap)
+			builder := roar.NewDeltaBuilderFrom(baseBitmap)
 			builder.AddMany(adds)
 			for _, id := range removes {
 				builder.Remove(id)

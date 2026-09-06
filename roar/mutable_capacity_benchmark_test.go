@@ -71,9 +71,9 @@ func BenchmarkInlineBufferMutate(b *testing.B) {
 	}
 }
 
-// BenchmarkMutableBuilderRealSweep measures the real MutableBuilder (current
+// BenchmarkDeltaBuilderRealSweep measures the real DeltaBuilder (current
 // inlineDeltaCapacity) end-to-end across delta sizes, as ground truth.
-func BenchmarkMutableBuilderRealSweep(b *testing.B) {
+func BenchmarkDeltaBuilderRealSweep(b *testing.B) {
 	for _, work := range deltaWorkloads {
 		b.Run(work.name, func(b *testing.B) {
 			adds := make([]uint64, work.adds)
@@ -86,7 +86,7 @@ func BenchmarkMutableBuilderRealSweep(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for range b.N {
-				builder := NewMutableBuilder()
+				builder := NewDeltaBuilder()
 				builder.AddMany(adds)
 				for _, id := range removes {
 					builder.Remove(id)

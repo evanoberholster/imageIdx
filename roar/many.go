@@ -1,6 +1,10 @@
 package roar
 
-import "math/bits"
+import (
+	"math/bits"
+
+	"github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+)
 
 // maxStackViews bounds the stack-scratch path for N-way operations.
 const maxStackViews = 8
@@ -81,16 +85,12 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 	}
 
 	if allBitmap {
-		words := bitmapWordsAt(containers[0])
 		scratch := dst.wordsScratch()
-		copy(scratch, words)
-		for _, container := range containers[1:] {
-			other := bitmapWordsAt(container)
-			for index := 0; index < BitmapWords; index++ {
-				scratch[index] &= other[index]
-			}
+		inputs := make([][]uint64, len(containers))
+		for index, container := range containers {
+			inputs[index] = bitmapWordsAt(container)
 		}
-		dst.emitWords(key, uint32(wordsCardinality(scratch)))
+		dst.emitWords(key, bitmapkernel.AndMany(scratch, inputs...))
 		return
 	}
 

@@ -3,15 +3,19 @@ package roar
 import "slices"
 
 // inlineDeltaCapacity is the number of pending additions and removals each
-// MutableBuilder stores without allocating. Most mutations are small; the
+// DeltaBuilder stores without allocating. Most mutations are small; the
 // buffers fall back to heap slices only when a batch exceeds this size.
 const inlineDeltaCapacity = 64
 
-// MutableBuilder is a writer-owned builder that accumulates raw additions and
+// DeltaBuilder is a writer-owned builder that accumulates raw additions and
 // removals against an immutable Bitmap and materializes the result on demand.
 // It backs small, high-frequency corrections such as the delta layers of a
 // copy-on-write index, where rebuilding an entire bitmap on every change
 // would be wasteful.
+//
+// Unlike MutableBitmap, which applies whole-set operations (Or, And, AndNot)
+// directly, DeltaBuilder defers raw ID additions and removals and folds them
+// once at Freeze.
 //
 // Pending additions are applied before pending removals, so a removal wins
 // when the same ID is both added and removed within one batch. This matches
@@ -20,8 +24,8 @@ const inlineDeltaCapacity = 64
 // Set operations (Or, And, AndNot) flush pending additions/removals first and
 // then combine with the current bitmap, preserving sequential semantics.
 //
-// MutableBuilder is not safe for concurrent use.
-type MutableBuilder struct {
+// DeltaBuilder is not safe for concurrent use.
+type DeltaBuilder struct {
 	bitmap    Bitmap
 	adds      []uint64
 	removes   []uint64
@@ -30,18 +34,18 @@ type MutableBuilder struct {
 	dirty     bool
 }
 
-// NewMutableBuilder returns an empty MutableBuilder.
-func NewMutableBuilder() *MutableBuilder {
-	m := &MutableBuilder{}
+// NewDeltaBuilder returns an empty DeltaBuilder.
+func NewDeltaBuilder() *DeltaBuilder {
+	m := &DeltaBuilder{}
 	m.adds = m.addBuf[:0]
 	m.removes = m.removeBuf[:0]
 	return m
 }
 
-// NewMutableBuilderFrom returns a MutableBuilder seeded with b. b is retained
+// NewDeltaBuilderFrom returns a DeltaBuilder seeded with b. b is retained
 // by reference and never mutated; the builder only replaces it.
-func NewMutableBuilderFrom(b Bitmap) *MutableBuilder {
-	m := &MutableBuilder{bitmap: b}
+func NewDeltaBuilderFrom(b Bitmap) *DeltaBuilder {
+	m := &DeltaBuilder{bitmap: b}
 	m.adds = m.addBuf[:0]
 	m.removes = m.removeBuf[:0]
 	return m
@@ -49,7 +53,7 @@ func NewMutableBuilderFrom(b Bitmap) *MutableBuilder {
 
 // AddMany stages additions of ids. They are merged into the bitmap lazily at
 // the next set operation or Freeze.
-func (m *MutableBuilder) AddMany(ids []uint64) {
+func (m *DeltaBuilder) AddMany(ids []uint64) {
 	if len(ids) == 0 {
 		return
 	}
@@ -58,7 +62,7 @@ func (m *MutableBuilder) AddMany(ids []uint64) {
 }
 
 // Remove stages a removal of id. InvalidImageID is ignored.
-func (m *MutableBuilder) Remove(id uint64) {
+func (m *DeltaBuilder) Remove(id uint64) {
 	if id == InvalidImageID {
 		return
 	}
@@ -67,26 +71,26 @@ func (m *MutableBuilder) Remove(id uint64) {
 }
 
 // Or unions b into the builder's current bitmap.
-func (m *MutableBuilder) Or(b Bitmap) {
+func (m *DeltaBuilder) Or(b Bitmap) {
 	m.flush()
 	m.bitmap = Or(m.bitmap, b)
 }
 
 // And intersects b with the builder's current bitmap.
-func (m *MutableBuilder) And(b Bitmap) {
+func (m *DeltaBuilder) And(b Bitmap) {
 	m.flush()
 	m.bitmap = And(m.bitmap, b)
 }
 
 // AndNot subtracts b from the builder's current bitmap.
-func (m *MutableBuilder) AndNot(b Bitmap) {
+func (m *DeltaBuilder) AndNot(b Bitmap) {
 	m.flush()
 	m.bitmap = AndNot(m.bitmap, b)
 }
 
 // Reset clears the builder and returns its pending slices to the inline
 // buffers.
-func (m *MutableBuilder) Reset() {
+func (m *DeltaBuilder) Reset() {
 	m.bitmap = Bitmap{}
 	m.adds = m.addBuf[:0]
 	m.removes = m.removeBuf[:0]
@@ -96,14 +100,14 @@ func (m *MutableBuilder) Reset() {
 // Freeze materializes pending additions/removals and returns the immutable
 // Bitmap. The builder remains usable afterward; the returned Bitmap is
 // independent of it.
-func (m *MutableBuilder) Freeze() Bitmap {
+func (m *DeltaBuilder) Freeze() Bitmap {
 	m.flush()
 	return m.bitmap
 }
 
 // flush merges pending additions (then removals) into the current bitmap in a
 // single pass, materializing no intermediate union bitmap.
-func (m *MutableBuilder) flush() {
+func (m *DeltaBuilder) flush() {
 	if !m.dirty {
 		return
 	}

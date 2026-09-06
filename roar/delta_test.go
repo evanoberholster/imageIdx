@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-func TestMutableBuilderAddRemove(t *testing.T) {
+func TestDeltaBuilderAddRemove(t *testing.T) {
 	base, err := FromSorted([]uint64{1, 2, 3, 4, 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	builder := NewMutableBuilderFrom(base)
+	builder := NewDeltaBuilderFrom(base)
 	builder.AddMany([]uint64{6, 7, 8})
 	builder.Remove(3)
 	builder.Remove(9)
@@ -23,8 +23,8 @@ func TestMutableBuilderAddRemove(t *testing.T) {
 	}
 }
 
-func TestMutableBuilderEmptyStart(t *testing.T) {
-	builder := NewMutableBuilder()
+func TestDeltaBuilderEmptyStart(t *testing.T) {
+	builder := NewDeltaBuilder()
 	builder.AddMany([]uint64{5, 1, 3})
 	builder.Remove(1)
 	got := builder.Freeze().AppendTo(nil)
@@ -33,8 +33,8 @@ func TestMutableBuilderEmptyStart(t *testing.T) {
 	}
 }
 
-func TestMutableBuilderRemovalWinsOverAdd(t *testing.T) {
-	builder := NewMutableBuilder()
+func TestDeltaBuilderRemovalWinsOverAdd(t *testing.T) {
+	builder := NewDeltaBuilder()
 	builder.AddMany([]uint64{7})
 	builder.Remove(7)
 	got := builder.Freeze().AppendTo(nil)
@@ -43,34 +43,34 @@ func TestMutableBuilderRemovalWinsOverAdd(t *testing.T) {
 	}
 }
 
-func TestMutableBuilderSetOps(t *testing.T) {
+func TestDeltaBuilderSetOps(t *testing.T) {
 	base, _ := FromSorted([]uint64{1, 2, 3})
 	other, _ := FromSorted([]uint64{2, 3, 4})
 
-	or := NewMutableBuilderFrom(base)
+	or := NewDeltaBuilderFrom(base)
 	or.Or(other)
 	if got, want := or.Freeze().AppendTo(nil), []uint64{1, 2, 3, 4}; !slices.Equal(got, want) {
 		t.Fatalf("Or = %v, want %v", got, want)
 	}
 
-	and := NewMutableBuilderFrom(base)
+	and := NewDeltaBuilderFrom(base)
 	and.And(other)
 	if got, want := and.Freeze().AppendTo(nil), []uint64{2, 3}; !slices.Equal(got, want) {
 		t.Fatalf("And = %v, want %v", got, want)
 	}
 
-	andNot := NewMutableBuilderFrom(base)
+	andNot := NewDeltaBuilderFrom(base)
 	andNot.AndNot(other)
 	if got, want := andNot.Freeze().AppendTo(nil), []uint64{1}; !slices.Equal(got, want) {
 		t.Fatalf("AndNot = %v, want %v", got, want)
 	}
 }
 
-func TestMutableBuilderFlushBeforeSetOp(t *testing.T) {
+func TestDeltaBuilderFlushBeforeSetOp(t *testing.T) {
 	base, _ := FromSorted([]uint64{1, 2, 3})
 	constraint, _ := FromSorted([]uint64{1, 3, 5})
 
-	builder := NewMutableBuilderFrom(base)
+	builder := NewDeltaBuilderFrom(base)
 	builder.AddMany([]uint64{4})
 	builder.And(constraint)
 	if got, want := builder.Freeze().AppendTo(nil), []uint64{1, 3}; !slices.Equal(got, want) {
@@ -78,8 +78,8 @@ func TestMutableBuilderFlushBeforeSetOp(t *testing.T) {
 	}
 }
 
-func TestMutableBuilderReset(t *testing.T) {
-	builder := NewMutableBuilder()
+func TestDeltaBuilderReset(t *testing.T) {
+	builder := NewDeltaBuilder()
 	builder.AddMany([]uint64{1, 2, 3})
 	if got := builder.Freeze().AppendTo(nil); len(got) != 3 {
 		t.Fatalf("Freeze = %v, want 3 IDs", got)
@@ -91,8 +91,8 @@ func TestMutableBuilderReset(t *testing.T) {
 	}
 }
 
-func TestMutableBuilderIgnoresZero(t *testing.T) {
-	builder := NewMutableBuilder()
+func TestDeltaBuilderIgnoresZero(t *testing.T) {
+	builder := NewDeltaBuilder()
 	builder.AddMany([]uint64{0, 1, 2})
 	builder.Remove(0)
 	if got, want := builder.Freeze().AppendTo(nil), []uint64{1, 2}; !slices.Equal(got, want) {
@@ -100,7 +100,7 @@ func TestMutableBuilderIgnoresZero(t *testing.T) {
 	}
 }
 
-func TestMutableBuilderMatchesReference(t *testing.T) {
+func TestDeltaBuilderMatchesReference(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 8))
 	for round := 0; round < 50; round++ {
 		pool := keyPool(rng, 16)
@@ -112,7 +112,7 @@ func TestMutableBuilderMatchesReference(t *testing.T) {
 		addBm, _ := FromSorted(adds)
 		removeBm, _ := FromSorted(removes)
 
-		builder := NewMutableBuilderFrom(baseBm)
+		builder := NewDeltaBuilderFrom(baseBm)
 		builder.AddMany(adds)
 		for _, id := range removes {
 			builder.Remove(id)
@@ -126,12 +126,12 @@ func TestMutableBuilderMatchesReference(t *testing.T) {
 	}
 }
 
-func TestMutableBuilderInlineBuffersAvoidAllocation(t *testing.T) {
+func TestDeltaBuilderInlineBuffersAvoidAllocation(t *testing.T) {
 	ids := make([]uint64, inlineDeltaCapacity)
 	for i := range ids {
 		ids[i] = uint64(i + 1)
 	}
-	builder := NewMutableBuilder()
+	builder := NewDeltaBuilder()
 	allocs := testing.AllocsPerRun(100, func() {
 		builder.Reset()
 		builder.AddMany(ids)

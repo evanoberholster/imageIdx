@@ -17,9 +17,10 @@ const valueScratchCap = 64
 //
 // Scratch storage belongs to the Builder. The dense word buffer is allocated
 // lazily on first use, and the sparse value buffer starts as a small inline
-// array, so array-only operations do not pay for the 8 KiB word buffer.
-// Operations reuse these buffers, so a caller performing one operation at a
-// time sees no per-operation scratch allocation after warmup.
+// array, so array-only operations do not pay for the 8 KiB word buffer. The
+// merge helpers write results into scratchValues in place (via *[]uint16), so
+// its growth is retained across containers; a caller performing one operation
+// at a time sees no per-operation scratch allocation after warmup.
 type Builder struct {
 	keys        []uint64
 	offsets     []uint64
@@ -131,7 +132,7 @@ func (b *Builder) emitWords(key uint64, card uint32) {
 		return
 	}
 	if card <= ArrayToBitmapThreshold {
-		b.scratchValues = extractWords(b.scratchValues[:0], b.scratchWords)
+		extractWords(&b.scratchValues, b.scratchWords)
 		b.appendArray(key, b.scratchValues)
 		return
 	}

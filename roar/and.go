@@ -1,6 +1,8 @@
 package roar
 
-import "math/bits"
+import (
+	"github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+)
 
 // AndInto appends the intersection of a and b to dst. The two key tables
 // are merge-walked in order; only matching containers are combined.
@@ -25,13 +27,13 @@ func andContainerInto(dst *Builder, key uint64, a, b []byte) {
 	ha, hb := containerHeaderAt(a), containerHeaderAt(b)
 	switch {
 	case ha.Type == uint16(ContainerArray) && hb.Type == uint16(ContainerArray):
-		dst.scratchValues = intersectArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
+		intersectArrays(&dst.scratchValues, arrayValuesAt(a), arrayValuesAt(b))
 		dst.appendArray(key, dst.scratchValues)
 	case ha.Type == uint16(ContainerArray):
-		dst.scratchValues = filterArrayByBitmap(dst.scratchValues[:0], arrayValuesAt(a), bitmapWordsAt(b))
+		filterArrayByBitmap(&dst.scratchValues, arrayValuesAt(a), bitmapWordsAt(b))
 		dst.appendArray(key, dst.scratchValues)
 	case hb.Type == uint16(ContainerArray):
-		dst.scratchValues = filterArrayByBitmap(dst.scratchValues[:0], arrayValuesAt(b), bitmapWordsAt(a))
+		filterArrayByBitmap(&dst.scratchValues, arrayValuesAt(b), bitmapWordsAt(a))
 		dst.appendArray(key, dst.scratchValues)
 	default:
 		card := andWords(dst.wordsScratch(), bitmapWordsAt(a), bitmapWordsAt(b))
@@ -39,36 +41,32 @@ func andContainerInto(dst *Builder, key uint64, a, b []byte) {
 	}
 }
 
-// filterArrayByBitmap appends the values present in words to dst.
-func filterArrayByBitmap(dst []uint16, values []uint16, words []uint64) []uint16 {
+// filterArrayByBitmap writes the values present in words to *dst.
+func filterArrayByBitmap(dst *[]uint16, values []uint16, words []uint64) {
+	out := (*dst)[:0]
 	for _, value := range values {
 		if bitmapContains(words, value) {
-			dst = append(dst, value)
+			out = append(out, value)
 		}
 	}
-	return dst
+	*dst = out
 }
 
-// filterArrayNotInBitmap appends the values absent from words to dst.
-func filterArrayNotInBitmap(dst []uint16, values []uint16, words []uint64) []uint16 {
+// filterArrayNotInBitmap writes the values absent from words to *dst.
+func filterArrayNotInBitmap(dst *[]uint16, values []uint16, words []uint64) {
+	out := (*dst)[:0]
 	for _, value := range values {
 		if !bitmapContains(words, value) {
-			dst = append(dst, value)
+			out = append(out, value)
 		}
 	}
-	return dst
+	*dst = out
 }
 
 // andWords writes the wordwise intersection into dst, which must hold
 // BitmapWords, and returns its cardinality.
 func andWords(dst, a, b []uint64) uint32 {
-	var card uint32
-	for index := 0; index < BitmapWords; index++ {
-		word := a[index] & b[index]
-		dst[index] = word
-		card += uint32(bits.OnesCount64(word))
-	}
-	return card
+	return bitmapkernel.And(dst, a, b)
 }
 
 // copyContainerInto appends an exact copy of a container to dst.

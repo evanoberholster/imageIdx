@@ -1,5 +1,7 @@
 package roar
 
+import "github.com/evanoberholster/imageIdx/internal/bitmapkernel"
+
 // applyInto appends (base ∪ add) ∖ remove to dst in one pass over the three
 // key tables, so the intermediate union is never materialized as a separate
 // bitmap. base and add may be empty; remove may be empty.
@@ -56,6 +58,16 @@ func applyInto(dst *Builder, base, add, remove Bitmap) {
 // intermediate container is allocated. base and add may be nil; remove must
 // be non-nil.
 func combineThreeInto(dst *Builder, key uint64, base, add, remove []byte) {
+	// Fast path: all three are dense bitmap containers, fused into one kernel
+	// expression (base | add) &^ remove with a single destination write.
+	if base != nil && add != nil && ContainerType(containerHeaderAt(remove).Type) == ContainerBitmap &&
+		ContainerType(containerHeaderAt(base).Type) == ContainerBitmap &&
+		ContainerType(containerHeaderAt(add).Type) == ContainerBitmap {
+		words := dst.wordsScratch()
+		dst.emitWords(key, bitmapkernel.Apply(words, bitmapWordsAt(base), bitmapWordsAt(add), bitmapWordsAt(remove)))
+		return
+	}
+
 	words := dst.wordsScratch()
 	clear(words)
 	if base != nil {

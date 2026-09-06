@@ -1,6 +1,6 @@
 package roar
 
-import "math/bits"
+import "github.com/evanoberholster/imageIdx/internal/bitmapkernel"
 
 // OrInto appends the union of a and b to dst.
 func OrInto(dst *Builder, a, b Bitmap) {
@@ -26,7 +26,7 @@ func orContainerInto(dst *Builder, key uint64, a, b []byte) {
 	ha, hb := containerHeaderAt(a), containerHeaderAt(b)
 	switch {
 	case ha.Type == uint16(ContainerArray) && hb.Type == uint16(ContainerArray):
-		dst.scratchValues = unionArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
+		unionArrays(&dst.scratchValues, arrayValuesAt(a), arrayValuesAt(b))
 		dst.emitValues(key, dst.scratchValues)
 	case ha.Type == uint16(ContainerArray):
 		orArrayBitmapInto(dst, key, arrayValuesAt(a), bitmapWordsAt(b), hb.Card)
@@ -58,11 +58,5 @@ func orArrayBitmapInto(dst *Builder, key uint64, values []uint16, words []uint64
 
 // orWords writes the wordwise union into dst and returns its cardinality.
 func orWords(dst, a, b []uint64) uint32 {
-	var card uint32
-	for index := 0; index < BitmapWords; index++ {
-		word := a[index] | b[index]
-		dst[index] = word
-		card += uint32(bits.OnesCount64(word))
-	}
-	return card
+	return bitmapkernel.Or(dst, a, b)
 }

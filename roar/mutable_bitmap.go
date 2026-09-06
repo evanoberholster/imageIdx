@@ -5,16 +5,19 @@ package roar
 // (Or, And, AndNot) against immutable Bitmaps and seeds itself from a
 // Bitmap or a sorted ID list.
 //
-// The mutable bitmap keeps its backing in the canonical format at all times,
-// so Freeze is zero-copy: it simply returns the current buffer as an
-// immutable Bitmap. The receiver should not be used after Freeze.
+// Unlike DeltaBuilder, which defers raw ID additions/removals, MutableBitmap
+// applies whole-set operations immediately and always keeps its backing in
+// the canonical format, so Freeze is zero-copy.
 //
 // A MutableBitmap is not safe for concurrent reads during mutation; use it to
 // build a result that will be shared only after Freeze.
 type MutableBitmap struct {
 	bitmap  Bitmap
 	builder Builder
-	owned   bool
+	// owned reports whether bitmap's buffer is exclusively owned by this
+	// MutableBitmap and can be recycled as the destination of the next op. A
+	// seeded Bitmap is shared and must not be overwritten.
+	owned bool
 }
 
 // NewMutableBitmap returns an empty MutableBitmap.

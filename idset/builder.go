@@ -9,11 +9,11 @@ import (
 // Freeze transfers its current bitmap to an immutable Ref; callers must not
 // mutate the Builder afterward.
 type Builder struct {
-	mutable *roar.MutableBuilder
+	mutable *roar.DeltaBuilder
 }
 
 func Clone(ref Ref) Builder {
-	return Builder{mutable: roar.NewMutableBuilderFrom(ref.bitmap)}
+	return Builder{mutable: roar.NewDeltaBuilderFrom(ref.bitmap)}
 }
 
 func (builder *Builder) AddMany(ids []imageidx.ImageID) {
@@ -34,7 +34,7 @@ func (builder *Builder) Or(ref Ref) {
 
 func (builder *Builder) And(ref Ref) {
 	if !ref.Valid() {
-		builder.mutable = roar.NewMutableBuilder()
+		builder.mutable = roar.NewDeltaBuilder()
 		return
 	}
 	builder.mutable.And(ref.bitmap)
