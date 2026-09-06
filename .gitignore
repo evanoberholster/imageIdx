@@ -14,3 +14,8 @@ coverage.*
 .idea/
 .vscode/
 .opencode/
+.sigmap-cache.json
+.context/gain.ndjson
+.context/sig-index.json
+.context/usage.json
+.gitignore

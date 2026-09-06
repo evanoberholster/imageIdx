@@ -57,6 +57,7 @@ var (
 	ErrUnsupportedEndian     = errors.New("roar: serialized format requires a little-endian host")
 	ErrUnsortedIDs           = errors.New("roar: image ids must be strictly increasing")
 	ErrSortedBuilderFinished = errors.New("roar: sorted builder is finished; call Reset before Add")
+	ErrSelectOutOfRange      = errors.New("roar: select index out of range")
 )
 
 // ContainerType identifies the payload kind stored after the container

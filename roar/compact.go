@@ -7,6 +7,7 @@ import "encoding/binary"
 func assemble(keys []uint64, offsets []uint64, data []byte) []byte {
 	containerBase := HeaderSize + len(keys)*KeyEntrySize
 	out := make([]byte, containerBase+len(data))
+	requireAligned(out)
 	binary.LittleEndian.PutUint32(out[0:4], Magic)
 	binary.LittleEndian.PutUint16(out[4:6], Version)
 	binary.LittleEndian.PutUint16(out[6:8], FlagCompact)

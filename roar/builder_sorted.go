@@ -170,6 +170,7 @@ func FromSorted(ids []uint64) ([]byte, error) {
 	}
 	containerBase := HeaderSize + keyCount*KeyEntrySize
 	out := make([]byte, containerBase+totalBlocks*8)
+	requireAligned(out)
 	binary.LittleEndian.PutUint32(out[0:4], Magic)
 	binary.LittleEndian.PutUint16(out[4:6], Version)
 	binary.LittleEndian.PutUint16(out[6:8], FlagCompact)

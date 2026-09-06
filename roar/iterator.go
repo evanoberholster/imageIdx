@@ -16,6 +16,7 @@ type Iterator struct {
 	data    []byte
 	entries []keyEntry
 	keyPos  int
+	keyEnd  int // exclusive upper bound on keyPos
 
 	base    uint64
 	card    int
@@ -32,7 +33,41 @@ type Iterator struct {
 // returned iterator must not outlive the Bitmap's backing bytes. The first
 // container is loaded lazily so the constructor stays trivial.
 func (v Bitmap) Iterator() Iterator {
-	return Iterator{data: v.data, entries: v.keyEntries(), keyPos: -1}
+	entries := v.keyEntries()
+	return Iterator{data: v.data, entries: entries, keyPos: -1, keyEnd: len(entries)}
+}
+
+// iteratorRange returns an iterator restricted to the key entries in
+// [start, end).
+func (v Bitmap) iteratorRange(start, end int) Iterator {
+	return Iterator{data: v.data, entries: v.keyEntries(), keyPos: start - 1, keyEnd: end}
+}
+
+// NewRangeIterators partitions the bitmap into numRanges contiguous key
+// ranges and returns one iterator per range, for parallel materialization.
+// Each iterator yields a disjoint, ascending slice of the bitmap.
+func (b Bitmap) NewRangeIterators(numRanges int) []Iterator {
+	entries := b.keyEntries()
+	count := len(entries)
+	if numRanges <= 1 || count == 0 {
+		return []Iterator{b.Iterator()}
+	}
+	if numRanges > count {
+		numRanges = count
+	}
+	iterators := make([]Iterator, numRanges)
+	width := count / numRanges
+	remainder := count % numRanges
+	start := 0
+	for index := range iterators {
+		size := width
+		if index < remainder {
+			size++
+		}
+		iterators[index] = b.iteratorRange(start, start+size)
+		start += size
+	}
+	return iterators
 }
 
 // advance moves to the next non-empty position: the next non-zero word of
@@ -50,7 +85,7 @@ func (it *Iterator) advance() bool {
 			}
 		}
 		it.keyPos++
-		if it.keyPos >= len(it.entries) {
+		if it.keyPos >= it.keyEnd {
 			return false
 		}
 		entry := it.entries[it.keyPos]
