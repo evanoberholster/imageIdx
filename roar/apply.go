@@ -56,7 +56,7 @@ func applyInto(dst *Builder, base, add, remove Bitmap) {
 // intermediate container is allocated. base and add may be nil; remove must
 // be non-nil.
 func combineThreeInto(dst *Builder, key uint64, base, add, remove []byte) {
-	words := dst.scratchWords
+	words := dst.wordsScratch()
 	clear(words)
 	if base != nil {
 		setContainerBits(words, base)

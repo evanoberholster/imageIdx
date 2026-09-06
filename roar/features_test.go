@@ -15,7 +15,7 @@ func TestMarshalBinaryRoundTrip(t *testing.T) {
 		{1, 1<<16 + 1, 3 << 48, ^uint64(0)},
 		denseSortedIDs(rngForTest(), 2),
 	} {
-		bitmap, err := FromSortedList(ids)
+		bitmap, err := FromSorted(ids)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -40,7 +40,7 @@ func TestMarshalBinaryRoundTrip(t *testing.T) {
 }
 
 func TestCloneIsIndependent(t *testing.T) {
-	bitmap, err := FromSortedList([]uint64{1, 2, 3, 1 << 48})
+	bitmap, err := FromSorted([]uint64{1, 2, 3, 1 << 48})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestCloneIsIndependent(t *testing.T) {
 }
 
 func TestUnmarshalBinary(t *testing.T) {
-	original, _ := FromSortedList([]uint64{5, 1 << 16})
+	original, _ := FromSorted([]uint64{5, 1 << 16})
 	data, _ := original.MarshalBinary()
 	var decoded Bitmap
 	if err := decoded.UnmarshalBinary(data); err != nil {
@@ -83,7 +83,7 @@ func TestRankSelectMinMaxAgainstSroar(t *testing.T) {
 	ids = append(ids, denseSortedIDs(rng, 3)...)
 	sortIDs(ids)
 
-	bitmap, err := FromSortedList(ids)
+	bitmap, err := FromSorted(ids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestRankSelectMinMaxAgainstSroar(t *testing.T) {
 		t.Fatalf("Maximum = %d, %v", got, want)
 	}
 
-	empty, _ := FromSortedList(nil)
+	empty, _ := FromSorted(nil)
 	if _, ok := empty.Minimum(); ok {
 		t.Fatal("empty Minimum reported ok")
 	}
@@ -134,7 +134,7 @@ func TestCursorContainsAndNextGeq(t *testing.T) {
 	rng := rand.New(rand.NewPCG(99, 3))
 	pool := keyPool(rng, 40)
 	ids := randomSetOver(rng, pool)
-	bitmap, _ := FromSortedList(ids)
+	bitmap, _ := FromSorted(ids)
 
 	cursor := bitmap.NewCursor()
 	// NextGeq over the whole sorted list must reproduce the list exactly.
@@ -177,8 +177,8 @@ func TestDirectSetOpsMatchInto(t *testing.T) {
 	pool := keyPool(rng, 24)
 	aIDs := randomSetOver(rng, pool)
 	bIDs := randomSetOver(rng, pool)
-	a, _ := FromSortedList(aIDs)
-	b, _ := FromSortedList(bIDs)
+	a, _ := FromSorted(aIDs)
+	b, _ := FromSorted(bIDs)
 
 	assertEq := func(name string, got Bitmap, want func() []uint64) {
 		t.Helper()
@@ -211,9 +211,9 @@ func TestDirectSetOpsMatchInto(t *testing.T) {
 func TestConcurrentOpsMatchSequential(t *testing.T) {
 	rng := rand.New(rand.NewPCG(8, 9))
 	pool := keyPool(rng, 32)
-	a, _ := FromSortedList(randomSetOver(rng, pool))
-	b, _ := FromSortedList(randomSetOver(rng, pool))
-	c, _ := FromSortedList(randomSetOver(rng, pool))
+	a, _ := FromSorted(randomSetOver(rng, pool))
+	b, _ := FromSorted(randomSetOver(rng, pool))
+	c, _ := FromSorted(randomSetOver(rng, pool))
 
 	for _, concurrency := range []int{1, 2, 4, 8} {
 		if got := AndConc(a, b, concurrency).AppendTo(nil); !slices.Equal(got, And(a, b).AppendTo(nil)) {
@@ -238,7 +238,7 @@ func TestNewRangeIteratorsCoverBitmap(t *testing.T) {
 	rng := rand.New(rand.NewPCG(11, 12))
 	pool := keyPool(rng, 64)
 	ids := randomSetOver(rng, pool)
-	bitmap, _ := FromSortedList(ids)
+	bitmap, _ := FromSorted(ids)
 
 	var combined []uint64
 	for _, iterator := range bitmap.NewRangeIterators(8) {
@@ -250,7 +250,7 @@ func TestNewRangeIteratorsCoverBitmap(t *testing.T) {
 		t.Fatalf("range iterators covered %d of %d IDs", len(combined), len(ids))
 	}
 
-	empty, _ := FromSortedList(nil)
+	empty, _ := FromSorted(nil)
 	if got := empty.NewRangeIterators(4); len(got) == 0 || got[0].Next() {
 		t.Fatal("empty range iterators misbehaved")
 	}

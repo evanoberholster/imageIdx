@@ -8,7 +8,7 @@ import "bytes"
 // It implements encoding.BinaryMarshaler.
 func (b Bitmap) MarshalBinary() ([]byte, error) {
 	if len(b.data) == 0 {
-		return assemble(nil, nil, nil), nil
+		return assemble(nil, nil, nil, 0), nil
 	}
 	cloned := bytes.Clone(b.data)
 	requireAligned(cloned)
@@ -44,7 +44,12 @@ func (b Bitmap) Bytes() []byte {
 	return b.data
 }
 
-// LenInBytes returns the size of the serialized representation in bytes.
+// LenInBytes returns the length in bytes of the serialized representation.
+// It matches the length of the bytes returned by MarshalBinary, including the
+// 24-byte header for an empty bitmap. It is the on-disk size of the bitmap.
 func (b Bitmap) LenInBytes() int {
+	if len(b.data) == 0 {
+		return HeaderSize
+	}
 	return len(b.data)
 }

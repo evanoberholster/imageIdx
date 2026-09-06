@@ -26,14 +26,14 @@ func orContainerInto(dst *Builder, key uint64, a, b []byte) {
 	ha, hb := containerHeaderAt(a), containerHeaderAt(b)
 	switch {
 	case ha.Type == uint16(ContainerArray) && hb.Type == uint16(ContainerArray):
-		values := unionArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
-		dst.emitValues(key, values)
+		dst.scratchValues = unionArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
+		dst.emitValues(key, dst.scratchValues)
 	case ha.Type == uint16(ContainerArray):
 		orArrayBitmapInto(dst, key, arrayValuesAt(a), bitmapWordsAt(b), hb.Card)
 	case hb.Type == uint16(ContainerArray):
 		orArrayBitmapInto(dst, key, arrayValuesAt(b), bitmapWordsAt(a), ha.Card)
 	default:
-		card := orWords(dst.scratchWords, bitmapWordsAt(a), bitmapWordsAt(b))
+		card := orWords(dst.wordsScratch(), bitmapWordsAt(a), bitmapWordsAt(b))
 		dst.emitWords(key, card)
 	}
 }
@@ -42,17 +42,18 @@ func orContainerInto(dst *Builder, key uint64, a, b []byte) {
 // result is dense because the input bitmap already exceeds the array
 // threshold.
 func orArrayBitmapInto(dst *Builder, key uint64, values []uint16, words []uint64, baseCard uint32) {
-	copy(dst.scratchWords, words)
+	scratch := dst.wordsScratch()
+	copy(scratch, words)
 	card := baseCard
 	for _, value := range values {
 		word, bit := value>>6, value&63
 		mask := uint64(1) << bit
-		if dst.scratchWords[word]&mask == 0 {
-			dst.scratchWords[word] |= mask
+		if scratch[word]&mask == 0 {
+			scratch[word] |= mask
 			card++
 		}
 	}
-	dst.appendBitmap(key, dst.scratchWords, card)
+	dst.appendBitmap(key, scratch, card)
 }
 
 // orWords writes the wordwise union into dst and returns its cardinality.

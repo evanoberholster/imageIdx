@@ -9,16 +9,11 @@ import (
 // modified or unmapped while a Bitmap referencing them remains in use.
 //
 // Bitmap values are cheap to copy and safe for concurrent reads. Their methods
-// do not lock. Construct a Bitmap with FromSortedList, Open, or OpenTrusted.
-// The zero value represents an empty bitmap.
+// do not lock. Construct a Bitmap with FromSorted, Open, or OpenTrusted. The
+// zero value represents an empty bitmap.
 type Bitmap struct {
 	data []byte
 }
-
-// View is an alias for Bitmap.
-//
-// Deprecated: use Bitmap.
-type View = Bitmap
 
 // OpenTrusted wraps already-validated bytes. The caller guarantees that the
 // bytes form a valid version-1 bitmap, that the base address is 8-byte
@@ -45,8 +40,18 @@ func (v Bitmap) keyEntries() []keyEntry {
 	)
 }
 
-// Cardinality sums the container cardinalities stored in the headers.
+// Cardinality returns the number of IDs. When the bitmap was built with the
+// stored-cardinality flag (all constructors emit it), it reads the total
+// directly from the header in O(1); otherwise it falls back to summing the
+// container headers.
 func (v Bitmap) Cardinality() uint64 {
+	if len(v.data) == 0 {
+		return 0
+	}
+	h := v.header()
+	if h.Flags&FlagStoredCardinality != 0 {
+		return h.Cardinality
+	}
 	var total uint64
 	for _, entry := range v.keyEntries() {
 		total += uint64(containerHeaderAt(v.data[entry.Offset:]).Card)

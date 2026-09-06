@@ -320,14 +320,11 @@ func partitionsOverlap(a, b []S2Key) bool {
 	return false
 }
 
-func safeBitmapFromBuffer(data []byte) (result idset.Ref, err error) {
-	defer func() {
-		if recover() != nil {
-			err = ErrCorruptStorage
-		}
-	}()
-	result = idset.FromBuffer(data)
-	_ = result.Cardinality()
+func safeBitmapFromBuffer(data []byte) (idset.Ref, error) {
+	result, err := idset.FromBuffer(data)
+	if err != nil {
+		return idset.Ref{}, ErrCorruptStorage
+	}
 	return result, nil
 }
 

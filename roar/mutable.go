@@ -116,6 +116,7 @@ func (m *MutableBuilder) flush() {
 		return
 	}
 	builder := NewBuilder(m.bitmap.KeyCount() + add.KeyCount())
+	builder.reserveData(m.bitmap.LenInBytes() + add.LenInBytes())
 	applyInto(builder, m.bitmap, add, remove)
 	m.bitmap = Bitmap{data: builder.Compact()}
 }
@@ -131,7 +132,7 @@ func bitmapFromUnique(ids []uint64) Bitmap {
 	if len(ids) == 0 {
 		return Bitmap{}
 	}
-	bitmap, err := FromSortedList(ids)
+	bitmap, err := FromSorted(ids)
 	if err != nil {
 		// Unreachable: ids are sorted, unique, and free of zero.
 		return Bitmap{}

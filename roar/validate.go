@@ -27,7 +27,7 @@ func Validate(data []byte) error {
 		return ErrInvalidBitmap
 	}
 	magic := binary.LittleEndian.Uint32(data[0:4])
-	if magic != Magic && magic != legacyMagic {
+	if magic != Magic {
 		return ErrInvalidMagic
 	}
 	if binary.LittleEndian.Uint16(data[4:6]) != Version {
@@ -38,6 +38,7 @@ func Validate(data []byte) error {
 	}
 	headerBytes := binary.LittleEndian.Uint32(data[8:12])
 	keyCount := binary.LittleEndian.Uint32(data[12:16])
+	flags := binary.LittleEndian.Uint16(data[6:8])
 	if headerBytes < HeaderSize || uint64(headerBytes) > uint64(len(data)) ||
 		headerBytes%Alignment != 0 || uintptr(unsafe.Pointer(unsafe.SliceData(data)))%Alignment != 0 {
 		return ErrInvalidBitmap
@@ -49,6 +50,7 @@ func Validate(data []byte) error {
 	}
 
 	var previous uint64
+	var totalCard uint64
 	for index := uint32(0); index < keyCount; index++ {
 		entry := tableStart + uint64(index)*KeyEntrySize
 		key := binary.LittleEndian.Uint64(data[entry : entry+8])
@@ -68,6 +70,12 @@ func Validate(data []byte) error {
 		}
 		if err := validateContainer(data[offset:], key); err != nil {
 			return err
+		}
+		totalCard += uint64(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+	}
+	if flags&FlagStoredCardinality != 0 {
+		if binary.LittleEndian.Uint64(data[16:24]) != totalCard {
+			return ErrCorruptContainer
 		}
 	}
 	return nil

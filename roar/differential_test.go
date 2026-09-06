@@ -23,11 +23,11 @@ func TestDifferentialAgainstSroar(t *testing.T) {
 		views := make([]Bitmap, len(sets))
 		bitmaps := make([]*sroar.Bitmap, len(sets))
 		for index, ids := range sets {
-			data, err := FromSorted(ids)
+			bitmap, err := FromSorted(ids)
 			if err != nil {
 				t.Fatal(err)
 			}
-			views[index] = OpenTrusted(data)
+			views[index] = bitmap
 			bitmaps[index] = sroar.FromSortedList(ids)
 		}
 

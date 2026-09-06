@@ -82,19 +82,21 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 
 	if allBitmap {
 		words := bitmapWordsAt(containers[0])
-		copy(dst.scratchWords, words)
+		scratch := dst.wordsScratch()
+		copy(scratch, words)
 		for _, container := range containers[1:] {
 			other := bitmapWordsAt(container)
 			for index := 0; index < BitmapWords; index++ {
-				dst.scratchWords[index] &= other[index]
+				scratch[index] &= other[index]
 			}
 		}
-		dst.emitWords(key, uint32(wordsCardinality(dst.scratchWords)))
+		dst.emitWords(key, uint32(wordsCardinality(scratch)))
 		return
 	}
 
 	dst.scratchValues = dst.scratchValues[:0]
-	clear(dst.scratchWords)
+	scratch := dst.wordsScratch()
+	clear(scratch)
 	survivors := 0
 	driverContainer := containers[driver]
 	if ContainerType(containerHeaderAt(driverContainer).Type) == ContainerArray {
@@ -113,7 +115,7 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 			value := uint16(wordIndex<<6 | bit)
 			if valuePresentInAll(value, driver, containers) {
 				dst.scratchValues = append(dst.scratchValues, value)
-				dst.scratchWords[wordIndex] |= uint64(1) << bit
+				scratch[wordIndex] |= uint64(1) << bit
 				survivors++
 			}
 			word &= word - 1
@@ -126,7 +128,7 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 		dst.appendArray(key, dst.scratchValues)
 		return
 	}
-	dst.appendBitmap(key, dst.scratchWords, uint32(survivors))
+	dst.appendBitmap(key, scratch, uint32(survivors))
 }
 
 func valuePresentInAll(value uint16, driver int, containers [][]byte) bool {

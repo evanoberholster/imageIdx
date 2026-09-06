@@ -6,24 +6,6 @@ import (
 	"testing"
 )
 
-func TestFromSortedErrors(t *testing.T) {
-	if _, err := FromSorted([]uint64{1 << 48}); err != nil {
-		t.Fatalf("FromSorted(1<<48) = %v", err)
-	}
-	if _, err := FromSorted([]uint64{0}); !is(err, ErrInvalidImageID) {
-		t.Fatalf("zero ID error = %v", err)
-	}
-	if _, err := FromSorted([]uint64{1 << 48, 1 << 48}); !is(err, ErrUnsortedIDs) {
-		t.Fatalf("duplicate ID error = %v", err)
-	}
-	if _, err := FromSorted([]uint64{2 << 48, 1 << 48}); !is(err, ErrUnsortedIDs) {
-		t.Fatalf("unsorted ID error = %v", err)
-	}
-	if _, err := FromSorted([]uint64{1<<48 + 1, 1<<48 + 2, 2<<48 + 1}); err != nil {
-		t.Fatalf("valid mixed input rejected: %v", err)
-	}
-}
-
 func TestSortedBuilder(t *testing.T) {
 	ids := []uint64{1<<48 + 1, 1<<48 + 2, 2<<48 + 9, 3<<48 + 65535}
 	builder := NewSortedBuilder(0)
@@ -130,11 +112,12 @@ func TestArrayToBitmapThreshold(t *testing.T) {
 		{"above threshold promotes", bitmapIDs, ContainerBitmap},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			data, err := FromSorted(test.ids)
+			bitmap, err := FromSorted(test.ids)
 			if err != nil {
 				t.Fatal(err)
 			}
-			offset := binary.LittleEndian.Uint64(data[24:32])
+			data := bitmap.Bytes()
+			offset := binary.LittleEndian.Uint64(data[32:40])
 			containerType := ContainerType(binary.LittleEndian.Uint16(data[offset+2 : offset+4]))
 			if containerType != test.want {
 				t.Fatalf("container type = %v, want %v", containerType, test.want)
@@ -153,7 +136,7 @@ func TestBuilderCompactAndReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	builder := NewBuilder(4)
-	AndInto(builder, OpenTrusted(left), OpenTrusted(right))
+	AndInto(builder, left, right)
 	result := builder.Compact()
 	if OpenTrusted(result).Cardinality() != 2 {
 		t.Fatalf("AND cardinality = %d", OpenTrusted(result).Cardinality())
@@ -168,7 +151,7 @@ func TestBuilderCompactAndReset(t *testing.T) {
 	if builder.KeyCount() != 0 {
 		t.Fatalf("KeyCount after Reset = %d", builder.KeyCount())
 	}
-	AndInto(builder, OpenTrusted(right), OpenTrusted(left))
+	AndInto(builder, right, left)
 	if OpenTrusted(builder.Compact()).Cardinality() != 2 {
 		t.Fatal("reused builder produced wrong result")
 	}
@@ -200,9 +183,9 @@ func TestBuilderResetReinitializesScratchWhenNeeded(t *testing.T) {
 	}
 
 	builder := NewBuilder(1)
-	OrInto(builder, OpenTrusted(denseData), OpenTrusted(denseData))
+	OrInto(builder, denseData, denseData)
 	builder.Reset()
-	OrInto(builder, OpenTrusted(leftData), OpenTrusted(rightData))
+	OrInto(builder, leftData, rightData)
 
 	want := append(slices.Clone(left), right...)
 	got := OpenTrusted(builder.Compact()).AppendTo(nil)

@@ -14,11 +14,10 @@ func TestContains(t *testing.T) {
 	ids = append(ids, dense...)
 	ids = append(ids, 4<<48+65535) // maximum low value
 
-	data, err := FromSorted(ids)
+	view, err := FromSorted(ids)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view := OpenTrusted(data)
 
 	for _, id := range ids {
 		if !view.Contains(id) {
@@ -44,11 +43,10 @@ func TestIteratorRoundTrip(t *testing.T) {
 		{"mixed keys", []uint64{1<<48 + 1, 2<<48 + 9, 2<<48 + 65535, 5 << 48}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			data, err := FromSorted(test.ids)
+			view, err := FromSorted(test.ids)
 			if err != nil {
 				t.Fatal(err)
 			}
-			view := OpenTrusted(data)
 			var got []uint64
 			for iterator := view.Iterator(); iterator.Next(); {
 				got = append(got, iterator.Value())
@@ -66,11 +64,10 @@ func TestIteratorRoundTrip(t *testing.T) {
 
 	t.Run("dense containers", func(t *testing.T) {
 		ids := denseSortedIDs(rngForTest(), 3)
-		data, err := FromSorted(ids)
+		view, err := FromSorted(ids)
 		if err != nil {
 			t.Fatal(err)
 		}
-		view := OpenTrusted(data)
 		iterator := view.Iterator()
 		for index := 0; index < len(ids); index++ {
 			if !iterator.Next() {

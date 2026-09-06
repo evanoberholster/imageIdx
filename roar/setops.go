@@ -5,6 +5,7 @@ package roar
 // forms when the result buffer can be reused.
 func And(a, b Bitmap) Bitmap {
 	builder := NewBuilder(min(a.KeyCount(), b.KeyCount()))
+	builder.reserveData(min(a.LenInBytes(), b.LenInBytes()))
 	AndInto(builder, a, b)
 	return Bitmap{data: builder.Compact()}
 }
@@ -12,6 +13,7 @@ func And(a, b Bitmap) Bitmap {
 // Or returns the union of a and b as a new Bitmap.
 func Or(a, b Bitmap) Bitmap {
 	builder := NewBuilder(a.KeyCount() + b.KeyCount())
+	builder.reserveData(a.LenInBytes() + b.LenInBytes())
 	OrInto(builder, a, b)
 	return Bitmap{data: builder.Compact()}
 }
@@ -19,6 +21,7 @@ func Or(a, b Bitmap) Bitmap {
 // AndNot returns a minus b as a new Bitmap.
 func AndNot(a, b Bitmap) Bitmap {
 	builder := NewBuilder(a.KeyCount())
+	builder.reserveData(a.LenInBytes())
 	AndNotInto(builder, a, b)
 	return Bitmap{data: builder.Compact()}
 }
@@ -29,12 +32,17 @@ func AndMany(bitmaps ...Bitmap) Bitmap {
 		return Bitmap{}
 	}
 	capacity := bitmaps[0].KeyCount()
+	bytes := bitmaps[0].LenInBytes()
 	for _, bm := range bitmaps[1:] {
 		if n := bm.KeyCount(); n < capacity {
 			capacity = n
 		}
+		if n := bm.LenInBytes(); n < bytes {
+			bytes = n
+		}
 	}
 	builder := NewBuilder(capacity)
+	builder.reserveData(bytes)
 	AndManyInto(builder, bitmaps...)
 	return Bitmap{data: builder.Compact()}
 }

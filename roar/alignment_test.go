@@ -11,13 +11,7 @@ import (
 func TestConstructorsProduceAlignedBuffers(t *testing.T) {
 	ids := denseSortedIDs(rngForTest(), 4)
 
-	fromSorted, err := FromSorted(ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	requireAligned(fromSorted)
-
-	bitmap, err := FromSortedList(ids)
+	bitmap, err := FromSorted(ids)
 	if err != nil {
 		t.Fatal(err)
 	}

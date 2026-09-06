@@ -13,6 +13,7 @@ type SortedBuilder struct {
 	offsets []uint64
 	data    []byte
 
+	cardinality   uint64
 	currentKey    uint64
 	currentValues []uint16
 	currentBitmap []uint64
@@ -40,6 +41,7 @@ func (b *SortedBuilder) Reset() {
 	b.keys = b.keys[:0]
 	b.offsets = b.offsets[:0]
 	b.data = b.data[:0]
+	b.cardinality = 0
 	b.currentValues = b.currentValues[:0]
 	if b.isBitmap {
 		clear(b.currentBitmap)
@@ -113,6 +115,7 @@ func (b *SortedBuilder) finishCurrent() {
 		clear(b.currentBitmap)
 		b.keys = append(b.keys, b.currentKey)
 		b.offsets = append(b.offsets, uint64(start))
+		b.cardinality += uint64(b.bitmapCard)
 		b.bitmapCard = 0
 		b.isBitmap = false
 	} else {
@@ -126,6 +129,7 @@ func (b *SortedBuilder) finishCurrent() {
 		}
 		b.keys = append(b.keys, b.currentKey)
 		b.offsets = append(b.offsets, uint64(start))
+		b.cardinality += uint64(len(values))
 		b.currentValues = b.currentValues[:0]
 	}
 	b.hasCurrent = false
@@ -136,7 +140,7 @@ func (b *SortedBuilder) finishCurrent() {
 func (b *SortedBuilder) Finish() ([]byte, error) {
 	b.finishCurrent()
 	b.finished = true
-	return assemble(b.keys, b.offsets, b.data), nil
+	return assemble(b.keys, b.offsets, b.data, b.cardinality), nil
 }
 
 func (b *SortedBuilder) extend(size int) []byte {
@@ -146,24 +150,23 @@ func (b *SortedBuilder) extend(size int) []byte {
 	return b.data[start:]
 }
 
-// FromSortedList constructs an immutable Bitmap from strictly increasing
-// ImageIDs. ImageID zero and duplicate IDs are rejected.
-func FromSortedList(ids []uint64) (Bitmap, error) {
-	data, err := FromSorted(ids)
+// FromSorted constructs an immutable Bitmap from strictly increasing ImageIDs.
+// ImageID zero and duplicate IDs are rejected.
+//
+// Construction is two-pass: the first pass validates the input and computes
+// the exact layout, and the second writes into one preallocated buffer. It
+// allocates the result once and never relocates containers.
+func FromSorted(ids []uint64) (Bitmap, error) {
+	data, err := fromSorted(ids)
 	if err != nil {
 		return Bitmap{}, err
 	}
 	return Bitmap{data: data}, nil
 }
 
-// FromSorted constructs the compact serialized representation of strictly
-// increasing ImageIDs. ImageID zero and duplicate IDs are rejected. Use
-// FromSortedList when an immediately queryable Bitmap is wanted.
-//
-// Construction is two-pass: the first pass validates the input and computes
-// the exact layout, and the second writes into one preallocated buffer. It
-// allocates the result once and never relocates containers.
-func FromSorted(ids []uint64) ([]byte, error) {
+// fromSorted builds the compact serialized representation of strictly
+// increasing ImageIDs.
+func fromSorted(ids []uint64) ([]byte, error) {
 	keyCount, totalBlocks, err := scanLayout(ids)
 	if err != nil {
 		return nil, err
@@ -173,9 +176,10 @@ func FromSorted(ids []uint64) ([]byte, error) {
 	requireAligned(out)
 	binary.LittleEndian.PutUint32(out[0:4], Magic)
 	binary.LittleEndian.PutUint16(out[4:6], Version)
-	binary.LittleEndian.PutUint16(out[6:8], FlagCompact)
+	binary.LittleEndian.PutUint16(out[6:8], FlagCompact|FlagStoredCardinality)
 	binary.LittleEndian.PutUint32(out[8:12], HeaderSize)
 	binary.LittleEndian.PutUint32(out[12:16], uint32(keyCount))
+	binary.LittleEndian.PutUint64(out[16:24], uint64(len(ids)))
 
 	keyIndex := 0
 	offset := containerBase

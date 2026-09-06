@@ -7,11 +7,11 @@ import (
 )
 
 func TestViewBasics(t *testing.T) {
-	data, err := FromSorted([]uint64{1<<48 + 1, 1<<48 + 2, 1<<48 + 3, 2<<48 + 9})
+	bitmap, err := FromSorted([]uint64{1<<48 + 1, 1<<48 + 2, 1<<48 + 3, 2<<48 + 9})
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := Open(data)
+	view, err := Open(bitmap.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,17 +29,18 @@ func TestViewBasics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	view = OpenTrusted(empty)
+	view = OpenTrusted(empty.Bytes())
 	if !view.IsEmpty() || view.Cardinality() != 0 || view.KeyCount() != 0 {
 		t.Fatal("empty bitmap invariants violated")
 	}
 }
 
 func TestOpenValidation(t *testing.T) {
-	valid, err := FromSorted([]uint64{1<<48 + 8, 1<<48 + 9, 2<<48 + 2})
+	built, err := FromSorted([]uint64{1<<48 + 8, 1<<48 + 9, 2<<48 + 2})
 	if err != nil {
 		t.Fatal(err)
 	}
+	valid := built.Bytes()
 	if _, err := Open(valid); err != nil {
 		t.Fatalf("valid bitmap rejected: %v", err)
 	}
@@ -85,13 +86,13 @@ func TestOpenValidation(t *testing.T) {
 		},
 		"bad container type": func() []byte {
 			corrupt := slices.Clone(valid)
-			offset := binary.LittleEndian.Uint64(corrupt[24:32])
+			offset := binary.LittleEndian.Uint64(corrupt[32:40])
 			binary.LittleEndian.PutUint16(corrupt[offset+2:], 7)
 			return corrupt
 		},
 		"wrong array order": func() []byte {
 			corrupt := slices.Clone(valid)
-			offset := binary.LittleEndian.Uint64(corrupt[24:32])
+			offset := binary.LittleEndian.Uint64(corrupt[32:40])
 			binary.LittleEndian.PutUint16(corrupt[offset+8:], 9)
 			binary.LittleEndian.PutUint16(corrupt[offset+10:], 8)
 			return corrupt
@@ -112,28 +113,12 @@ func TestOpenValidation(t *testing.T) {
 	}
 }
 
-func TestOpenAcceptsLegacyMagic(t *testing.T) {
-	data, err := FromSorted([]uint64{1, 2, 1<<16 + 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	binary.LittleEndian.PutUint32(data[:4], legacyMagic)
-
-	bitmap, err := Open(data)
-	if err != nil {
-		t.Fatalf("Open legacy image: %v", err)
-	}
-	want := []uint64{1, 2, 1<<16 + 3}
-	if got := bitmap.AppendTo(nil); !slices.Equal(got, want) {
-		t.Fatalf("legacy image values = %v, want %v", got, want)
-	}
-}
-
 func TestValidateRejectsOverflowingContainerOffset(t *testing.T) {
-	data, err := FromSorted([]uint64{1})
+	built, err := FromSorted([]uint64{1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	data := built.Bytes()
 	entry := binary.LittleEndian.Uint32(data[8:12])
 	binary.LittleEndian.PutUint64(data[entry+8:], ^uint64(0)-7)
 
@@ -174,11 +159,12 @@ func TestValidateRejectsReservedImageID(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			data, err := FromSorted(test.ids)
+			built, err := FromSorted(test.ids)
 			if err != nil {
 				t.Fatal(err)
 			}
-			offset := binary.LittleEndian.Uint64(data[24:32])
+			data := built.Bytes()
+			offset := binary.LittleEndian.Uint64(data[32:40])
 			test.mutate(data, offset)
 
 			if err := Validate(data); err != ErrInvalidImageID {

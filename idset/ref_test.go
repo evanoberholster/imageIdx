@@ -17,9 +17,21 @@ func TestRefBuilderAndBufferRoundTrip(t *testing.T) {
 	if !slices.Equal(replacement.ToArray(), []uint64{1, 5, 7, 9}) {
 		t.Fatalf("replacement = %v", replacement.ToArray())
 	}
-	mapped := FromBuffer(replacement.MarshalBinary())
+	mapped, err := FromBuffer(replacement.MarshalBinary())
+	if err != nil {
+		t.Fatalf("FromBuffer = %v", err)
+	}
 	if !slices.Equal(mapped.ToArray(), replacement.ToArray()) {
 		t.Fatalf("mapped = %v", mapped.ToArray())
+	}
+}
+
+func TestFromBufferRejectsCorrupt(t *testing.T) {
+	if _, err := FromBuffer([]byte{0xde, 0xad}); err == nil {
+		t.Fatal("FromBuffer accepted corrupt data")
+	}
+	if _, err := FromBuffer(nil); err == nil {
+		t.Fatal("FromBuffer accepted nil")
 	}
 }
 
@@ -34,5 +46,22 @@ func TestOperands(t *testing.T) {
 	}
 	if got := operands.Or().ToArray(); !slices.Equal(got, []uint64{1, 2, 3, 4}) {
 		t.Fatalf("Or = %v", got)
+	}
+}
+
+func TestEmptyRef(t *testing.T) {
+	empty := Empty()
+	if !empty.Valid() || !empty.IsEmpty() || empty.Cardinality() != 0 {
+		t.Fatal("Empty is not a valid empty set")
+	}
+	var zero Ref
+	if zero.Valid() {
+		t.Fatal("zero Ref reports valid")
+	}
+	if !zero.IsEmpty() || zero.Cardinality() != 0 || len(zero.ToArray()) != 0 {
+		t.Fatal("zero Ref invariants violated")
+	}
+	if zero.Contains(1) {
+		t.Fatal("zero Ref contains an ID")
 	}
 }

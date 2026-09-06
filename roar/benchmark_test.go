@@ -53,11 +53,11 @@ func buildBenchData() {
 	benchOpen = make([]benchViews, len(benchData))
 	for familyIndex, family := range benchData {
 		for listIndex, ids := range family.ids {
-			data, err := FromSorted(ids)
+			bitmap, err := FromSorted(ids)
 			if err != nil {
 				panic(err)
 			}
-			benchOpen[familyIndex].views[listIndex] = OpenTrusted(data)
+			benchOpen[familyIndex].views[listIndex] = bitmap
 			benchOpen[familyIndex].bitmaps[listIndex] = sroar.FromSortedList(ids)
 		}
 	}
@@ -156,7 +156,7 @@ func BenchmarkBuild(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
-					benchSinkBytes = result
+					benchSinkBytes = result.Bytes()
 				}
 				b.ReportMetric(float64(len(benchSinkBytes)), "bytes")
 			})

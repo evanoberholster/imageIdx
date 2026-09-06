@@ -1,23 +1,29 @@
-// Package idset provides immutable image-ID sets backed by roaring bitmaps.
-// It owns representation and serialization mechanics but no logical index,
+// Package idset provides immutable image-ID sets backed by roar bitmaps. It
+// owns representation and serialization mechanics but no logical index,
 // publication, or persistence policy.
 package idset
 
 import (
 	"sort"
 
-	"github.com/dgraph-io/sroar"
 	imageidx "github.com/evanoberholster/imageIdx"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
-// Ref is an immutable image-ID set. backing retains an owned or mmap-backed
-// serialized buffer for as long as the set is reachable.
+// Ref is an immutable image-ID set. The underlying roar bitmap may reference
+// an owned buffer or an mmap, which the caller must keep alive and unchanged
+// for the Ref's lifetime.
 type Ref struct {
-	bitmap  *sroar.Bitmap
-	backing []byte
+	bitmap roar.Bitmap
 }
 
-func Empty() Ref { return Ref{bitmap: sroar.NewBitmap()} }
+func Empty() Ref {
+	bitmap, err := roar.FromSorted(nil)
+	if err != nil {
+		return Ref{}
+	}
+	return Ref{bitmap: bitmap}
+}
 
 func New(ids []imageidx.ImageID) Ref {
 	if len(ids) == 0 {
@@ -26,65 +32,59 @@ func New(ids []imageidx.ImageID) Ref {
 	values := append([]uint64(nil), ids...)
 	sort.Slice(values, func(left, right int) bool { return values[left] < values[right] })
 	values = compact(values)
-	return Ref{bitmap: sroar.FromSortedList(values)}
+	if len(values) != 0 && values[0] == 0 {
+		values = values[1:]
+	}
+	bitmap, err := roar.FromSorted(values)
+	if err != nil {
+		return Empty()
+	}
+	return Ref{bitmap: bitmap}
 }
 
-// FromBuffer creates an immutable view over a serialized sroar buffer. The
-// caller must keep the buffer contents unchanged for the Ref's lifetime.
-func FromBuffer(buffer []byte) Ref {
-	return Ref{bitmap: sroar.FromBuffer(buffer), backing: buffer}
+// FromBuffer creates an immutable view over a serialized roar buffer. The
+// buffer is validated; the caller must keep its contents unchanged for the
+// Ref's lifetime.
+func FromBuffer(buffer []byte) (Ref, error) {
+	bitmap, err := roar.Open(buffer)
+	if err != nil {
+		return Ref{}, err
+	}
+	return Ref{bitmap: bitmap}, nil
 }
 
-func (ref Ref) Valid() bool { return ref.bitmap != nil }
+// Valid reports whether the Ref holds a real bitmap. The zero Ref is invalid.
+func (ref Ref) Valid() bool { return ref.bitmap.Bytes() != nil }
 
 func (ref Ref) Contains(id imageidx.ImageID) bool {
-	return ref.bitmap != nil && ref.bitmap.Contains(id)
+	return ref.bitmap.Contains(id)
 }
 
 func (ref Ref) Cardinality() uint64 {
-	if ref.bitmap == nil {
-		return 0
-	}
-	return uint64(ref.bitmap.GetCardinality())
+	return ref.bitmap.Cardinality()
 }
 
 func (ref Ref) IsEmpty() bool {
-	return ref.bitmap == nil || ref.bitmap.IsEmpty()
+	return ref.bitmap.IsEmpty()
 }
 
 func (ref Ref) ToArray() []imageidx.ImageID {
-	if ref.bitmap == nil {
-		return nil
-	}
-	return ref.bitmap.ToArray()
+	return ref.bitmap.AppendTo(nil)
 }
 
 // AppendTo emits IDs in ascending order without materializing the set. The
-// caller owns dst; the only allocation is the roaring iterator itself.
+// caller owns dst; no allocation occurs for a sufficient-capacity dst.
 func (ref Ref) AppendTo(dst []imageidx.ImageID) []imageidx.ImageID {
-	if ref.bitmap == nil {
-		return dst
-	}
-	cardinality := ref.bitmap.GetCardinality()
-	if cardinality == 0 {
-		return dst
-	}
-	// sroar's iterator uses 0 as its end sentinel, which is ambiguous for a
-	// set that contains ID 0, so iterate exactly cardinality times instead of
-	// stopping on the sentinel.
-	iterator := ref.bitmap.NewIterator()
-	for range cardinality {
-		dst = append(dst, iterator.Next())
-	}
-	return dst
+	return ref.bitmap.AppendTo(dst)
 }
 
-// MarshalBinary returns an owned serialized sroar image.
+// MarshalBinary returns an owned serialized roar image.
 func (ref Ref) MarshalBinary() []byte {
-	if ref.bitmap == nil {
-		return Empty().bitmap.ToBufferWithCopy()
+	data, err := ref.bitmap.MarshalBinary()
+	if err != nil {
+		return nil
 	}
-	return ref.bitmap.ToBufferWithCopy()
+	return data
 }
 
 func compact(values []uint64) []uint64 {

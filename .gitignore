@@ -19,3 +19,10 @@ coverage.*
 .context/sig-index.json
 .context/usage.json
 .gitignore
+AGENTS.md
+.github/copilot-instructions.md
+.github/copilot-instructions.md
+.github/copilot-instructions.md
+.gitignore
+gen-context.config.json
+.gitignore

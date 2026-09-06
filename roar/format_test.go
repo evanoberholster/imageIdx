@@ -42,12 +42,12 @@ func TestSerializedAlignment(t *testing.T) {
 
 	views := make([]Bitmap, len(datasets))
 	for index, ids := range datasets {
-		data, err := FromSorted(ids)
+		bitmap, err := FromSorted(ids)
 		if err != nil {
 			t.Fatalf("FromSorted(%d): %v", index, err)
 		}
-		assertAligned(t, data)
-		views[index] = OpenTrusted(data)
+		assertAligned(t, bitmap.Bytes())
+		views[index] = bitmap
 	}
 
 	builder := NewBuilder(0)
@@ -124,12 +124,13 @@ func TestGoldenBytes(t *testing.T) {
 	wantEmpty := []byte{
 		0x52, 0x4F, 0x41, 0x52, // "ROAR"
 		0x01, 0x00, // version 1
-		0x01, 0x00, // FlagCompact
-		0x10, 0x00, 0x00, 0x00, // HeaderBytes 16
+		0x03, 0x00, // FlagCompact | FlagStoredCardinality
+		0x18, 0x00, 0x00, 0x00, // HeaderBytes 24
 		0x00, 0x00, 0x00, 0x00, // KeyCount 0
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Cardinality 0
 	}
-	if string(empty) != string(wantEmpty) {
-		t.Fatalf("empty bitmap = % x, want % x", empty, wantEmpty)
+	if got := empty.Bytes(); string(got) != string(wantEmpty) {
+		t.Fatalf("empty bitmap = % x, want % x", got, wantEmpty)
 	}
 
 	one, err := FromSorted([]uint64{1<<48 + 5})
@@ -139,18 +140,19 @@ func TestGoldenBytes(t *testing.T) {
 	wantOne := []byte{
 		0x52, 0x4F, 0x41, 0x52,
 		0x01, 0x00,
-		0x01, 0x00,
-		0x10, 0x00, 0x00, 0x00,
+		0x03, 0x00,
+		0x18, 0x00, 0x00, 0x00,
 		0x01, 0x00, 0x00, 0x00, // KeyCount 1
-		// key entry: key = 1<<48, offset = 32
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Cardinality 1
+		// key entry: key = 1<<48, offset = 40
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
-		0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		// container: blocks 2, array, card 1
 		0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
 		// values: 5, padding
 		0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	}
-	if string(one) != string(wantOne) {
-		t.Fatalf("one-ID bitmap = % x, want % x", one, wantOne)
+	if got := one.Bytes(); string(got) != string(wantOne) {
+		t.Fatalf("one-ID bitmap = % x, want % x", got, wantOne)
 	}
 }

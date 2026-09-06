@@ -3,9 +3,18 @@
 // representation: a Bitmap operates directly over mmap-backed bytes without
 // decoding container objects.
 //
+// The serialized format is frozen at version 1; see FORMAT.md. Any change
+// that alters the layout must bump Version rather than modify this format.
+//
 // IDs are split into an upper 48-bit container key and a lower 16-bit value.
 // Containers are either sorted uint16 arrays (sparse) or 1,024 uint64 words
 // (dense). ImageID zero is reserved and never represents an image.
+//
+// The format is little-endian by design: all multi-byte fields are encoded
+// with the host's native little-endian order and read back with zero-copy
+// unsafe casts, trading portability for speed and compactness. Open rejects
+// big-endian hosts (ErrUnsupportedEndian); constructors and OpenTrusted
+// assume a little-endian host as a precondition of the format.
 package roar
 
 import "errors"
@@ -22,7 +31,7 @@ const (
 	// uint64 access valid and leaves room for future SIMD alignment.
 	Alignment = 8
 
-	HeaderSize          = 16
+	HeaderSize          = 24
 	KeyEntrySize        = 16
 	ContainerHeaderSize = 8
 
@@ -34,11 +43,6 @@ const (
 	// it. The value is a runtime policy, not a format guarantee.
 	ArrayToBitmapThreshold = 2048
 )
-
-// legacyMagic is the transposed "RAOR" signature emitted before Magic was
-// corrected. Open accepts it so existing version-1 images remain readable;
-// constructors always emit Magic.
-const legacyMagic uint32 = 0x524F4152
 
 const (
 	FlagCompact uint16 = 1 << iota
@@ -69,13 +73,14 @@ const (
 	ContainerBitmap
 )
 
-// header is the fixed 16-byte leading record.
+// header is the fixed 24-byte leading record.
 type header struct {
 	Magic       uint32
 	Version     uint16
 	Flags       uint16
 	HeaderBytes uint32
 	KeyCount    uint32
+	Cardinality uint64
 }
 
 // keyEntry is one fixed 16-byte record mapping an upper-48-bit key to the

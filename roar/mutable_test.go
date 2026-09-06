@@ -7,7 +7,7 @@ import (
 )
 
 func TestMutableBuilderAddRemove(t *testing.T) {
-	base, err := FromSortedList([]uint64{1, 2, 3, 4, 5})
+	base, err := FromSorted([]uint64{1, 2, 3, 4, 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,8 +44,8 @@ func TestMutableBuilderRemovalWinsOverAdd(t *testing.T) {
 }
 
 func TestMutableBuilderSetOps(t *testing.T) {
-	base, _ := FromSortedList([]uint64{1, 2, 3})
-	other, _ := FromSortedList([]uint64{2, 3, 4})
+	base, _ := FromSorted([]uint64{1, 2, 3})
+	other, _ := FromSorted([]uint64{2, 3, 4})
 
 	or := NewMutableBuilderFrom(base)
 	or.Or(other)
@@ -67,8 +67,8 @@ func TestMutableBuilderSetOps(t *testing.T) {
 }
 
 func TestMutableBuilderFlushBeforeSetOp(t *testing.T) {
-	base, _ := FromSortedList([]uint64{1, 2, 3})
-	constraint, _ := FromSortedList([]uint64{1, 3, 5})
+	base, _ := FromSorted([]uint64{1, 2, 3})
+	constraint, _ := FromSorted([]uint64{1, 3, 5})
 
 	builder := NewMutableBuilderFrom(base)
 	builder.AddMany([]uint64{4})
@@ -108,9 +108,9 @@ func TestMutableBuilderMatchesReference(t *testing.T) {
 		adds := randomSetOver(rng, pool)
 		removes := randomSetOver(rng, pool)
 
-		baseBm, _ := FromSortedList(base)
-		addBm, _ := FromSortedList(adds)
-		removeBm, _ := FromSortedList(removes)
+		baseBm, _ := FromSorted(base)
+		addBm, _ := FromSorted(adds)
+		removeBm, _ := FromSorted(removes)
 
 		builder := NewMutableBuilderFrom(baseBm)
 		builder.AddMany(adds)

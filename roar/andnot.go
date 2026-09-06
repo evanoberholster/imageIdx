@@ -26,16 +26,16 @@ func andNotContainerInto(dst *Builder, key uint64, a, b []byte) {
 	ha, hb := containerHeaderAt(a), containerHeaderAt(b)
 	switch {
 	case ha.Type == uint16(ContainerArray) && hb.Type == uint16(ContainerArray):
-		values := differenceArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
-		dst.appendArray(key, values)
+		dst.scratchValues = differenceArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
+		dst.appendArray(key, dst.scratchValues)
 	case ha.Type == uint16(ContainerArray):
-		values := filterArrayNotInBitmap(dst.scratchValues[:0], arrayValuesAt(a), bitmapWordsAt(b))
-		dst.appendArray(key, values)
+		dst.scratchValues = filterArrayNotInBitmap(dst.scratchValues[:0], arrayValuesAt(a), bitmapWordsAt(b))
+		dst.appendArray(key, dst.scratchValues)
 	case hb.Type == uint16(ContainerArray):
-		card := andNotWordsArray(dst.scratchWords, bitmapWordsAt(a), arrayValuesAt(b))
+		card := andNotWordsArray(dst.wordsScratch(), bitmapWordsAt(a), arrayValuesAt(b))
 		dst.emitWords(key, card)
 	default:
-		card := andNotWords(dst.scratchWords, bitmapWordsAt(a), bitmapWordsAt(b))
+		card := andNotWords(dst.wordsScratch(), bitmapWordsAt(a), bitmapWordsAt(b))
 		dst.emitWords(key, card)
 	}
 }

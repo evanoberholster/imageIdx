@@ -43,7 +43,7 @@ type segment struct {
 }
 
 // writeSegment writes all effective bitmap states into one ordered immutable
-// segment. Payloads are page-aligned for direct mmap use by sroar.
+// segment. Payloads are page-aligned for direct mmap use by roar.
 func writeSegment(path string, generation uint64, indexes []*Index) error {
 	ordered := append([]*Index(nil), indexes...)
 	for _, index := range ordered {
@@ -207,7 +207,10 @@ func openSegment(path string, config Config) (*segment, error) {
 			return fail()
 		}
 		previous = key
-		base := idset.FromBuffer(payload)
+		base, bufferErr := idset.FromBuffer(payload)
+		if bufferErr != nil {
+			return fail()
+		}
 		if base.Cardinality() != entry.cardinality {
 			return fail()
 		}

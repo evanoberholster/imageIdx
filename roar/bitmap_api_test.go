@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-func TestFromSortedList(t *testing.T) {
+func TestFromSorted(t *testing.T) {
 	ids := []uint64{1, 1 << 48, 1<<48 + 7, ^uint64(0)}
-	bitmap, err := FromSortedList(ids)
+	bitmap, err := FromSorted(ids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,16 +23,10 @@ func TestFromSortedList(t *testing.T) {
 			t.Errorf("Contains(%d) = false", id)
 		}
 	}
-
-	// View remains source-compatible with callers of the original API.
-	var view View = bitmap
-	if view.Cardinality() != bitmap.Cardinality() {
-		t.Fatal("View alias changed bitmap behavior")
-	}
 }
 
-func TestFromSortedListEmpty(t *testing.T) {
-	bitmap, err := FromSortedList(nil)
+func TestFromSortedEmpty(t *testing.T) {
+	bitmap, err := FromSorted(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,11 +34,11 @@ func TestFromSortedListEmpty(t *testing.T) {
 		t.Fatal("empty input produced a non-empty Bitmap")
 	}
 	if _, err := Open(bitmap.data); err != nil {
-		t.Fatalf("FromSortedList returned invalid encoding: %v", err)
+		t.Fatalf("FromSorted returned invalid encoding: %v", err)
 	}
 }
 
-func TestFromSortedListErrors(t *testing.T) {
+func TestFromSortedErrors(t *testing.T) {
 	tests := []struct {
 		name string
 		ids  []uint64
@@ -57,7 +51,7 @@ func TestFromSortedListErrors(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			bitmap, err := FromSortedList(test.ids)
+			bitmap, err := FromSorted(test.ids)
 			if err != test.want {
 				t.Fatalf("error = %v, want %v", err, test.want)
 			}
@@ -87,7 +81,7 @@ func TestBitmapZeroValue(t *testing.T) {
 		t.Fatalf("AppendTo changed destination: %v", got)
 	}
 
-	other, err := FromSortedList([]uint64{1, 1 << 16})
+	other, err := FromSorted([]uint64{1, 1 << 16})
 	if err != nil {
 		t.Fatal(err)
 	}

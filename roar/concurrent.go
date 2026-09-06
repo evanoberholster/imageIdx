@@ -41,9 +41,11 @@ func keyRange(entries []keyEntry, lo, hi uint64) (int, int) {
 // ascending into one serialization.
 func combineBuilders(builders []*Builder) []byte {
 	totalKeys, totalData := 0, 0
+	var totalCard uint64
 	for _, builder := range builders {
 		totalKeys += len(builder.keys)
 		totalData += len(builder.data)
+		totalCard += builder.cardinality
 	}
 	keys := make([]uint64, 0, totalKeys)
 	offsets := make([]uint64, 0, totalKeys)
@@ -56,7 +58,7 @@ func combineBuilders(builders []*Builder) []byte {
 		}
 		data = append(data, builder.data...)
 	}
-	return assemble(keys, offsets, data)
+	return assemble(keys, offsets, data, totalCard)
 }
 
 // runParallel executes fn over numGo contiguous key ranges and merges the

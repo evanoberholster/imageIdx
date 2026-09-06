@@ -6,20 +6,29 @@ import (
 	"unsafe"
 )
 
+// valueScratchCap is the number of uint16 values the Builder stores inline
+// for sparse merging before falling back to a heap slice. Most array
+// intersections and unions produce small results, so the common case avoids
+// allocating.
+const valueScratchCap = 64
+
 // Builder accumulates result containers in key order for materializing
 // operations such as AndInto. It is not safe for concurrent use.
 //
-// Scratch storage belongs to the Builder: an 8 KiB word buffer for dense
-// operations and a value buffer for sparse merging. Operations reuse these
-// buffers, so a caller performing one operation at a time sees no
-// per-operation scratch allocation after warmup.
+// Scratch storage belongs to the Builder. The dense word buffer is allocated
+// lazily on first use, and the sparse value buffer starts as a small inline
+// array, so array-only operations do not pay for the 8 KiB word buffer.
+// Operations reuse these buffers, so a caller performing one operation at a
+// time sees no per-operation scratch allocation after warmup.
 type Builder struct {
-	keys    []uint64
-	offsets []uint64
-	data    []byte
+	keys        []uint64
+	offsets     []uint64
+	data        []byte
+	cardinality uint64
 
 	scratchWords  []uint64
 	scratchValues []uint16
+	valuesBuf     [valueScratchCap]uint16
 }
 
 // NewBuilder returns a Builder with room for capacity containers.
@@ -27,12 +36,20 @@ func NewBuilder(capacity int) *Builder {
 	if capacity < 0 {
 		capacity = 0
 	}
-	return &Builder{
-		keys:          make([]uint64, 0, capacity),
-		offsets:       make([]uint64, 0, capacity),
-		scratchWords:  make([]uint64, BitmapWords),
-		scratchValues: make([]uint16, 0, 2*ArrayToBitmapThreshold),
+	b := &Builder{
+		keys:    make([]uint64, 0, capacity),
+		offsets: make([]uint64, 0, capacity),
 	}
+	b.scratchValues = b.valuesBuf[:0]
+	return b
+}
+
+// wordsScratch returns the dense word buffer, allocating it on first use.
+func (b *Builder) wordsScratch() []uint64 {
+	if b.scratchWords == nil {
+		b.scratchWords = make([]uint64, BitmapWords)
+	}
+	return b.scratchWords
 }
 
 // Reset clears accumulated containers while retaining allocated capacity.
@@ -41,11 +58,30 @@ func (b *Builder) Reset() {
 	b.keys = b.keys[:0]
 	b.offsets = b.offsets[:0]
 	b.data = b.data[:0]
+	b.cardinality = 0
 	b.scratchValues = b.scratchValues[:0]
 }
 
 // KeyCount returns the number of containers accumulated so far.
 func (b *Builder) KeyCount() int { return len(b.keys) }
+
+// reserveData ensures the container region can hold at least n more bytes
+// without reallocation. Callers that know an upper bound on the result size
+// use it to avoid the geometric reallocation that appending otherwise incurs.
+func (b *Builder) reserveData(n int) {
+	if n > cap(b.data) {
+		b.data = make([]byte, 0, n)
+	}
+}
+
+// reserveKeys ensures the key and offset slices can hold at least n entries
+// without reallocation.
+func (b *Builder) reserveKeys(n int) {
+	if n > cap(b.keys) {
+		b.keys = make([]uint64, 0, n)
+		b.offsets = make([]uint64, 0, n)
+	}
+}
 
 // extend grows the container region by size zeroed bytes and returns the
 // new region.
@@ -69,6 +105,7 @@ func (b *Builder) appendArray(key uint64, values []uint16) {
 	}
 	b.keys = append(b.keys, key)
 	b.offsets = append(b.offsets, uint64(start))
+	b.cardinality += uint64(len(values))
 }
 
 func (b *Builder) appendBitmap(key uint64, words []uint64, card uint32) {
@@ -83,6 +120,7 @@ func (b *Builder) appendBitmap(key uint64, words []uint64, card uint32) {
 	copy(dst, words[:BitmapWords])
 	b.keys = append(b.keys, key)
 	b.offsets = append(b.offsets, uint64(start))
+	b.cardinality += uint64(card)
 }
 
 // emitWords selects an array or bitmap container for a dense result with
@@ -93,8 +131,8 @@ func (b *Builder) emitWords(key uint64, card uint32) {
 		return
 	}
 	if card <= ArrayToBitmapThreshold {
-		values := extractWords(b.scratchValues[:0], b.scratchWords)
-		b.appendArray(key, values)
+		b.scratchValues = extractWords(b.scratchValues[:0], b.scratchWords)
+		b.appendArray(key, b.scratchValues)
 		return
 	}
 	b.appendBitmap(key, b.scratchWords, card)
@@ -110,12 +148,13 @@ func (b *Builder) emitValues(key uint64, values []uint16) {
 		b.appendArray(key, values)
 		return
 	}
-	clear(b.scratchWords)
+	words := b.wordsScratch()
+	clear(words)
 	card := uint32(len(values))
 	for _, value := range values {
-		b.scratchWords[value>>6] |= uint64(1) << (value & 63)
+		words[value>>6] |= uint64(1) << (value & 63)
 	}
-	b.appendBitmap(key, b.scratchWords, card)
+	b.appendBitmap(key, words, card)
 }
 
 func writeContainerHeader(dst []byte, blocks uint16, containerType ContainerType, card uint32) {

@@ -99,7 +99,7 @@ func TestBoundedLayersAndCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	for start := uint64(0); start < 200; start += 3 {
-		if err = index.Apply(Mutation{Add: []ImageID{start, start + 1, start + 2}}); err != nil {
+		if err = index.Apply(Mutation{Add: []ImageID{start + 1, start + 2, start + 3}}); err != nil {
 			t.Fatal(err)
 		}
 		view := index.view.Load()

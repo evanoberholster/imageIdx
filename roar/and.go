@@ -25,16 +25,16 @@ func andContainerInto(dst *Builder, key uint64, a, b []byte) {
 	ha, hb := containerHeaderAt(a), containerHeaderAt(b)
 	switch {
 	case ha.Type == uint16(ContainerArray) && hb.Type == uint16(ContainerArray):
-		values := intersectArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
-		dst.appendArray(key, values)
+		dst.scratchValues = intersectArrays(dst.scratchValues[:0], arrayValuesAt(a), arrayValuesAt(b))
+		dst.appendArray(key, dst.scratchValues)
 	case ha.Type == uint16(ContainerArray):
-		values := filterArrayByBitmap(dst.scratchValues[:0], arrayValuesAt(a), bitmapWordsAt(b))
-		dst.appendArray(key, values)
+		dst.scratchValues = filterArrayByBitmap(dst.scratchValues[:0], arrayValuesAt(a), bitmapWordsAt(b))
+		dst.appendArray(key, dst.scratchValues)
 	case hb.Type == uint16(ContainerArray):
-		values := filterArrayByBitmap(dst.scratchValues[:0], arrayValuesAt(b), bitmapWordsAt(a))
-		dst.appendArray(key, values)
+		dst.scratchValues = filterArrayByBitmap(dst.scratchValues[:0], arrayValuesAt(b), bitmapWordsAt(a))
+		dst.appendArray(key, dst.scratchValues)
 	default:
-		card := andWords(dst.scratchWords, bitmapWordsAt(a), bitmapWordsAt(b))
+		card := andWords(dst.wordsScratch(), bitmapWordsAt(a), bitmapWordsAt(b))
 		dst.emitWords(key, card)
 	}
 }
@@ -76,12 +76,13 @@ func copyContainerInto(dst *Builder, key uint64, container []byte) {
 	h := containerHeaderAt(container)
 	switch ContainerType(h.Type) {
 	case ContainerArray:
-		values := append(dst.scratchValues[:0], arrayValuesAt(container)...)
-		dst.appendArray(key, values)
+		dst.scratchValues = append(dst.scratchValues[:0], arrayValuesAt(container)...)
+		dst.appendArray(key, dst.scratchValues)
 	case ContainerBitmap:
 		words := bitmapWordsAt(container)
-		copy(dst.scratchWords, words)
-		dst.appendBitmap(key, dst.scratchWords, h.Card)
+		scratch := dst.wordsScratch()
+		copy(scratch, words)
+		dst.appendBitmap(key, scratch, h.Card)
 	}
 }
 
