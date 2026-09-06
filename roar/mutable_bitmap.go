@@ -10,9 +10,10 @@ package roar
 // the canonical format, so Freeze is zero-copy.
 //
 // A MutableBitmap is not safe for concurrent reads during mutation; use it to
-// build a result that will be shared only after Freeze. Do not copy a
-// MutableBitmap after first use: its Builder scratch may alias its own
-// inline buffer.
+// build a result that will be shared only after Freeze. Confine each
+// MutableBitmap to one goroutine: it has no locks, atomics, or reader
+// tracking. Do not copy a MutableBitmap after first use: its Builder scratch
+// may alias its own inline buffer.
 type MutableBitmap struct {
 	bitmap  Bitmap
 	builder Builder
@@ -74,11 +75,7 @@ func (m *MutableBitmap) AndNot(b Bitmap) {
 // commit materializes the builder's result into m.bitmap, recycling m.bitmap's
 // buffer only when the MutableBitmap owns it (a seeded Bitmap may be shared).
 func (m *MutableBitmap) commit() {
-	if m.owned {
-		m.bitmap = Bitmap{data: m.builder.CompactInto(m.bitmap.Bytes())}
-		return
-	}
-	m.bitmap = Bitmap{data: m.builder.Compact()}
+	m.bitmap = Bitmap{data: m.builder.finishResult(m.bitmap.Bytes(), m.owned)}
 	m.owned = true
 }
 

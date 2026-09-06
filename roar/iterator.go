@@ -149,9 +149,20 @@ func (it *Iterator) Value() uint64 {
 }
 
 // AppendTo appends all IDs in ascending order to dst. The walk runs in one
-// tight loop without per-value calls and allocates nothing; prefer it over
-// Next/Value when materializing results.
+// tight loop without per-value calls and allocates nothing when dst has
+// spare capacity; a single up-front growth covers under-sized callers.
+// Prefer it over Next/Value when materializing results.
 func (v Bitmap) AppendTo(dst []uint64) []uint64 {
+	if len(v.data) == 0 {
+		return dst
+	}
+	if n := v.Cardinality(); n > 0 {
+		if need := int(n); need > cap(dst)-len(dst) {
+			grown := make([]uint64, len(dst), len(dst)+need)
+			copy(grown, dst)
+			dst = grown
+		}
+	}
 	for _, entry := range v.keyEntries() {
 		container := v.data[entry.Offset:]
 		h := (*containerHeader)(unsafe.Pointer(unsafe.SliceData(container)))

@@ -53,3 +53,13 @@ func (b *Builder) CompactInto(reuse []byte) []byte {
 	}
 	return b.Compact()
 }
+
+// finishResult returns the accumulated result. When owned is true, reuse must
+// be exclusively owned by the result being built; otherwise a fresh owned
+// buffer is returned.
+func (b *Builder) finishResult(reuse []byte, owned bool) []byte {
+	if owned {
+		return b.CompactInto(reuse)
+	}
+	return b.Compact()
+}

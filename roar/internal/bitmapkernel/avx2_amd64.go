@@ -17,6 +17,8 @@ func andCardinalityAVX2FixedAsm(a, b []uint64) uint64
 func orCardinalityAVX2FixedAsm(a, b []uint64) uint64
 func andNotCardinalityAVX2FixedAsm(a, b []uint64) uint64
 func cardinalityAVX2FixedAsm(words []uint64) uint64
+func andMany3AVX2FixedAsm(dst, a, b, c []uint64) uint32
+func andMany4AVX2FixedAsm(dst, a, b, c, d []uint64) uint32
 
 // The AVX2 backend processes four uint64 words per 256-bit vector. It is
 // selected only when the CPU reports AVX2 support.
@@ -206,6 +208,9 @@ func andManyAVX2(dst []uint64, inputs ...[]uint64) uint32 {
 }
 
 func andMany3AVX2(dst, a, b, c []uint64) uint32 {
+	if len(dst) == fixedBitmapWords {
+		return andMany3AVX2FixedAsm(dst, a, b, c)
+	}
 	var card uint32
 	i := 0
 	for ; i+4 <= len(dst); i += 4 {
@@ -222,6 +227,9 @@ func andMany3AVX2(dst, a, b, c []uint64) uint32 {
 }
 
 func andMany4AVX2(dst, a, b, c, d []uint64) uint32 {
+	if len(dst) == fixedBitmapWords {
+		return andMany4AVX2FixedAsm(dst, a, b, c, d)
+	}
 	var card uint32
 	i := 0
 	for ; i+4 <= len(dst); i += 4 {

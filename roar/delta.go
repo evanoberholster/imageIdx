@@ -28,9 +28,9 @@ const inlineDeltaCapacity = 64
 // MutableBitmap's scratch policy. Final bitmaps are always freshly assembled
 // so Freeze stays independent of later reuse.
 //
-// DeltaBuilder is not safe for concurrent use. Do not copy a DeltaBuilder
-// after first use: pending slices and Builder scratch may alias its own
-// inline buffers.
+// DeltaBuilder is not safe for concurrent use. Confine each DeltaBuilder to
+// one goroutine. Do not copy a DeltaBuilder after first use: pending slices
+// and Builder scratch may alias its own inline buffers.
 type DeltaBuilder struct {
 	bitmap    Bitmap
 	adds      []uint64
@@ -101,7 +101,7 @@ func (m *DeltaBuilder) foldSet(operand Bitmap, keyCount, dataBytes int, op func(
 	m.flush()
 	m.fold.prepareResult(keyCount, dataBytes)
 	op(&m.fold, m.bitmap, operand)
-	m.bitmap = Bitmap{data: m.fold.Compact()}
+	m.bitmap = Bitmap{data: m.fold.finishResult(nil, false)}
 }
 
 // Reset clears the builder and returns its pending slices to the inline
@@ -138,7 +138,7 @@ func (m *DeltaBuilder) flush() {
 	}
 	m.fold.prepareResult(m.bitmap.KeyCount()+add.KeyCount(), m.bitmap.LenInBytes()+add.LenInBytes())
 	applyInto(&m.fold, m.bitmap, add, remove)
-	m.bitmap = Bitmap{data: m.fold.Compact()}
+	m.bitmap = Bitmap{data: m.fold.finishResult(nil, false)}
 }
 
 // bitmapFromUnique sorts ids in place, removes duplicates and the reserved

@@ -268,3 +268,85 @@ cardinality_avx2_fixed_loop:
 	VZEROUPPER
 	MOVQ R8, ret+24(FP)
 	RET
+
+// func andMany3AVX2FixedAsm(dst, a, b, c []uint64) uint32
+TEXT ·andMany3AVX2FixedAsm(SB), NOSPLIT, $0-100
+	MOVQ dst_base+0(FP), AX
+	MOVQ a_base+24(FP), BX
+	MOVQ b_base+48(FP), CX
+	MOVQ c_base+72(FP), DI
+	MOVQ $256, DX
+	XORQ R8, R8
+	XORQ R13, R13
+	XORQ R14, R14
+	XORQ R15, R15
+and_many3_avx2_fixed_loop:
+	VMOVDQU (BX), Y0
+	VMOVDQU (CX), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU (DI), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU Y0, (AX)
+	POPCNTQ 0(AX), R9
+	ADDQ R9, R8
+	POPCNTQ 8(AX), R10
+	ADDQ R10, R13
+	POPCNTQ 16(AX), R11
+	ADDQ R11, R14
+	POPCNTQ 24(AX), R12
+	ADDQ R12, R15
+	ADDQ $32, AX
+	ADDQ $32, BX
+	ADDQ $32, CX
+	ADDQ $32, DI
+	DECQ DX
+	JNZ and_many3_avx2_fixed_loop
+	ADDQ R13, R8
+	ADDQ R14, R8
+	ADDQ R15, R8
+	VZEROUPPER
+	MOVL R8, ret+96(FP)
+	RET
+
+// func andMany4AVX2FixedAsm(dst, a, b, c, d []uint64) uint32
+TEXT ·andMany4AVX2FixedAsm(SB), NOSPLIT, $0-124
+	MOVQ dst_base+0(FP), AX
+	MOVQ a_base+24(FP), BX
+	MOVQ b_base+48(FP), CX
+	MOVQ c_base+72(FP), DI
+	MOVQ d_base+96(FP), SI
+	MOVQ $256, DX
+	XORQ R8, R8
+	XORQ R13, R13
+	XORQ R14, R14
+	XORQ R15, R15
+and_many4_avx2_fixed_loop:
+	VMOVDQU (BX), Y0
+	VMOVDQU (CX), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU (DI), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU (SI), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU Y0, (AX)
+	POPCNTQ 0(AX), R9
+	ADDQ R9, R8
+	POPCNTQ 8(AX), R10
+	ADDQ R10, R13
+	POPCNTQ 16(AX), R11
+	ADDQ R11, R14
+	POPCNTQ 24(AX), R12
+	ADDQ R12, R15
+	ADDQ $32, AX
+	ADDQ $32, BX
+	ADDQ $32, CX
+	ADDQ $32, DI
+	ADDQ $32, SI
+	DECQ DX
+	JNZ and_many4_avx2_fixed_loop
+	ADDQ R13, R8
+	ADDQ R14, R8
+	ADDQ R15, R8
+	VZEROUPPER
+	MOVL R8, ret+120(FP)
+	RET

@@ -1,7 +1,5 @@
 package roar
 
-import "sort"
-
 // arrayLinearSearchThreshold switches array membership from a branch-light
 // linear scan to binary search. It is a runtime policy that benchmarks may
 // tune.
@@ -44,7 +42,9 @@ func lowerBoundFrom(values []uint16, from int, target uint16) int {
 	return lo
 }
 
-// arrayContains reports whether a sorted array contains x.
+// arrayContains reports whether a sorted array contains x. The binary path
+// is a manual loop to keep Contains inlinable (sort.Search closures do not
+// inline).
 func arrayContains(values []uint16, x uint16) bool {
 	if len(values) <= arrayLinearSearchThreshold {
 		for _, value := range values {
@@ -57,10 +57,16 @@ func arrayContains(values []uint16, x uint16) bool {
 		}
 		return false
 	}
-	index := sort.Search(len(values), func(i int) bool {
-		return values[i] >= x
-	})
-	return index < len(values) && values[index] == x
+	lo, hi := 0, len(values)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if values[mid] < x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo < len(values) && values[lo] == x
 }
 
 // intersectArrays writes the sorted intersection of a and b to *dst.
