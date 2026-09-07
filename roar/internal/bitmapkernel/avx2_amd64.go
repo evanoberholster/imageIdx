@@ -186,6 +186,17 @@ func cardinalityAVX2(words []uint64) uint64 {
 }
 
 func andManyAVX2(dst []uint64, inputs ...[]uint64) uint32 {
+	switch len(inputs) {
+	case 5:
+		return andMany5AVX2(dst, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4])
+	case 6:
+		return andMany6AVX2(dst, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5])
+	case 7:
+		return andMany7AVX2(dst, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6])
+	case 8:
+		return andMany8AVX2(dst, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6], inputs[7])
+	}
+
 	var card uint32
 	i := 0
 	for ; i+4 <= len(dst); i += 4 {
@@ -201,6 +212,92 @@ func andManyAVX2(dst []uint64, inputs ...[]uint64) uint32 {
 		for _, in := range inputs[1:] {
 			w &= in[i]
 		}
+		dst[i] = w
+		card += uint32(bits.OnesCount64(w))
+	}
+	return card
+}
+
+func andMany5AVX2(dst, a, b, c, d, e []uint64) uint32 {
+	var card uint32
+	i := 0
+	for ; i+4 <= len(dst); i += 4 {
+		r := archsimd.LoadUint64x4(a[i:]).
+			And(archsimd.LoadUint64x4(b[i:])).
+			And(archsimd.LoadUint64x4(c[i:])).
+			And(archsimd.LoadUint64x4(d[i:])).
+			And(archsimd.LoadUint64x4(e[i:]))
+		r.Store(dst[i:])
+		card += uint32(bits.OnesCount64(dst[i]) + bits.OnesCount64(dst[i+1]) + bits.OnesCount64(dst[i+2]) + bits.OnesCount64(dst[i+3]))
+	}
+	for ; i < len(dst); i++ {
+		w := a[i] & b[i] & c[i] & d[i] & e[i]
+		dst[i] = w
+		card += uint32(bits.OnesCount64(w))
+	}
+	return card
+}
+
+func andMany6AVX2(dst, a, b, c, d, e, f []uint64) uint32 {
+	var card uint32
+	i := 0
+	for ; i+4 <= len(dst); i += 4 {
+		r := archsimd.LoadUint64x4(a[i:]).
+			And(archsimd.LoadUint64x4(b[i:])).
+			And(archsimd.LoadUint64x4(c[i:])).
+			And(archsimd.LoadUint64x4(d[i:])).
+			And(archsimd.LoadUint64x4(e[i:])).
+			And(archsimd.LoadUint64x4(f[i:]))
+		r.Store(dst[i:])
+		card += uint32(bits.OnesCount64(dst[i]) + bits.OnesCount64(dst[i+1]) + bits.OnesCount64(dst[i+2]) + bits.OnesCount64(dst[i+3]))
+	}
+	for ; i < len(dst); i++ {
+		w := a[i] & b[i] & c[i] & d[i] & e[i] & f[i]
+		dst[i] = w
+		card += uint32(bits.OnesCount64(w))
+	}
+	return card
+}
+
+func andMany7AVX2(dst, a, b, c, d, e, f, g []uint64) uint32 {
+	var card uint32
+	i := 0
+	for ; i+4 <= len(dst); i += 4 {
+		r := archsimd.LoadUint64x4(a[i:]).
+			And(archsimd.LoadUint64x4(b[i:])).
+			And(archsimd.LoadUint64x4(c[i:])).
+			And(archsimd.LoadUint64x4(d[i:])).
+			And(archsimd.LoadUint64x4(e[i:])).
+			And(archsimd.LoadUint64x4(f[i:])).
+			And(archsimd.LoadUint64x4(g[i:]))
+		r.Store(dst[i:])
+		card += uint32(bits.OnesCount64(dst[i]) + bits.OnesCount64(dst[i+1]) + bits.OnesCount64(dst[i+2]) + bits.OnesCount64(dst[i+3]))
+	}
+	for ; i < len(dst); i++ {
+		w := a[i] & b[i] & c[i] & d[i] & e[i] & f[i] & g[i]
+		dst[i] = w
+		card += uint32(bits.OnesCount64(w))
+	}
+	return card
+}
+
+func andMany8AVX2(dst, a, b, c, d, e, f, g, h []uint64) uint32 {
+	var card uint32
+	i := 0
+	for ; i+4 <= len(dst); i += 4 {
+		r := archsimd.LoadUint64x4(a[i:]).
+			And(archsimd.LoadUint64x4(b[i:])).
+			And(archsimd.LoadUint64x4(c[i:])).
+			And(archsimd.LoadUint64x4(d[i:])).
+			And(archsimd.LoadUint64x4(e[i:])).
+			And(archsimd.LoadUint64x4(f[i:])).
+			And(archsimd.LoadUint64x4(g[i:])).
+			And(archsimd.LoadUint64x4(h[i:]))
+		r.Store(dst[i:])
+		card += uint32(bits.OnesCount64(dst[i]) + bits.OnesCount64(dst[i+1]) + bits.OnesCount64(dst[i+2]) + bits.OnesCount64(dst[i+3]))
+	}
+	for ; i < len(dst); i++ {
+		w := a[i] & b[i] & c[i] & d[i] & e[i] & f[i] & g[i] & h[i]
 		dst[i] = w
 		card += uint32(bits.OnesCount64(w))
 	}

@@ -2,6 +2,7 @@ package bitmapkernel
 
 import (
 	"math/rand/v2"
+	"strconv"
 	"testing"
 )
 
@@ -159,6 +160,26 @@ func BenchmarkAndManyVariadic3(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		_ = AndMany(dst, a, bb, c)
+	}
+}
+
+func BenchmarkAndManyVariadic5To8(b *testing.B) {
+	rng := rand.New(rand.NewPCG(21, 22))
+	inputs := make([][]uint64, 8)
+	for index := range inputs {
+		inputs[index] = make([]uint64, testWords)
+		for word := range inputs[index] {
+			inputs[index][word] = rng.Uint64()
+		}
+	}
+	dst := make([]uint64, testWords)
+	for count := 5; count <= len(inputs); count++ {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = AndMany(dst, inputs[:count]...)
+			}
+		})
 	}
 }
 

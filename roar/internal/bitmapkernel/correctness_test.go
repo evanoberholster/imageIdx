@@ -173,6 +173,28 @@ func TestFusedKernelsAgainstReference(t *testing.T) {
 	}
 }
 
+func TestGenericAndManyAgainstReference(t *testing.T) {
+	rng := rand.New(rand.NewPCG(21, 22))
+	inputs := make([][]uint64, 8)
+	for index := range inputs {
+		inputs[index] = makeShape("dense", rng)
+	}
+
+	got := make([]uint64, testWords)
+	want := make([]uint64, testWords)
+	for count := 5; count <= len(inputs); count++ {
+		gotCard := AndMany(got, inputs[:count]...)
+		copy(want, inputs[0])
+		var wantCard uint32
+		for _, input := range inputs[1:count] {
+			wantCard = refAnd(want, want, input)
+		}
+		if gotCard != wantCard || !slices.Equal(got, want) {
+			t.Fatalf("AndMany(%d) mismatch", count)
+		}
+	}
+}
+
 func refOrInto(a, b []uint64) []uint64 {
 	out := make([]uint64, len(a))
 	refOr(out, a, b)
