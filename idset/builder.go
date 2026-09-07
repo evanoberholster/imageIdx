@@ -46,9 +46,18 @@ func (builder *Builder) AndNot(ref Ref) {
 	}
 }
 
-// Cleanup is a no-op retained for API compatibility: roar has no run
-// containers to decompress.
-func (builder *Builder) Cleanup() {}
+// ApplyDelta folds additions minus removals into the builder in a single
+// pass. Invalid refs are treated as empty.
+func (builder *Builder) ApplyDelta(add, remove Ref) {
+	var addBm, removeBm roar.Bitmap
+	if add.Valid() {
+		addBm = add.bitmap
+	}
+	if remove.Valid() {
+		removeBm = remove.bitmap
+	}
+	builder.mutable.ApplyDelta(addBm, removeBm)
+}
 
 func (builder *Builder) Freeze() Ref {
 	if builder == nil || builder.mutable == nil {
@@ -62,8 +71,7 @@ func (builder *Builder) Freeze() Ref {
 // Operands collects immutable refs for roar's optimized multi-set kernels
 // without exposing concrete bitmap values to sibling packages.
 type Operands struct {
-	refs   []roar.Bitmap
-	single Ref
+	refs []roar.Bitmap
 }
 
 func NewOperands(capacity int) Operands {
@@ -74,9 +82,6 @@ func (operands *Operands) Add(ref Ref) {
 	if !ref.Valid() {
 		return
 	}
-	if len(operands.refs) == 0 {
-		operands.single = ref
-	}
 	operands.refs = append(operands.refs, ref.bitmap)
 }
 
@@ -85,7 +90,7 @@ func (operands Operands) And() Ref {
 	case 0:
 		return Empty()
 	case 1:
-		return operands.single
+		return Ref{bitmap: operands.refs[0]}
 	default:
 		return Ref{bitmap: roar.AndMany(operands.refs...)}
 	}
@@ -96,7 +101,7 @@ func (operands Operands) Or() Ref {
 	case 0:
 		return Empty()
 	case 1:
-		return operands.single
+		return Ref{bitmap: operands.refs[0]}
 	default:
 		return Ref{bitmap: roar.FastParOr(1, operands.refs...)}
 	}

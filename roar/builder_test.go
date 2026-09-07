@@ -197,3 +197,31 @@ func TestBuilderResetReinitializesScratchWhenNeeded(t *testing.T) {
 func is(err error, target error) bool {
 	return err == target
 }
+
+func TestTinyOpsAvoidDenseScratch(t *testing.T) {
+	a, err := FromSorted([]uint64{1, 2, 3, 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := FromSorted([]uint64{3, 4, 5, 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []struct {
+		name string
+		fn   func(*Builder)
+	}{
+		{"And", func(dst *Builder) { AndInto(dst, a, b) }},
+		{"Or", func(dst *Builder) { OrInto(dst, a, b) }},
+		{"AndNot", func(dst *Builder) { AndNotInto(dst, a, b) }},
+	} {
+		builder := NewBuilder(2)
+		op.fn(builder)
+		if builder.scratchWords != nil {
+			t.Fatalf("%s allocated dense scratch for tiny arrays", op.name)
+		}
+		if got := OpenTrusted(builder.Compact()).Cardinality(); op.name == "Or" && got != 6 {
+			t.Fatalf("Or cardinality = %d, want 6", got)
+		}
+	}
+}

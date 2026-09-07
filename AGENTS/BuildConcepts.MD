@@ -1,7 +1,7 @@
 # Build Concepts
 
 Operational guide for building, testing, and extending `imageIdx`. The
-`BitmapIndex.md`, `TimestampIndex.md`, `GeoIndex.md`, `Search.md`, and
+`BitmapIndex.md`, `Timeidx.md`, `Geoidx.md`, `Search.md`, and
 `RoarFormat.md` describe the implemented designs. This document records the
 cross-package contracts and the commands an agent must run before considering
 work complete.
@@ -18,7 +18,7 @@ before scalar correctness and benchmarks are stable.
 - Go: `1.27.0`
 - `github.com/dgraph-io/sroar` — immutable roaring sets (`idset` only)
 - `github.com/weaviate/sroar` — benchmark comparison baseline for `roar`
-- `github.com/golang/geo/s2` — S2 geometry (geoindex)
+- `github.com/golang/geo/s2` — S2 geometry (geoidx)
 - `github.com/pkg/errors` — indirect
 
 ## Build, Test, Benchmark
@@ -33,9 +33,9 @@ go run ./cmd/imageidx
 Per-package benchmarks:
 
 ```sh
-go test ./timestamp  -run '^$' -bench 'Benchmark(Search|Update|DeltaCapacity|BlockSize)' -benchmem
+go test ./timeidx  -run '^$' -bench 'Benchmark(Search|Update|DeltaCapacity|BlockSize)' -benchmem
 go test ./bitmapidx  -run '^$' -bench 'Benchmark(Contains|Intersect4|ApplyBatch1000)' -benchmem
-go test ./geoindex   -run '^$' -bench 'Benchmark(SingleCell|BoundingBox|BatchIngest1000)' -benchmem
+go test ./geoidx   -run '^$' -bench 'Benchmark(SingleCell|BoundingBox|BatchIngest1000)' -benchmem
 go test ./search     -run '^$' -bench 'BenchmarkCombinedSearch' -benchmem
 go test ./roar       -run '^$' -bench . -benchmem
 ```
@@ -53,8 +53,8 @@ Every change must pass `go build ./...`, `go test ./...`, and
 idset/       immutable roaring ID-set representation and buffer codec
 roar/        zero-copy immutable bitmap index (AGENTS/RoarFormat.md)
 bitmapidx/   logical bitmap predicates and bounded deltas
-timestamp/   standalone block-local timestamp index
-geoindex/    S2 level-16 spatial index (depends on idset)
+timeidx/   standalone block-local timestamp index
+geoidx/    S2 level-16 spatial index (depends on idset)
 internal/indexutil/ shared non-domain mechanisms used by all three indexes
 search/      cross-index planner and conjunctive query executor
 cmd/imageidx/ runnable one-shot and HTTP-server combined-search example
@@ -132,12 +132,12 @@ representation.
 
 ### `ImageID` is one type everywhere
 
-- `bitmapidx.ImageID`, `geoindex.ImageID`, and `timestamp.ImageID` are aliases
+- `bitmapidx.ImageID`, `geoidx.ImageID`, and `timeidx.ImageID` are aliases
   of `imageidx.ImageID`.
 - Cross-index search never converts or copies IDs solely because of package
   type differences.
 
-`ImageID(0)` is reserved/invalid in `geoindex` only; `timestamp` and `bitmapidx`
+`ImageID(0)` is reserved/invalid in `geoidx` only; `timeidx` and `bitmapidx`
 do not reserve zero.
 
 ## Core Build Concepts
@@ -155,8 +155,8 @@ Every index follows the same conceptual skeleton. New code must conform.
    memory reusable. Retired views, deltas, and mmap regions are only reclaimed
    after `WaitForPriorReaders()` guarantees no earlier reader still references
    them. `Close` performs this wait before unmapping storage.
-4. **Bounded read layers.** `Base + Frozen + Active` (bitmapidx/timestamp);
-   `Sparse + Bitmap` (geoindex). Unbounded LSM-style delta chains are forbidden;
+4. **Bounded read layers.** `Base + Frozen + Active` (bitmapidx/timeidx);
+   `Sparse + Bitmap` (geoidx). Unbounded LSM-style delta chains are forbidden;
    apply backpressure or compact instead.
 5. **SoA and fixed-width storage.** Persisted data is structure-of-arrays,
    little-endian, page-aligned, and mmap-friendly. No Go pointers are persisted;
@@ -172,8 +172,8 @@ Every index follows the same conceptual skeleton. New code must conform.
    defaults through `(Config) withDefaults() (Config, error)`. Constants are
    tunable and must not be baked into the persisted format.
 9. **Errors.** Each package defines its own exported sentinel errors prefixed
-   with the package name (e.g. `bitmapidx: ...`, `timestamp: ...`,
-   `geoindex: ...`).
+   with the package name (e.g. `bitmapidx: ...`, `timeidx: ...`,
+   `geoidx: ...`).
 
 ## Package Contracts
 
@@ -198,7 +198,7 @@ Every index follows the same conceptual skeleton. New code must conform.
   All indexes in one store share its private reader tracker; standalone indexes
   own independent trackers.
 
-### timestamp
+### timeidx
 
 - `New(Spec, Config)` follows the same stable `IndexID`/flags pattern as the
   other indexes. `Metadata` exposes a copied summary rather than mutable
@@ -214,7 +214,7 @@ Every index follows the same conceptual skeleton. New code must conform.
   layout with an atomic manifest. Markers remain `uint32`; image IDs remain
   `uint64` in a separate column.
 
-### geoindex
+### geoidx
 
 - One coordinate per image, normalized to S2 level 16 (`cellID >> 28`).
 - Sparse cells (1-4 IDs) use a fixed 4-slot SoA; dense cells (5+) use
@@ -222,14 +222,14 @@ Every index follows the same conceptual skeleton. New code must conform.
 - Searches load one private immutable `indexView` and never inspect writer-side
   mutations. The view contains 256 independently replaceable shards;
   visibility is threshold/timer driven and `Flush()` forces a boundary.
-- Public writes use explicit `geoindex.Mutation{ImageID, From, To}` values.
+- Public writes use explicit `geoidx.Mutation{ImageID, From, To}` values.
   Zero is the absent/removal sentinel, avoiding a reverse image-to-cell map.
 - `Nearest` is currently a full scan over `AppendTo()`; the expanding-S2-cap executor
   is future work. Keep its API compatible.
 - `RangesFromCellIDs` converts valid S2 cells at levels 0-16 to sorted,
   non-overlapping, inclusive level-16 `Range`s.
 - `CoverRegion(dst, region, options)` accepts reusable `CoverWorkspace` scratch
-  and caller-owned output. With sufficient capacities, the geoindex coverer
+   and caller-owned output. With sufficient capacities, the geoidx coverer
   adds no allocations; a supplied `s2.Region` implementation may allocate in
   its own methods.
 
@@ -263,14 +263,14 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 | Package | Kind | Magic | Version |
 |---|---|---|---|
-| timestamp | manifest | `0x54534d46` TSMF | 2 |
-| timestamp | WAL | `0x5453574c` TSWL | 1 |
+| timeidx | manifest | `0x54534d46` TSMF | 2 |
+| timeidx | WAL | `0x5453574c` TSWL | 1 |
 | bitmapidx | segment | `0x424d5347` BMSG | 2 |
 | bitmapidx | manifest | `0x424d4d46` BMMF | 1 |
 | bitmapidx | WAL | `0x424d574c` BMWL | 1 |
-| geoindex | storage generation | `0x47454f49` GEOI | 2 |
-| geoindex | manifest | `0x47454f4d` GEOM | 1 |
-| geoindex | WAL | `0x4745574c` GEWL | 1 |
+| geoidx | storage generation | `0x47454f49` GEOI | 2 |
+| geoidx | manifest | `0x47454f4d` GEOM | 1 |
+| geoidx | WAL | `0x4745574c` GEWL | 1 |
 
 All multi-byte integers are little-endian. All payloads are CRC32/IEEE
 checksummed. Fixed records and structural boundaries are multiples of eight;
@@ -283,15 +283,15 @@ file boundary.
 
 | Package | Constant | Value |
 |---|---|---|
-| timestamp | `DefaultBlockSize` | 65,536 entries |
-| timestamp | `DefaultDeltaCapacity` | 2,048 |
-| timestamp | `TimestampShift` | 24 |
+| timeidx | `DefaultBlockSize` | 65,536 entries |
+| timeidx | `DefaultDeltaCapacity` | 2,048 |
+| timeidx | `TimestampShift` | 24 |
 | bitmapidx | `DefaultActiveTarget` | 2,048 |
 | bitmapidx | `DefaultHardDeltaLimit` | 4,095 |
-| geoindex | `GeoS2Level` | 16 |
-| geoindex | sparse slot count (format-private) | 4 |
-| geoindex | `DefaultPublishThreshold` | 256 |
-| geoindex | `DefaultCoverCells` | 32 |
+| geoidx | `GeoS2Level` | 16 |
+| geoidx | sparse slot count (format-private) | 4 |
+| geoidx | `DefaultPublishThreshold` | 256 |
+| geoidx | `DefaultCoverCells` | 32 |
 
 These are benchmark-driven; change them only with supporting evidence.
 

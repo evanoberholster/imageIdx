@@ -61,6 +61,17 @@ func combineBuilders(builders []*Builder) []byte {
 	return assemble(keys, offsets, data, totalCard)
 }
 
+// minParallelKeys is the minimum total container count for parallel execution
+// to pay off. Smaller inputs run sequentially to avoid goroutine, sync, and
+// per-range Builder allocation overhead.
+const minParallelKeys = 32
+
+// shouldParallelize reports whether numGo-way parallel execution is worthwhile
+// for totalKeys containers.
+func shouldParallelize(totalKeys, numGo int) bool {
+	return numGo > 1 && totalKeys >= minParallelKeys
+}
+
 // runParallel executes fn over numGo contiguous key ranges and merges the
 // results. With numGo <= 1 it runs inline.
 func runParallel(numGo int, fn func(dst *Builder, lo, hi uint64)) Bitmap {
@@ -91,37 +102,58 @@ func runParallel(numGo int, fn func(dst *Builder, lo, hi uint64)) Bitmap {
 }
 
 // AndConc returns the intersection of a and b, computing container pairs in
-// parallel across up to maxConcurrency key ranges.
+// parallel across up to maxConcurrency key ranges. Small inputs run
+// sequentially.
 func AndConc(a, b Bitmap, maxConcurrency int) Bitmap {
+	if !shouldParallelize(a.KeyCount()+b.KeyCount(), maxConcurrency) {
+		return And(a, b)
+	}
 	return runParallel(maxConcurrency, func(dst *Builder, lo, hi uint64) {
 		andIntoRange(dst, a, b, lo, hi)
 	})
 }
 
 // OrConc returns the union of a and b, computing container pairs in parallel
-// across up to maxConcurrency key ranges.
+// across up to maxConcurrency key ranges. Small inputs run sequentially.
 func OrConc(a, b Bitmap, maxConcurrency int) Bitmap {
+	if !shouldParallelize(a.KeyCount()+b.KeyCount(), maxConcurrency) {
+		return Or(a, b)
+	}
 	return runParallel(maxConcurrency, func(dst *Builder, lo, hi uint64) {
 		orIntoRange(dst, a, b, lo, hi)
 	})
 }
 
 // AndNotConc returns a minus b, computed in parallel across up to
-// maxConcurrency key ranges.
+// maxConcurrency key ranges. Small inputs run sequentially.
 func AndNotConc(a, b Bitmap, maxConcurrency int) Bitmap {
+	if !shouldParallelize(a.KeyCount()+b.KeyCount(), maxConcurrency) {
+		return AndNot(a, b)
+	}
 	return runParallel(maxConcurrency, func(dst *Builder, lo, hi uint64) {
 		andNotIntoRange(dst, a, b, lo, hi)
 	})
 }
 
 // FastParOr returns the union of bitmaps, computing it in parallel across
-// numGo key ranges.
+// numGo key ranges. Small inputs fold sequentially.
 func FastParOr(numGo int, bitmaps ...Bitmap) Bitmap {
 	switch len(bitmaps) {
 	case 0:
 		return Bitmap{}
 	case 1:
 		return bitmaps[0]
+	}
+	total := 0
+	for _, bm := range bitmaps {
+		total += bm.KeyCount()
+	}
+	if !shouldParallelize(total, numGo) {
+		result := bitmaps[0]
+		for _, bm := range bitmaps[1:] {
+			result = Or(result, bm)
+		}
+		return result
 	}
 	return runParallel(numGo, func(dst *Builder, lo, hi uint64) {
 		orManyIntoRange(dst, lo, hi, bitmaps...)
@@ -237,7 +269,8 @@ func minBoundedKey(entries [][]keyEntry, positions, ends []int) (uint64, bool) {
 }
 
 // orContainers ORs the containers that share a key into dst as one container.
-// fold and buffer are caller-provided scratch reused across keys.
+// fold and buffer are caller-provided scratch reused across keys. The final
+// pair writes directly to dst to avoid an extra intermediate copy.
 func orContainers(dst, fold *Builder, buffer *[]byte, key uint64, containers [][]byte) {
 	switch len(containers) {
 	case 0:
@@ -245,13 +278,19 @@ func orContainers(dst, fold *Builder, buffer *[]byte, key uint64, containers [][
 	case 1:
 		copyContainerInto(dst, key, containers[0])
 		return
+	case 2:
+		orContainerInto(dst, key, containers[0], containers[1])
+		return
 	}
 	result := containers[0]
-	for _, container := range containers[1:] {
+	for i, container := range containers[1:] {
+		if i == len(containers)-2 {
+			orContainerInto(dst, key, result, container)
+			return
+		}
 		fold.Reset()
 		orContainerInto(fold, key, result, container)
 		*buffer = append((*buffer)[:0], fold.data...)
 		result = *buffer
 	}
-	copyContainerInto(dst, key, result)
 }

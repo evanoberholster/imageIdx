@@ -51,22 +51,39 @@ func (m *MutableBitmap) FromSortedList(ids []uint64) error {
 	return nil
 }
 
-// Or unions b into the bitmap in place.
+// Or unions b into the bitmap in place. Empty operands are skipped, and an
+// empty receiver adopts b by reference.
 func (m *MutableBitmap) Or(b Bitmap) {
+	if b.IsEmpty() {
+		return
+	}
+	if m.bitmap.IsEmpty() {
+		m.bitmap = b
+		m.owned = false
+		return
+	}
 	m.builder.prepareResult(m.bitmap.KeyCount()+b.KeyCount(), m.bitmap.LenInBytes()+b.LenInBytes())
 	OrInto(&m.builder, m.bitmap, b)
 	m.commit()
 }
 
-// And intersects b with the bitmap in place.
+// And intersects b with the bitmap in place. Empty operands produce an empty
+// result without building.
 func (m *MutableBitmap) And(b Bitmap) {
+	if m.bitmap.IsEmpty() || b.IsEmpty() {
+		m.bitmap = Bitmap{}
+		return
+	}
 	m.builder.prepareResult(min(m.bitmap.KeyCount(), b.KeyCount()), min(m.bitmap.LenInBytes(), b.LenInBytes()))
 	AndInto(&m.builder, m.bitmap, b)
 	m.commit()
 }
 
-// AndNot subtracts b from the bitmap in place.
+// AndNot subtracts b from the bitmap in place. Empty operands are no-ops.
 func (m *MutableBitmap) AndNot(b Bitmap) {
+	if b.IsEmpty() || m.bitmap.IsEmpty() {
+		return
+	}
 	m.builder.prepareResult(m.bitmap.KeyCount(), m.bitmap.LenInBytes())
 	AndNotInto(&m.builder, m.bitmap, b)
 	m.commit()

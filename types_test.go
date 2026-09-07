@@ -5,21 +5,21 @@ import (
 
 	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoindex"
-	"github.com/evanoberholster/imageIdx/timestamp"
+	"github.com/evanoberholster/imageIdx/geoidx"
+	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
 func TestIndexPackagesShareDomainTypes(t *testing.T) {
 	rootID := imageidx.ImageID(42)
 	var bitmapID bitmapidx.ImageID = rootID
-	var geoID geoindex.ImageID = bitmapID
-	var timestampID timestamp.ImageID = geoID
+	var geoID geoidx.ImageID = bitmapID
+	var timestampID timeidx.ImageID = geoID
 	if timestampID != rootID {
 		t.Fatalf("shared ImageID = %d", timestampID)
 	}
 
-	var durability timestamp.Durability = bitmapidx.DurabilitySync
-	if durability != geoindex.DurabilitySync {
+	var durability timeidx.Durability = bitmapidx.DurabilitySync
+	if durability != geoidx.DurabilitySync {
 		t.Fatalf("geo Durability = %d", durability)
 	}
 	if durability != imageidx.DurabilitySync {
@@ -33,12 +33,12 @@ func TestIndexPackagesShareDomainTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = bitmap.Close() })
-	geo, err := geoindex.New(geoindex.Spec{IndexID: 102, Flags: 7}, geoindex.Config{})
+	geo, err := geoidx.New(geoidx.Spec{IndexID: 102, Flags: 7}, geoidx.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = geo.Close() })
-	times, err := timestamp.New(timestamp.Spec{IndexID: 103, Flags: 7, Offset: 1_000}, timestamp.Config{})
+	times, err := timeidx.New(timeidx.Spec{IndexID: 103, Flags: 7, Offset: 1_000}, timeidx.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

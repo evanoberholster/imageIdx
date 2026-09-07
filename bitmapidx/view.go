@@ -164,15 +164,11 @@ func (v *indexView) effectiveBuilder() idset.Builder {
 	return builder
 }
 
-// applyDelta applies a delta's additions and removals to a Builder in place.
+// applyDelta applies a delta's additions and removals to a Builder in a
+// single pass.
 func applyDelta(dst *idset.Builder, delta *bitmapDelta) {
 	if delta == nil {
 		return
 	}
-	if delta.additions.Valid() {
-		dst.Or(delta.additions)
-	}
-	if delta.removals.Valid() {
-		dst.AndNot(delta.removals)
-	}
+	dst.ApplyDelta(delta.additions, delta.removals)
 }

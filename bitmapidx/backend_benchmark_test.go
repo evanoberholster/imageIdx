@@ -7,11 +7,11 @@ import (
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
-// These benchmarks compare the two backends on the exact set primitives
-// bitmapidx relies on: build, membership, materialization, and the
-// intersection/union/mutation patterns behind Intersect, Union, and Apply.
-// "idset" is the current sroar-backed implementation; "roar" is the
-// immutable zero-copy backend.
+// These benchmarks compare the idset wrapper against raw roar on the exact
+// set primitives bitmapidx relies on: build, membership, materialization,
+// and the intersection/union/mutation patterns behind Intersect, Union, and
+// Apply. Both sides share the roar representation; the delta between the two
+// sub-benchmarks is the wrapper overhead.
 
 func spacedIDs(count, step, shift int) []uint64 {
 	ids := make([]uint64, count)

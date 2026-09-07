@@ -18,12 +18,12 @@ import (
 
 	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoindex"
+	"github.com/evanoberholster/imageIdx/geoidx"
 	"github.com/evanoberholster/imageIdx/search"
-	"github.com/evanoberholster/imageIdx/timestamp"
+	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
-const demoQuantum = uint64(1) << timestamp.TimestampShift
+const demoQuantum = uint64(1) << timeidx.TimestampShift
 
 type searchRequest struct {
 	Start   uint64   `json:"start"`
@@ -37,8 +37,8 @@ type searchResponse struct {
 
 type demoService struct {
 	favorites *bitmapidx.Index
-	times     *timestamp.Index
-	geo       *geoindex.Index
+	times     *timeidx.Index
+	geo       *geoidx.Index
 	canonical map[imageidx.ImageID]uint64
 	demoCell  uint64
 }
@@ -136,35 +136,35 @@ func newDemoService() (*demoService, error) {
 		300: 3 * demoQuantum,
 		400: 4 * demoQuantum,
 	}
-	times, err := timestamp.New(timestamp.Spec{
+	times, err := timeidx.New(timeidx.Spec{
 		IndexID: 2,
-		Entries: []timestamp.Entry{
+		Entries: []timeidx.Entry{
 			{ImageID: 100, Timestamp: canonical[100]},
 			{ImageID: 200, Timestamp: canonical[200]},
 			{ImageID: 300, Timestamp: canonical[300]},
 			{ImageID: 400, Timestamp: canonical[400]},
 		},
-	}, timestamp.Config{})
+	}, timeidx.Config{})
 	if err != nil {
 		_ = favorites.Close()
 		return nil, err
 	}
 
-	geo, err := geoindex.New(geoindex.Spec{
+	geo, err := geoidx.New(geoidx.Spec{
 		IndexID: 3,
-		Entries: []geoindex.Entry{
+		Entries: []geoidx.Entry{
 			{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
 			{ImageID: 200, Latitude: 37.7749, Longitude: -122.4194},
 			{ImageID: 300, Latitude: 34.0522, Longitude: -118.2437},
 			{ImageID: 400, Latitude: 40.7128, Longitude: -74.0060},
 		},
-	}, geoindex.Config{})
+	}, geoidx.Config{})
 	if err != nil {
 		_ = times.Close()
 		_ = favorites.Close()
 		return nil, err
 	}
-	key, err := geoindex.KeyFromLatLng(37.7749, -122.4194)
+	key, err := geoidx.KeyFromLatLng(37.7749, -122.4194)
 	if err != nil {
 		_ = geo.Close()
 		_ = times.Close()
@@ -173,7 +173,7 @@ func newDemoService() (*demoService, error) {
 	}
 	return &demoService{
 		favorites: favorites, times: times, geo: geo,
-		canonical: canonical, demoCell: geoindex.DecodeS2Key(key),
+		canonical: canonical, demoCell: geoidx.DecodeS2Key(key),
 	}, nil
 }
 

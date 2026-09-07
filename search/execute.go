@@ -4,6 +4,8 @@ import (
 	"context"
 	"iter"
 	"slices"
+
+	"github.com/evanoberholster/imageIdx/bitmapidx"
 )
 
 // Search compiles clauses and immediately appends their sorted, unique matches
@@ -49,6 +51,13 @@ func (plan Plan) Count(workspace *Workspace) int {
 func (plan Plan) CountContext(ctx context.Context, workspace *Workspace) (int, error) {
 	if plan.IsEmpty() {
 		return 0, nil
+	}
+	// Bitmap-only plans count the intersection without materializing IDs.
+	if len(plan.stages) == 1 && plan.stages[0].kind == StageBitmap {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return int(bitmapidx.Intersect(plan.stages[0].bitmaps...).Cardinality()), nil
 	}
 	// Materialize into a private dst so it never aliases workspace scratch,
 	// which searchInto uses for per-stage collects.
@@ -131,7 +140,7 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 			continue
 		}
 		candidates := dst[start:]
-		filtered := st.filter(candidates[:0], candidates)
+		filtered := st.filter(candidates[:0], candidates, ws.scratch)
 		dst = dst[:start+len(filtered)]
 		if len(dst) == start {
 			return truncateLimit(dst, start, limit), nil

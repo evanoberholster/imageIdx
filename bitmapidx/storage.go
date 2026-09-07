@@ -3,13 +3,13 @@ package bitmapidx
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/internal/persist"
 )
 
 const (
@@ -48,7 +48,7 @@ type bitmapManifest struct {
 // NewPersistent creates and checkpoints a persistent bitmap store.
 func NewPersistent(dir string, specs []Spec, config Config, durability Durability) (*Store, error) {
 	config, err := config.withDefaults()
-	if err != nil || durability > DurabilitySync {
+	if err != nil || !durability.Valid() {
 		if err != nil {
 			return nil, err
 		}
@@ -88,7 +88,7 @@ func NewPersistent(dir string, specs []Spec, config Config, durability Durabilit
 // OpenPersistent opens a checkpoint and replays its WAL tail.
 func OpenPersistent(dir string, config Config, durability Durability) (*Store, error) {
 	config, err := config.withDefaults()
-	if err != nil || durability > DurabilitySync {
+	if err != nil || !durability.Valid() {
 		if err != nil {
 			return nil, err
 		}
@@ -179,7 +179,7 @@ func (s *Store) Checkpoint() error {
 	if s.wal == nil || s.dir == "" {
 		return ErrNotPersistent
 	}
-	offset, err := s.wal.offset()
+	offset, err := s.wal.Offset()
 	if err != nil {
 		return err
 	}
@@ -207,19 +207,7 @@ func (s *Store) Vacuum() error {
 		return err
 	}
 	s.readers.WaitForPriorReaders()
-	paths, err := filepath.Glob(filepath.Join(s.dir, "segment-*.idx"))
-	if err != nil {
-		return err
-	}
-	current := segmentPath(s.dir, s.generation)
-	for _, path := range paths {
-		if path != current {
-			if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
-	}
-	return nil
+	return persist.RemoveObsolete(s.dir, "segment-*.idx", segmentPath(s.dir, s.generation))
 }
 
 func (s *Store) Close() error {
@@ -230,7 +218,7 @@ func (s *Store) Close() error {
 	}
 	var result error
 	if s.wal != nil {
-		result = s.wal.close()
+		result = s.wal.Close()
 	}
 	s.writeMu.Unlock()
 	if s.segment != nil {
@@ -250,14 +238,12 @@ func segmentPath(dir string, generation uint64) string {
 }
 
 func writeBitmapManifest(dir string, manifest bitmapManifest) error {
-	data := make([]byte, bitmapManifestSize)
-	binary.LittleEndian.PutUint32(data[0:4], bitmapManifestMagic)
-	binary.LittleEndian.PutUint16(data[4:6], bitmapManifestVersion)
-	binary.LittleEndian.PutUint64(data[8:16], manifest.generation)
-	binary.LittleEndian.PutUint64(data[16:24], uint64(manifest.walOffset))
-	binary.LittleEndian.PutUint64(data[24:32], manifest.count)
-	binary.LittleEndian.PutUint32(data[44:48], crc32.ChecksumIEEE(data[:44]))
-	return indexutil.WriteFileAtomic(dir, "manifest.tmp", "manifest", data, 0o644)
+	data := persist.BuildManifest(bitmapManifestSize, bitmapManifestMagic, bitmapManifestVersion, 44, 44, func(data []byte) {
+		binary.LittleEndian.PutUint64(data[8:16], manifest.generation)
+		binary.LittleEndian.PutUint64(data[16:24], uint64(manifest.walOffset))
+		binary.LittleEndian.PutUint64(data[24:32], manifest.count)
+	})
+	return persist.WriteManifest(dir, data)
 }
 
 func readBitmapManifest(path string) (bitmapManifest, error) {
@@ -265,9 +251,7 @@ func readBitmapManifest(path string) (bitmapManifest, error) {
 	if err != nil {
 		return bitmapManifest{}, err
 	}
-	if len(data) != bitmapManifestSize || binary.LittleEndian.Uint32(data[0:4]) != bitmapManifestMagic ||
-		binary.LittleEndian.Uint16(data[4:6]) != bitmapManifestVersion ||
-		binary.LittleEndian.Uint32(data[44:48]) != crc32.ChecksumIEEE(data[:44]) {
+	if err := persist.VerifyManifest(data, bitmapManifestSize, bitmapManifestMagic, bitmapManifestVersion, 44, 44); err != nil {
 		return bitmapManifest{}, ErrCorruptManifest
 	}
 	return bitmapManifest{

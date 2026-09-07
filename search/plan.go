@@ -1,11 +1,12 @@
 package search
 
 import (
+	"slices"
 	"sort"
 
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoindex"
-	"github.com/evanoberholster/imageIdx/timestamp"
+	"github.com/evanoberholster/imageIdx/geoidx"
+	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
 type StageKind uint8
@@ -44,13 +45,13 @@ type stage struct {
 
 	bitmaps []*bitmapidx.Index
 
-	tsIndex *timestamp.Index
+	tsIndex *timeidx.Index
 	tsStart uint64
 	tsEnd   uint64
-	tsExact timestamp.ExactTimestampFunc
+	tsExact timeidx.ExactTimestampFunc
 
-	geoIndex  *geoindex.Index
-	geoRanges []geoindex.Range
+	geoIndex  *geoidx.Index
+	geoRanges []geoidx.Range
 }
 
 func (s *stage) metadata() Stage {
@@ -59,14 +60,18 @@ func (s *stage) metadata() Stage {
 
 // canFilter reports whether filter can verify candidates without collecting.
 // Bitmap stages always filter via FilterCandidates. Timestamp stages filter
-// only with an exact canonical lookup. Geo stages never filter: geoindex has
-// no reverse ID->cell map, so verification requires a range collect.
+// only with an exact canonical lookup. Geo stages filter by verifying
+// candidates against covered cells; filter itself falls back to
+// collect+intersect when the covered population is small relative to the
+// candidate set.
 func (s *stage) canFilter() bool {
 	switch s.kind {
 	case StageBitmap:
 		return true
 	case StageTimestamp:
 		return s.tsExact != nil
+	case StageGeo:
+		return true
 	default:
 		return false
 	}
@@ -88,7 +93,7 @@ func (s *stage) collect(dst []ImageID) []ImageID {
 	}
 }
 
-func (s *stage) filter(dst, candidates []ImageID) []ImageID {
+func (s *stage) filter(dst, candidates, scratch []ImageID) []ImageID {
 	switch s.kind {
 	case StageBitmap:
 		return bitmapidx.FilterCandidates(dst, candidates, s.bitmaps...)
@@ -103,9 +108,39 @@ func (s *stage) filter(dst, candidates []ImageID) []ImageID {
 			}
 		}
 		return dst
+	case StageGeo:
+		return geoFilter(dst, candidates, scratch, s)
 	default:
 		return append(dst, candidates...)
 	}
+}
+
+// geoFilterProbeBound bounds the verify-vs-collect decision for geo stages.
+// Verifying costs about one cursor probe per (cell, candidate) pair while
+// collecting costs a materialize plus sort per covered ID. Dense level-16
+// cell measurements put the crossover near probes <= 4*population.
+const geoFilterProbeBound = 4
+
+// geoFilter restricts candidates to the stage's ranges. Few candidates
+// relative to the covered population verify in place against covered cells;
+// otherwise it collects the ranges into scratch and intersects as before, so
+// large geo stages keep the workspace-reuse profile. Either path returns a
+// sorted subset of candidates.
+func geoFilter(dst, candidates, scratch []ImageID, s *stage) []ImageID {
+	if s.geoIndex == nil || len(s.geoRanges) == 0 || s.estimate == 0 {
+		return dst
+	}
+	if cells := s.geoIndex.CountCells(s.geoRanges); uint64(cells)*uint64(len(candidates)) <= geoFilterProbeBound*s.estimate {
+		start := len(dst)
+		dst = s.geoIndex.FilterRanges(dst, candidates, s.geoRanges)
+		slices.Sort(dst[start:])
+		return dst
+	}
+	scratch = s.geoIndex.SearchRanges(scratch[:0], s.geoRanges)
+	scratch = sortUnique(scratch)
+	start := len(dst)
+	dst = append(dst, candidates...)
+	return intersectSortedSuffix(dst, start, scratch)
 }
 
 func smallestBitmap(indexes []*bitmapidx.Index) *bitmapidx.Index {
@@ -195,7 +230,7 @@ func Compile(clauses ...Clause) (Plan, error) {
 
 	var bitmaps []*bitmapidx.Index
 	bitmapOrder := -1
-	lossyRanges := make(map[*timestamp.Index]*timestampRange)
+	lossyRanges := make(map[*timeidx.Index]*timestampRange)
 	type orderedStage struct {
 		s     stage
 		order int

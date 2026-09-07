@@ -12,8 +12,9 @@ type readToken struct {
 
 // Intersect returns the logical intersection of the supplied immutable
 // snapshots. Each operand's Active/Frozen corrections are applied first.
-// When no operand carries deltas the intersection runs directly over the raw
-// bases with a single clone.
+// Delta-free operands contribute their raw base without cloning; only
+// delta-carrying operands are materialized, and the combination runs as a
+// single N-way intersection.
 func Intersect(indexes ...*Index) idset.Ref {
 	if len(indexes) == 0 {
 		return idset.Empty()
@@ -23,31 +24,19 @@ func Intersect(indexes ...*Index) idset.Ref {
 	defer releaseReaders(tokens)
 
 	planned := planIntersection(indexes)
-	if allDeltaFree(planned) {
-		operands := idset.NewOperands(len(planned))
-		for _, index := range planned {
-			if index == nil || index.closed.Load() {
-				return idset.Empty()
-			}
-			operands.Add(index.view.Load().base)
-		}
-		return operands.And()
-	}
-
-	var result idset.Builder
-	for position, index := range planned {
+	operands := idset.NewOperands(len(planned))
+	for _, index := range planned {
 		if index == nil || index.closed.Load() {
 			return idset.Empty()
 		}
-		operand := index.view.Load().effectiveBuilder()
-		if position == 0 {
-			result = operand
-			continue
+		view := index.view.Load()
+		if view.hasDeltas() {
+			operands.Add(view.effectiveBitmap())
+		} else {
+			operands.Add(view.base)
 		}
-		result.And(operand.Freeze())
 	}
-	result.Cleanup()
-	return result.Freeze()
+	return operands.And()
 }
 
 // Union returns the logical union. Removals remain operand-aware because each
@@ -109,10 +98,36 @@ func filterCandidatesGuarded(dst, candidates []ImageID, indexes []*Index) []Imag
 		}
 		views = append(views, index.view.Load())
 	}
+	// Cursors accelerate repeated probes against delta-free bases. They are
+	// per-call scratch (never shared) and only used when the view carries no
+	// correction layers, so results match view.contains exactly.
+	var cursorStack [8]idset.Cursor
+	var useCursorStack [8]bool
+	var cursors []idset.Cursor
+	var useCursor []bool
+	if len(views) > len(cursorStack) {
+		cursors = make([]idset.Cursor, len(views))
+		useCursor = make([]bool, len(views))
+	} else {
+		cursors = cursorStack[:len(views)]
+		useCursor = useCursorStack[:len(views)]
+	}
+	for i, view := range views {
+		if !view.hasDeltas() {
+			cursors[i] = view.base.NewCursor()
+			useCursor[i] = true
+		}
+	}
 	for _, id := range candidates {
 		present := true
-		for _, view := range views {
-			if !view.contains(id) {
+		for i, view := range views {
+			var ok bool
+			if useCursor[i] {
+				ok = cursors[i].Contains(id)
+			} else {
+				ok = view.contains(id)
+			}
+			if !ok {
 				present = false
 				break
 			}
@@ -122,20 +137,6 @@ func filterCandidatesGuarded(dst, candidates []ImageID, indexes []*Index) []Imag
 		}
 	}
 	return dst
-}
-
-// allDeltaFree reports whether every index currently publishes a view with no
-// correction layers, which lets Intersect operate on the raw Bases directly.
-func allDeltaFree(indexes []*Index) bool {
-	for _, index := range indexes {
-		if index == nil {
-			return false
-		}
-		if index.view.Load().hasDeltas() {
-			return false
-		}
-	}
-	return true
 }
 
 // acquireReaders registers with each distinct tracker, deduplicating privately

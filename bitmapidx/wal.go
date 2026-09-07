@@ -2,12 +2,9 @@ package bitmapidx
 
 import (
 	"encoding/binary"
-	"errors"
 	"hash/crc32"
-	"io"
-	"os"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/internal/persist"
 )
 
 const (
@@ -17,7 +14,7 @@ const (
 )
 
 type bitmapWAL struct {
-	file *os.File
+	*persist.WAL
 }
 
 type walMutation struct {
@@ -27,11 +24,11 @@ type walMutation struct {
 }
 
 func openBitmapWAL(path string) (*bitmapWAL, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	wal, err := persist.OpenWAL(path, 0)
 	if err != nil {
 		return nil, err
 	}
-	return &bitmapWAL{file: file}, nil
+	return &bitmapWAL{WAL: wal}, nil
 }
 
 func (w *bitmapWAL) append(key Key, indexID uint64, mutation Mutation, durability Durability) error {
@@ -42,7 +39,7 @@ func (w *bitmapWAL) append(key Key, indexID uint64, mutation Mutation, durabilit
 	if count > int(^uint32(0))/8 {
 		return ErrInvalidIndex
 	}
-	payload := make([]byte, count*8)
+	payload := w.Scratch(count * 8)
 	for n, id := range mutation.Add {
 		binary.LittleEndian.PutUint64(payload[n*8:(n+1)*8], id)
 	}
@@ -60,61 +57,30 @@ func (w *bitmapWAL) append(key Key, indexID uint64, mutation Mutation, durabilit
 	binary.LittleEndian.PutUint32(header[24:28], uint32(len(mutation.Remove)))
 	binary.LittleEndian.PutUint64(header[32:40], indexID)
 	binary.LittleEndian.PutUint64(header[40:48], key.ValueID)
-	if err := indexutil.WriteFull(w.file, header); err != nil {
-		return err
-	}
-	if err := indexutil.WriteFull(w.file, payload); err != nil {
-		return err
-	}
-	if durability == DurabilitySync {
-		return w.file.Sync()
-	}
-	return nil
+	return w.AppendFrame(header, payload, durability == DurabilitySync)
 }
 
-func (w *bitmapWAL) offset() (int64, error) { return w.file.Seek(0, io.SeekEnd) }
-func (w *bitmapWAL) close() error           { return w.file.Close() }
-
 func replayBitmapWAL(path string, offset int64) ([]walMutation, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	if _, err = file.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
-	}
 	var records []walMutation
-	header := make([]byte, bitmapWALHeaderSize)
-	for {
-		_, err = io.ReadFull(file, header)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return records, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		if binary.LittleEndian.Uint32(header[0:4]) != bitmapWALMagic ||
-			binary.LittleEndian.Uint16(header[4:6]) != bitmapWALVersion {
-			return nil, ErrCorruptWAL
-		}
+	err := persist.Replay(path, offset, persist.FrameSpec{
+		HeaderSize: bitmapWALHeaderSize,
+		Magic:      bitmapWALMagic,
+		Version:    bitmapWALVersion,
+		Corrupt:    ErrCorruptWAL,
+	}, func(header []byte) (uint64, error) {
 		payloadSize := binary.LittleEndian.Uint32(header[12:16])
 		adds := binary.LittleEndian.Uint32(header[20:24])
 		removes := binary.LittleEndian.Uint32(header[24:28])
 		if uint64(payloadSize) != uint64(adds+removes)*8 {
-			return nil, ErrCorruptWAL
+			return 0, ErrCorruptWAL
 		}
-		payload := make([]byte, payloadSize)
-		_, err = io.ReadFull(file, payload)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return records, nil
+		return uint64(payloadSize), nil
+	}, func(header, payload []byte) error {
+		if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(header[16:20]) {
+			return ErrCorruptWAL
 		}
-		if err != nil || crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(header[16:20]) {
-			return nil, ErrCorruptWAL
-		}
+		adds := binary.LittleEndian.Uint32(header[20:24])
+		removes := binary.LittleEndian.Uint32(header[24:28])
 		record := walMutation{
 			key:      Key{Type: IndexType(binary.LittleEndian.Uint16(header[6:8])), ValueID: binary.LittleEndian.Uint64(header[40:48])},
 			indexID:  binary.LittleEndian.Uint64(header[32:40]),
@@ -128,5 +94,10 @@ func replayBitmapWAL(path string, offset int64) ([]walMutation, error) {
 			record.mutation.Remove[n] = binary.LittleEndian.Uint64(payload[position : position+8])
 		}
 		records = append(records, record)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	return records, nil
 }

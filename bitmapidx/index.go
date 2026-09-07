@@ -83,16 +83,7 @@ func (i *Index) PendingCompactions() int64 { return i.pending.Load() }
 // WaitIdle blocks until all background compactions have drained or ctx is
 // cancelled.
 func (i *Index) WaitIdle(ctx context.Context) error {
-	ticker := time.NewTicker(100 * time.Microsecond)
-	defer ticker.Stop()
-	for i.pending.Load() != 0 {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-	return nil
+	return indexutil.WaitForCondition(ctx, func() bool { return i.pending.Load() == 0 })
 }
 
 // Contains reports whether id is a member of the effective set. It registers

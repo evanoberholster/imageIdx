@@ -17,3 +17,6 @@ const (
 	DurabilityOS Durability = iota
 	DurabilitySync
 )
+
+// Valid reports whether d is a recognized durability level.
+func (d Durability) Valid() bool { return d <= DurabilitySync }

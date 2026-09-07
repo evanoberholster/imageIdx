@@ -78,6 +78,15 @@ func (ref Ref) AppendTo(dst []imageidx.ImageID) []imageidx.ImageID {
 	return ref.bitmap.AppendTo(dst)
 }
 
+// FilterSorted appends the candidates present in the set to dst. Candidates
+// must arrive in non-decreasing order. A sticky cursor reuses the loaded
+// container across runs of IDs that share a key, so sorted probes avoid the
+// key-table search that Contains pays per ID. It allocates nothing and
+// supports in-place filtering (dst may alias candidates' backing store).
+func (ref Ref) FilterSorted(dst, candidates []imageidx.ImageID) []imageidx.ImageID {
+	return ref.bitmap.FilterSorted(dst, candidates)
+}
+
 // MarshalBinary returns an owned serialized roar image.
 func (ref Ref) MarshalBinary() []byte {
 	data, err := ref.bitmap.MarshalBinary()
@@ -85,6 +94,12 @@ func (ref Ref) MarshalBinary() []byte {
 		return nil
 	}
 	return data
+}
+
+// Bytes returns the underlying serialized bytes without copying. The caller
+// must not modify the returned slice; the Ref retains ownership.
+func (ref Ref) Bytes() []byte {
+	return ref.bitmap.Bytes()
 }
 
 func compact(values []uint64) []uint64 {

@@ -27,3 +27,10 @@ coverage.*
 gen-context.config.json
 .contextignore
 opencode.json
+.opencode/commands/implement.md
+.opencode/commands/investigate.md
+.opencode/commands/perf.md
+.github/copilot-instructions.md
+.context/query-context.md
+.context/session.json
+.context/usage.json.nudge.lock

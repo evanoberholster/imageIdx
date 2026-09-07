@@ -94,6 +94,19 @@ func (m *DeltaBuilder) AndNot(b Bitmap) {
 	m.foldSet(b, m.bitmap.KeyCount(), m.bitmap.LenInBytes(), AndNotInto)
 }
 
+// ApplyDelta folds additions minus removals into the builder in a single
+// pass, without materializing separate union/difference bitmaps. Pending
+// additions/removals are flushed first, preserving sequential semantics.
+func (m *DeltaBuilder) ApplyDelta(add, remove Bitmap) {
+	m.flush()
+	if add.IsEmpty() && remove.IsEmpty() {
+		return
+	}
+	m.fold.prepareResult(m.bitmap.KeyCount()+add.KeyCount(), m.bitmap.LenInBytes()+add.LenInBytes())
+	applyInto(&m.fold, m.bitmap, add, remove)
+	m.bitmap = Bitmap{data: m.fold.finishResult(nil, false)}
+}
+
 // foldSet applies one whole-set operation with the shared result Builder. The
 // result is freshly assembled, so a bitmap returned by Freeze stays
 // independent of later reuse.

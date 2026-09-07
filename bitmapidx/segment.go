@@ -9,6 +9,7 @@ import (
 
 	"github.com/evanoberholster/imageIdx/idset"
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/internal/persist"
 )
 
 const (
@@ -158,12 +159,12 @@ func openSegment(path string, config Config) (*segment, error) {
 	if err != nil {
 		return nil, err
 	}
-	mapping, err := mmapFile(path)
+	mapping, err := persist.MapFile(path, ErrCorruptSegment)
 	if err != nil {
 		return nil, err
 	}
 	fail := func() (*segment, error) {
-		_ = unmapFile(mapping)
+		_ = persist.Unmap(mapping)
 		return nil, ErrCorruptSegment
 	}
 	if len(mapping) < segmentHeaderSize || len(mapping)%8 != 0 {
@@ -226,7 +227,7 @@ func openSegment(path string, config Config) (*segment, error) {
 	}
 	directory, err := NewDirectory(indexes...)
 	if err != nil {
-		_ = unmapFile(mapping)
+		_ = persist.Unmap(mapping)
 		return nil, err
 	}
 	return &segment{
@@ -246,7 +247,7 @@ func (s *segment) close() error {
 		index.workers.Wait()
 	}
 	s.readers.WaitForPriorReaders()
-	err := unmapFile(s.mapping)
+	err := persist.Unmap(s.mapping)
 	s.mapping = nil
 	return err
 }

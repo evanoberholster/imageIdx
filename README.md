@@ -3,8 +3,11 @@
 Image indexing tools written in Go 1.27. The root `imageidx` package defines
 the shared `ImageID` and durability types. The `idset` package owns immutable
 roaring representation, while logical indexes live in the
-`bitmapidx`, `timestamp`, and `geoindex` subpackages. The `roar` package is a
+`bitmapidx`, `timeidx`, and `geoidx` subpackages. The `roar` package is a
 zero-copy immutable bitmap index documented in `AGENTS/RoarFormat.md`.
+
+Pre-v1 note: `timestamp` and `geoindex` were renamed to `timeidx` and
+`geoidx`. Import paths changed; persisted formats are unchanged.
 
 ## Roar bitmap index
 
@@ -37,7 +40,7 @@ photo-database-shaped distributions.
 
 ## Timestamp index
 
-The `timestamp` package provides a scalar, block-local timestamp index designed
+The `timeidx` package provides a scalar, block-local timestamp index designed
 for large image collections. Its current implementation includes:
 
 - immutable, sorted structure-of-arrays base blocks;
@@ -50,19 +53,19 @@ for large image collections. Its current implementation includes:
 - scalar search kernels only; SIMD is reserved for a later implementation.
 
 ```go
-idx, err := timestamp.New(timestamp.Spec{
+idx, err := timeidx.New(timeidx.Spec{
 	IndexID: 1,
 	Offset:  offset,
-	Entries: []timestamp.Entry{
+	Entries: []timeidx.Entry{
 		{ImageID: 100, Timestamp: createdAt},
 	},
-}, timestamp.Config{})
+}, timeidx.Config{})
 if err != nil {
 	log.Fatal(err)
 }
 defer idx.Close()
 
-results := make([]timestamp.ImageID, 0, 256)
+results := make([]timeidx.ImageID, 0, 256)
 results = idx.Search(results, start, end)
 ```
 
@@ -72,8 +75,8 @@ Reuse a `Batch` to keep normal updates allocation-free. Mutations are created
 with `Insert`, `Delete`, and `Move`:
 
 ```go
-batch := timestamp.NewBatch(1)
-batch.Append(timestamp.Move(100, oldTimestamp, newTimestamp))
+batch := timeidx.NewBatch(1)
+batch.Append(timeidx.Move(100, oldTimestamp, newTimestamp))
 if err := idx.Apply(batch); err != nil {
 	log.Fatal(err)
 }
@@ -87,7 +90,7 @@ go run ./cmd/imageidx
 go run ./cmd/imageidx -mode server -addr :8080
 go test ./...
 go test -race ./...
-go test ./timestamp -run '^$' -bench 'Benchmark(SearchParallel|UpdateParallel)$' -benchmem
+go test ./timeidx -run '^$' -bench 'Benchmark(SearchParallel|UpdateParallel)$' -benchmem
 go test ./search -run '^$' -bench BenchmarkCombinedSearch -benchmem
 ```
 
@@ -132,19 +135,19 @@ matches := paris.AppendTo(nil)
 
 ## Geographic index
 
-The `geoindex` package stores one coordinate per image in fixed S2 level-16
+The `geoidx` package stores one coordinate per image in fixed S2 level-16
 cells. Cells with up to four images use a fixed-width sparse SoA layout; denser
 cells reuse immutable `idset.Ref` values. The read representation is split into
 private immutable shards, so a publication rebuilds only shards affected by a
 batch. Searches load one atomic generation and never inspect writer mutations.
 
 ```go
-geo, err := geoindex.New(geoindex.Spec{
+geo, err := geoidx.New(geoidx.Spec{
 	IndexID: 1,
-	Entries: []geoindex.Entry{
+	Entries: []geoidx.Entry{
 		{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
 	},
-}, geoindex.Config{})
+}, geoidx.Config{})
 if err != nil {
 	log.Fatal(err)
 }
@@ -152,11 +155,11 @@ defer geo.Close()
 
 // Small writes become visible at the configured threshold or timer. Flush is
 // available when the caller needs an explicit visibility boundary.
-losAngeles, err := geoindex.KeyFromLatLng(34.0522, -118.2437)
+losAngeles, err := geoidx.KeyFromLatLng(34.0522, -118.2437)
 if err != nil {
 	log.Fatal(err)
 }
-if err := geo.Apply([]geoindex.Mutation{
+if err := geo.Apply([]geoidx.Mutation{
 	{ImageID: 200, To: losAngeles}, // From zero means the image was absent.
 }); err != nil {
 	log.Fatal(err)
@@ -166,9 +169,9 @@ if err := geo.Flush(); err != nil {
 }
 
 cellIDs := []uint64{
-	uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(37.7749, -122.4194)).Parent(geoindex.GeoS2Level)),
+	uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(37.7749, -122.4194)).Parent(geoidx.GeoS2Level)),
 }
-ranges, err := geoindex.RangesFromCellIDs(nil, cellIDs)
+ranges, err := geoidx.RangesFromCellIDs(nil, cellIDs)
 if err != nil {
 	log.Fatal(err)
 }
@@ -187,8 +190,8 @@ the caller-supplied region's `IntersectsCell` and `ContainsCell` methods remains
 the responsibility of that region implementation.
 
 Geo persistence uses checksummed, mmap-oriented generation files, an atomic
-manifest, and a global batch WAL through `geoindex.NewPersistent` and
-`geoindex.OpenPersistent`.
+manifest, and a global batch WAL through `geoidx.NewPersistent` and
+`geoidx.OpenPersistent`.
 
 ## Combined search
 

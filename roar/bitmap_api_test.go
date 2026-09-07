@@ -95,3 +95,43 @@ func TestBitmapZeroValue(t *testing.T) {
 		t.Fatalf("AndNotCardinality = %d, want %d", got, other.Cardinality())
 	}
 }
+
+func TestEmptyOperandsShortCircuit(t *testing.T) {
+	empty := Bitmap{}
+	other, err := FromSorted([]uint64{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := And(empty, other); !got.IsEmpty() {
+		t.Fatal("And(empty, x) is not empty")
+	}
+	if got := And(other, empty); !got.IsEmpty() {
+		t.Fatal("And(x, empty) is not empty")
+	}
+	if got := Or(empty, other); !slices.Equal(got.AppendTo(nil), []uint64{1, 2, 3}) {
+		t.Fatalf("Or(empty, x) = %v", got.AppendTo(nil))
+	}
+	if got := Or(other, empty); !slices.Equal(got.AppendTo(nil), []uint64{1, 2, 3}) {
+		t.Fatalf("Or(x, empty) = %v", got.AppendTo(nil))
+	}
+	if got := AndNot(empty, other); !got.IsEmpty() {
+		t.Fatal("AndNot(empty, x) is not empty")
+	}
+	if got := AndNot(other, empty); !slices.Equal(got.AppendTo(nil), []uint64{1, 2, 3}) {
+		t.Fatalf("AndNot(x, empty) = %v", got.AppendTo(nil))
+	}
+	if got := AndMany(other, empty); !got.IsEmpty() {
+		t.Fatal("AndMany with empty is not empty")
+	}
+
+	m := NewMutableBitmapFrom(other)
+	m.And(empty)
+	if !m.Freeze().IsEmpty() {
+		t.Fatal("MutableBitmap.And(empty) is not empty")
+	}
+	m = NewMutableBitmapFrom(other)
+	m.Or(empty)
+	if got := m.Freeze().AppendTo(nil); !slices.Equal(got, []uint64{1, 2, 3}) {
+		t.Fatalf("MutableBitmap.Or(empty) = %v", got)
+	}
+}

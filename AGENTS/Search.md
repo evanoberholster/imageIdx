@@ -1,7 +1,7 @@
 # Combined Search Implementation
 
-The `search` package is the only package that imports `bitmapidx`, `timestamp`,
-and `geoindex`. It compiles conjunctive clauses into a reusable execution plan.
+The `search` package is the only package that imports `bitmapidx`, `timeidx`,
+and `geoidx`. It compiles conjunctive clauses into a reusable execution plan.
 
 ## Clauses
 
