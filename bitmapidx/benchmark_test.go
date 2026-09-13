@@ -15,7 +15,7 @@ func BenchmarkContains(b *testing.B) {
 	}
 }
 
-func BenchmarkIntersect4(b *testing.B) {
+func BenchmarkAnd4(b *testing.B) {
 	indexes := make([]*Index, 4)
 	for n := range indexes {
 		ids := make([]uint64, 20_000)
@@ -27,7 +27,7 @@ func BenchmarkIntersect4(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = Intersect(indexes...)
+		_ = And(indexes...)
 	}
 }
 
@@ -58,7 +58,7 @@ func BenchmarkAppendTo(b *testing.B) {
 	}
 }
 
-func BenchmarkUnion4(b *testing.B) {
+func BenchmarkOr4(b *testing.B) {
 	indexes := make([]*Index, 4)
 	for n := range indexes {
 		ids := make([]uint64, 20_000)
@@ -70,11 +70,11 @@ func BenchmarkUnion4(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = Union(indexes...)
+		_ = Or(indexes...)
 	}
 }
 
-func BenchmarkFilterCandidates(b *testing.B) {
+func BenchmarkFilter(b *testing.B) {
 	indexes := make([]*Index, 4)
 	for n := range indexes {
 		ids := make([]uint64, 20_000)
@@ -91,6 +91,6 @@ func BenchmarkFilterCandidates(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		buffer = FilterCandidates(buffer[:0], candidates, indexes...)
+		buffer = Filter(buffer[:0], candidates, indexes...)
 	}
 }

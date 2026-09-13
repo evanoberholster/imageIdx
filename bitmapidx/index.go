@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/idset"
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 // Index is one logical bitmap predicate: an immutable set of ImageIDs with a
@@ -41,7 +41,7 @@ func newIndex(spec Spec, config Config, readers *indexutil.ReaderTracker) (*Inde
 	if spec.Key.Type == 0 || readers == nil {
 		return nil, ErrInvalidIndex
 	}
-	base := idset.New(spec.IDs)
+	base := roar.FromUnsorted(spec.IDs)
 	idx := &Index{config: config, readers: readers}
 	idx.view.Store(&indexView{
 		version:     bitmapFormatVersion,
@@ -57,7 +57,7 @@ func newIndex(spec Spec, config Config, readers *indexutil.ReaderTracker) (*Inde
 }
 
 func newIndexFromView(view *indexView, config Config, readers *indexutil.ReaderTracker) (*Index, error) {
-	if view == nil || view.version != bitmapFormatVersion || view.indexType == 0 || !view.base.Valid() {
+	if view == nil || view.version != bitmapFormatVersion || view.indexType == 0 {
 		return nil, ErrInvalidIndex
 	}
 	idx := &Index{config: config, readers: readers}
@@ -138,7 +138,7 @@ func (i *Index) Apply(mutation Mutation) error {
 		// Case 1: very large batch. Rewrite the Base; the replacement is still
 		// published once and the old Base remains immutable for readers.
 		builder := current.effectiveBuilder()
-		applyMutation(&builder, mutation)
+		applyMutation(builder, mutation)
 		i.publishLocked(current, builder.Freeze(), nil, nil)
 		return nil
 	}
@@ -166,7 +166,7 @@ func (i *Index) Apply(mutation Mutation) error {
 // publishLocked builds the replacement view and publishes it with one atomic
 // store. It must be called with writerMu held. The returned view shares
 // metadata with old but links the supplied layers.
-func (i *Index) publishLocked(old *indexView, base idset.Ref, frozen, active *bitmapDelta) *indexView {
+func (i *Index) publishLocked(old *indexView, base roar.Bitmap, frozen, active *bitmapDelta) *indexView {
 	next := &indexView{
 		version:     old.version,
 		indexType:   old.indexType,
@@ -190,10 +190,10 @@ func (i *Index) publishLocked(old *indexView, base idset.Ref, frozen, active *bi
 func composeActive(view *indexView, mutation Mutation) *bitmapDelta {
 	states := make(map[ImageID]bool, len(mutation.Add)+len(mutation.Remove)+deltaLen(view.active))
 	if view.active != nil {
-		for _, id := range view.active.additions.ToArray() {
+		for _, id := range view.active.additions.AppendTo(nil) {
 			states[id] = true
 		}
-		for _, id := range view.active.removals.ToArray() {
+		for _, id := range view.active.removals.AppendTo(nil) {
 			states[id] = false
 		}
 	}
@@ -236,8 +236,8 @@ func deltaLen(delta *bitmapDelta) int {
 	return delta.len()
 }
 
-// applyMutation applies raw additions and removals to a Builder in place.
-func applyMutation(builder *idset.Builder, mutation Mutation) {
+// applyMutation applies raw additions and removals to a DeltaBuilder in place.
+func applyMutation(builder *roar.DeltaBuilder, mutation Mutation) {
 	if len(mutation.Add) != 0 {
 		builder.AddMany(mutation.Add)
 	}
@@ -248,9 +248,9 @@ func applyMutation(builder *idset.Builder, mutation Mutation) {
 
 // compactBase folds a delta into a replacement Base without mutating either
 // input.
-func compactBase(base idset.Ref, delta *bitmapDelta) idset.Ref {
-	builder := idset.Clone(base)
-	applyDelta(&builder, delta)
+func compactBase(base roar.Bitmap, delta *bitmapDelta) roar.Bitmap {
+	builder := roar.NewDeltaBuilderFrom(base)
+	applyDelta(builder, delta)
 	return builder.Freeze()
 }
 

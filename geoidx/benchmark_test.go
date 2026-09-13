@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 )
@@ -131,6 +132,68 @@ func BenchmarkFlushSmallBatch(b *testing.B) {
 		if err := index.Flush(); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// collectFixture builds an index over a grid spaced widely enough that each
+// coordinate forms its own cell, so sparse-heavy fixtures stay sparse and
+// dense-heavy fixtures form bitmap containers. It returns ranges covering
+// every cell.
+func collectFixture(b *testing.B, cells, perCell int) (*Index, []Range) {
+	b.Helper()
+	entries := make(map[S2Key][]ImageID, cells)
+	var id uint64 = 1
+	for c := 0; c < cells; c++ {
+		key, err := KeyFromLatLng(30.0+float64(c%100)*0.05, -120.0+float64(c/100)*0.05)
+		if err != nil {
+			b.Fatal(err)
+		}
+		list := make([]ImageID, perCell)
+		for i := range list {
+			list[i] = ImageID(id)
+			id++
+		}
+		entries[key] = append(entries[key], list...)
+	}
+	return testIndexFromCells(b, 7, entries), []Range{{Start: 0, End: ^S2Key(0)}}
+}
+
+// BenchmarkCollectVsSearchRanges gates the mutable collect path: accumulating
+// covered cells into a reused MutableBitmap and materializing once must beat
+// appending ID lists and sorting them, on both sparse-heavy and dense-heavy
+// populations.
+func BenchmarkCollectVsSearchRanges(b *testing.B) {
+	for _, fixture := range []struct {
+		name    string
+		cells   int
+		perCell int
+	}{
+		{"sparse", 2000, 2},
+		{"dense", 20, 5000},
+	} {
+		index, ranges := collectFixture(b, fixture.cells, fixture.perCell)
+		b.Run(fixture.name+"/searchRanges", func(b *testing.B) {
+			buf := make([]ImageID, 0, 1024)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				buf = index.SearchRanges(buf[:0], ranges)
+				slices.Sort(buf)
+				buf = slices.Compact(buf)
+			}
+		})
+		b.Run(fixture.name+"/mutable", func(b *testing.B) {
+			mutable := roar.NewMutableBitmap()
+			out := make([]ImageID, 0, 1024)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				mutable.Reset()
+				index.CollectRanges(mutable, ranges)
+				out = mutable.AppendTo(out[:0])
+			}
+		})
+		index.Close()
 	}
 }
 

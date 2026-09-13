@@ -1,6 +1,9 @@
 package geoidx
 
-import "github.com/evanoberholster/imageIdx/internal/indexutil"
+import (
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/roar"
+)
 
 // SearchRanges appends candidates from sorted, normalized key ranges. Covers
 // produced by CoverRegion and RangesFromCellIDs satisfy this contract. Search
@@ -34,6 +37,41 @@ func (g *Index) SearchRanges(dst []ImageID, ranges []Range) []ImageID {
 	}
 	g.readers.Release(token)
 	return dst
+}
+
+// CollectRanges accumulates the candidates of sorted, normalized key ranges
+// into the transient MutableBitmap m, which the caller resets first. Dense
+// cells fold without decoding to IDs; sparse slots stage raw IDs. Materialize
+// once with m.AppendTo for sorted, unique output. It allocates only as the
+// accumulation grows.
+func (g *Index) CollectRanges(m *roar.MutableBitmap, ranges []Range) {
+	token := g.readers.Acquire()
+	if !g.closed.Load() {
+		view := g.view.Load()
+		for rangeIndex := range ranges {
+			keyRange := ranges[rangeIndex : rangeIndex+1]
+			if keyRange[0].End < keyRange[0].Start {
+				continue
+			}
+			first := shardForKey(keyRange[0].Start)
+			if first >= geoShardCount {
+				continue
+			}
+			last := shardForKey(keyRange[0].End)
+			if last >= geoShardCount {
+				last = geoShardCount - 1
+			}
+			for shardIndex := first; shardIndex <= last; shardIndex++ {
+				shard := view.shards[shardIndex]
+				if shard == nil {
+					continue
+				}
+				shard.sparse.collectRanges(m, keyRange)
+				shard.dense.collectRanges(m, keyRange)
+			}
+		}
+	}
+	g.readers.Release(token)
 }
 
 // FilterRanges appends the candidates present in any of ranges to dst.

@@ -7,9 +7,9 @@ import (
 	"os"
 	"sort"
 
-	"github.com/evanoberholster/imageIdx/idset"
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 	"github.com/evanoberholster/imageIdx/internal/persist"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 const (
@@ -88,7 +88,7 @@ func writeSegment(path string, generation uint64, indexes []*Index) error {
 	for n, index := range ordered {
 		view := index.view.Load()
 		effective := view.effectiveBitmap()
-		payload := effective.MarshalBinary()
+		payload, _ := effective.MarshalBinary()
 		offset, seekErr := file.Seek(0, io.SeekEnd)
 		if seekErr != nil {
 			releaseReaders(tokens)
@@ -208,7 +208,7 @@ func openSegment(path string, config Config) (*segment, error) {
 			return fail()
 		}
 		previous = key
-		base, bufferErr := idset.FromBuffer(payload)
+		base, bufferErr := roar.Open(payload)
 		if bufferErr != nil {
 			return fail()
 		}

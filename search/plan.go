@@ -59,7 +59,7 @@ func (s *stage) metadata() Stage {
 }
 
 // canFilter reports whether filter can verify candidates without collecting.
-// Bitmap stages always filter via FilterCandidates. Timestamp stages filter
+// Bitmap stages always filter via Filter. Timestamp stages filter
 // only with an exact canonical lookup. Geo stages filter by verifying
 // candidates against covered cells; filter itself falls back to
 // collect+intersect when the covered population is small relative to the
@@ -93,10 +93,10 @@ func (s *stage) collect(dst []ImageID) []ImageID {
 	}
 }
 
-func (s *stage) filter(dst, candidates, scratch []ImageID) []ImageID {
+func (s *stage) filter(dst, candidates, scratch []ImageID, ws *Workspace) []ImageID {
 	switch s.kind {
 	case StageBitmap:
-		return bitmapidx.FilterCandidates(dst, candidates, s.bitmaps...)
+		return bitmapidx.Filter(dst, candidates, s.bitmaps...)
 	case StageTimestamp:
 		if s.tsExact == nil {
 			return append(dst, candidates...)
@@ -109,7 +109,7 @@ func (s *stage) filter(dst, candidates, scratch []ImageID) []ImageID {
 		}
 		return dst
 	case StageGeo:
-		return geoFilter(dst, candidates, scratch, s)
+		return geoFilter(dst, candidates, scratch, ws, s)
 	default:
 		return append(dst, candidates...)
 	}
@@ -123,10 +123,10 @@ const geoFilterProbeBound = 4
 
 // geoFilter restricts candidates to the stage's ranges. Few candidates
 // relative to the covered population verify in place against covered cells;
-// otherwise it collects the ranges into scratch and intersects as before, so
-// large geo stages keep the workspace-reuse profile. Either path returns a
-// sorted subset of candidates.
-func geoFilter(dst, candidates, scratch []ImageID, s *stage) []ImageID {
+// otherwise it collects the ranges into scratch through the workspace-owned
+// MutableBitmap and intersects as before, so large geo stages keep the
+// workspace-reuse profile. Either path returns a sorted subset of candidates.
+func geoFilter(dst, candidates, scratch []ImageID, ws *Workspace, s *stage) []ImageID {
 	if s.geoIndex == nil || len(s.geoRanges) == 0 || s.estimate == 0 {
 		return dst
 	}
@@ -136,8 +136,7 @@ func geoFilter(dst, candidates, scratch []ImageID, s *stage) []ImageID {
 		slices.Sort(dst[start:])
 		return dst
 	}
-	scratch = s.geoIndex.SearchRanges(scratch[:0], s.geoRanges)
-	scratch = sortUnique(scratch)
+	scratch = collectStage(scratch[:0], ws, s)
 	start := len(dst)
 	dst = append(dst, candidates...)
 	return intersectSortedSuffix(dst, start, scratch)
@@ -165,7 +164,7 @@ func collectBitmaps(dst []ImageID, indexes []*bitmapidx.Index) []ImageID {
 	start := len(dst)
 	dst = smallest.AppendTo(dst)
 	candidates := dst[start:]
-	filtered := bitmapidx.FilterCandidates(candidates[:0], candidates, indexes...)
+	filtered := bitmapidx.Filter(candidates[:0], candidates, indexes...)
 	return dst[:start+len(filtered)]
 }
 

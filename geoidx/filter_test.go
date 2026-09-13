@@ -3,6 +3,8 @@ package geoidx
 import (
 	"slices"
 	"testing"
+
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 // filterTestIndex builds an index with sparse cells (k1: 2 IDs, k2: 4 IDs),
@@ -161,5 +163,37 @@ func TestFilterRangesAfterPromotionAndDemotion(t *testing.T) {
 	}
 	if got := index.CountCells(query); got != countCellsForTest(index, query) {
 		t.Fatalf("CountCells after flush = %d, want %d", got, countCellsForTest(index, query))
+	}
+}
+
+func TestCollectRangesMatchesSearchRanges(t *testing.T) {
+	index, keys := filterTestIndex(t)
+	defer index.Close()
+	lo, hi := keys[0], keys[0]
+	for _, key := range keys[1:] {
+		if key < lo {
+			lo = key
+		}
+		if key > hi {
+			hi = key
+		}
+	}
+	queries := [][]Range{
+		{{Start: lo, End: hi}},
+		{{Start: keys[0], End: keys[0]}, {Start: keys[2], End: keys[2]}},
+		{{Start: hi + 1, End: hi}},
+		{{Start: 0, End: ^S2Key(0)}},
+	}
+	mutable := roar.NewMutableBitmap()
+	for _, query := range queries {
+		want := collectSorted(index, query)
+		mutable.Reset()
+		index.CollectRanges(mutable, query)
+		if got := mutable.AppendTo(nil); !slices.Equal(got, want) {
+			t.Fatalf("CollectRanges(%v) = %v, want %v", query, got, want)
+		}
+		if got := mutable.Cardinality(); got != uint64(len(want)) {
+			t.Fatalf("CollectRanges(%v) cardinality = %d, want %d", query, got, len(want))
+		}
 	}
 }

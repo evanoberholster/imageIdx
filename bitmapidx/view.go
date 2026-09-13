@@ -3,15 +3,15 @@ package bitmapidx
 import (
 	"slices"
 
-	"github.com/evanoberholster/imageIdx/idset"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 // bitmapDelta is an immutable set of recent corrections applied on top of the
 // Base: additions are IDs to include, removals are IDs to exclude. The two
 // sets are kept disjoint; if an ID is named in both, removal wins.
 type bitmapDelta struct {
-	additions idset.Ref
-	removals  idset.Ref
+	additions roar.Bitmap
+	removals  roar.Bitmap
 }
 
 // newBitmapDelta builds a delta from raw ID slices, canonicalizing the input
@@ -21,14 +21,12 @@ func newBitmapDelta(additions, removals []ImageID) *bitmapDelta {
 	if len(additions) == 0 && len(removals) == 0 {
 		return nil
 	}
-	add := idset.New(additions)
-	remove := idset.New(removals)
+	add := roar.FromUnsorted(additions)
+	remove := roar.FromUnsorted(removals)
 	// As with Apply, removal wins when an ID appears in both sets.
-	if add.Valid() && remove.Valid() {
-		builder := idset.Clone(add)
-		builder.AndNot(remove)
-		add = builder.Freeze()
-	}
+	builder := roar.NewDeltaBuilderFrom(add)
+	builder.AndNot(remove)
+	add = builder.Freeze()
 	if add.IsEmpty() && remove.IsEmpty() {
 		return nil
 	}
@@ -82,7 +80,7 @@ type indexView struct {
 	cardinality uint64
 	generation  uint64
 
-	base   idset.Ref
+	base   roar.Bitmap
 	frozen *bitmapDelta
 	active *bitmapDelta
 }
@@ -140,33 +138,33 @@ func (v *indexView) appendTo(dst []ImageID) []ImageID {
 	return dst[:start+len(values)]
 }
 
-// effectiveBitmap materializes the fully merged set as a new immutable Ref.
-// It clones the Base, so prefer contains or appendTo when a full set is not
-// required.
-func (v *indexView) effectiveBitmap() idset.Ref {
+// effectiveBitmap materializes the fully merged set as a new immutable
+// Bitmap. It clones the Base, so prefer contains or appendTo when a full set
+// is not required.
+func (v *indexView) effectiveBitmap() roar.Bitmap {
 	if v == nil {
-		return idset.Empty()
+		return roar.Bitmap{}
 	}
 	builder := v.effectiveBuilder()
 	return builder.Freeze()
 }
 
-// effectiveBuilder clones the Base into a writer-owned Builder and applies the
-// Frozen and Active corrections. The returned Builder must not escape without
-// first being frozen.
-func (v *indexView) effectiveBuilder() idset.Builder {
+// effectiveBuilder clones the Base into a writer-owned DeltaBuilder and
+// applies the Frozen and Active corrections. The returned builder must not
+// escape without first being frozen.
+func (v *indexView) effectiveBuilder() *roar.DeltaBuilder {
 	if v == nil {
-		return idset.Clone(idset.Empty())
+		return roar.NewDeltaBuilder()
 	}
-	builder := idset.Clone(v.base)
-	applyDelta(&builder, v.frozen)
-	applyDelta(&builder, v.active)
+	builder := roar.NewDeltaBuilderFrom(v.base)
+	applyDelta(builder, v.frozen)
+	applyDelta(builder, v.active)
 	return builder
 }
 
-// applyDelta applies a delta's additions and removals to a Builder in a
+// applyDelta applies a delta's additions and removals to a builder in a
 // single pass.
-func applyDelta(dst *idset.Builder, delta *bitmapDelta) {
+func applyDelta(dst *roar.DeltaBuilder, delta *bitmapDelta) {
 	if delta == nil {
 		return
 	}

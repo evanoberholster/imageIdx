@@ -37,6 +37,11 @@ const (
 	IndexTypeTag
 	IndexTypeObject
 	IndexTypeEvent
+
+	// v3 additions
+	IndexTypeRating
+	IndexTypeColorLabel
+	IndexTypeFlag
 )
 
 // Key identifies one logical bitmap predicate: an IndexType plus a value

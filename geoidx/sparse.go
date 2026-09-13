@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 type sparseRef struct {
@@ -98,6 +99,27 @@ func (s sparseRef) estimateRanges(ranges []Range) uint64 {
 		}
 	}
 	return count
+}
+
+// collectRanges stages covered sparse slots, stopping at zero padding, into
+// the transient MutableBitmap m. Duplicates canonicalize away at
+// materialization.
+func (s sparseRef) collectRanges(m *roar.MutableBitmap, ranges []Range) {
+	keyIndex := 0
+	for _, keyRange := range ranges {
+		if keyIndex < len(s.keys) && s.keys[keyIndex] < keyRange.Start {
+			keyIndex += lowerBound(s.keys[keyIndex:], keyRange.Start)
+		}
+		for keyIndex < len(s.keys) && s.keys[keyIndex] <= keyRange.End {
+			offset := keyIndex * geoSparseSlots
+			end := offset
+			for end < offset+geoSparseSlots && s.imageIDs[end] != 0 {
+				end++
+			}
+			m.AddMany(s.imageIDs[offset:end])
+			keyIndex++
+		}
+	}
 }
 
 func appendSparseIDs(dst []ImageID, values []uint64) []ImageID {

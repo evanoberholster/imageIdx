@@ -83,10 +83,10 @@ func TestAndOrWithOperandAwareRemovals(t *testing.T) {
 	defer b.Close()
 	_ = a.Apply(Mutation{Add: []ImageID{5}, Remove: []ImageID{3}})
 	_ = b.Apply(Mutation{Add: []ImageID{2}, Remove: []ImageID{4}})
-	if got := Intersect(a, b).ToArray(); !slices.Equal(got, []uint64{2}) {
+	if got := And(a, b).AppendTo(nil); !slices.Equal(got, []uint64{2}) {
 		t.Fatalf("AND = %v", got)
 	}
-	if got := Union(a, b).ToArray(); !slices.Equal(got, []uint64{1, 2, 3, 5}) {
+	if got := Or(a, b).AppendTo(nil); !slices.Equal(got, []uint64{1, 2, 3, 5}) {
 		t.Fatalf("OR = %v", got)
 	}
 }
@@ -193,7 +193,7 @@ func TestPlannerUsesBaseCardinality(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 	_ = b.Apply(Mutation{Add: []ImageID{2, 3, 4, 5, 6}})
-	planned := planIntersection([]*Index{a, b})
+	planned := planAnd([]*Index{a, b})
 	if planned[0] != b {
 		t.Fatal("planner inspected delta cardinality")
 	}

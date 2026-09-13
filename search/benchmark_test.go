@@ -3,6 +3,8 @@ package search
 import (
 	"testing"
 
+	"github.com/golang/geo/s2"
+
 	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
 	"github.com/evanoberholster/imageIdx/geoidx"
@@ -59,6 +61,55 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	}
 	workspace := NewWorkspace(10_000)
 	results := make([]ImageID, 0, 10_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		results = plan.Search(results[:0], workspace)
+	}
+}
+
+// BenchmarkGeoCollectSearch forces the geo stage down the collect+intersect
+// path: 50k bitmap candidates against ~100k covered cells far exceed the
+// verify-vs-collect probe bound, so ranges accumulate into the
+// workspace-owned MutableBitmap. Steady state must allocate nothing.
+func BenchmarkGeoCollectSearch(b *testing.B) {
+	const count = 100_000
+	bitmapIDs := make([]uint64, 0, count/2)
+	geoEntries := make([]geoidx.Entry, 0, count)
+	for id := uint64(1); id <= count; id++ {
+		if id%2 == 0 {
+			bitmapIDs = append(bitmapIDs, id)
+		}
+		geoEntries = append(geoEntries, geoidx.Entry{
+			ImageID:   id,
+			Latitude:  30.0 + float64(id%200)*0.05,
+			Longitude: -120.0 + float64(id/200)*0.05,
+		})
+	}
+	bitmap, err := bitmapidx.New(bitmapidx.Spec{
+		Key: bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1}, IndexID: 1, IDs: bitmapIDs,
+	}, bitmapidx.Config{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = bitmap.Close() })
+	geo, err := geoidx.New(geoidx.Spec{IndexID: 2, Entries: geoEntries}, geoidx.Config{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = geo.Close() })
+	cover := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(30, -120)).Parent(0))
+	geoClause, err := WithinCells(geo, cover)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	plan, err := Compile(AllBitmaps(bitmap), geoClause)
+	if err != nil {
+		b.Fatal(err)
+	}
+	workspace := NewWorkspace(count)
+	results := make([]ImageID, 0, count)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {

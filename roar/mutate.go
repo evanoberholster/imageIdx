@@ -271,20 +271,6 @@ func (m *MutableBitmap) AndNot(b Bitmap) {
 	m.foldInto(b, d.bitmap.KeyCount(), d.bitmap.LenInBytes(), AndNotInto)
 }
 
-// ApplyDelta folds additions minus removals into the accumulation in a
-// single pass.
-func (m *MutableBitmap) ApplyDelta(add, remove Bitmap) {
-	d := &m.delta
-	m.flushPending()
-	if add.IsEmpty() && remove.IsEmpty() {
-		return
-	}
-	d.fold.prepareResult(d.bitmap.KeyCount()+add.KeyCount(), d.bitmap.LenInBytes()+add.LenInBytes())
-	applyInto(&d.fold, d.bitmap, add, remove)
-	m.assemble()
-	m.folded = true
-}
-
 // Freeze materializes the accumulation as a Bitmap over the mutable's live
 // scratch: further accumulation may recycle its bytes. Clone the result to
 // retain it across mutation. When only reads follow, prefer AppendTo or

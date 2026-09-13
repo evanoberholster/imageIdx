@@ -5,13 +5,13 @@ import (
 	"slices"
 )
 
-// planIntersection returns a stable copy ordered by Base cardinality. Delta
+// planAnd returns a stable copy ordered by Base cardinality. Delta
 // sizes are intentionally absent from the comparison.
-func planIntersection(indexes []*Index) []*Index {
-	return planIntersectionInto(nil, indexes)
+func planAnd(indexes []*Index) []*Index {
+	return planAndInto(nil, indexes)
 }
 
-func planIntersectionInto(dst, indexes []*Index) []*Index {
+func planAndInto(dst, indexes []*Index) []*Index {
 	planned := append(dst, indexes...)
 	slices.SortStableFunc(planned, func(a, b *Index) int {
 		switch {

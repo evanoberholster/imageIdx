@@ -3,7 +3,7 @@ package geoidx
 import (
 	"slices"
 
-	"github.com/evanoberholster/imageIdx/idset"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 // Apply validates and queues one atomic batch of explicit cell moves. A
@@ -154,9 +154,9 @@ func deltaForShard(byShard map[int]*shardDelta, shard int) *shardDelta {
 
 // applyShardDelta folds one shard's cell deltas into a replacement shard.
 // Untouched cells are reused by reference (dense) or copied (sparse slots);
-// only affected cells are recomputed. Dense updates go through idset.Builder
-// over the existing bitmap, so neither ToArray materialization nor a re-sort
-// touches large cells. It returns nil when no cells remain.
+// only affected cells are recomputed. Dense updates go through a
+// DeltaBuilder over the existing bitmap, so neither AppendTo materialization
+// nor a re-sort touches large cells. It returns nil when no cells remain.
 func applyShardDelta(previous *geoShard, delta *shardDelta) *geoShard {
 	var oldSparse sparseRef
 	var oldDense bitmapRef
@@ -174,7 +174,7 @@ func applyShardDelta(previous *geoShard, delta *shardDelta) *geoShard {
 	}
 	slices.Sort(affected)
 
-	promotions := make(map[S2Key]idset.Ref)
+	promotions := make(map[S2Key]roar.Bitmap)
 	sparseKeys := make([]S2Key, 0, len(oldSparse.keys)+len(affected))
 	sparseIDs := make([]uint64, 0, (len(oldSparse.keys)+len(affected))*geoSparseSlots)
 	emitSparse := func(key S2Key, list []ImageID) {
@@ -182,7 +182,7 @@ func applyShardDelta(previous *geoShard, delta *shardDelta) *geoShard {
 		case len(list) == 0:
 			return
 		case len(list) > geoSparseSlots:
-			promotions[key] = idset.New(list)
+			promotions[key] = roar.FromUnsorted(list)
 			return
 		}
 		sparseKeys = append(sparseKeys, key)
@@ -233,9 +233,9 @@ func applyShardDelta(previous *geoShard, delta *shardDelta) *geoShard {
 	}
 
 	// Dense walk in key order: reuse untouched bitmaps, fold affected cells
-	// through idset.Builder, absorb sparse promotions at their key position.
+	// through a DeltaBuilder, absorb sparse promotions at their key position.
 	var denseKeys []S2Key
-	var denseBitmaps []idset.Ref
+	var denseBitmaps []roar.Bitmap
 	di, ai := 0, 0
 	for di < len(oldDense.keys) || ai < len(affected) {
 		var key S2Key
@@ -274,11 +274,8 @@ func applyShardDelta(previous *geoShard, delta *shardDelta) *geoShard {
 			continue
 		}
 		updated := updateDenseCell(oldRef, rems, adds)
-		if !updated.Valid() {
-			continue
-		}
 		if updated.Cardinality() <= geoSparseSlots {
-			demoteSparseCell(&sparseKeys, &sparseIDs, key, updated.ToArray())
+			demoteSparseCell(&sparseKeys, &sparseIDs, key, updated.AppendTo(nil))
 			continue
 		}
 		denseKeys = append(denseKeys, key)
@@ -294,11 +291,11 @@ func applyShardDelta(previous *geoShard, delta *shardDelta) *geoShard {
 	}
 }
 
-// updateDenseCell folds removals and additions into a copy of ref through
-// idset.Builder, which stages small batches without allocating and merges in
+// updateDenseCell folds removals and additions into a copy of ref through a
+// DeltaBuilder, which stages small batches without allocating and merges in
 // one pass at Freeze. The source bitmap is never mutated.
-func updateDenseCell(ref idset.Ref, rems, adds []ImageID) idset.Ref {
-	builder := idset.Clone(ref)
+func updateDenseCell(ref roar.Bitmap, rems, adds []ImageID) roar.Bitmap {
+	builder := roar.NewDeltaBuilderFrom(ref)
 	for _, id := range rems {
 		builder.Remove(id)
 	}

@@ -1,13 +1,19 @@
 package search
 
-import imageidx "github.com/evanoberholster/imageIdx"
+import (
+	imageidx "github.com/evanoberholster/imageIdx"
+	"github.com/evanoberholster/imageIdx/roar"
+)
 
 type ImageID = imageidx.ImageID
 
 // Workspace retains intermediate candidates between searches. A Workspace is
-// reusable but must not be used by concurrent searches.
+// reusable but must not be used by concurrent searches. It owns a transient
+// roar.MutableBitmap for geo-stage accumulation; steady-state queries using
+// it allocate nothing.
 type Workspace struct {
 	scratch []ImageID
+	mutable *roar.MutableBitmap
 }
 
 func NewWorkspace(capacity int) *Workspace {
@@ -21,7 +27,23 @@ func NewWorkspace(capacity int) *Workspace {
 func (workspace *Workspace) Reset() {
 	if workspace != nil {
 		workspace.scratch = workspace.scratch[:0]
+		if workspace.mutable != nil {
+			workspace.mutable.Reset()
+		}
 	}
+}
+
+// mutableBitmap returns the workspace-owned transient set accumulator,
+// allocating it on first use. Callers must Reset it before accumulating;
+// Workspace.Reset clears it for the next pooled query.
+func (workspace *Workspace) mutableBitmap() *roar.MutableBitmap {
+	if workspace == nil {
+		return roar.NewMutableBitmap()
+	}
+	if workspace.mutable == nil {
+		workspace.mutable = roar.NewMutableBitmap()
+	}
+	return workspace.mutable
 }
 
 // Len returns the number of buffered intermediate IDs.

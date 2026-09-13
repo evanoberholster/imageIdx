@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestFilterCandidatesSupportsInPlaceCandidates(t *testing.T) {
+func TestFilterSupportsInPlaceCandidates(t *testing.T) {
 	first, err := New(Spec{Key: Key{Type: IndexTypeTag, ValueID: 1}, IndexID: 1, IDs: []ImageID{1, 2, 3}}, Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -18,9 +18,9 @@ func TestFilterCandidatesSupportsInPlaceCandidates(t *testing.T) {
 	defer second.Close()
 
 	candidates := []ImageID{1, 2, 3, 4}
-	got := FilterCandidates(candidates[:0], candidates, first, second)
+	got := Filter(candidates[:0], candidates, first, second)
 	if !slices.Equal(got, []ImageID{2, 3}) {
-		t.Fatalf("FilterCandidates = %v", got)
+		t.Fatalf("Filter = %v", got)
 	}
 }
 

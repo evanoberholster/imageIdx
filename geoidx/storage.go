@@ -7,9 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/evanoberholster/imageIdx/idset"
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 	"github.com/evanoberholster/imageIdx/internal/persist"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 func writeGeoGeneration(path string, storageGeneration uint64, view *indexView) error {
@@ -205,7 +205,7 @@ func readGeoGeneration(path string, config Config) (*Index, uint64, error) {
 	if err != nil {
 		return fail(err)
 	}
-	bitmaps := make([]idset.Ref, bitmapCount)
+	bitmaps := make([]roar.Bitmap, bitmapCount)
 	for index := range bitmaps {
 		encoded := bitmapMetaBytes[index*geoBitmapMetaSize : (index+1)*geoBitmapMetaSize]
 		offset := binary.LittleEndian.Uint64(encoded[0:8])
@@ -259,7 +259,7 @@ func flattenView(view *indexView) (sparseRef, bitmapRef) {
 	sparseKeys := make([]S2Key, 0, view.sparseCellCount)
 	sparseIDs := make([]uint64, 0, view.sparseCellCount*geoSparseSlots)
 	denseKeys := make([]S2Key, 0, view.denseCellCount)
-	denseBitmaps := make([]idset.Ref, 0, view.denseCellCount)
+	denseBitmaps := make([]roar.Bitmap, 0, view.denseCellCount)
 	for _, shard := range view.shards {
 		if shard == nil {
 			continue
@@ -321,10 +321,10 @@ func partitionsOverlap(a, b []S2Key) bool {
 	return false
 }
 
-func safeBitmapFromBuffer(data []byte) (idset.Ref, error) {
-	result, err := idset.FromBuffer(data)
+func safeBitmapFromBuffer(data []byte) (roar.Bitmap, error) {
+	result, err := roar.Open(data)
 	if err != nil {
-		return idset.Ref{}, ErrCorruptStorage
+		return roar.Bitmap{}, ErrCorruptStorage
 	}
 	return result, nil
 }
