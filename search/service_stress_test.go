@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoidx"
+
 	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
@@ -30,8 +30,8 @@ type stressFixture struct {
 	service *Service
 	bitmap  *bitmapidx.Index
 	times   *timeidx.Index
-	geo     *geoidx.Index
-	cell    geoidx.S2Key
+	geo     *bitmapidx.FieldIndex
+	cell    bitmapidx.S2Key
 	quantum uint64
 }
 
@@ -42,13 +42,13 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 
 	bitmapIDs := make([]uint64, 0, initial/2)
 	records := make([]timeidx.Entry, 0, initial)
-	geoEntries := make([]geoidx.Entry, 0, initial)
+	geoEntries := make([]bitmapidx.GeoEntry, 0, initial)
 	for id := uint64(1); id <= initial; id++ {
 		if id%2 == 0 {
 			bitmapIDs = append(bitmapIDs, id)
 		}
 		records = append(records, timeidx.Entry{Timestamp: id * quantum, ImageID: ImageID(id)})
-		geoEntries = append(geoEntries, geoidx.Entry{ImageID: id, Latitude: 37, Longitude: -122})
+		geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122})
 	}
 
 	bitmap, err := bitmapidx.New(bitmapidx.Spec{
@@ -66,17 +66,17 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 	}
 	tb.Cleanup(func() { _ = timeIndex.Close() })
 
-	geo, err := geoidx.New(geoidx.Spec{IndexID: 3, Entries: geoEntries}, geoidx.Config{})
+	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(3), geoEntries, bitmapidx.FieldConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { _ = geo.Close() })
 
-	cell, err := geoidx.KeyFromLatLng(37, -122)
+	cell, err := bitmapidx.KeyFromLatLng(37, -122)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	geoClause, err := WithinCells(geo, geoidx.DecodeS2Key(cell))
+	geoClause, err := WithinCells(geo, bitmapidx.DecodeS2Key(cell))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -173,22 +173,13 @@ func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize 
 					return
 				}
 				service.ReleaseBatch(batch)
-				mutations := make([]geoidx.Mutation, 0, len(ids))
+				moves := make([]bitmapidx.Move, 0, len(ids))
 				for _, id := range ids {
-					mutations = append(mutations, geoidx.Mutation{ImageID: id, From: 0, To: fixture.cell})
+					moves = append(moves, bitmapidx.Move{ImageID: id, To: int64(fixture.cell)})
 				}
-				if err := fixture.geo.Apply(mutations); err != nil {
+				if err := fixture.geo.Move(moves...); err != nil {
 					errs <- err
 					return
-				}
-				// Flush is the geo visibility boundary and takes the writer
-				// lock; twice per writer is enough for the final count to
-				// observe all moves.
-				if round%5 == 4 {
-					if err := fixture.geo.Flush(); err != nil {
-						errs <- err
-						return
-					}
 				}
 			}
 		}(w)
@@ -343,7 +334,7 @@ func BenchmarkServiceStaleVsFreshPlan(b *testing.B) {
 	if _, err := runLoad(fixture, 0, stressWriters, 0, stressWriteRound, stressBatchSize); err != nil {
 		b.Fatal(err)
 	}
-	geoClause, err := WithinCells(fixture.geo, geoidx.DecodeS2Key(fixture.cell))
+	geoClause, err := WithinCells(fixture.geo, bitmapidx.DecodeS2Key(fixture.cell))
 	if err != nil {
 		b.Fatal(err)
 	}

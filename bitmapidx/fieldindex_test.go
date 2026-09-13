@@ -633,8 +633,101 @@ func TestFieldIndexClose(t *testing.T) {
 	if err := index.Add(Entry{ImageID: 1, Value: StringValue("x")}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Add after close = %v, want ErrClosed", err)
 	}
+	// Writes fail even when the batch is empty.
+	if err := index.Add(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("empty Add after close = %v, want ErrClosed", err)
+	}
+	if err := index.Apply(FieldMutation{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("empty Apply after close = %v, want ErrClosed", err)
+	}
+	// Reads report empty results without errors.
+	if present, err := index.Contains(1, StringValue("x")); err != nil || present {
+		t.Fatalf("Contains after close = %v, %v; want false, nil", present, err)
+	}
+	if key, ok, err := index.KeyForValue(StringValue("x")); err != nil || ok || key != (FieldKey{}) {
+		t.Fatalf("KeyForValue after close = %+v, %v, %v; want zero, false, nil", key, ok, err)
+	}
+	if ids, err := index.ValueIDs(nil, StringValue("x")); err != nil || len(ids) != 0 {
+		t.Fatalf("ValueIDs after close = %v, %v; want empty, nil", ids, err)
+	}
+	if match, err := index.MatchValues(StringValue("x")); err != nil || !match.IsEmpty() {
+		t.Fatalf("MatchValues after close = %v, %v; want empty, nil", match.AppendTo(nil), err)
+	}
+	if match, err := index.MatchValues(); err != nil || !match.IsEmpty() {
+		t.Fatalf("empty MatchValues after close = %v, %v; want empty, nil", match.AppendTo(nil), err)
+	}
+	if count, err := index.CountValues(StringValue("x")); err != nil || count != 0 {
+		t.Fatalf("CountValues after close = %d, %v; want 0, nil", count, err)
+	}
+	if ids := index.AppendTo(nil); len(ids) != 0 {
+		t.Fatalf("AppendTo after close = %v; want empty", ids)
+	}
+	if _, ok := index.LookupValue(nil, FieldKey{}); ok {
+		t.Fatal("LookupValue after close reported presence")
+	}
+	visited := 0
+	index.Iterate(func(FieldKey, []byte) bool { visited++; return true })
+	index.Prefix(nil, func(FieldKey, []byte) bool { visited++; return true })
+	if visited != 0 {
+		t.Fatalf("Iterate/Prefix after close visited %d entries", visited)
+	}
 	if err := index.WaitIdle(shortContext(t)); err != nil {
 		t.Fatalf("WaitIdle: %v", err)
+	}
+}
+
+func TestMatchValuesEmpty(t *testing.T) {
+	index := mustField(t, enumField(IndexTypeTag), FieldConfig{})
+	defer func() { _ = index.Close() }()
+	if err := index.Add(Entry{ImageID: 1, Value: StringValue("x")}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	// An empty conjunction matches nothing rather than everything.
+	if match, err := index.MatchValues(); err != nil || !match.IsEmpty() {
+		t.Fatalf("empty MatchValues = %v, %v; want empty, nil", match.AppendTo(nil), err)
+	}
+	if count, err := index.CountValues(); err != nil || count != 0 {
+		t.Fatalf("empty CountValues = %d, %v; want 0, nil", count, err)
+	}
+	if got, err := index.FilterValues([]ImageID{9}, []ImageID{1, 2}); err != nil || !slices.Equal(got, []ImageID{9}) {
+		t.Fatalf("empty FilterValues = %v, %v; want [9], nil", got, err)
+	}
+}
+
+func TestDictionaryCompaction(t *testing.T) {
+	index := mustField(t, enumField(IndexTypeTag), FieldConfig{})
+	defer func() { _ = index.Close() }()
+	const values = dictActiveTargetEntries + 100
+	adds := make([]Entry, 0, values)
+	for n := 0; n < values; n++ {
+		adds = append(adds, Entry{
+			ImageID: ImageID(n + 1),
+			Value:   Value{Kind: KindEnum, Bytes: []byte{byte(n), byte(n >> 8)}},
+		})
+	}
+	if err := index.Add(adds...); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	// The batch exceeds both delta bounds, so it folds straight into a
+	// compacted base with no active layer left behind.
+	view := index.view.Load()
+	if len(view.dict.active) != 0 {
+		t.Fatalf("active entries = %d, want 0", len(view.dict.active))
+	}
+	if len(view.dict.base) != values {
+		t.Fatalf("base entries = %d, want %d", len(view.dict.base), values)
+	}
+	first := Value{Kind: KindEnum, Bytes: []byte{0, 0}}
+	if _, ok, err := index.KeyForValue(first); err != nil || !ok {
+		t.Fatalf("KeyForValue ok = %v, %v; want true, nil", ok, err)
+	}
+	if ids, err := index.ValueIDs(nil, first); err != nil || !slices.Equal(ids, []ImageID{1}) {
+		t.Fatalf("ValueIDs = %v, %v; want [1], nil", ids, err)
+	}
+	visited := 0
+	index.Iterate(func(FieldKey, []byte) bool { visited++; return true })
+	if visited != values {
+		t.Fatalf("Iterate visited %d, want %d", visited, values)
 	}
 }
 

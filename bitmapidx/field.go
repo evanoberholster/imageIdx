@@ -19,9 +19,12 @@ const (
 	KindBool                       // explicit false/true value
 	KindText                       // analyzer tokens, each hashed
 	KindContinuous                 // int64 grid key, order preserving
+	KindGeo                        // S2 level-16 cell key, order preserving
 )
 
 // Storage selects the in-memory representation and lookup path for a field.
+// Both modes mutate and query identically; the distinction is reserved for
+// the persisted tier and currently changes no behavior.
 type Storage uint8
 
 const (
@@ -80,6 +83,13 @@ type Quantizer struct {
 	Offset  int64
 }
 
+// GeoCodec identifies the S2 cell level of a KindGeo field. Level zero means
+// the default GeoS2Level; other levels are rejected until supported.
+type GeoCodec struct {
+	Version uint16
+	Level   uint8
+}
+
 // Field is one registered metadata field: its stable type, value shape,
 // storage strategy, and the codecs that interpret values.
 type Field struct {
@@ -87,6 +97,7 @@ type Field struct {
 	Kind       Kind
 	Storage    Storage
 	Quant      Quantizer // KindContinuous only
+	Geo        GeoCodec  // KindGeo only
 	Normalizer CodecSpec // KindEnum only
 	Analyzer   CodecSpec // KindText only
 	Flags      uint32    // supported feature bits; unknown bits are rejected
@@ -121,6 +132,21 @@ var (
 	// ErrUnsupportedOperation reports an operation a field kind does not
 	// support, such as Add on a text field.
 	ErrUnsupportedOperation = errors.New("bitmapidx: unsupported operation for field kind")
+	// ErrInvalidCoordinate reports an out-of-domain geographic coordinate.
+	ErrInvalidCoordinate = errors.New("bitmapidx: invalid geographic coordinate")
+	// ErrInvalidRegion reports a nil geographic region.
+	ErrInvalidRegion = errors.New("bitmapidx: invalid geographic region")
+	// ErrInvalidS2Cell reports an invalid or wrong-level S2 cell.
+	ErrInvalidS2Cell = errors.New("bitmapidx: invalid S2 cell")
+	// ErrInvalidS2Level reports an unsupported S2 cell level.
+	ErrInvalidS2Level = errors.New("bitmapidx: unsupported S2 level")
+	// ErrTooManyCells reports a range expansion that would cover more S2
+	// buckets than the caller's budget allows.
+	ErrTooManyCells = errors.New("bitmapidx: range covers too many S2 cells")
+	// ErrCoverWorkspaceFull reports insufficient cover workspace capacity.
+	ErrCoverWorkspaceFull = errors.New("bitmapidx: cover workspace capacity is insufficient")
+	// ErrCoverBufferFull reports insufficient cover destination capacity.
+	ErrCoverBufferFull = errors.New("bitmapidx: cover destination capacity is insufficient")
 )
 
 // MaxValueBytes bounds one canonical value. Longer values are rejected before
@@ -147,6 +173,10 @@ func validateField(f Field) error {
 			return ErrInvalidField
 		}
 		if f.Quant.Code == QuantIdentity && (f.Quant.Scale != 1 || f.Quant.Offset != 0) {
+			return ErrInvalidField
+		}
+	case KindGeo:
+		if f.Geo.Version > 1 || (f.Geo.Level != 0 && f.Geo.Level != GeoS2Level) {
 			return ErrInvalidField
 		}
 	default:
@@ -256,6 +286,10 @@ func BoolValue(value bool) Value { return Value{Kind: KindBool, Bool: value} }
 // int64 grid domain.
 func IntValue(value int64) Value { return Value{Kind: KindContinuous, Int: value} }
 
+// GeoValue returns a KindGeo value carrying a level-16 S2 key. Keys fit in
+// int64; use KeyFromLatLng, KeyFromCellID or RangesFromCellIDs to build them.
+func GeoValue(key uint64) Value { return Value{Kind: KindGeo, Int: int64(key)} }
+
 // Entry is one ImageID to value membership change.
 type Entry struct {
 	ImageID ImageID
@@ -269,8 +303,9 @@ type FieldMutation struct {
 	Remove []Entry
 }
 
-// Move is an explicit continuous-value transition: HasFrom=false inserts,
-// HasTo=false removes, both set moves. Flags resolve the zero-value ambiguity.
+// Move is an explicit value transition: HasFrom=false inserts, HasTo=false
+// removes, both set moves. Flags resolve the zero-value ambiguity; for KindGeo
+// a zero key is absent, so the flags may be omitted there.
 type Move struct {
 	ImageID ImageID
 	From    int64
@@ -288,7 +323,10 @@ type TextReplacement struct {
 	After   []string
 }
 
-// Registry holds the field definitions known to a database.
+// Registry holds the field definitions known to a database. It is not safe
+// for concurrent use: register all fields during setup before sharing.
+// Returned definitions share no mutable state with the registry except codec
+// params, which callers must not mutate.
 type Registry struct {
 	fields map[IndexType]Field
 }
@@ -340,7 +378,7 @@ func (r *Registry) Fields() []Field {
 // sameField reports whether two definitions are identical.
 func sameField(a, b Field) bool {
 	if a.Type != b.Type || a.Kind != b.Kind || a.Storage != b.Storage ||
-		a.Flags != b.Flags || a.Quant != b.Quant ||
+		a.Flags != b.Flags || a.Quant != b.Quant || a.Geo != b.Geo ||
 		a.Normalizer.Code != b.Normalizer.Code || a.Normalizer.Version != b.Normalizer.Version ||
 		!bytes.Equal(a.Normalizer.Params, b.Normalizer.Params) ||
 		a.Analyzer.Code != b.Analyzer.Code || a.Analyzer.Version != b.Analyzer.Version ||
@@ -357,7 +395,7 @@ func (r *Registry) MarshalBinary() ([]byte, error) {
 	fields := r.Fields()
 	size := 2 + 4
 	for _, field := range fields {
-		size += 28 + 8 + len(field.Normalizer.Params) + 8 + len(field.Analyzer.Params)
+		size += 32 + 8 + len(field.Normalizer.Params) + 8 + len(field.Analyzer.Params)
 	}
 	out := make([]byte, 0, size)
 	out = binary.LittleEndian.AppendUint16(out, registryVersion)
@@ -406,6 +444,8 @@ func appendField(out []byte, field Field) []byte {
 	out = binary.LittleEndian.AppendUint16(out, field.Quant.Version)
 	out = binary.LittleEndian.AppendUint64(out, uint64(field.Quant.Scale))
 	out = binary.LittleEndian.AppendUint64(out, uint64(field.Quant.Offset))
+	out = binary.LittleEndian.AppendUint16(out, field.Geo.Version)
+	out = append(out, field.Geo.Level, 0)
 	out = appendCodec(out, field.Normalizer)
 	out = appendCodec(out, field.Analyzer)
 	return out
@@ -420,7 +460,7 @@ func appendCodec(out []byte, spec CodecSpec) []byte {
 }
 
 func decodeField(data []byte, offset int) (Field, int, error) {
-	if offset+24 > len(data) {
+	if offset+32 > len(data) {
 		return Field{}, 0, ErrInvalidField
 	}
 	field := Field{
@@ -434,8 +474,12 @@ func decodeField(data []byte, offset int) (Field, int, error) {
 			Scale:   int64(binary.LittleEndian.Uint64(data[offset+12 : offset+20])),
 			Offset:  int64(binary.LittleEndian.Uint64(data[offset+20 : offset+28])),
 		},
+		Geo: GeoCodec{
+			Version: binary.LittleEndian.Uint16(data[offset+28 : offset+30]),
+			Level:   data[offset+30],
+		},
 	}
-	normalizer, next, err := decodeCodec(data, offset+28)
+	normalizer, next, err := decodeCodec(data, offset+32)
 	if err != nil {
 		return Field{}, 0, err
 	}

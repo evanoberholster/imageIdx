@@ -176,7 +176,7 @@ func collectStage(dst []ImageID, ws *Workspace, st *stage) []ImageID {
 	if st.kind == StageGeo && ws != nil {
 		m := ws.mutableBitmap()
 		m.Reset()
-		st.geoIndex.CollectRanges(m, st.geoRanges)
+		st.geoIndex.CollectGeoRanges(m, st.geoRanges)
 		return m.AppendTo(dst)
 	}
 	start := len(dst)

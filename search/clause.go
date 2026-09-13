@@ -4,7 +4,7 @@ import (
 	"errors"
 
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoidx"
+
 	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
@@ -71,21 +71,22 @@ func During(index *timeidx.Index, start, end uint64, options ...TimestampOption)
 }
 
 type geoClause struct {
-	index  *geoidx.Index
-	ranges []geoidx.Range
+	index  *bitmapidx.FieldIndex
+	ranges []bitmapidx.GeoRange
 }
 
 func (geoClause) searchClause() {}
 
-// WithinCells restricts images to the union of the supplied S2 cells. Cells
-// may be at any valid level up to geoidx.GeoS2Level; coarser cells are
-// converted to level-16 descendant ranges when the clause is created.
-// Invalid cell IDs join ErrInvalidClause with the underlying cause.
-func WithinCells(index *geoidx.Index, cellIDs ...uint64) (Clause, error) {
-	if index == nil || len(cellIDs) == 0 {
+// WithinCells restricts images to the union of the supplied S2 cells. The
+// index must be a KindGeo field. Coarser cells are converted to level-16
+// descendant ranges when the clause is created; finer cells snap to their
+// level-16 ancestor. Invalid cell IDs join ErrInvalidClause with the
+// underlying cause.
+func WithinCells(index *bitmapidx.FieldIndex, cellIDs ...uint64) (Clause, error) {
+	if index == nil || len(cellIDs) == 0 || index.Field().Kind != bitmapidx.KindGeo {
 		return nil, ErrInvalidClause
 	}
-	ranges, err := geoidx.RangesFromCellIDs(make([]geoidx.Range, 0, len(cellIDs)), cellIDs)
+	ranges, err := bitmapidx.RangesFromCellIDs(make([]bitmapidx.GeoRange, 0, len(cellIDs)), cellIDs)
 	if err != nil {
 		return nil, errors.Join(ErrInvalidClause, err)
 	}

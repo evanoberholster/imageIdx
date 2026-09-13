@@ -34,6 +34,17 @@ func (w *WAL) Offset() (int64, error) { return w.file.Seek(0, io.SeekEnd) }
 // Close closes the WAL file.
 func (w *WAL) Close() error { return w.file.Close() }
 
+// Truncate discards all WAL contents. Callers must first publish a checkpoint
+// or manifest that no longer depends on the discarded records, and must
+// serialize against concurrent appends.
+func (w *WAL) Truncate() error {
+	if err := w.file.Truncate(0); err != nil {
+		return err
+	}
+	_, err := w.file.Seek(0, io.SeekStart)
+	return err
+}
+
 // Scratch returns reusable scratch of length n, growing the WAL buffer. The
 // slice is valid until the next Scratch call; only one Scratch slice may be
 // live at a time, and callers must fully encode it.

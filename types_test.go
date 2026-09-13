@@ -5,21 +5,21 @@ import (
 
 	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoidx"
+
 	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
 func TestIndexPackagesShareDomainTypes(t *testing.T) {
 	rootID := imageidx.ImageID(42)
 	var bitmapID bitmapidx.ImageID = rootID
-	var geoID geoidx.ImageID = bitmapID
+	var geoID bitmapidx.ImageID = bitmapID
 	var timestampID timeidx.ImageID = geoID
 	if timestampID != rootID {
 		t.Fatalf("shared ImageID = %d", timestampID)
 	}
 
 	var durability timeidx.Durability = bitmapidx.DurabilitySync
-	if durability != geoidx.DurabilitySync {
+	if durability != bitmapidx.DurabilitySync {
 		t.Fatalf("geo Durability = %d", durability)
 	}
 	if durability != imageidx.DurabilitySync {
@@ -33,7 +33,12 @@ func TestIndexPackagesShareDomainTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = bitmap.Close() })
-	geo, err := geoidx.New(geoidx.Spec{IndexID: 102, Flags: 7}, geoidx.Config{})
+	geo, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
+		Type:    bitmapidx.IndexTypeLocation,
+		Kind:    bitmapidx.KindGeo,
+		Storage: bitmapidx.StoragePerType,
+		Geo:     bitmapidx.GeoCodec{Version: 1},
+	}, bitmapidx.FieldConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,10 +49,10 @@ func TestIndexPackagesShareDomainTypes(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = times.Close() })
 
-	if bitmap.Metadata().IndexID != 101 || geo.Metadata().IndexID != 102 || times.Metadata().IndexID != 103 {
+	if bitmap.Metadata().IndexID != 101 || times.Metadata().IndexID != 103 {
 		t.Fatal("stable index identity is not exposed consistently")
 	}
-	if bitmap.Metadata().Flags != 7 || geo.Metadata().Flags != 7 || times.Metadata().Flags != 7 {
+	if bitmap.Metadata().Flags != 7 || times.Metadata().Flags != 7 {
 		t.Fatal("index flags are not exposed consistently")
 	}
 	if bitmap.Metadata().Generation == 0 || geo.Metadata().Generation == 0 || times.Metadata().Generation == 0 {

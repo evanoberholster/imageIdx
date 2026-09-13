@@ -18,7 +18,7 @@ import (
 
 	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoidx"
+
 	"github.com/evanoberholster/imageIdx/search"
 	"github.com/evanoberholster/imageIdx/timeidx"
 )
@@ -38,7 +38,7 @@ type searchResponse struct {
 type demoService struct {
 	favorites *bitmapidx.Index
 	times     *timeidx.Index
-	geo       *geoidx.Index
+	geo       *bitmapidx.FieldIndex
 	canonical map[imageidx.ImageID]uint64
 	demoCell  uint64
 }
@@ -150,30 +150,20 @@ func newDemoService() (*demoService, error) {
 		return nil, err
 	}
 
-	geo, err := geoidx.New(geoidx.Spec{
-		IndexID: 3,
-		Entries: []geoidx.Entry{
-			{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
-			{ImageID: 200, Latitude: 37.7749, Longitude: -122.4194},
-			{ImageID: 300, Latitude: 34.0522, Longitude: -118.2437},
-			{ImageID: 400, Latitude: 40.7128, Longitude: -74.0060},
-		},
-	}, geoidx.Config{})
+	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexTypeLocation, []bitmapidx.GeoEntry{
+		{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
+		{ImageID: 200, Latitude: 37.7749, Longitude: -122.4194},
+		{ImageID: 300, Latitude: 34.0522, Longitude: -118.2437},
+		{ImageID: 400, Latitude: 40.7128, Longitude: -74.0060},
+	}, bitmapidx.FieldConfig{})
 	if err != nil {
-		_ = times.Close()
-		_ = favorites.Close()
-		return nil, err
-	}
-	key, err := geoidx.KeyFromLatLng(37.7749, -122.4194)
-	if err != nil {
-		_ = geo.Close()
 		_ = times.Close()
 		_ = favorites.Close()
 		return nil, err
 	}
 	return &demoService{
 		favorites: favorites, times: times, geo: geo,
-		canonical: canonical, demoCell: geoidx.DecodeS2Key(key),
+		canonical: canonical, demoCell: bitmapidx.CellIDFromLatLng(37.7749, -122.4194),
 	}, nil
 }
 

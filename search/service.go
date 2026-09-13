@@ -15,7 +15,7 @@ import (
 // buffer. Service enforces that by pooling workspaces: agents share the
 // Service, never a Workspace.
 //
-// Writes need no service-level lock: bitmapidx and geoidx serialize
+// Writes need no service-level lock: bitmapidx indexes serialize
 // writers on their internal writerMu, and timeidx.Apply funnels batches
 // through its single-owner writerLoop. The one rule writers must follow is
 // timestamp's: one Batch per writer at a time. AcquireBatch/ReleaseBatch

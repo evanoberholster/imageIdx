@@ -11,7 +11,8 @@ import (
 )
 
 // Index is one logical bitmap predicate: an immutable set of ImageIDs with a
-// stable Key and IndexID.
+// stable Key and IndexID. The zero value is not usable; construct with New,
+// NewPersistent, or OpenPersistent.
 //
 // Concurrency is split along the read/write boundary. Readers load the single
 // atomically published indexView and operate on immutable data only, taking no

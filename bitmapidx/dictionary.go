@@ -22,11 +22,10 @@ type dictEntry struct {
 	length uint32
 }
 
-// dictionaryView is one immutable dictionary snapshot with bounded layers.
-// Lookup precedence is active, then frozen, then base.
+// dictionaryView is one immutable dictionary snapshot: a compacted base plus
+// recently sealed active entries. Lookup precedence is active, then base.
 type dictionaryView struct {
 	base   []dictEntry
-	frozen []dictEntry
 	active []dictEntry
 	chunks [][]byte
 }
@@ -34,9 +33,6 @@ type dictionaryView struct {
 // entry returns the highest-precedence entry for key.
 func (v *dictionaryView) entry(key FieldKey) (dictEntry, bool) {
 	if e, ok := findDictEntry(v.active, key); ok {
-		return e, true
-	}
-	if e, ok := findDictEntry(v.frozen, key); ok {
 		return e, true
 	}
 	return findDictEntry(v.base, key)
@@ -58,15 +54,14 @@ func (v *dictionaryView) lookup(dst []byte, key FieldKey) ([]byte, bool) {
 	return append(dst, v.bytes(e)...), true
 }
 
-// merged returns one entry per key, newest layer wins, sorted by key.
+// merged returns one entry per key, sorted by key.
 func (v *dictionaryView) merged() []dictEntry {
-	total := len(v.base) + len(v.frozen) + len(v.active)
+	total := len(v.base) + len(v.active)
 	if total == 0 {
 		return nil
 	}
 	entries := make([]dictEntry, 0, total)
 	entries = append(entries, v.base...)
-	entries = append(entries, v.frozen...)
 	entries = append(entries, v.active...)
 	slices.SortStableFunc(entries, func(a, b dictEntry) int { return compareFieldKey(a.key, b.key) })
 	out := entries[:0]
@@ -132,7 +127,7 @@ func groupEntries(entries []dictEntry, base FieldKey) []dictEntry {
 // layers, highest precedence first.
 func (v *dictionaryView) entriesWithHash(base FieldKey) []dictEntry {
 	var out []dictEntry
-	for _, layer := range [][]dictEntry{v.active, v.frozen, v.base} {
+	for _, layer := range [][]dictEntry{v.active, v.base} {
 		out = append(out, groupEntries(layer, base)...)
 	}
 	return out
@@ -140,7 +135,7 @@ func (v *dictionaryView) entriesWithHash(base FieldKey) []dictEntry {
 
 // resolve returns the key of the entry whose canonical bytes equal canonical.
 func (v *dictionaryView) resolve(base FieldKey, canonical []byte) (FieldKey, bool) {
-	for _, layer := range [][]dictEntry{v.active, v.frozen, v.base} {
+	for _, layer := range [][]dictEntry{v.active, v.base} {
 		for _, entry := range groupEntries(layer, base) {
 			if bytes.Equal(v.bytes(entry), canonical) {
 				return entry.key, true
@@ -190,20 +185,24 @@ func compareFieldHash(a, b FieldKey) int {
 }
 
 // dictionaryWriter owns mutable dictionary state between publications. Its
-// base/frozen/active slices are immutable once published; staging accumulates
+// base/active slices are immutable once published; staging accumulates
 // in pending and seals into a fresh active slice. It is confined to the
 // FieldIndex writer lock.
 type dictionaryWriter struct {
 	chunks        [][]byte
 	base          []dictEntry
-	frozen        []dictEntry
 	active        []dictEntry
 	pending       []dictEntry
 	pendingByHash map[FieldKey][]int
+	// generation identifies the visible value set. It advances only when the
+	// set changes: folding staged values in seal, or dropping dead values in
+	// rebuild. Merges that preserve the set (rotate, compact) leave it alone,
+	// so compiled queries can skip re-resolution while it is stable.
+	generation uint64
 }
 
 func (d *dictionaryWriter) view() *dictionaryView {
-	return &dictionaryView{base: d.base, frozen: d.frozen, active: d.active, chunks: d.chunks}
+	return &dictionaryView{base: d.base, active: d.active, chunks: d.chunks}
 }
 
 // appendBytes copies canonical bytes into the active chunk and returns their
@@ -297,65 +296,75 @@ func (d *dictionaryWriter) resolvePending(base FieldKey, canonical []byte) (Fiel
 	return FieldKey{}, false
 }
 
+// abort discards entries staged by a batch that failed before publication,
+// so a later seal cannot publish values whose postings were never written.
+// Caller holds the FieldIndex writer lock.
+func (d *dictionaryWriter) abort() {
+	d.pending = nil
+	d.pendingByHash = nil
+}
+
 // seal publishes pending entries into a fresh active slice and folds layers
-// when they exceed their bounds.
+// when they exceed their bounds. Pending entries sort once, then merge with
+// the already-sorted active run instead of re-sorting the whole layer.
 func (d *dictionaryWriter) seal() {
 	if len(d.pending) != 0 {
-		next := make([]dictEntry, 0, len(d.active)+len(d.pending))
-		next = append(next, d.active...)
-		next = append(next, d.pending...)
-		slices.SortFunc(next, func(a, b dictEntry) int { return compareFieldKey(a.key, b.key) })
-		d.active = next
+		slices.SortFunc(d.pending, func(a, b dictEntry) int { return compareFieldKey(a.key, b.key) })
+		if len(d.active) == 0 {
+			d.active = d.pending
+		} else {
+			next := make([]dictEntry, 0, len(d.active)+len(d.pending))
+			left, right := 0, 0
+			for left < len(d.active) && right < len(d.pending) {
+				if compareFieldKey(d.active[left].key, d.pending[right].key) <= 0 {
+					next = append(next, d.active[left])
+					left++
+				} else {
+					next = append(next, d.pending[right])
+					right++
+				}
+			}
+			next = append(next, d.active[left:]...)
+			next = append(next, d.pending[right:]...)
+			d.active = next
+		}
 		d.pending = nil
 		d.pendingByHash = nil
+		d.generation++
 	}
 	if len(d.active) > dictActiveTargetEntries {
-		d.rotate()
-	}
-	if len(d.frozen) > dictActiveTargetEntries {
 		d.compact()
 	}
 }
 
-// rotate seals Active into Frozen, merging any previous Frozen run.
-func (d *dictionaryWriter) rotate() {
+// compact folds Active into Base.
+func (d *dictionaryWriter) compact() {
 	if len(d.active) == 0 {
 		return
 	}
-	d.frozen = mergeDictEntries(d.base, d.frozen, d.active)
-	d.active = nil
-}
-
-// compact folds all layers into Base.
-func (d *dictionaryWriter) compact() {
-	if len(d.frozen) == 0 && len(d.active) == 0 {
-		return
-	}
-	d.base = mergeDictEntries(d.base, d.frozen, d.active)
-	d.frozen = nil
+	d.base = mergeDictEntries(d.base, d.active)
 	d.active = nil
 }
 
 // rebuild replaces writer state with a compacted base built from live values.
 func (d *dictionaryWriter) rebuild(entries []dictEntry, chunks [][]byte) {
 	d.base = entries
-	d.frozen = nil
 	d.active = nil
 	d.pending = nil
 	d.pendingByHash = nil
 	d.chunks = chunks
+	d.generation++
 }
 
 // mergeDictEntries merges sorted layers, newest precedence first, dropping
 // duplicate keys.
-func mergeDictEntries(base, frozen, active []dictEntry) []dictEntry {
-	total := len(base) + len(frozen) + len(active)
+func mergeDictEntries(base, active []dictEntry) []dictEntry {
+	total := len(base) + len(active)
 	if total == 0 {
 		return nil
 	}
 	ranked := make([]dictEntry, 0, total)
 	ranked = append(ranked, base...)
-	ranked = append(ranked, frozen...)
 	ranked = append(ranked, active...)
 	precedence := make(map[FieldKey]int, total)
 	for index, entry := range ranked {

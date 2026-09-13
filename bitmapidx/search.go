@@ -14,7 +14,8 @@ type readToken struct {
 // snapshots. Each operand's Active/Frozen corrections are applied first.
 // Delta-free operands contribute their raw base without cloning; only
 // delta-carrying operands are materialized, and the combination runs as a
-// single N-way intersection.
+// single N-way intersection. A nil index is an empty predicate and empties
+// the conjunction.
 func And(indexes ...*Index) roar.Bitmap {
 	if len(indexes) == 0 {
 		return roar.Bitmap{}
@@ -22,6 +23,21 @@ func And(indexes ...*Index) roar.Bitmap {
 	var tokenStack [8]readToken
 	tokens := acquireReaders(tokenStack[:0], indexes)
 	defer releaseReaders(tokens)
+
+	if len(indexes) <= 2 {
+		a, ok := andOperand(indexes, 0)
+		if !ok {
+			return roar.Bitmap{}
+		}
+		if len(indexes) == 1 {
+			return a
+		}
+		b, ok := andOperand(indexes, 1)
+		if !ok {
+			return roar.Bitmap{}
+		}
+		return roar.And(a, b)
+	}
 
 	planned := planAnd(indexes)
 	operands := make([]roar.Bitmap, 0, len(planned))
@@ -46,9 +62,25 @@ func And(indexes ...*Index) roar.Bitmap {
 	}
 }
 
+// andOperand materializes one AND operand: the shared base for delta-free
+// indexes, otherwise the corrected bitmap. ok is false for a missing or
+// closed index, which empties the conjunction.
+func andOperand(indexes []*Index, at int) (roar.Bitmap, bool) {
+	index := indexes[at]
+	if index == nil || index.closed.Load() {
+		return roar.Bitmap{}, false
+	}
+	view := index.view.Load()
+	if view.hasDeltas() {
+		return view.effectiveBitmap(), true
+	}
+	return view.base, true
+}
+
 // Or returns the logical union. Removals remain operand-aware because each
 // operand is corrected independently before the union is evaluated. Delta-free
-// operands are added without cloning their base.
+// operands are added without cloning their base. Nil indexes are skipped as
+// empty predicates.
 func Or(indexes ...*Index) roar.Bitmap {
 	if len(indexes) == 0 {
 		return roar.Bitmap{}
@@ -56,6 +88,37 @@ func Or(indexes ...*Index) roar.Bitmap {
 	var tokenStack [8]readToken
 	tokens := acquireReaders(tokenStack[:0], indexes)
 	defer releaseReaders(tokens)
+
+	if len(indexes) <= 2 {
+		var first, second roar.Bitmap
+		live := 0
+		for _, index := range indexes {
+			if index == nil || index.closed.Load() {
+				continue
+			}
+			view := index.view.Load()
+			var operand roar.Bitmap
+			if view.hasDeltas() {
+				operand = view.effectiveBitmap()
+			} else {
+				operand = view.base
+			}
+			if live == 0 {
+				first = operand
+			} else {
+				second = operand
+			}
+			live++
+		}
+		switch live {
+		case 0:
+			return roar.Bitmap{}
+		case 1:
+			return first
+		default:
+			return roar.Or(first, second)
+		}
+	}
 
 	operands := make([]roar.Bitmap, 0, len(indexes))
 	for _, index := range indexes {
@@ -83,7 +146,7 @@ func Or(indexes ...*Index) roar.Bitmap {
 // materializing the intersection. Delta-free operands count directly from
 // container headers without allocating (up to eight indexes); when any
 // operand carries corrections it falls back to And, which evaluates them
-// per ID.
+// per ID. A nil index counts zero.
 func Count(indexes ...*Index) uint64 {
 	if len(indexes) == 0 {
 		return 0
@@ -119,7 +182,8 @@ func Count(indexes ...*Index) uint64 {
 // Filter appends candidates present in every index to dst. It enters
 // each distinct internal reader tracker once and supports dst reusing
 // candidates' backing storage, allowing a scheduler to filter an existing
-// candidate slice in place.
+// candidate slice in place. A nil index matches nothing, so no candidates
+// are appended once one is seen.
 func Filter(dst, candidates []ImageID, indexes ...*Index) []ImageID {
 	if len(indexes) == 0 {
 		return append(dst, candidates...)

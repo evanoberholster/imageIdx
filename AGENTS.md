@@ -110,25 +110,34 @@ search/service.go                             +NewService
 
 ## bitmapidx
 
-### bitmapidx/backend_benchmark_test.go
+### bitmapidx/benchmark_test.go
 ```
-func spacedIDs(count, step, shift int) → []uint64  :13-20
-func benchmarkBackendBuild(b *testing.B)  :22-28
-func benchmarkBackendContains(b *testing.B)  :30-37
-func benchmarkBackendAppendTo(b *testing.B)  :39-47
-func backendFourSets(count int) → []roar.Bitmap  :49-55
-func benchmarkBackendAnd4(b *testing.B)  :57-63
-func benchmarkBackendOr4(b *testing.B)  :65-71
-func benchmarkBackendApply(b *testing.B)  :73-76
-func benchmarkBackendApplySmall(b *testing.B)  :78-81
-func benchBackendApply(b *testing.B, base, adds, removes []uint64)  :83-94
-func BenchmarkBackendBuild(b *testing.B)  :96-96
-func BenchmarkBackendContains(b *testing.B)  :97-97
-func BenchmarkBackendAppendTo(b *testing.B)  :98-98
-func BenchmarkBackendAnd4(b *testing.B)  :99-99
-func BenchmarkBackendOr4(b *testing.B)  :100-100
-func BenchmarkBackendApply(b *testing.B)  :101-101
-func BenchmarkBackendApplySmall(b *testing.B)  :102-102
+func BenchmarkContains(b *testing.B)  :9-20
+func BenchmarkAnd4(b *testing.B)  :22-36
+func BenchmarkApplyBatch1000(b *testing.B)  :38-49
+func BenchmarkAppendTo(b *testing.B)  :51-63
+func BenchmarkOr4(b *testing.B)  :65-79
+func BenchmarkAnd2(b *testing.B)  :81-95
+func BenchmarkOr2(b *testing.B)  :97-111
+func BenchmarkFilter(b *testing.B)  :113-132
+func spacedIDs(count, step, shift int) → []uint64  :140-147
+func benchmarkBackendBuild(b *testing.B)  :149-155
+func benchmarkBackendContains(b *testing.B)  :157-164
+func benchmarkBackendAppendTo(b *testing.B)  :166-174
+func backendFourSets(count int) → []roar.Bitmap  :176-182
+func benchmarkBackendAnd4(b *testing.B)  :184-190
+func benchmarkBackendOr4(b *testing.B)  :192-198
+func benchmarkBackendApply(b *testing.B)  :200-203
+func benchmarkBackendApplySmall(b *testing.B)  :205-208
+func benchBackendApply(b *testing.B, base, adds, removes []uint64)  :210-221
+func BenchmarkBackendBuild(b *testing.B)  :223-223
+func BenchmarkBackendContains(b *testing.B)  :224-224
+func BenchmarkBackendAppendTo(b *testing.B)  :225-225
+func BenchmarkBackendAnd4(b *testing.B)  :226-226
+func BenchmarkBackendOr4(b *testing.B)  :227-227
+func BenchmarkBackendApply(b *testing.B)  :228-228
+func BenchmarkBackendApplySmall(b *testing.B)  :229-229
+… +3 more signatures
 ```
 
 ### bitmapidx/index.go

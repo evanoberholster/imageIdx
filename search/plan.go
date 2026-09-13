@@ -5,7 +5,7 @@ import (
 	"sort"
 
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoidx"
+
 	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
@@ -50,8 +50,8 @@ type stage struct {
 	tsEnd   uint64
 	tsExact timeidx.ExactTimestampFunc
 
-	geoIndex  *geoidx.Index
-	geoRanges []geoidx.Range
+	geoIndex  *bitmapidx.FieldIndex
+	geoRanges []bitmapidx.GeoRange
 }
 
 func (s *stage) metadata() Stage {
@@ -87,7 +87,11 @@ func (s *stage) collect(dst []ImageID) []ImageID {
 		}
 		return s.tsIndex.Search(dst, s.tsStart, s.tsEnd)
 	case StageGeo:
-		return s.geoIndex.SearchRanges(dst, s.geoRanges)
+		match, err := s.geoIndex.GeoRanges(s.geoRanges)
+		if err != nil {
+			return dst
+		}
+		return match.AppendTo(dst)
 	default:
 		return dst
 	}
@@ -130,9 +134,13 @@ func geoFilter(dst, candidates, scratch []ImageID, ws *Workspace, s *stage) []Im
 	if s.geoIndex == nil || len(s.geoRanges) == 0 || s.estimate == 0 {
 		return dst
 	}
-	if cells := s.geoIndex.CountCells(s.geoRanges); uint64(cells)*uint64(len(candidates)) <= geoFilterProbeBound*s.estimate {
+	if cells := s.geoIndex.CountGeoCells(s.geoRanges); uint64(cells)*uint64(len(candidates)) <= geoFilterProbeBound*s.estimate {
 		start := len(dst)
-		dst = s.geoIndex.FilterRanges(dst, candidates, s.geoRanges)
+		filtered, err := s.geoIndex.FilterGeoRanges(dst, candidates, s.geoRanges)
+		if err != nil {
+			return dst
+		}
+		dst = filtered
 		slices.Sort(dst[start:])
 		return dst
 	}
@@ -311,10 +319,14 @@ func Compile(clauses ...Clause) (Plan, error) {
 			if value.index == nil || len(value.ranges) == 0 {
 				return Plan{}, ErrInvalidClause
 			}
+			estimate, err := value.index.EstimateGeoRanges(value.ranges)
+			if err != nil {
+				return Plan{}, ErrInvalidClause
+			}
 			ordered = append(ordered, orderedStage{
 				s: stage{
 					kind:      StageGeo,
-					estimate:  value.index.EstimateRanges(value.ranges),
+					estimate:  estimate,
 					geoIndex:  value.index,
 					geoRanges: value.ranges,
 				},

@@ -3,19 +3,18 @@
 Image indexing tools written in Go 1.27. The root `imageidx` package defines
 the shared `ImageID` and durability types. The `roar` package owns the
 immutable zero-copy bitmap representation, used directly by the logical
-indexes in `bitmapidx`, `timeidx`, `geoidx`, and `vectoridx`. The `search` package compiles
-and executes queries across them.
+indexes in `bitmapidx`, `timeidx`, and `vectoridx`. The `search` package
+compiles and executes queries across them.
 
 - `bitmapidx` provides persistent caller-keyed predicate sets and an in-memory
-  unified field index for enum, bool, text and continuous values.
+  unified field index for enum, bool, text, continuous and geo values.
 - `timeidx` indexes timestamps for range search.
-- `geoidx` indexes coordinates through fixed-level S2 cells.
 - `vectoridx` indexes fixed-dimension embeddings with persistent HNSW ANN search.
 - `search` combines bitmap, timestamp and geographic clauses with AND
   semantics.
 
 Pre-v1 note: `timestamp` and `geoindex` were renamed to `timeidx` and
-`geoidx`. Import paths changed; persisted formats are unchanged.
+`geoidx`; geo is now part of `bitmapidx`. Persisted geo formats are unchanged.
 
 ## Roar bitmap index
 
@@ -185,11 +184,11 @@ if err := store.Vacuum(); err != nil {
 Reopen with `bitmapidx.OpenPersistent`, which maps the published generation and
 replays the WAL tail.
 
-## Field index (enum, bool, text, continuous)
+## Field index (enum, bool, text, continuous, geo)
 
 `bitmapidx` also provides an in-memory unified field index for metadata that
 does not fit a caller-assigned numeric predicate ID. One `FieldIndex` holds one
-field and supports four value shapes:
+field and supports five value shapes:
 
 | Kind | Values | Query |
 |---|---|---|
@@ -197,6 +196,7 @@ field and supports four value shapes:
 | `KindBool` | explicit false/true; missing is neither | `MatchValues` |
 | `KindText` | tokenized documents (title, caption) | `MatchText` |
 | `KindContinuous` | `int64` grid values (ISO, focal length) | `Range` |
+| `KindGeo` | level-16 S2 cell keys | `GeoRanges` |
 
 Values are identified by a 64-bit xxh3 hash. Rare hash collisions claim a
 dictionary slot, so distinct values never share membership. The built-in Latin
@@ -303,6 +303,59 @@ match, err = focals.Range(bitmapidx.AtLeast(200))
 estimate, err := focals.EstimateRange(bitmapidx.Between(24, 70)) // planning hint
 ```
 
+Geo fields store one level-16 S2 cell per image. Keys come from coordinates or
+cells, and queries take inclusive key ranges produced by `RangesFromCellIDs` or
+`CoverRegion`:
+
+```go
+geoField := bitmapidx.Field{
+	Type:    bitmapidx.IndexTypeLocation,
+	Kind:    bitmapidx.KindGeo,
+	Storage: bitmapidx.StoragePerType,
+	Geo:     bitmapidx.GeoCodec{Version: 1},
+}
+locations, err := bitmapidx.NewFieldIndex(geoField, bitmapidx.FieldConfig{})
+if err != nil {
+	log.Fatal(err)
+}
+defer locations.Close()
+
+key, err := bitmapidx.KeyFromLatLng(37.7749, -122.4194)
+if err != nil {
+	log.Fatal(err)
+}
+// One cell per image: insert, move and remove with explicit transitions.
+if err = locations.Move(bitmapidx.Move{ImageID: 100, To: int64(key)}); err != nil {
+	log.Fatal(err)
+}
+
+cellIDs := []uint64{
+	bitmapidx.CellIDFromLatLng(37.7749, -122.4194),
+}
+ranges, err := bitmapidx.RangesFromCellIDs(nil, cellIDs)
+if err != nil {
+	log.Fatal(err)
+}
+geoMatch, err := locations.GeoRanges(ranges)
+if err != nil {
+	log.Fatal(err)
+}
+geoIDs := geoMatch.AppendTo(nil)
+geoCount, err := locations.CountGeoRanges(ranges)
+geoFiltered, err := locations.FilterGeoRanges(nil, candidates, ranges)
+geoEstimate, err := locations.EstimateGeoRanges(ranges) // planning hint
+
+// Cover a region to ranges; Nearest returns exact top K using canonical
+// coordinates supplied by the caller.
+workspace := bitmapidx.NewGeoCoverWorkspace(64)
+ranges, err = bitmapidx.CoverRegion(ranges[:0], region, bitmapidx.GeoCoverOptions{MaxCells: 32, Workspace: workspace})
+nearest := locations.Nearest(nil, 37.7749, -122.4194, 10, coordinateLookup)
+```
+
+Stale `From` values and duplicate inserts into the same cell are rejected
+before publication. No reverse index is kept, so a cross-cell
+insert without `From` is caller discipline.
+
 Text fields are replaced whole, so callers supply the old and new field text
 and the index diffs token sets. A token present in both before and after is
 retained:
@@ -349,94 +402,68 @@ if err := tags.Vacuum(); err != nil {
 }
 ```
 
-Field indexes are in-memory only; persistence for the v3 field model is not
-implemented yet. They are not yet accepted as `search` clauses.
+Field indexes are in-memory only; persistence for the field model is not
+implemented yet. Geo fields are accepted as `search` clauses through
+`search.WithinCells`; enum, bool, text and continuous fields are queried
+directly and combined in the caller.
 
 ## Geographic index
 
-The `geoidx` package stores one coordinate per image in fixed S2 level-16
-cells. Cells with up to four images use a fixed-width sparse SoA layout; denser
-cells reuse immutable `roar.Bitmap` values. The read representation is split into
-private immutable shards, so a publication rebuilds only shards affected by a
-batch. Searches load one atomic generation and never inspect writer mutations.
+Geo is a `bitmapidx` field kind. Each image holds one level-16 S2 bucket key;
+higher-level areas are searched by expanding cells into lexicographic key
+ranges, so any S2 level up to 16 maps onto the same bucket table.
+`search.WithinCells` takes the field directly, and the same queries are
+available without the search package.
 
 ```go
-geo, err := geoidx.New(geoidx.Spec{
-	IndexID: 1,
-	Entries: []geoidx.Entry{
-		{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
-	},
-}, geoidx.Config{})
+locations, err := bitmapidx.NewGeoField(bitmapidx.IndexTypeLocation, []bitmapidx.GeoEntry{
+	{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
+}, bitmapidx.FieldConfig{})
 if err != nil {
 	log.Fatal(err)
 }
-defer geo.Close()
+defer locations.Close()
 
-// Small writes become visible at the configured threshold or timer. Flush is
-// available when the caller needs an explicit visibility boundary.
-losAngeles, err := geoidx.KeyFromLatLng(34.0522, -118.2437)
+// One cell per image: insert, move and remove with explicit transitions.
+losAngeles, err := bitmapidx.KeyFromLatLng(34.0522, -118.2437)
 if err != nil {
 	log.Fatal(err)
 }
-if err := geo.Apply([]geoidx.Mutation{
-	{ImageID: 200, To: losAngeles}, // From zero means the image was absent.
-}); err != nil {
-	log.Fatal(err)
-}
-if err := geo.Flush(); err != nil {
+if err := locations.Move(bitmapidx.Move{ImageID: 200, To: int64(losAngeles)}); err != nil {
 	log.Fatal(err)
 }
 
 cellIDs := []uint64{
-	uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(37.7749, -122.4194)).Parent(geoidx.GeoS2Level)),
+	bitmapidx.CellIDFromLatLng(37.7749, -122.4194),
 }
-ranges, err := geoidx.RangesFromCellIDs(nil, cellIDs)
+ranges, err := bitmapidx.RangesFromCellIDs(nil, cellIDs)
 if err != nil {
 	log.Fatal(err)
 }
-candidates := geo.SearchRanges(nil, ranges)
-```
-
-Moves and removals are explicit: use `{ImageID: id, From: old, To: next}` to
-move an image and `{ImageID: id, From: old}` to remove it. `S2Key(0)` is the
-absent sentinel. This keeps the index from retaining a database-sized reverse
-map from image ID to cell.
-
-`CoverRegion` remains available when a caller needs to convert an `s2.Region`
-to ranges. Supply both a reusable `CoverWorkspace` and a destination with
-sufficient capacity for the allocation-free path. Allocation behavior inside
-the caller-supplied region's `IntersectsCell` and `ContainsCell` methods remains
-the responsibility of that region implementation.
-
-Geo persistence uses checksummed, mmap-oriented generation files, an atomic
-manifest, and a global batch WAL:
-
-```go
-persistent, err := geoidx.NewPersistent(
-	"./data/geo",
-	geoidx.Spec{
-		IndexID: 1,
-		Entries: []geoidx.Entry{
-			{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
-		},
-	},
-	geoidx.Config{},
-	imageidx.DurabilityOS,
-)
+match, err := locations.GeoRanges(ranges) // inclusive key-range union
 if err != nil {
 	log.Fatal(err)
 }
-defer persistent.Close()
-
-if err := persistent.Checkpoint(); err != nil {
-	log.Fatal(err)
-}
-if err := persistent.Vacuum(); err != nil {
-	log.Fatal(err)
-}
+ids := match.AppendTo(nil)
+count, err := locations.CountGeoRanges(ranges)
+filtered, err := locations.FilterGeoRanges(nil, candidates, ranges)
 ```
 
-`geoidx.OpenPersistent` maps the published generation and replays the WAL tail.
+Moves and removals use explicit transitions. Geo keys are never zero, so the
+presence flags may be omitted there (`To: key` inserts, `From: key, To: key`
+moves, `From: key` removes); continuous fields keep the flags because zero is a
+valid grid value. `GeoValue` carries a bucket key for direct `Add`/`Remove`.
+Stale `From` values and duplicate inserts into the same bucket are rejected
+before publication, and no reverse image-to-cell map is retained, so a
+cross-cell insert without `From` is caller discipline.
+
+`CoverRegion` converts an `s2.Region` to ranges. Supply both a reusable
+`GeoCoverWorkspace` and a destination with sufficient capacity for the
+allocation-free path; `Nearest` returns exact top-K using a caller-supplied
+coordinate lookup. Allocation behavior inside the caller-supplied region's
+`IntersectsCell` and `ContainsCell` methods remains the responsibility of that
+region implementation. Geo fields are in-memory like the other field kinds;
+persistence arrives with the field store.
 
 ## Vector index
 
@@ -486,17 +513,21 @@ scratch for zero steady-state allocations.
 
 ## Combined search
 
-The `search` package compiles and executes clauses across all three index
-types. Every clause is combined with AND semantics:
+The `search` package compiles and executes clauses across the bitmap,
+timestamp and geographic indexes. Every clause is combined with AND semantics:
 
-- all bitmap indexes must contain the image;
-- every timestamp range must contain the image;
+- all bitmap indexes must contain the image (`AllBitmaps` clauses merge into
+  one group);
+- every timestamp range must contain the image (lossy-only ranges on the same
+  index coalesce by intersection; each `ExactTimestamp` range is separate);
 - every geographic range set must contain the image.
 
 The compiler orders these stages using live cardinality estimates. This only
 changes execution order; it does not change query results. Results are returned
 as sorted, unique `search.ImageID` values. All index packages alias the
-canonical root `imageidx.ImageID` type.
+canonical root `imageidx.ImageID` type. There is no OR, no result ordering or
+reranking, and no `vectoridx` involvement: `SearchLimit` truncates the sorted
+prefix.
 
 ```go
 geoClause, err := search.WithinCells(geo, cellIDs...)
@@ -543,10 +574,11 @@ the combined search path performs zero heap allocations.
 A `Plan` exposes several execution shapes over the same compiled stages:
 
 ```go
-// Count matches without materializing IDs.
+// Count matches without materializing IDs (bitmap-only plans skip
+// materialization via bitmapidx.Count).
 count := plan.Count(workspace)
 
-// Stop after N sorted matches.
+// Stop after N sorted matches (truncation, not ranking).
 top := plan.SearchLimit(nil, workspace, 100)
 
 // Stream sorted, unique matches without building a result slice.
@@ -570,24 +602,28 @@ matches, err = service.QueryContext(ctx, matches[:0])
 count = service.Count()
 
 batch := service.AcquireBatch() // sized for the plan's timestamp writer
-// fill batch with timeidx.Insert/Delete/Move mutations, then apply through
+// fill batch with timeidx mutations, then apply through
 // the timestamp index; return it so another agent can reuse its buffers.
 service.ReleaseBatch(batch)
 ```
 
-Clauses are additive: `search.AllBitmaps` takes one or more `bitmapidx`
-predicate indexes, `search.During` a timestamp range (optionally with
-`search.ExactTimestamp`), and `search.WithinCells` one or more S2 cell IDs. The
-`bitmapidx` field index (enum, bool, text, continuous) is not yet a clause
-source; query it directly and combine results in the caller.
+Clauses are conjunctive: `search.AllBitmaps` takes one or more `bitmapidx`
+predicate indexes, `search.During` a half-open timestamp range (optionally with
+`search.ExactTimestamp`), and `search.WithinCells` a `KindGeo` field index plus
+one or more S2 cell IDs. `WithinCells` is the only clause constructor that
+returns an error. Enum, bool, text and continuous field indexes are not
+yet clause sources; query them directly and combine results in the caller.
+`vectoridx` is not a clause source either.
 
 Timestamp ranges use the timestamp index's compressed candidate semantics.
-Add `search.ExactTimestamp` when exact boundary filtering is required.
-Geographic search options are S2 cell IDs, not latitude/longitude values:
-`search.WithinCells` accepts one or more valid cells at levels 0 through 16 and
-normalizes them to level-16 descendant ranges. Exact polygon or coordinate
-verification belongs in the caller's canonical-data layer before or after the
-candidate search.
+Add `search.ExactTimestamp` when exact boundary filtering is required; only
+exact timestamp stages can filter candidates in place. An empty range
+(`start >= end`) compiles to a valid empty plan. Geographic search options
+are S2 cell IDs, not latitude/longitude values: `search.WithinCells` accepts
+one or more valid cells and normalizes them to level-16 descendant ranges
+(coarser cells expand, finer cells snap to their ancestor). Exact polygon or
+coordinate verification belongs in the caller's canonical-data layer before or
+after the candidate search.
 
 A combined search does not create a database-wide transactional snapshot. Each
 stage reads one independently published immutable view, consistent with the
@@ -611,6 +647,14 @@ JSON result:
 ```sh
 go run ./cmd/imageidx
 # {"image_ids":[100,200]}
+```
+
+Focused, copy-pasteable programs live under `cmd/imageidx/examples`:
+
+```sh
+go run ./cmd/imageidx/examples/basic      # bitmap + timestamp + geo plan
+go run ./cmd/imageidx/examples/bitmaponly # Search, Count, SearchLimit, Iterate
+go run ./cmd/imageidx/examples/service    # shared Service plus batch reuse
 ```
 
 Server mode demonstrates a long-lived HTTP function:

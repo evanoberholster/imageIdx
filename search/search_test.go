@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/geoidx"
+
 	"github.com/evanoberholster/imageIdx/timeidx"
 	"github.com/golang/geo/s2"
 )
@@ -40,21 +40,21 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	}
 	defer timeIndex.Close()
 
-	geo, err := geoidx.New(geoidx.Spec{IndexID: 2, Entries: []geoidx.Entry{
+	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(2), []bitmapidx.GeoEntry{
 		{ImageID: 1, Latitude: 37, Longitude: -122},
 		{ImageID: 2, Latitude: 37, Longitude: -122},
 		{ImageID: 3, Latitude: 37, Longitude: -122},
 		{ImageID: 4, Latitude: 37, Longitude: -122},
-	}}, geoidx.Config{})
+	}, bitmapidx.FieldConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer geo.Close()
-	key, err := geoidx.KeyFromLatLng(37, -122)
+	key, err := bitmapidx.KeyFromLatLng(37, -122)
 	if err != nil {
 		t.Fatal(err)
 	}
-	geoClause, err := WithinCells(geo, geoidx.DecodeS2Key(key))
+	geoClause, err := WithinCells(geo, bitmapidx.DecodeS2Key(key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,26 +92,28 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 }
 
 func TestWithinCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
-	geo, err := geoidx.New(geoidx.Spec{IndexID: 1, Entries: []geoidx.Entry{
+	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(1), []bitmapidx.GeoEntry{
 		{ImageID: 1, Latitude: 37.7749, Longitude: -122.4194},
 		{ImageID: 2, Latitude: 34.0522, Longitude: -118.2437},
-	}}, geoidx.Config{})
+	}, bitmapidx.FieldConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer geo.Close()
 
-	cell := s2.CellIDFromLatLng(s2.LatLngFromDegrees(37.7749, -122.4194)).Parent(geoidx.GeoS2Level)
-	clause, err := WithinCells(geo, uint64(cell.Parent(12)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := Search(nil, clause)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(got, []ImageID{1}) {
-		t.Fatalf("Search = %v", got)
+	cell := s2.CellID(bitmapidx.CellIDFromLatLng(37.7749, -122.4194))
+	for _, level := range []int{16, 12, 10} {
+		clause, err := WithinCells(geo, uint64(cell.Parent(level)))
+		if err != nil {
+			t.Fatalf("level %d clause: %v", level, err)
+		}
+		got, err := Search(nil, clause)
+		if err != nil {
+			t.Fatalf("level %d search: %v", level, err)
+		}
+		if !slices.Equal(got, []ImageID{1}) {
+			t.Fatalf("level %d Search = %v, want [1]", level, got)
+		}
 	}
 
 	if _, err = WithinCells(geo, 0); err == nil {
@@ -238,17 +240,17 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 		}
 		return index
 	}
-	newGeo := func(t *testing.T, ids []uint64) (*geoidx.Index, geoidx.S2Key) {
+	newGeo := func(t *testing.T, ids []uint64) (*bitmapidx.FieldIndex, bitmapidx.S2Key) {
 		t.Helper()
-		entries := make([]geoidx.Entry, len(ids))
+		entries := make([]bitmapidx.GeoEntry, len(ids))
 		for i, id := range ids {
-			entries[i] = geoidx.Entry{ImageID: id, Latitude: 37, Longitude: -122}
+			entries[i] = bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122}
 		}
-		index, err := geoidx.New(geoidx.Spec{IndexID: 2, Entries: entries}, geoidx.Config{})
+		index, err := bitmapidx.NewGeoField(bitmapidx.IndexType(2), entries, bitmapidx.FieldConfig{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		key, err := geoidx.KeyFromLatLng(37, -122)
+		key, err := bitmapidx.KeyFromLatLng(37, -122)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -260,7 +262,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 	defer bitmap.Close()
 	geo, key := newGeo(t, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
 	defer geo.Close()
-	geoClause, err := WithinCells(geo, geoidx.DecodeS2Key(key))
+	geoClause, err := WithinCells(geo, bitmapidx.DecodeS2Key(key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,23 +278,23 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 	// Fallback path: 90 candidates across 10 cells of a 100-ID geo
 	// population (10*90 > 4*100), so the stage collects and intersects.
 	geoIDs := make([]uint64, 0, 100)
-	geoEntries := make([]geoidx.Entry, 0, 100)
+	geoEntries := make([]bitmapidx.GeoEntry, 0, 100)
 	cellIDs := make([]uint64, 0, 10)
 	for cell := range 10 {
-		key, err := geoidx.KeyFromLatLng(37+float64(cell)/100, -122)
+		key, err := bitmapidx.KeyFromLatLng(37+float64(cell)/100, -122)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cell == 0 || geoidx.DecodeS2Key(key) != cellIDs[len(cellIDs)-1] {
-			cellIDs = append(cellIDs, geoidx.DecodeS2Key(key))
+		if cell == 0 || bitmapidx.DecodeS2Key(key) != cellIDs[len(cellIDs)-1] {
+			cellIDs = append(cellIDs, bitmapidx.DecodeS2Key(key))
 		}
 		for i := range 10 {
 			id := uint64(cell*10 + i + 1)
 			geoIDs = append(geoIDs, id)
-			geoEntries = append(geoEntries, geoidx.Entry{ImageID: id, Latitude: 37 + float64(cell)/100, Longitude: -122})
+			geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37 + float64(cell)/100, Longitude: -122})
 		}
 	}
-	bigGeo, err := geoidx.New(geoidx.Spec{IndexID: 4, Entries: geoEntries}, geoidx.Config{})
+	bigGeo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(4), geoEntries, bitmapidx.FieldConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

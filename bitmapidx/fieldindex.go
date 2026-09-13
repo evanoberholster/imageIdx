@@ -19,6 +19,9 @@ var (
 	ErrInvalidMutation = errors.New("bitmapidx: invalid mutation")
 	// ErrInvalidImageID reports ImageID zero, which is reserved.
 	ErrInvalidImageID = errors.New("bitmapidx: image ID zero is reserved")
+	// ErrDuplicateImageID reports an image already holding a value in a field
+	// that allows only one value per image.
+	ErrDuplicateImageID = errors.New("bitmapidx: duplicate image ID")
 )
 
 // FieldConfig controls field delta rotation and compaction. The zero value is
@@ -73,34 +76,34 @@ type FieldMetadata struct {
 // postingTable is the immutable base of one field: sorted keys and their
 // postings. Slices are shared across publications and never mutated.
 type postingTable struct {
-	keys []FieldKey
-	bits []roar.Bitmap
+	keys     []FieldKey
+	postings []posting
 }
 
-func (t *postingTable) get(key FieldKey) (roar.Bitmap, bool) {
+func (t *postingTable) get(key FieldKey) (*posting, bool) {
 	index, ok := slices.BinarySearchFunc(t.keys, key, func(e FieldKey, k FieldKey) int {
 		return compareFieldKey(e, k)
 	})
 	if !ok {
-		return roar.Bitmap{}, false
+		return nil, false
 	}
-	return t.bits[index], true
+	return &t.postings[index], true
 }
 
 func (t *postingTable) clone() postingTable {
-	return postingTable{keys: slices.Clone(t.keys), bits: slices.Clone(t.bits)}
+	return postingTable{keys: slices.Clone(t.keys), postings: slices.Clone(t.postings)}
 }
 
-func (t *postingTable) upsert(key FieldKey, bit roar.Bitmap) {
+func (t *postingTable) upsert(key FieldKey, p posting) {
 	index, ok := slices.BinarySearchFunc(t.keys, key, func(e FieldKey, k FieldKey) int {
 		return compareFieldKey(e, k)
 	})
 	if ok {
-		t.bits[index] = bit
+		t.postings[index] = p
 		return
 	}
 	t.keys = slices.Insert(t.keys, index, key)
-	t.bits = slices.Insert(t.bits, index, bit)
+	t.postings = slices.Insert(t.postings, index, p)
 }
 
 func (t *postingTable) remove(key FieldKey) {
@@ -111,7 +114,7 @@ func (t *postingTable) remove(key FieldKey) {
 		return
 	}
 	t.keys = slices.Delete(t.keys, index, index+1)
-	t.bits = slices.Delete(t.bits, index, index+1)
+	t.postings = slices.Delete(t.postings, index, index+1)
 }
 
 // fieldDelta is one immutable correction layer: per-key added/removed IDs.
@@ -155,18 +158,27 @@ type fieldView struct {
 	frozen     *fieldDelta
 	active     *fieldDelta
 	dict       *dictionaryView
+	dictGen    uint64
 	generation uint64
 }
 
+func (v *fieldView) hasDeltas() bool { return v.frozen != nil || v.active != nil }
+
 func (v *fieldView) contains(key FieldKey, id ImageID) bool {
+	if v.active == nil && v.frozen == nil {
+		if p, ok := v.base.get(key); ok {
+			return p.contains(id)
+		}
+		return false
+	}
 	if present, ok := v.active.state(key, id); ok {
 		return present
 	}
 	if present, ok := v.frozen.state(key, id); ok {
 		return present
 	}
-	if bit, ok := v.base.get(key); ok {
-		return bit.Contains(id)
+	if p, ok := v.base.get(key); ok {
+		return p.contains(id)
 	}
 	return false
 }
@@ -175,14 +187,15 @@ func (v *fieldView) containsWithoutActive(key FieldKey, id ImageID) bool {
 	if present, ok := v.frozen.state(key, id); ok {
 		return present
 	}
-	if bit, ok := v.base.get(key); ok {
-		return bit.Contains(id)
+	if p, ok := v.base.get(key); ok {
+		return p.contains(id)
 	}
 	return false
 }
 
-// effective returns the fully corrected posting for key.
-func (v *fieldView) effective(key FieldKey) (roar.Bitmap, bool) {
+// effective returns the fully corrected posting for key. The fast path
+// returns the shared immutable base posting; corrected keys build a new one.
+func (v *fieldView) effective(key FieldKey) (*posting, bool) {
 	base, hasBase := v.base.get(key)
 	frozen, hasFrozen := v.frozen.delta(key)
 	active, hasActive := v.active.delta(key)
@@ -191,7 +204,7 @@ func (v *fieldView) effective(key FieldKey) (roar.Bitmap, bool) {
 	}
 	var builder *roar.DeltaBuilder
 	if hasBase {
-		builder = roar.NewDeltaBuilderFrom(base)
+		builder = roar.NewDeltaBuilderFrom(base.bitmap())
 	} else {
 		builder = roar.NewDeltaBuilder()
 	}
@@ -202,7 +215,11 @@ func (v *fieldView) effective(key FieldKey) (roar.Bitmap, bool) {
 		builder.ApplyDelta(active.additions, active.removals)
 	}
 	out := builder.Freeze()
-	return out, !out.IsEmpty()
+	if out.IsEmpty() {
+		return nil, false
+	}
+	corrected := makePosting(out)
+	return &corrected, true
 }
 
 // effectiveTable folds the supplied deltas into a replacement posting table.
@@ -216,7 +233,7 @@ func (v *fieldView) effectiveTable(deltas ...*fieldDelta) postingTable {
 			base, hasBase := table.get(key)
 			var builder *roar.DeltaBuilder
 			if hasBase {
-				builder = roar.NewDeltaBuilderFrom(base)
+				builder = roar.NewDeltaBuilderFrom(base.bitmap())
 			} else {
 				builder = roar.NewDeltaBuilder()
 			}
@@ -225,7 +242,7 @@ func (v *fieldView) effectiveTable(deltas ...*fieldDelta) postingTable {
 			if out.IsEmpty() {
 				table.remove(key)
 			} else {
-				table.upsert(key, out)
+				table.upsert(key, makePosting(out))
 			}
 		}
 	}
@@ -248,6 +265,10 @@ type stagedChange struct {
 // FieldIndex is one immutable-field, multi-value index. Readers load one
 // atomically published fieldView and take no locks. Writers serialize through
 // writerMu. One batch is published atomically across postings and dictionary.
+//
+// Reads against a closed index report empty results, as do queries compiled
+// after close; writes and maintenance report ErrClosed. The zero value is
+// not usable; construct with NewFieldIndex.
 type FieldIndex struct {
 	view     atomic.Pointer[fieldView]
 	readers  *indexutil.ReaderTracker
@@ -358,11 +379,20 @@ func (i *FieldIndex) Apply(mutation FieldMutation) error {
 	return i.applyPrepared(mutation)
 }
 
-// Move applies explicit continuous-value transitions.
+// Move applies explicit value transitions for continuous and geo fields. For
+// geo fields the presence flags may be omitted: a level-16 key is never zero,
+// so zero is the absent sentinel. Continuous fields keep explicit flags
+// because zero is a valid grid value.
 func (i *FieldIndex) Move(moves ...Move) error {
 	field := i.Field()
-	if field.Kind != KindContinuous {
+	if field.Kind != KindContinuous && field.Kind != KindGeo {
 		return ErrFieldMismatch
+	}
+	value := func(v int64) Value {
+		if field.Kind == KindGeo {
+			return GeoValue(uint64(v))
+		}
+		return IntValue(v)
 	}
 	var mutation FieldMutation
 	seen := make(map[ImageID]struct{}, len(moves))
@@ -374,6 +404,14 @@ func (i *FieldIndex) Move(moves ...Move) error {
 			return ErrInvalidMutation
 		}
 		seen[move.ImageID] = struct{}{}
+		if field.Kind == KindGeo {
+			if !move.HasFrom && move.From != 0 {
+				move.HasFrom = true
+			}
+			if !move.HasTo && move.To != 0 {
+				move.HasTo = true
+			}
+		}
 		if !move.HasFrom && !move.HasTo {
 			continue
 		}
@@ -381,10 +419,10 @@ func (i *FieldIndex) Move(moves ...Move) error {
 			continue
 		}
 		if move.HasFrom {
-			mutation.Remove = append(mutation.Remove, Entry{ImageID: move.ImageID, Value: IntValue(move.From)})
+			mutation.Remove = append(mutation.Remove, Entry{ImageID: move.ImageID, Value: value(move.From)})
 		}
 		if move.HasTo {
-			mutation.Add = append(mutation.Add, Entry{ImageID: move.ImageID, Value: IntValue(move.To)})
+			mutation.Add = append(mutation.Add, Entry{ImageID: move.ImageID, Value: value(move.To)})
 		}
 	}
 	return i.applyPrepared(mutation)
@@ -483,25 +521,6 @@ func (i *FieldIndex) LookupValue(dst []byte, key FieldKey) ([]byte, bool) {
 	return out, ok
 }
 
-// VisitValue calls fn with the canonical bytes for key. The slice is borrowed
-// and valid only during the callback.
-func (i *FieldIndex) VisitValue(key FieldKey, fn func(value []byte) bool) bool {
-	token := i.readers.Acquire()
-	view := i.view.Load()
-	if i.closed.Load() {
-		i.readers.Release(token)
-		return false
-	}
-	entry, ok := view.dict.entry(key)
-	if !ok {
-		i.readers.Release(token)
-		return false
-	}
-	result := fn(view.dict.bytes(entry))
-	i.readers.Release(token)
-	return result
-}
-
 // Iterate visits one dictionary value per key in key order. Returning false
 // stops.
 func (i *FieldIndex) Iterate(fn func(key FieldKey, value []byte) bool) {
@@ -524,7 +543,8 @@ func (i *FieldIndex) Prefix(prefix []byte, fn func(key FieldKey, value []byte) b
 }
 
 // KeyForValue canonicalizes and hashes value, returning its dictionary key.
-// Absent values report ok=false; keys include any collision slot.
+// Absent values, and any value on a closed index, report ok=false; resolved
+// keys include any collision slot.
 func (i *FieldIndex) KeyForValue(value Value) (FieldKey, bool, error) {
 	field := i.Field()
 	key, canonical, err := i.keyForValue(field, value)
@@ -538,7 +558,7 @@ func (i *FieldIndex) KeyForValue(value Value) (FieldKey, bool, error) {
 	view := i.view.Load()
 	if i.closed.Load() {
 		i.readers.Release(token)
-		return FieldKey{}, false, ErrClosed
+		return FieldKey{}, false, nil
 	}
 	resolved, ok := view.dict.resolve(key, canonical)
 	i.readers.Release(token)
@@ -549,6 +569,9 @@ func (i *FieldIndex) KeyForValue(value Value) (FieldKey, bool, error) {
 }
 
 func (i *FieldIndex) applyPrepared(mutation FieldMutation) error {
+	if i.closed.Load() {
+		return ErrClosed
+	}
 	changes, err := i.prepare(i.Field(), mutation)
 	if err != nil {
 		return err
@@ -653,6 +676,18 @@ func (i *FieldIndex) keyForValue(field Field, value Value) (FieldKey, []byte, er
 			return FieldKey{}, nil, ErrValueKind
 		}
 		return continuousKey(field.Type, value.Int), nil, nil
+	case KindGeo:
+		if value.Kind != KindGeo {
+			return FieldKey{}, nil, ErrValueKind
+		}
+		if value.Int < 0 {
+			return FieldKey{}, nil, ErrInvalidS2Cell
+		}
+		key := uint64(value.Int)
+		if _, err := CellIDFromKey(key); err != nil {
+			return FieldKey{}, nil, err
+		}
+		return FieldKey{Hash: key, Type: field.Type}, nil, nil
 	default:
 		return FieldKey{}, nil, ErrInvalidField
 	}
@@ -669,6 +704,11 @@ func (i *FieldIndex) applyChanges(changes []stagedChange) error {
 	current := i.view.Load()
 	resolved, err := i.resolveChanges(current, changes)
 	if err != nil {
+		i.dict.abort()
+		return err
+	}
+	if err := validateGeoChanges(current, resolved); err != nil {
+		i.dict.abort()
 		return err
 	}
 	active := composeFieldDelta(current, resolved)
@@ -734,65 +774,167 @@ func (i *FieldIndex) resolveChanges(view *fieldView, changes []stagedChange) ([]
 	return out, nil
 }
 
-// composeFieldDelta resolves desired states against the current view.
+// composeFieldDelta resolves the batch against the current view. It shallow-
+// copies the Active map -- untouched deltas are shared -- and recomputes only
+// the keys the batch touches. Underlying membership is checked only for batch
+// IDs that are not already named in the key's existing delta; everything else
+// follows from the layer's existing canonical form.
 func composeFieldDelta(view *fieldView, changes []stagedChange) *fieldDelta {
-	desired := make(map[FieldKey]map[ImageID]bool)
-	ensure := func(key FieldKey) map[ImageID]bool {
-		states, ok := desired[key]
-		if !ok {
-			states = make(map[ImageID]bool)
-			desired[key] = states
-		}
-		return states
-	}
-	if view.active != nil {
-		for key, bd := range view.active.values {
-			states := ensure(key)
-			for _, id := range bd.additions.AppendTo(nil) {
-				states[id] = true
-			}
-			for _, id := range bd.removals.AppendTo(nil) {
-				states[id] = false
-			}
-		}
-	}
-	for _, change := range changes {
-		states := ensure(change.key)
-		for _, id := range change.add {
-			states[id] = true
-		}
-		for _, id := range change.remove {
-			states[id] = false // remove wins within the batch
-		}
-	}
-	values := make(map[FieldKey]*bitmapDelta)
+	var values map[FieldKey]*bitmapDelta
 	var keys []FieldKey
 	ids := 0
-	for key, states := range desired {
-		var additions, removals []ImageID
-		for id, want := range states {
-			if want == view.containsWithoutActive(key, id) {
+	if view.active != nil {
+		values = make(map[FieldKey]*bitmapDelta, len(view.active.values)+len(changes))
+		for key, bd := range view.active.values {
+			values[key] = bd
+		}
+		keys = slices.Clone(view.active.keys)
+		ids = view.active.ids
+	} else {
+		values = make(map[FieldKey]*bitmapDelta, len(changes))
+	}
+
+	for _, change := range changes {
+		adds := dedupeSortedIDs(change.add)
+		rems := dedupeSortedIDs(change.remove)
+		adds = subtractSortedIDs(adds, rems) // remove wins within the batch
+
+		old, _ := view.active.delta(change.key)
+		var oldAdds, oldRems []ImageID
+		oldLen := 0
+		if old != nil {
+			if !old.additions.IsEmpty() {
+				oldAdds = old.additions.AppendTo(nil)
+			}
+			if !old.removals.IsEmpty() {
+				oldRems = old.removals.AppendTo(nil)
+			}
+			oldLen = old.len()
+		}
+
+		// Corrections that stay valid keep their state without rechecking the
+		// underlying layers: removals carry through, additions carry through.
+		stayingAdds := subtractSortedIDs(oldAdds, rems)
+		stayingRems := subtractSortedIDs(oldRems, adds)
+		var newAdds, newRems []ImageID
+		for _, id := range adds {
+			// Already added: underlying lacks the ID. Covered by stayingAdds.
+			if containsSortedID(oldAdds, id) {
 				continue
 			}
-			if want {
-				additions = append(additions, id)
-			} else {
-				removals = append(removals, id)
+			// Previously removed: underlying holds the ID, so an addition
+			// would match published state and must not be recorded.
+			if containsSortedID(oldRems, id) {
+				continue
+			}
+			if !view.containsWithoutActive(change.key, id) {
+				newAdds = append(newAdds, id)
 			}
 		}
-		bd := newBitmapDelta(additions, removals)
-		if bd == nil {
+		for _, id := range rems {
+			// Already removed: covered by stayingRems.
+			if containsSortedID(oldRems, id) {
+				continue
+			}
+			// Previously added: underlying lacks the ID, so dropping the
+			// addition is enough.
+			if containsSortedID(oldAdds, id) {
+				continue
+			}
+			if view.containsWithoutActive(change.key, id) {
+				newRems = append(newRems, id)
+			}
+		}
+		addFinal := mergeSortedIDs(stayingAdds, newAdds)
+		remFinal := mergeSortedIDs(stayingRems, newRems)
+		if len(addFinal) == 0 && len(remFinal) == 0 {
+			if old != nil {
+				delete(values, change.key)
+				if index, ok := slices.BinarySearchFunc(keys, change.key, compareFieldKey); ok {
+					keys = slices.Delete(keys, index, index+1)
+				}
+				ids -= oldLen
+			}
 			continue
 		}
-		values[key] = bd
-		keys = append(keys, key)
-		ids += bd.len()
+		values[change.key] = &bitmapDelta{
+			additions: roar.FromUnsorted(addFinal),
+			removals:  roar.FromUnsorted(remFinal),
+		}
+		if old == nil {
+			index, _ := slices.BinarySearchFunc(keys, change.key, compareFieldKey)
+			keys = slices.Insert(keys, index, change.key)
+		}
+		ids += len(addFinal) + len(remFinal) - oldLen
 	}
 	if len(values) == 0 {
 		return nil
 	}
-	slices.SortFunc(keys, compareFieldKey)
 	return &fieldDelta{values: values, keys: keys, ids: ids}
+}
+
+// dedupeSortedIDs sorts ids in place and returns the unique prefix. The input
+// must be owned by the caller.
+func dedupeSortedIDs(ids []ImageID) []ImageID {
+	slices.Sort(ids)
+	return slices.Compact(ids)
+}
+
+// containsSortedID reports whether id is present in the ascending slice.
+func containsSortedID(ids []ImageID, id ImageID) bool {
+	_, ok := slices.BinarySearch(ids, id)
+	return ok
+}
+
+// subtractSortedIDs returns the ascending values minus the ascending minus.
+func subtractSortedIDs(values, minus []ImageID) []ImageID {
+	if len(values) == 0 || len(minus) == 0 {
+		return values
+	}
+	out := values[:0]
+	keep, drop := 0, 0
+	for keep < len(values) && drop < len(minus) {
+		switch {
+		case values[keep] < minus[drop]:
+			out = append(out, values[keep])
+			keep++
+		case values[keep] > minus[drop]:
+			drop++
+		default:
+			keep++
+			drop++
+		}
+	}
+	return append(out, values[keep:]...)
+}
+
+// mergeSortedIDs returns the ascending union of two ascending, individually
+// unique slices, assigning nothing when both are empty.
+func mergeSortedIDs(first, second []ImageID) []ImageID {
+	if len(first) == 0 {
+		return second
+	}
+	if len(second) == 0 {
+		return first
+	}
+	out := make([]ImageID, 0, len(first)+len(second))
+	left, right := 0, 0
+	for left < len(first) && right < len(second) {
+		switch {
+		case first[left] < second[right]:
+			out = append(out, first[left])
+			left++
+		case first[left] > second[right]:
+			out = append(out, second[right])
+			right++
+		default:
+			out = append(out, first[left])
+			left++
+			right++
+		}
+	}
+	out = append(out, first[left:]...)
+	return append(out, second[right:]...)
 }
 
 // publishLocked publishes a replacement field view. Caller holds writerMu.
@@ -803,6 +945,7 @@ func (i *FieldIndex) publishLocked(old *fieldView, base postingTable, frozen, ac
 		frozen:     frozen,
 		active:     active,
 		dict:       i.dict.view(),
+		dictGen:    i.dict.generation,
 		generation: old.generation + 1,
 	}
 	i.view.Store(next)

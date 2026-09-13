@@ -16,8 +16,7 @@ before scalar correctness and benchmarks are stable.
 
 - Module path: `github.com/evanoberholster/imageIdx`
 - Go: `1.27.0`
-- `github.com/dgraph-io/sroar` — immutable roaring sets (`idset` only)
-- `github.com/weaviate/sroar` — benchmark comparison baseline for `roar`
+- `github.com/weaviate/sroar` — test-only benchmark and differential baseline for `roar`
 - `github.com/golang/geo/s2` — S2 geometry (geoidx)
 - `github.com/pkg/errors` — indirect
 
@@ -34,7 +33,7 @@ Per-package benchmarks:
 
 ```sh
 go test ./timeidx  -run '^$' -bench 'Benchmark(Search|Update|DeltaCapacity|BlockSize)' -benchmem
-go test ./bitmapidx  -run '^$' -bench 'Benchmark(Contains|Intersect4|ApplyBatch1000)' -benchmem
+go test ./bitmapidx  -run '^$' -bench 'Benchmark(Contains|And4|ApplyBatch1000)' -benchmem
 go test ./geoidx   -run '^$' -bench 'Benchmark(SingleCell|BoundingBox|BatchIngest1000)' -benchmem
 go test ./search     -run '^$' -bench 'BenchmarkCombinedSearch' -benchmem
 go test ./roar       -run '^$' -bench . -benchmem
@@ -50,19 +49,19 @@ Every change must pass `go build ./...`, `go test ./...`, and
 
 ```text
 ./           imageidx: shared ImageID and durability domain types
-idset/       immutable roaring ID-set representation and buffer codec
-roar/        zero-copy immutable bitmap index (AGENTS/RoarFormat.md)
+roar/        immutable zero-copy bitmap sets used directly by bitmapidx and geoidx
 bitmapidx/   logical bitmap predicates and bounded deltas
 timeidx/   standalone block-local timestamp index
-geoidx/    S2 level-16 spatial index (depends on idset)
+geoidx/    S2 level-16 spatial index (dense cells are roar bitmaps)
 internal/indexutil/ shared non-domain mechanisms used by all three indexes
 search/      cross-index planner and conjunctive query executor
 cmd/imageidx/ runnable one-shot and HTTP-server combined-search example
 ```
 
 Dependency direction remains one-way: the root `imageidx` package imports no
-subpackages; `idset` imports the root and owns the only `sroar` dependency; all
-indexes may import the root, `idset`, and `internal/indexutil` as appropriate.
+subpackages; `roar` is standalone and imports only `internal/indexutil` (plus
+its own `internal/bitmapkernel`) and the standard library; all indexes may
+import the root, `roar`, and `internal/indexutil` as appropriate.
 Specialized index packages remain independent of one another. `search` imports
 all three indexes; index packages must never import `search`. Never introduce a
 reverse dependency.
@@ -87,15 +86,20 @@ reverse dependency.
 - `imageidx.Durability` is shared by persistent index APIs; package constants
   remain aliases for convenient migration.
 
-### Immutable ID sets live in `idset`
+### Immutable ID sets live in `roar`
 
-- `idset.Ref` is the immutable roaring handle shared by logical bitmap
-  predicates and dense S2 cells.
-- `idset.Builder` owns mutable replacement construction. Published `Ref` values
-  must never be mutated; notably, raw `sroar.FastAnd` consumes its first input.
-- `idset.FromBuffer` and `Ref.MarshalBinary` are the common owned/mmap buffer
-  boundary. Package-specific directories and file formats remain separate.
-- Index packages use `idset.Ref` directly; they do not expose representation
+- `roar.Bitmap` is the immutable set handle shared by logical bitmap
+  predicates and dense S2 cells. Its zero value is an empty set; every method
+  is nil-safe.
+- `roar.DeltaBuilder` owns mutable replacement construction (deferred ID
+  additions/removals plus whole-set Or/And/AndNot). Published `Bitmap` values
+  must never be mutated.
+- `roar.FromSorted` builds from strictly increasing IDs; `roar.FromUnsorted`
+  accepts any order (copying only when canonicalization is needed).
+  `roar.Open`/`OpenTrusted` and `Bitmap.MarshalBinary` are the common
+  owned/mmap buffer boundary. Package-specific directories and file formats
+  remain separate.
+- Index packages use `roar.Bitmap` directly; they do not expose representation
   aliases.
 
 ### Zero-copy bitmap index lives in `roar`
@@ -118,17 +122,24 @@ representation.
   `Intersects`) allocate nothing. `AppendTo` is the fast materialization
   path; `Iterator.Next/Value` is the compatibility API and is slower than
   `AppendTo` because the Go inliner refuses the per-value state machine.
-- `FromSortedList` returns an immutable `Bitmap`; `FromSorted` exposes its raw
-  encoding. Construction is two-pass: one validation/layout pass, one write
-  pass into a single allocation. `Builder` accumulates operation results;
-  `Compact` assembles them. Thresholds (`ArrayToBitmapThreshold` 2048,
+- `FromSorted` builds an immutable `Bitmap` from strictly increasing IDs;
+  `FromUnsorted` accepts any order. Construction is two-pass: one
+  validation/layout pass, one write pass into a single allocation.
+  `DeltaBuilder` accumulates deferred ID edits and whole-set operations;
+  `Builder` accumulates operation results; `Compact` assembles them.
+  `MutableBitmap` is the transient search-time accumulator over the same
+  machinery: single-owner, workspace-resident, never persisted. ID-only
+  accumulation materializes with one sort and no bitmap involvement; folds
+  apply eagerly so retained bytes stay valid after read guards release, and
+  fold assemblies recycle one owned result buffer. Steady-state search
+  accumulation allocates nothing.
+  Thresholds (`ArrayToBitmapThreshold` 2048,
   `linearKeySearchThreshold` 16, `arrayLinearSearchThreshold` 16) are runtime
   policies, not format guarantees.
 - `roar` benchmarks compare against `github.com/weaviate/sroar` on
   photo-DB-shaped distributions (geo cells, people, tags, dense time
   buckets, favorites, mixed). Note: sroar's `And`/`Or`/`AndNot` mutate their
-  receiver, so benchmark and differential code must clone first.
-- `idset` remains on `dgraph-io/sroar`; `roar` is currently standalone.
+   receiver, so benchmark and differential code must clone first.
 
 ### `ImageID` is one type everywhere
 
@@ -184,10 +195,9 @@ Every index follows the same conceptual skeleton. New code must conform.
 - `Apply(Mutation)` is the canonical mutation API. A 1,000-ID mutation
   publishes once, never 1,000 times.
 - If an ID appears in both `Mutation.Add` and `Mutation.Remove`, removal wins.
-- `Intersect`/`Union` materialize `effectiveBitmap()` today. A future delta-aware
-  correction path (Base-only ops + re-evaluating delta-touched IDs) is proposed
-  but not implemented.
-- Intersection planning is private and orders by Base cardinality only; delta
+- `And`/`Or` materialize per-operand corrections before the N-way combination.
+  `Count` skips materialization for delta-free operands via fused cardinality.
+- And-planning is private and orders by Base cardinality only; delta
   cardinalities are ignored.
 - Reader-visible views, deltas, segment entries, and raw segment operations are
   private. Public callers use `Metadata`, `Contains`, `AppendTo`, and the set
@@ -218,7 +228,7 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 - One coordinate per image, normalized to S2 level 16 (`cellID >> 28`).
 - Sparse cells (1-4 IDs) use a fixed 4-slot SoA; dense cells (5+) use
-  `idset.Ref`.
+  `roar.Bitmap`.
 - Searches load one private immutable `indexView` and never inspect writer-side
   mutations. The view contains 256 independently replaceable shards;
   visibility is threshold/timer driven and `Flush()` forces a boundary.
@@ -248,9 +258,10 @@ Every index follows the same conceptual skeleton. New code must conform.
   correctness.
 - Bitmap predicates remain one group. The first-stage path streams the
   smallest bitmap into caller storage and filters it in place; after another
-  stage has produced candidates, `bitmapidx.FilterCandidates` tests them under
+  stage has produced candidates, `bitmapidx.Filter` tests them under
   one registration per distinct private tracker. Timestamp exact clauses can
-  filter candidates in place; geographic clauses collect cell ranges and the
+  filter candidates in place; geographic stages accumulate cell ranges into
+  the workspace-owned `roar.MutableBitmap` and materialize once, and the
   executor intersects.
 - Combined results are sorted and unique. A caller-owned result slice and
   `Workspace` reuse all result/intermediate buffers, allowing zero-allocation
@@ -298,10 +309,9 @@ These are benchmark-driven; change them only with supporting evidence.
 ## Conventions When Extending
 
 - Add new functionality to an existing package; do not duplicate reader
-  tracking, WAL, or mmap code into a new package. Specialized indexes depend
-  on the `idset` representation boundary, not directly on competing roaring
-  implementations; `roar` remains a candidate backend until a measured
-  migration replaces the current `sroar` implementation behind `idset`.
+  tracking, WAL, or mmap code into a new package. Specialized indexes use the
+  `roar.Bitmap` representation boundary directly; `weaviate/sroar` remains a
+  test-only benchmark baseline.
 - Mirror the existing `*_test.go` split: unit tests, storage tests
   (`storage_test.go`), and benchmarks (`benchmark_test.go`). Use
   `b.ReportAllocs()` and `b.ResetTimer()` in benchmarks.
