@@ -4,10 +4,12 @@ import (
 	"encoding/binary"
 	"math/rand/v2"
 	"testing"
+	"unsafe"
 )
 
 // TestFormatConstantsAligned locks the structural sizes that guarantee
-// 8-byte alignment throughout the serialized layout.
+// 8-byte alignment throughout the serialized layout, plus the exact in-memory
+// header layout that the new offsets below depend on.
 func TestFormatConstantsAligned(t *testing.T) {
 	if HeaderSize%Alignment != 0 {
 		t.Fatalf("HeaderSize = %d is not %d-byte aligned", HeaderSize, Alignment)
@@ -20,6 +22,23 @@ func TestFormatConstantsAligned(t *testing.T) {
 	}
 	if BitmapBytes%Alignment != 0 {
 		t.Fatalf("BitmapBytes = %d is not %d-byte aligned", BitmapBytes, Alignment)
+	}
+	if size := unsafe.Sizeof(header{}); size != HeaderSize {
+		t.Fatalf("sizeof(header) = %d, want HeaderSize %d", size, HeaderSize)
+	}
+	var h header
+	base := unsafe.Pointer(&h)
+	if off := uintptr(unsafe.Pointer(&h.Version)) - uintptr(base); off != 0 {
+		t.Fatalf("header.Version offset = %d, want 0", off)
+	}
+	if off := uintptr(unsafe.Pointer(&h.Flags)) - uintptr(base); off != 2 {
+		t.Fatalf("header.Flags offset = %d, want 2", off)
+	}
+	if off := uintptr(unsafe.Pointer(&h.KeyCount)) - uintptr(base); off != 4 {
+		t.Fatalf("header.KeyCount offset = %d, want 4", off)
+	}
+	if off := uintptr(unsafe.Pointer(&h.Cardinality)) - uintptr(base); off != 8 {
+		t.Fatalf("header.Cardinality offset = %d, want 8", off)
 	}
 }
 
@@ -93,8 +112,8 @@ func assertAligned(t *testing.T, data []byte) {
 	if len(data)%Alignment != 0 {
 		t.Fatalf("serialized size %d is not %d-byte aligned", len(data), Alignment)
 	}
-	headerBytes := binary.LittleEndian.Uint32(data[8:12])
-	keyCount := binary.LittleEndian.Uint32(data[12:16])
+	headerBytes := uint64(HeaderSize)
+	keyCount := binary.LittleEndian.Uint32(data[4:8])
 	if headerBytes%Alignment != 0 {
 		t.Fatalf("key table start %d is not %d-byte aligned", headerBytes, Alignment)
 	}
@@ -122,10 +141,8 @@ func TestGoldenBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantEmpty := []byte{
-		0x52, 0x4F, 0x41, 0x52, // "ROAR"
 		0x01, 0x00, // version 1
 		0x03, 0x00, // FlagCompact | FlagStoredCardinality
-		0x18, 0x00, 0x00, 0x00, // HeaderBytes 24
 		0x00, 0x00, 0x00, 0x00, // KeyCount 0
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Cardinality 0
 	}
@@ -138,15 +155,13 @@ func TestGoldenBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantOne := []byte{
-		0x52, 0x4F, 0x41, 0x52,
 		0x01, 0x00,
 		0x03, 0x00,
-		0x18, 0x00, 0x00, 0x00,
 		0x01, 0x00, 0x00, 0x00, // KeyCount 1
 		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Cardinality 1
-		// key entry: key = 1<<48, offset = 40
+		// key entry: key = 1<<48, offset = 32
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
-		0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		// container: blocks 2, array, card 1
 		0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
 		// values: 5, padding
@@ -154,5 +169,38 @@ func TestGoldenBytes(t *testing.T) {
 	}
 	if got := one.Bytes(); string(got) != string(wantOne) {
 		t.Fatalf("one-ID bitmap = % x, want % x", got, wantOne)
+	}
+}
+
+// TestRejectsPreSealLayouts locks the seal promise: bytes written by
+// pre-seal layouts must fail closed, never parse. The development magic word
+// lands on the version tag and mismatches; the short-lived 24-byte header
+// parses its headerBytes word as key count 24 and runs out of bounds.
+func TestRejectsPreSealLayouts(t *testing.T) {
+	withMagic := []byte{
+		0x52, 0x4F, 0x41, 0x52, // "ROAR" over the version tag
+		0x03, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+	if err := Validate(withMagic); err != ErrUnsupportedVersion {
+		t.Fatalf("magic-prefixed bytes error = %v, want %v", err, ErrUnsupportedVersion)
+	}
+
+	twentyFour := []byte{
+		0x01, 0x00,
+		0x03, 0x00,
+		0x18, 0x00, 0x00, 0x00, // old headerBytes word reads as keyCount 24
+		0x01, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+		0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+		0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+	if err := Validate(twentyFour); err == nil {
+		t.Fatal("24-byte-header bytes validated under the 16-byte layout")
 	}
 }

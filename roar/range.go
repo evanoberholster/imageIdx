@@ -7,7 +7,10 @@ import (
 
 // IDRange is a half-open interval [Lo, Hi) of image IDs.
 type IDRange struct {
-	Lo, Hi uint64
+	// Lo is the inclusive lower bound.
+	Lo uint64
+	// Hi is the exclusive upper bound.
+	Hi uint64
 }
 
 // RemoveRange returns a new Bitmap with all IDs in the half-open interval

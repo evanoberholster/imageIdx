@@ -30,6 +30,11 @@ const inlineDeltaCapacity = 64
 // DeltaBuilder is not safe for concurrent use. Confine each DeltaBuilder to
 // one goroutine. Do not copy a DeltaBuilder after first use: pending slices
 // and Builder scratch may alias its own inline buffers.
+//
+// Selection rule: writers that publish immutable Bitmaps (index apply paths)
+// use DeltaBuilder; single-goroutine query workspaces accumulating transient
+// sets use MutableBitmap below, which recycles its assembly buffer across
+// queries instead of guaranteeing Freeze independence.
 type DeltaBuilder struct {
 	bitmap    Bitmap
 	adds      []uint64

@@ -222,7 +222,9 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 	dst.appendBitmap(key, scratch, uint32(survivors))
 }
 
-// orManyContainersInto folds the containers sharing one key into dst.
+// orManyContainersInto folds the containers sharing one key into dst. Pairs
+// use the pairwise kernels; wider fan-ins accumulate into the dense scratch
+// buffer, which also handles mixed array/bitmap sets without intermediates.
 func orManyContainersInto(dst *Builder, key uint64, containers [][]byte) {
 	switch len(containers) {
 	case 0:
@@ -256,6 +258,9 @@ func valuePresentInAll(value uint16, driver int, containers [][]byte) bool {
 
 // AndManyCardinality counts the N-way intersection of views without
 // materializing it. It allocates nothing for up to maxStackViews inputs.
+//
+// Note: only intersection has an N-way counting form; union cardinality is
+// available pairwise via OrCardinality.
 func AndManyCardinality(views ...Bitmap) uint64 {
 	if len(views) < 2 {
 		if len(views) == 1 {

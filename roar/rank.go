@@ -34,7 +34,8 @@ func (b Bitmap) Rank(x uint64) uint64 {
 	return total
 }
 
-// Select returns the x-th smallest ID (zero-indexed). It returns
+// Select returns the x-th smallest ID (zero-indexed). It walks the key
+// table linearly, so it is O(containers). It returns
 // ErrSelectOutOfRange when x is not less than the cardinality.
 func (b Bitmap) Select(x uint64) (uint64, error) {
 	entries := b.keyEntries()

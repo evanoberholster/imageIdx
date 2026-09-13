@@ -173,18 +173,7 @@ func andIntoRange(dst *Builder, a, b Bitmap, lo, hi uint64) {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	ai, aEnd := keyRange(aEntries, lo, hi)
 	bi, bEnd := keyRange(bEntries, lo, hi)
-	for ai < aEnd && bi < bEnd {
-		switch {
-		case aEntries[ai].Key < bEntries[bi].Key:
-			ai++
-		case aEntries[ai].Key > bEntries[bi].Key:
-			bi++
-		default:
-			andContainerInto(dst, aEntries[ai].Key, a.data[aEntries[ai].Offset:], b.data[bEntries[bi].Offset:])
-			ai++
-			bi++
-		}
-	}
+	andEntriesInto(dst, a.data, b.data, aEntries[ai:aEnd], bEntries[bi:bEnd])
 }
 
 // orIntoRange is OrInto restricted to keys in [lo, hi).
@@ -192,20 +181,7 @@ func orIntoRange(dst *Builder, a, b Bitmap, lo, hi uint64) {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	ai, aEnd := keyRange(aEntries, lo, hi)
 	bi, bEnd := keyRange(bEntries, lo, hi)
-	for ai < aEnd || bi < bEnd {
-		switch {
-		case bi >= bEnd || ai < aEnd && aEntries[ai].Key < bEntries[bi].Key:
-			copyContainerInto(dst, aEntries[ai].Key, a.data[aEntries[ai].Offset:])
-			ai++
-		case ai >= aEnd || aEntries[ai].Key > bEntries[bi].Key:
-			copyContainerInto(dst, bEntries[bi].Key, b.data[bEntries[bi].Offset:])
-			bi++
-		default:
-			orContainerInto(dst, aEntries[ai].Key, a.data[aEntries[ai].Offset:], b.data[bEntries[bi].Offset:])
-			ai++
-			bi++
-		}
-	}
+	orEntriesInto(dst, a.data, b.data, aEntries[ai:aEnd], bEntries[bi:bEnd])
 }
 
 // andNotIntoRange is AndNotInto restricted to keys in [lo, hi).
@@ -213,28 +189,31 @@ func andNotIntoRange(dst *Builder, a, b Bitmap, lo, hi uint64) {
 	aEntries, bEntries := a.keyEntries(), b.keyEntries()
 	ai, aEnd := keyRange(aEntries, lo, hi)
 	bi, bEnd := keyRange(bEntries, lo, hi)
-	for ai < aEnd {
-		if bi >= bEnd || aEntries[ai].Key < bEntries[bi].Key {
-			copyContainerInto(dst, aEntries[ai].Key, a.data[aEntries[ai].Offset:])
-			ai++
-			continue
-		}
-		if aEntries[ai].Key > bEntries[bi].Key {
-			bi++
-			continue
-		}
-		andNotContainerInto(dst, aEntries[ai].Key, a.data[aEntries[ai].Offset:], b.data[bEntries[bi].Offset:])
-		ai++
-		bi++
-	}
+	andNotEntriesInto(dst, a.data, b.data, aEntries[ai:aEnd], bEntries[bi:bEnd])
 }
 
 // orManyIntoRange is the N-way union restricted to keys in [lo, hi).
 func orManyIntoRange(dst *Builder, lo, hi uint64, bitmaps ...Bitmap) {
 	count := len(bitmaps)
-	entries := make([][]keyEntry, count)
-	positions := make([]int, count)
-	ends := make([]int, count)
+	var stackEntries [maxStackViews][]keyEntry
+	var stackPositions [maxStackViews]int
+	var stackEnds [maxStackViews]int
+	var stackContainers [maxStackViews][]byte
+	entries := stackEntries[:0]
+	positions := stackPositions[:0]
+	ends := stackEnds[:0]
+	var containers [][]byte
+	if count > maxStackViews {
+		entries = make([][]keyEntry, count)
+		positions = make([]int, count)
+		ends = make([]int, count)
+		containers = make([][]byte, 0, count)
+	} else {
+		containers = stackContainers[:0]
+	}
+	entries = entries[:count]
+	positions = positions[:count]
+	ends = ends[:count]
 	for index, bm := range bitmaps {
 		list := bm.keyEntries()
 		start, end := keyRange(list, lo, hi)
@@ -242,7 +221,6 @@ func orManyIntoRange(dst *Builder, lo, hi uint64, bitmaps ...Bitmap) {
 		positions[index] = start
 		ends[index] = end
 	}
-	containers := make([][]byte, 0, count)
 	for {
 		minKey, found := minKey(entries, positions, ends)
 		if !found {

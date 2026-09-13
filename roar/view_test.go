@@ -49,50 +49,45 @@ func TestOpenValidation(t *testing.T) {
 		"truncated header": func() []byte {
 			return valid[:10]
 		},
-		"bad magic": func() []byte {
-			corrupt := slices.Clone(valid)
-			binary.LittleEndian.PutUint32(corrupt[0:4], 0xdeadbeef)
-			return corrupt
-		},
 		"bad version": func() []byte {
 			corrupt := slices.Clone(valid)
-			binary.LittleEndian.PutUint16(corrupt[4:6], 9)
+			binary.LittleEndian.PutUint16(corrupt[0:2], 9)
 			return corrupt
 		},
 		"misaligned offset": func() []byte {
 			corrupt := slices.Clone(valid)
-			entry := binary.LittleEndian.Uint32(corrupt[8:12])
+			entry := uint32(HeaderSize)
 			binary.LittleEndian.PutUint64(corrupt[entry+8:], 9)
 			return corrupt
 		},
 		"out of bounds offset": func() []byte {
 			corrupt := slices.Clone(valid)
-			entry := binary.LittleEndian.Uint32(corrupt[8:12])
+			entry := uint32(HeaderSize)
 			binary.LittleEndian.PutUint64(corrupt[entry+8:], uint64(len(corrupt)))
 			return corrupt
 		},
 		"unsorted keys": func() []byte {
 			corrupt := slices.Clone(valid)
-			entry := binary.LittleEndian.Uint32(corrupt[8:12])
+			entry := uint32(HeaderSize)
 			binary.LittleEndian.PutUint64(corrupt[entry:], 3<<48)
 			binary.LittleEndian.PutUint64(corrupt[entry+16:], 2<<48)
 			return corrupt
 		},
 		"uncleared low key bits": func() []byte {
 			corrupt := slices.Clone(valid)
-			entry := binary.LittleEndian.Uint32(corrupt[8:12])
+			entry := uint32(HeaderSize)
 			binary.LittleEndian.PutUint64(corrupt[entry:], 1<<48+3)
 			return corrupt
 		},
 		"bad container type": func() []byte {
 			corrupt := slices.Clone(valid)
-			offset := binary.LittleEndian.Uint64(corrupt[32:40])
+			offset := binary.LittleEndian.Uint64(corrupt[24:32])
 			binary.LittleEndian.PutUint16(corrupt[offset+2:], 7)
 			return corrupt
 		},
 		"wrong array order": func() []byte {
 			corrupt := slices.Clone(valid)
-			offset := binary.LittleEndian.Uint64(corrupt[32:40])
+			offset := binary.LittleEndian.Uint64(corrupt[24:32])
 			binary.LittleEndian.PutUint16(corrupt[offset+8:], 9)
 			binary.LittleEndian.PutUint16(corrupt[offset+10:], 8)
 			return corrupt
@@ -102,7 +97,7 @@ func TestOpenValidation(t *testing.T) {
 		},
 		"key table out of bounds": func() []byte {
 			corrupt := slices.Clone(valid)
-			binary.LittleEndian.PutUint32(corrupt[12:16], 1000)
+			binary.LittleEndian.PutUint32(corrupt[4:8], 1000)
 			return corrupt
 		},
 	}
@@ -119,7 +114,7 @@ func TestValidateRejectsOverflowingContainerOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := built.Bytes()
-	entry := binary.LittleEndian.Uint32(data[8:12])
+	entry := uint32(HeaderSize)
 	binary.LittleEndian.PutUint64(data[entry+8:], ^uint64(0)-7)
 
 	if err := Validate(data); err != ErrInvalidBitmap {
@@ -164,7 +159,7 @@ func TestValidateRejectsReservedImageID(t *testing.T) {
 				t.Fatal(err)
 			}
 			data := built.Bytes()
-			offset := binary.LittleEndian.Uint64(data[32:40])
+			offset := binary.LittleEndian.Uint64(data[24:32])
 			test.mutate(data, offset)
 
 			if err := Validate(data); err != ErrInvalidImageID {

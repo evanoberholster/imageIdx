@@ -110,7 +110,13 @@ func OrMany(bitmaps ...Bitmap) Bitmap {
 // AndInto appends the intersection of a and b to dst. The two key tables
 // are merge-walked in order; only matching containers are combined.
 func AndInto(dst *Builder, a, b Bitmap) {
-	aEntries, bEntries := a.keyEntries(), b.keyEntries()
+	andEntriesInto(dst, a.data, b.data, a.keyEntries(), b.keyEntries())
+}
+
+// andEntriesInto appends the intersection of the entry slices to dst.
+// Offsets in aEntries address aData and offsets in bEntries address bData,
+// so callers may pass sub-slices restricting the walk to a key range.
+func andEntriesInto(dst *Builder, aData, bData []byte, aEntries, bEntries []keyEntry) {
 	i, j := 0, 0
 	for i < len(aEntries) && j < len(bEntries) {
 		switch {
@@ -119,7 +125,7 @@ func AndInto(dst *Builder, a, b Bitmap) {
 		case aEntries[i].Key > bEntries[j].Key:
 			j++
 		default:
-			andContainerInto(dst, aEntries[i].Key, a.data[aEntries[i].Offset:], b.data[bEntries[j].Offset:])
+			andContainerInto(dst, aEntries[i].Key, aData[aEntries[i].Offset:], bData[bEntries[j].Offset:])
 			i++
 			j++
 		}
@@ -146,18 +152,24 @@ func andContainerInto(dst *Builder, key uint64, a, b []byte) {
 
 // OrInto appends the union of a and b to dst.
 func OrInto(dst *Builder, a, b Bitmap) {
-	aEntries, bEntries := a.keyEntries(), b.keyEntries()
+	orEntriesInto(dst, a.data, b.data, a.keyEntries(), b.keyEntries())
+}
+
+// orEntriesInto appends the union of the entry slices to dst. Offsets in
+// aEntries address aData and offsets in bEntries address bData, so callers
+// may pass sub-slices restricting the walk to a key range.
+func orEntriesInto(dst *Builder, aData, bData []byte, aEntries, bEntries []keyEntry) {
 	i, j := 0, 0
 	for i < len(aEntries) || j < len(bEntries) {
 		switch {
 		case j >= len(bEntries) || i < len(aEntries) && aEntries[i].Key < bEntries[j].Key:
-			copyContainerInto(dst, aEntries[i].Key, a.data[aEntries[i].Offset:])
+			copyContainerInto(dst, aEntries[i].Key, aData[aEntries[i].Offset:])
 			i++
 		case i >= len(aEntries) || aEntries[i].Key > bEntries[j].Key:
-			copyContainerInto(dst, bEntries[j].Key, b.data[bEntries[j].Offset:])
+			copyContainerInto(dst, bEntries[j].Key, bData[bEntries[j].Offset:])
 			j++
 		default:
-			orContainerInto(dst, aEntries[i].Key, a.data[aEntries[i].Offset:], b.data[bEntries[j].Offset:])
+			orContainerInto(dst, aEntries[i].Key, aData[aEntries[i].Offset:], bData[bEntries[j].Offset:])
 			i++
 			j++
 		}
@@ -200,11 +212,18 @@ func orArrayBitmapInto(dst *Builder, key uint64, values []uint16, words []uint64
 
 // AndNotInto appends a minus b to dst.
 func AndNotInto(dst *Builder, a, b Bitmap) {
-	aEntries, bEntries := a.keyEntries(), b.keyEntries()
+	andNotEntriesInto(dst, a.data, b.data, a.keyEntries(), b.keyEntries())
+}
+
+// andNotEntriesInto appends the entry slices of a minus the entry slices of
+// b to dst. Offsets in aEntries address aData and offsets in bEntries
+// address bData, so callers may pass sub-slices restricting the walk to a
+// key range.
+func andNotEntriesInto(dst *Builder, aData, bData []byte, aEntries, bEntries []keyEntry) {
 	i, j := 0, 0
 	for i < len(aEntries) {
 		if j >= len(bEntries) || aEntries[i].Key < bEntries[j].Key {
-			copyContainerInto(dst, aEntries[i].Key, a.data[aEntries[i].Offset:])
+			copyContainerInto(dst, aEntries[i].Key, aData[aEntries[i].Offset:])
 			i++
 			continue
 		}
@@ -212,7 +231,7 @@ func AndNotInto(dst *Builder, a, b Bitmap) {
 			j++
 			continue
 		}
-		andNotContainerInto(dst, aEntries[i].Key, a.data[aEntries[i].Offset:], b.data[bEntries[j].Offset:])
+		andNotContainerInto(dst, aEntries[i].Key, aData[aEntries[i].Offset:], bData[bEntries[j].Offset:])
 		i++
 		j++
 	}

@@ -29,14 +29,15 @@ func (v Bitmap) header() *header {
 }
 
 // keyEntries returns a zero-copy view of the key table. The key table
-// begins at HeaderBytes, which the format guarantees is 8-byte aligned.
+// starts immediately after the fixed-size header, which the format
+// guarantees is 8-byte aligned.
 func (v Bitmap) keyEntries() []keyEntry {
 	if len(v.data) == 0 {
 		return nil
 	}
 	h := v.header()
 	return unsafe.Slice(
-		(*keyEntry)(unsafe.Pointer(unsafe.SliceData(v.data[h.HeaderBytes:]))),
+		(*keyEntry)(unsafe.Pointer(unsafe.SliceData(v.data[HeaderSize:]))),
 		int(h.KeyCount),
 	)
 }
@@ -138,11 +139,16 @@ func findKey(entries []keyEntry, key uint64) (int, bool) {
 // It allocates nothing and performs no popcounts: cardinality comes from the
 // stored header total when present, otherwise from the container headers.
 type Stats struct {
-	Containers  int
-	Arrays      int
-	Bitmaps     int
+	// Containers is the total number of key-table entries.
+	Containers int
+	// Arrays is the number of sparse sorted-uint16 containers.
+	Arrays int
+	// Bitmaps is the number of dense 1024-word containers.
+	Bitmaps int
+	// Cardinality is the total number of IDs.
 	Cardinality uint64
-	Bytes       int
+	// Bytes is the serialized size including the header.
+	Bytes int
 }
 
 // Stats returns the layout summary of the bitmap. The zero Bitmap reports

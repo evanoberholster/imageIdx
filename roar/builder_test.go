@@ -117,7 +117,7 @@ func TestArrayToBitmapThreshold(t *testing.T) {
 				t.Fatal(err)
 			}
 			data := bitmap.Bytes()
-			offset := binary.LittleEndian.Uint64(data[32:40])
+			offset := binary.LittleEndian.Uint64(data[24:32])
 			containerType := ContainerType(binary.LittleEndian.Uint16(data[offset+2 : offset+4]))
 			if containerType != test.want {
 				t.Fatalf("container type = %v, want %v", containerType, test.want)

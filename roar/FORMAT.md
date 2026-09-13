@@ -11,9 +11,15 @@ The version-1 format is **frozen**. The header layout, container types
 (array and bitmap), flags, and alignment rules described here are the
 stability contract: they will not change for data tagged version 1. Any future
 change (for example a run-length container type) will bump `Version` and be
-read as a distinct format, leaving version-1 data readable unchanged. The
-transposed "RAOR" magic was accepted during development and is no longer
-recognized.
+read as a distinct format, leaving version-1 data readable unchanged.
+
+A bitmap carries no magic signature: roar bitmaps always travel embedded
+inside parent envelopes (segments, WAL records, manifests) that already carry
+their own magic and version, so an inner signature would be redundant.
+Identification starts at the version tag, followed by exhaustive structural
+validation. Pre-seal development builds used a `"ROAR"` magic word; it was
+removed before v1 was sealed and such bytes are rejected with
+`ErrUnsupportedVersion`, never misread.
 
 ## Design goals
 
@@ -40,23 +46,25 @@ non-zero value is valid; only the full `uint64` `0` is rejected.
 ```
 +--------+------------+-----------------------+---------------------+
 | header | key table  | containers            |                     |
-| 24 B   | 16 B/entry | (variable, aligned)   |                     |
+| 16 B   | 16 B/entry | (variable, aligned)   |                     |
 +--------+------------+-----------------------+---------------------+
 ```
 
 The header records the absolute byte offset of every container, so readers
 jump straight to a key's payload without walking intermediate containers.
 
-## Header (24 bytes, little-endian)
+## Header (16 bytes, little-endian)
+
+The key table always starts immediately after the fixed-size header, so no
+offset field is stored. With no magic and no offset to accommodate, every
+field sits at its natural alignment:
 
 | offset | size | field | description |
 |--------|------|-------|-------------|
-| 0 | 4 | magic | `0x52414F52` ("ROAR") |
-| 4 | 2 | version | `1` |
-| 6 | 2 | flags | see Flags below |
-| 8 | 4 | header bytes | offset of the key table (24) |
-| 12 | 4 | key count | number of key entries |
-| 16 | 8 | cardinality | total ID count (when flag set) |
+| 0 | 2 | version | `1` |
+| 2 | 2 | flags | see Flags below |
+| 4 | 4 | key count | number of key entries |
+| 8 | 8 | cardinality | total ID count (when flag set) |
 
 ## Flags
 
@@ -114,7 +122,7 @@ above the threshold.
 
 ## Validation
 
-`Open`/`Validate` reject untrusted input that fails any of: magic or version
+`Open`/`Validate` reject untrusted input that fails any of: version
 mismatch, unaligned base address or offsets, key table out of bounds, unsorted
 or duplicate keys, low key bits set, reserved `ImageID` 0, unsorted array
 values, bitmap cardinality mismatch, and (when stored) a cardinality that does

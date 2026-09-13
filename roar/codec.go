@@ -69,7 +69,7 @@ func (b Bitmap) Bytes() []byte {
 
 // LenInBytes returns the length in bytes of the serialized representation.
 // It matches the length of the bytes returned by MarshalBinary, including the
-// 24-byte header for an empty bitmap. It is the on-disk size of the bitmap.
+// 16-byte header for an empty bitmap. It is the on-disk size of the bitmap.
 func (b Bitmap) LenInBytes() int {
 	if len(b.data) == 0 {
 		return HeaderSize
@@ -90,29 +90,25 @@ func Open(data []byte) (Bitmap, error) {
 
 // Validate checks that data forms a well-formed version-1 bitmap. It uses
 // the portable safe decoder and performs no unchecked typed access, so it is
-// safe for untrusted input.
+// safe for untrusted input. There is no magic signature: roar bitmaps travel
+// inside parent envelopes that already identify the payload, so validation
+// starts at the version tag and then checks structure exhaustively.
 func Validate(data []byte) error {
 	if len(data) < HeaderSize {
 		return ErrInvalidBitmap
 	}
-	magic := binary.LittleEndian.Uint32(data[0:4])
-	if magic != Magic {
-		return ErrInvalidMagic
-	}
-	if binary.LittleEndian.Uint16(data[4:6]) != Version {
+	if binary.LittleEndian.Uint16(data[0:2]) != Version {
 		return ErrUnsupportedVersion
 	}
 	if !indexutil.HostIsLittleEndian() {
 		return ErrUnsupportedEndian
 	}
-	headerBytes := binary.LittleEndian.Uint32(data[8:12])
-	keyCount := binary.LittleEndian.Uint32(data[12:16])
-	flags := binary.LittleEndian.Uint16(data[6:8])
-	if headerBytes < HeaderSize || uint64(headerBytes) > uint64(len(data)) ||
-		headerBytes%Alignment != 0 || uintptr(unsafe.Pointer(unsafe.SliceData(data)))%Alignment != 0 {
+	flags := binary.LittleEndian.Uint16(data[2:4])
+	keyCount := binary.LittleEndian.Uint32(data[4:8])
+	if uintptr(unsafe.Pointer(unsafe.SliceData(data)))%Alignment != 0 {
 		return ErrInvalidBitmap
 	}
-	tableStart := uint64(headerBytes)
+	const tableStart = uint64(HeaderSize)
 	tableEnd, ok := indexutil.CheckedEnd(tableStart, uint64(keyCount), KeyEntrySize, uint64(len(data)))
 	if !ok {
 		return ErrInvalidBitmap
@@ -143,7 +139,7 @@ func Validate(data []byte) error {
 		totalCard += uint64(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
 	}
 	if flags&FlagStoredCardinality != 0 {
-		if binary.LittleEndian.Uint64(data[16:24]) != totalCard {
+		if binary.LittleEndian.Uint64(data[8:16]) != totalCard {
 			return ErrCorruptContainer
 		}
 	}

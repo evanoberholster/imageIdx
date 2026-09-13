@@ -104,7 +104,7 @@ func (b *Builder) prepareResult(keyCount, dataBytes int) {
 // extendNoClear grows the container region by size bytes and returns the new
 // region without zeroing it. The caller must overwrite every byte, e.g. with
 // a verbatim container copy or a full dense-word write; array appends must
-// keep using extend so padding bytes stay zero.
+// explicitly clear the padding tail (see appendArray).
 func (b *Builder) extendNoClear(size int) []byte {
 	start := len(b.data)
 	b.data = slices.Grow(b.data, size)[:start+size]
@@ -196,12 +196,10 @@ func assemble(keys []uint64, offsets []uint64, data []byte, cardinality uint64) 
 // whose length is HeaderSize + len(keys)*KeyEntrySize. Container offsets in
 // the key table are absolute (containerBase + relative offset).
 func writeHeaderKeyTable(out []byte, keys, offsets []uint64, cardinality uint64) {
-	binary.LittleEndian.PutUint32(out[0:4], Magic)
-	binary.LittleEndian.PutUint16(out[4:6], Version)
-	binary.LittleEndian.PutUint16(out[6:8], FlagCompact|FlagStoredCardinality)
-	binary.LittleEndian.PutUint32(out[8:12], HeaderSize)
-	binary.LittleEndian.PutUint32(out[12:16], uint32(len(keys)))
-	binary.LittleEndian.PutUint64(out[16:24], cardinality)
+	binary.LittleEndian.PutUint16(out[0:2], Version)
+	binary.LittleEndian.PutUint16(out[2:4], FlagCompact|FlagStoredCardinality)
+	binary.LittleEndian.PutUint32(out[4:8], uint32(len(keys)))
+	binary.LittleEndian.PutUint64(out[8:16], cardinality)
 	containerBase := HeaderSize + len(keys)*KeyEntrySize
 	for index := range keys {
 		entry := HeaderSize + index*KeyEntrySize

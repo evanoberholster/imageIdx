@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	// Magic is the version-1 byte signature "ROAR".
-	Magic   uint32 = 0x52414F52
+	// Version is the version-1 format tag. roar bitmaps are always embedded
+	// inside parent envelopes that carry their own magic, so the bitmap
+	// header stores no signature of its own.
 	Version uint16 = 1
 
 	// Alignment is the required byte alignment of every structural boundary
@@ -34,7 +35,7 @@ const (
 	// uint64 access valid and leaves room for future SIMD alignment.
 	Alignment = 8
 
-	HeaderSize          = 24
+	HeaderSize          = 16
 	KeyEntrySize        = 16
 	ContainerHeaderSize = 8
 
@@ -57,7 +58,6 @@ const InvalidImageID uint64 = 0
 
 var (
 	ErrInvalidBitmap         = errors.New("roar: invalid bitmap")
-	ErrInvalidMagic          = errors.New("roar: invalid magic")
 	ErrUnsupportedVersion    = errors.New("roar: unsupported version")
 	ErrInvalidImageID        = errors.New("roar: invalid image id")
 	ErrCorruptContainer      = errors.New("roar: corrupt container")
@@ -76,12 +76,12 @@ const (
 	ContainerBitmap
 )
 
-// header is the fixed 24-byte leading record.
+// header is the fixed 16-byte leading record. The key table always starts
+// immediately after it, so no offset field is stored; every field sits at
+// its natural alignment with no padding.
 type header struct {
-	Magic       uint32
 	Version     uint16
 	Flags       uint16
-	HeaderBytes uint32
 	KeyCount    uint32
 	Cardinality uint64
 }

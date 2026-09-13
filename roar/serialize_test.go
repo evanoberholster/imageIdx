@@ -39,10 +39,10 @@ func TestStoredCardinality(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := bitmap.Bytes()
-	if flags := binary.LittleEndian.Uint16(data[6:8]); flags&FlagStoredCardinality == 0 {
+	if flags := binary.LittleEndian.Uint16(data[2:4]); flags&FlagStoredCardinality == 0 {
 		t.Fatal("constructor did not set FlagStoredCardinality")
 	}
-	if stored := binary.LittleEndian.Uint64(data[16:24]); stored != uint64(len(ids)) {
+	if stored := binary.LittleEndian.Uint64(data[8:16]); stored != uint64(len(ids)) {
 		t.Fatalf("stored cardinality = %d, want %d", stored, len(ids))
 	}
 	if got := bitmap.Cardinality(); got != uint64(len(ids)) {
@@ -56,7 +56,7 @@ func TestStoredCardinalityValidated(t *testing.T) {
 		t.Fatal(err)
 	}
 	corrupt := slices.Clone(bitmap.Bytes())
-	binary.LittleEndian.PutUint64(corrupt[16:24], 999)
+	binary.LittleEndian.PutUint64(corrupt[8:16], 999)
 	if err := Validate(corrupt); err == nil {
 		t.Fatal("Validate accepted a mismatched stored cardinality")
 	}
@@ -69,7 +69,7 @@ func TestCardinalityFallbackWithoutFlag(t *testing.T) {
 	}
 	// Clear the stored-cardinality flag to exercise the summing fallback.
 	data := slices.Clone(bitmap.Bytes())
-	binary.LittleEndian.PutUint16(data[6:8], FlagCompact)
+	binary.LittleEndian.PutUint16(data[2:4], FlagCompact)
 	view, err := Open(data)
 	if err != nil {
 		t.Fatal(err)

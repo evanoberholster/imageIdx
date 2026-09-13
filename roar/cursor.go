@@ -212,6 +212,9 @@ func (b Bitmap) FilterSorted(dst, candidates []uint64) []uint64 {
 // calls avoids repeating the key-table setup that FilterSorted pays per call.
 // It allocates nothing and supports in-place filtering.
 func (c *Cursor) FilterSorted(dst, candidates []uint64) []uint64 {
+	if len(candidates) == 0 || len(c.entries) == 0 {
+		return dst
+	}
 	for _, id := range candidates {
 		if id == InvalidImageID {
 			continue
