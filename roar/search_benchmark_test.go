@@ -10,7 +10,7 @@ import (
 
 // Search-shaped benchmarks: fold ~20,000-ID bitmaps with a mixed sequence of
 // Or and And operations, comparing the immutable Bitmap free functions, the
-// single-owner MutableBitmap, and weaviate/sroar's in-place mutation.
+// single-owner DeltaBuilder, and weaviate/sroar's in-place mutation.
 
 const searchBitmapCount = 6
 
@@ -71,8 +71,8 @@ func searchSequence(bitmaps []Bitmap) Bitmap {
 	return res
 }
 
-func searchSequenceMutable(bitmaps []Bitmap) Bitmap {
-	m := NewMutableBitmapFrom(bitmaps[0])
+func searchSequenceDelta(bitmaps []Bitmap) Bitmap {
+	m := NewDeltaBuilderFrom(bitmaps[0])
 	m.Or(bitmaps[1])
 	m.Or(bitmaps[2])
 	m.And(bitmaps[3])
@@ -104,10 +104,10 @@ func BenchmarkSearch(b *testing.B) {
 				_ = searchSequence(roarBm)
 			}
 		})
-		b.Run(name+"/mutable", func(b *testing.B) {
+		b.Run(name+"/delta", func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
-				_ = searchSequenceMutable(roarBm)
+				_ = searchSequenceDelta(roarBm)
 			}
 		})
 		b.Run(name+"/sroar", func(b *testing.B) {

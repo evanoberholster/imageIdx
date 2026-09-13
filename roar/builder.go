@@ -70,18 +70,25 @@ func (b *Builder) KeyCount() int { return len(b.keys) }
 // reserveData ensures the container region can hold at least n more bytes
 // without reallocation. Callers that know an upper bound on the result size
 // use it to avoid the geometric reallocation that appending otherwise incurs.
+// It preserves existing contents.
 func (b *Builder) reserveData(n int) {
-	if n > cap(b.data) {
-		b.data = make([]byte, 0, n)
+	if need := len(b.data) + n; need > cap(b.data) {
+		grown := make([]byte, len(b.data), need)
+		copy(grown, b.data)
+		b.data = grown
 	}
 }
 
 // reserveKeys ensures the key and offset slices can hold at least n entries
-// without reallocation.
+// without reallocation. It preserves existing contents.
 func (b *Builder) reserveKeys(n int) {
-	if n > cap(b.keys) {
-		b.keys = make([]uint64, 0, n)
-		b.offsets = make([]uint64, 0, n)
+	if need := len(b.keys) + n; need > cap(b.keys) {
+		grownKeys := make([]uint64, len(b.keys), need)
+		copy(grownKeys, b.keys)
+		b.keys = grownKeys
+		grownOffsets := make([]uint64, len(b.offsets), need)
+		copy(grownOffsets, b.offsets)
+		b.offsets = grownOffsets
 	}
 }
 
@@ -94,12 +101,13 @@ func (b *Builder) prepareResult(keyCount, dataBytes int) {
 	b.reserveData(dataBytes)
 }
 
-// extend grows the container region by size zeroed bytes and returns the
-// new region.
-func (b *Builder) extend(size int) []byte {
+// extendNoClear grows the container region by size bytes and returns the new
+// region without zeroing it. The caller must overwrite every byte, e.g. with
+// a verbatim container copy or a full dense-word write; array appends must
+// keep using extend so padding bytes stay zero.
+func (b *Builder) extendNoClear(size int) []byte {
 	start := len(b.data)
 	b.data = slices.Grow(b.data, size)[:start+size]
-	clear(b.data[start:])
 	return b.data[start:]
 }
 
@@ -109,11 +117,10 @@ func (b *Builder) appendArray(key uint64, values []uint16) {
 	}
 	blocks := uint16((ContainerHeaderSize + 2*len(values) + 7) / 8)
 	start := len(b.data)
-	region := b.extend(int(blocks) * 8)
+	region := b.extendNoClear(int(blocks) * 8)
 	writeContainerHeader(region, blocks, ContainerArray, uint32(len(values)))
-	for index, value := range values {
-		binary.LittleEndian.PutUint16(region[ContainerHeaderSize+2*index:], value)
-	}
+	putUint16s(region[ContainerHeaderSize:], values)
+	clear(region[ContainerHeaderSize+2*len(values):])
 	b.keys = append(b.keys, key)
 	b.offsets = append(b.offsets, uint64(start))
 	b.cardinality += uint64(len(values))
@@ -125,7 +132,7 @@ func (b *Builder) appendBitmap(key uint64, words []uint64, card uint32) {
 	}
 	blocks := uint16(1 + BitmapWords)
 	start := len(b.data)
-	region := b.extend(int(blocks) * 8)
+	region := b.extendNoClear(int(blocks) * 8)
 	writeContainerHeader(region, blocks, ContainerBitmap, card)
 	dst := unsafe.Slice((*uint64)(unsafe.Pointer(unsafe.SliceData(region[ContainerHeaderSize:]))), BitmapWords)
 	copy(dst, words[:BitmapWords])
@@ -172,4 +179,66 @@ func writeContainerHeader(dst []byte, blocks uint16, containerType ContainerType
 	binary.LittleEndian.PutUint16(dst[0:2], blocks)
 	binary.LittleEndian.PutUint16(dst[2:4], uint16(containerType))
 	binary.LittleEndian.PutUint32(dst[4:8], card)
+}
+
+// assemble writes the header, key table, and container payloads into one
+// compact little-endian byte region. cardinality is the total number of IDs
+// across all containers, stored so readers can query it in O(1).
+func assemble(keys []uint64, offsets []uint64, data []byte, cardinality uint64) []byte {
+	containerBase := HeaderSize + len(keys)*KeyEntrySize
+	out := make([]byte, containerBase, containerBase+len(data))
+	requireAligned(out)
+	writeHeaderKeyTable(out, keys, offsets, cardinality)
+	return append(out, data...)
+}
+
+// writeHeaderKeyTable writes the header and key table into the front of out,
+// whose length is HeaderSize + len(keys)*KeyEntrySize. Container offsets in
+// the key table are absolute (containerBase + relative offset).
+func writeHeaderKeyTable(out []byte, keys, offsets []uint64, cardinality uint64) {
+	binary.LittleEndian.PutUint32(out[0:4], Magic)
+	binary.LittleEndian.PutUint16(out[4:6], Version)
+	binary.LittleEndian.PutUint16(out[6:8], FlagCompact|FlagStoredCardinality)
+	binary.LittleEndian.PutUint32(out[8:12], HeaderSize)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(len(keys)))
+	binary.LittleEndian.PutUint64(out[16:24], cardinality)
+	containerBase := HeaderSize + len(keys)*KeyEntrySize
+	for index := range keys {
+		entry := HeaderSize + index*KeyEntrySize
+		binary.LittleEndian.PutUint64(out[entry:entry+8], keys[index])
+		binary.LittleEndian.PutUint64(out[entry+8:entry+16], uint64(containerBase)+offsets[index])
+	}
+}
+
+// Compact assembles the accumulated containers into a compact serialized
+// bitmap. The builder's contents are unchanged and it may be reused after a
+// Reset.
+func (b *Builder) Compact() []byte {
+	return assemble(b.keys, b.offsets, b.data, b.cardinality)
+}
+
+// CompactInto assembles the accumulated containers into reuse's backing array
+// when it is large enough, avoiding a fresh allocation and the associated
+// zeroing. It falls back to Compact otherwise.
+func (b *Builder) CompactInto(reuse []byte) []byte {
+	containerBase := HeaderSize + len(b.keys)*KeyEntrySize
+	total := containerBase + len(b.data)
+	if cap(reuse) >= total {
+		out := reuse[:total]
+		requireAligned(out)
+		writeHeaderKeyTable(out, b.keys, b.offsets, b.cardinality)
+		copy(out[containerBase:], b.data)
+		return out
+	}
+	return b.Compact()
+}
+
+// finishResult returns the accumulated result. When owned is true, reuse must
+// be exclusively owned by the result being built; otherwise a fresh owned
+// buffer is returned.
+func (b *Builder) finishResult(reuse []byte, owned bool) []byte {
+	if owned {
+		return b.CompactInto(reuse)
+	}
+	return b.Compact()
 }

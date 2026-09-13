@@ -125,7 +125,7 @@ func andNotContainerCardinality(a, b []byte) uint64 {
 	case ha.Type == uint16(ContainerArray):
 		return uint64(countArrayNotInBitmap(arrayValuesAt(a), bitmapWordsAt(b)))
 	case hb.Type == uint16(ContainerArray):
-		return andNotWordsCardinalityArray(bitmapWordsAt(a), arrayValuesAt(b))
+		return andNotWordsCardinalityArray(bitmapWordsAt(a), arrayValuesAt(b), ha.Card)
 	default:
 		return andNotWordsCardinality(bitmapWordsAt(a), bitmapWordsAt(b))
 	}
@@ -183,12 +183,12 @@ func arrayIntersectsBitmap(values []uint16, words []uint64) bool {
 	return false
 }
 
-func andNotWordsCardinalityArray(words []uint64, values []uint16) uint64 {
-	count := wordsCardinality(words)
+func andNotWordsCardinalityArray(words []uint64, values []uint16, baseCard uint32) uint64 {
+	cleared := uint64(0)
 	for _, value := range values {
 		if bitmapContains(words, value) {
-			count--
+			cleared++
 		}
 	}
-	return count
+	return uint64(baseCard) - cleared
 }

@@ -17,8 +17,11 @@ func andCardinalityAVX2FixedAsm(a, b []uint64) uint64
 func orCardinalityAVX2FixedAsm(a, b []uint64) uint64
 func andNotCardinalityAVX2FixedAsm(a, b []uint64) uint64
 func cardinalityAVX2FixedAsm(words []uint64) uint64
+func cardinalityPrefixAVX2Asm(words []uint64, vectorCount int) uint64
 func andMany3AVX2FixedAsm(dst, a, b, c []uint64) uint32
 func andMany4AVX2FixedAsm(dst, a, b, c, d []uint64) uint32
+func andMany3CardinalityAVX2FixedAsm(a, b, c []uint64) uint64
+func andMany4CardinalityAVX2FixedAsm(a, b, c, d []uint64) uint64
 
 // The AVX2 backend processes four uint64 words per 256-bit vector. It is
 // selected only when the CPU reports AVX2 support.
@@ -35,9 +38,12 @@ func init() {
 	orCardinalityKernel = orCardinalityAVX2
 	andNotCardinalityKernel = andNotCardinalityAVX2
 	cardinalityKernel = cardinalityAVX2
+	cardinalityPrefixKernel = cardinalityPrefixAVX2
 	andManyKernel = andManyAVX2
 	andMany3Kernel = andMany3AVX2
 	andMany4Kernel = andMany4AVX2
+	andMany3CardinalityKernel = andMany3CardinalityAVX2
+	andMany4CardinalityKernel = andMany4CardinalityAVX2
 	applyKernel = applyAVX2
 }
 
@@ -183,6 +189,15 @@ func cardinalityAVX2(words []uint64) uint64 {
 		card += uint64(bits.OnesCount64(words[i]))
 	}
 	return card
+}
+
+func cardinalityPrefixAVX2(words []uint64, wordCount int) uint64 {
+	vectorWords := wordCount &^ 3
+	var card uint64
+	if vectorWords != 0 {
+		card = cardinalityPrefixAVX2Asm(words, vectorWords/4)
+	}
+	return card + cardinalityPrefixScalar(words[vectorWords:], wordCount-vectorWords)
 }
 
 func andManyAVX2(dst []uint64, inputs ...[]uint64) uint32 {
@@ -340,6 +355,20 @@ func andMany4AVX2(dst, a, b, c, d []uint64) uint32 {
 		card += uint32(bits.OnesCount64(w))
 	}
 	return card
+}
+
+func andMany3CardinalityAVX2(a, b, c []uint64) uint64 {
+	if len(a) == fixedBitmapWords {
+		return andMany3CardinalityAVX2FixedAsm(a, b, c)
+	}
+	return andMany3CardinalityScalar(a, b, c)
+}
+
+func andMany4CardinalityAVX2(a, b, c, d []uint64) uint64 {
+	if len(a) == fixedBitmapWords {
+		return andMany4CardinalityAVX2FixedAsm(a, b, c, d)
+	}
+	return andMany4CardinalityScalar(a, b, c, d)
 }
 
 func applyAVX2(dst, base, add, remove []uint64) uint32 {

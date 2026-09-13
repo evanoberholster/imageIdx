@@ -2,7 +2,8 @@ package roar
 
 import (
 	"math/bits"
-	"sort"
+
+	"github.com/evanoberholster/imageIdx/roar/internal/bitmapkernel"
 )
 
 // Rank returns the number of IDs less than or equal to x. It allocates
@@ -75,23 +76,39 @@ func (b Bitmap) Maximum() (uint64, bool) {
 	return entry.Key | uint64(containerMax(b.data[entry.Offset:])), true
 }
 
-// arrayUpperBound returns the count of values <= x in a sorted array.
+// arrayUpperBound returns the count of values <= x in a sorted array. Like
+// arrayContains it is a manual loop to stay inlinable.
 func arrayUpperBound(values []uint16, x uint16) int {
-	return sort.Search(len(values), func(i int) bool { return values[i] > x })
+	lo, hi := 0, len(values)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if values[mid] <= x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 // arrayLowerBound returns the index of the first value >= x.
 func arrayLowerBound(values []uint16, x uint16) int {
-	return sort.Search(len(values), func(i int) bool { return values[i] >= x })
+	lo, hi := 0, len(values)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if values[mid] < x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 // bitmapRank counts the set bits in words with value <= x.
 func bitmapRank(words []uint64, x uint16) uint64 {
 	fullWords := int(x >> 6)
-	var count uint64
-	for index := 0; index < fullWords; index++ {
-		count += uint64(bits.OnesCount64(words[index]))
-	}
+	count := bitmapkernel.CardinalityPrefix(words, fullWords)
 	mask := ^uint64(0) >> (63 - (x & 63))
 	count += uint64(bits.OnesCount64(words[fullWords] & mask))
 	return count

@@ -9,18 +9,21 @@ const fixedBitmapWords = 1024
 // never these variables directly.
 
 var (
-	andKernel               = andScalar
-	orKernel                = orScalar
-	andNotKernel            = andNotScalar
-	intersectsKernel        = intersectsScalar
-	andCardinalityKernel    = andCardinalityScalar
-	orCardinalityKernel     = orCardinalityScalar
-	andNotCardinalityKernel = andNotCardinalityScalar
-	cardinalityKernel       = cardinalityScalar
-	andManyKernel           = andManyScalar
-	andMany3Kernel          = andMany3Scalar
-	andMany4Kernel          = andMany4Scalar
-	applyKernel             = applyScalar
+	andKernel                 = andScalar
+	orKernel                  = orScalar
+	andNotKernel              = andNotScalar
+	intersectsKernel          = intersectsScalar
+	andCardinalityKernel      = andCardinalityScalar
+	orCardinalityKernel       = orCardinalityScalar
+	andNotCardinalityKernel   = andNotCardinalityScalar
+	cardinalityKernel         = cardinalityScalar
+	cardinalityPrefixKernel   = cardinalityPrefixScalar
+	andManyKernel             = andManyScalar
+	andMany3Kernel            = andMany3Scalar
+	andMany4Kernel            = andMany4Scalar
+	andMany3CardinalityKernel = andMany3CardinalityScalar
+	andMany4CardinalityKernel = andMany4CardinalityScalar
+	applyKernel               = applyScalar
 )
 
 // And writes a & b to dst and returns the exact cardinality of the result.
@@ -48,6 +51,12 @@ func AndNotCardinality(a, b []uint64) uint64 { return andNotCardinalityKernel(a,
 // Cardinality returns the number of set bits in w.
 func Cardinality(w []uint64) uint64 { return cardinalityKernel(w) }
 
+// CardinalityPrefix returns the number of set bits in the first wordCount
+// words. wordCount must not exceed len(words).
+func CardinalityPrefix(words []uint64, wordCount int) uint64 {
+	return cardinalityPrefixKernel(words, wordCount)
+}
+
 // AndMany writes the N-way intersection of inputs to dst and returns its
 // cardinality. len(dst) and every len(inputs[i]) must be equal.
 func AndMany(dst []uint64, inputs ...[]uint64) uint32 {
@@ -72,6 +81,18 @@ func AndMany3(dst, a, b, c []uint64) uint32 {
 // slice. It is the allocation-free fast path for the common four-way case.
 func AndMany4(dst, a, b, c, d []uint64) uint32 {
 	return andMany4Kernel(dst, a, b, c, d)
+}
+
+// AndMany3Cardinality returns the cardinality of a & b & c without writing a
+// temporary bitmap.
+func AndMany3Cardinality(a, b, c []uint64) uint64 {
+	return andMany3CardinalityKernel(a, b, c)
+}
+
+// AndMany4Cardinality returns the cardinality of a & b & c & d without
+// writing a temporary bitmap.
+func AndMany4Cardinality(a, b, c, d []uint64) uint64 {
+	return andMany4CardinalityKernel(a, b, c, d)
 }
 
 // Apply writes (base | add) &^ remove to dst and returns its cardinality.

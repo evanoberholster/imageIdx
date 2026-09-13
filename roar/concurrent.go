@@ -1,7 +1,6 @@
 package roar
 
 import (
-	"sort"
 	"sync"
 )
 
@@ -30,15 +29,17 @@ func keyBoundaries(numGo int) []uint64 {
 }
 
 // keyRange returns the half-open index range [start, end) of entries whose
-// keys fall within [lo, hi).
+// keys fall within [lo, hi). It reuses findKey so small tables stay linear,
+// matching the lookup policy on the Contains hot path.
 func keyRange(entries []keyEntry, lo, hi uint64) (int, int) {
-	start := sort.Search(len(entries), func(i int) bool { return entries[i].Key >= lo })
-	end := sort.Search(len(entries), func(i int) bool { return entries[i].Key >= hi })
+	start, _ := findKey(entries, lo)
+	end, _ := findKey(entries, hi)
 	return start, end
 }
 
 // combineBuilders concatenates builders whose key sets are disjoint and
-// ascending into one serialization.
+// ascending into one serialization. Payload bytes are copied once, directly
+// into the final buffer.
 func combineBuilders(builders []*Builder) []byte {
 	totalKeys, totalData := 0, 0
 	var totalCard uint64
@@ -49,16 +50,23 @@ func combineBuilders(builders []*Builder) []byte {
 	}
 	keys := make([]uint64, 0, totalKeys)
 	offsets := make([]uint64, 0, totalKeys)
-	data := make([]byte, 0, totalData)
+	rel := uint64(0)
 	for _, builder := range builders {
-		base := uint64(len(data))
-		for index, key := range builder.keys {
-			keys = append(keys, key)
-			offsets = append(offsets, base+builder.offsets[index])
+		keys = append(keys, builder.keys...)
+		for _, off := range builder.offsets {
+			offsets = append(offsets, rel+off)
 		}
-		data = append(data, builder.data...)
+		rel += uint64(len(builder.data))
 	}
-	return assemble(keys, offsets, data, totalCard)
+	containerBase := HeaderSize + totalKeys*KeyEntrySize
+	out := make([]byte, containerBase+totalData)
+	requireAligned(out)
+	writeHeaderKeyTable(out, keys, offsets, totalCard)
+	pos := containerBase
+	for _, builder := range builders {
+		pos += copy(out[pos:], builder.data)
+	}
+	return out
 }
 
 // minParallelKeys is the minimum total container count for parallel execution
@@ -235,10 +243,8 @@ func orManyIntoRange(dst *Builder, lo, hi uint64, bitmaps ...Bitmap) {
 		ends[index] = end
 	}
 	containers := make([][]byte, 0, count)
-	fold := NewBuilder(1)
-	var buffer []byte
 	for {
-		minKey, found := minBoundedKey(entries, positions, ends)
+		minKey, found := minKey(entries, positions, ends)
 		if !found {
 			return
 		}
@@ -249,48 +255,6 @@ func orManyIntoRange(dst *Builder, lo, hi uint64, bitmaps ...Bitmap) {
 				positions[index]++
 			}
 		}
-		orContainers(dst, fold, &buffer, minKey, containers)
-	}
-}
-
-func minBoundedKey(entries [][]keyEntry, positions, ends []int) (uint64, bool) {
-	var minKey uint64
-	found := false
-	for index := range entries {
-		if positions[index] < ends[index] {
-			key := entries[index][positions[index]].Key
-			if !found || key < minKey {
-				minKey = key
-				found = true
-			}
-		}
-	}
-	return minKey, found
-}
-
-// orContainers ORs the containers that share a key into dst as one container.
-// fold and buffer are caller-provided scratch reused across keys. The final
-// pair writes directly to dst to avoid an extra intermediate copy.
-func orContainers(dst, fold *Builder, buffer *[]byte, key uint64, containers [][]byte) {
-	switch len(containers) {
-	case 0:
-		return
-	case 1:
-		copyContainerInto(dst, key, containers[0])
-		return
-	case 2:
-		orContainerInto(dst, key, containers[0], containers[1])
-		return
-	}
-	result := containers[0]
-	for i, container := range containers[1:] {
-		if i == len(containers)-2 {
-			orContainerInto(dst, key, result, container)
-			return
-		}
-		fold.Reset()
-		orContainerInto(fold, key, result, container)
-		*buffer = append((*buffer)[:0], fold.data...)
-		result = *buffer
+		orManyContainersInto(dst, minKey, containers)
 	}
 }

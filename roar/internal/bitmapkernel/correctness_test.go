@@ -136,6 +136,11 @@ func TestKernelsAgainstReference(t *testing.T) {
 			if Cardinality(a) != uint64(refOr(wantDst, a, bZero)) {
 				t.Fatal("Cardinality mismatch")
 			}
+			for _, wordCount := range []int{0, 1, 7, 8, 63, 64, 511, 512, testWords} {
+				if CardinalityPrefix(a, wordCount) != cardinalityPrefixScalar(a, wordCount) {
+					t.Fatalf("CardinalityPrefix(%d) mismatch", wordCount)
+				}
+			}
 		})
 	}
 }
@@ -169,6 +174,14 @@ func TestFusedKernelsAgainstReference(t *testing.T) {
 		wantCard = refAnd(want, refAndInto(refAndInto(base, c), d), remove)
 		if gotCard != wantCard || !slices.Equal(got, want) {
 			t.Fatalf("AndMany4 round %d mismatch", round)
+		}
+		wantCard = refAnd(want, refAndInto(base, c), d)
+		if got := AndMany3Cardinality(base, c, d); got != uint64(wantCard) {
+			t.Fatalf("AndMany3Cardinality round %d mismatch", round)
+		}
+		wantCard = refAnd(want, refAndInto(refAndInto(base, c), d), remove)
+		if got := AndMany4Cardinality(base, c, d, remove); got != uint64(wantCard) {
+			t.Fatalf("AndMany4Cardinality round %d mismatch", round)
 		}
 	}
 }

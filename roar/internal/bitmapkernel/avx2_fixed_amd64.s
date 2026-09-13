@@ -398,3 +398,123 @@ and_many4_avx2_fixed_loop:
 	VZEROUPPER
 	MOVL R8, ret+120(FP)
 	RET
+
+// func cardinalityPrefixAVX2Asm(words []uint64, vectorCount int) uint64
+// vectorCount is the number of four-word AVX2 vectors to count.
+TEXT ·cardinalityPrefixAVX2Asm(SB), NOSPLIT, $0-40
+	MOVQ words_base+0(FP), AX
+	MOVQ vectorCount+24(FP), CX
+	XORQ R8, R8
+	XORQ R13, R13
+	XORQ R14, R14
+	XORQ R15, R15
+cardinality_prefix_avx2_loop:
+	VMOVDQU (AX), Y0
+	VEXTRACTI128 $1, Y0, X1
+	VPEXTRQ $0, X0, R9
+	VPEXTRQ $1, X0, R10
+	VPEXTRQ $0, X1, R11
+	VPEXTRQ $1, X1, R12
+	POPCNTQ R9, R9
+	POPCNTQ R10, R10
+	POPCNTQ R11, R11
+	POPCNTQ R12, R12
+	ADDQ R9, R8
+	ADDQ R10, R13
+	ADDQ R11, R14
+	ADDQ R12, R15
+	ADDQ $32, AX
+	DECQ CX
+	JNZ cardinality_prefix_avx2_loop
+	ADDQ R13, R8
+	ADDQ R14, R8
+	ADDQ R15, R8
+	VZEROUPPER
+	MOVQ R8, ret+32(FP)
+	RET
+
+// func andMany3CardinalityAVX2FixedAsm(a, b, c []uint64) uint64
+TEXT ·andMany3CardinalityAVX2FixedAsm(SB), NOSPLIT, $0-80
+	MOVQ a_base+0(FP), AX
+	MOVQ b_base+24(FP), BX
+	MOVQ c_base+48(FP), CX
+	MOVQ $256, DX
+	XORQ R8, R8
+	XORQ R13, R13
+	XORQ R14, R14
+	XORQ R15, R15
+and_many3_card_avx2_fixed_loop:
+	VMOVDQU (AX), Y0
+	VMOVDQU (BX), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU (CX), Y1
+	VPAND Y1, Y0, Y0
+	VEXTRACTI128 $1, Y0, X1
+	VPEXTRQ $0, X0, R9
+	VPEXTRQ $1, X0, R10
+	VPEXTRQ $0, X1, R11
+	VPEXTRQ $1, X1, R12
+	POPCNTQ R9, R9
+	POPCNTQ R10, R10
+	POPCNTQ R11, R11
+	POPCNTQ R12, R12
+	ADDQ R9, R8
+	ADDQ R10, R13
+	ADDQ R11, R14
+	ADDQ R12, R15
+	ADDQ $32, AX
+	ADDQ $32, BX
+	ADDQ $32, CX
+	DECQ DX
+	JNZ and_many3_card_avx2_fixed_loop
+	ADDQ R13, R8
+	ADDQ R14, R8
+	ADDQ R15, R8
+	VZEROUPPER
+	MOVQ R8, ret+72(FP)
+	RET
+
+// func andMany4CardinalityAVX2FixedAsm(a, b, c, d []uint64) uint64
+TEXT ·andMany4CardinalityAVX2FixedAsm(SB), NOSPLIT, $0-104
+	MOVQ a_base+0(FP), AX
+	MOVQ b_base+24(FP), BX
+	MOVQ c_base+48(FP), CX
+	MOVQ d_base+72(FP), DI
+	MOVQ $256, DX
+	XORQ R8, R8
+	XORQ R13, R13
+	XORQ R14, R14
+	XORQ R15, R15
+and_many4_card_avx2_fixed_loop:
+	VMOVDQU (AX), Y0
+	VMOVDQU (BX), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU (CX), Y1
+	VPAND Y1, Y0, Y0
+	VMOVDQU (DI), Y1
+	VPAND Y1, Y0, Y0
+	VEXTRACTI128 $1, Y0, X1
+	VPEXTRQ $0, X0, R9
+	VPEXTRQ $1, X0, R10
+	VPEXTRQ $0, X1, R11
+	VPEXTRQ $1, X1, R12
+	POPCNTQ R9, R9
+	POPCNTQ R10, R10
+	POPCNTQ R11, R11
+	POPCNTQ R12, R12
+	ADDQ R9, R8
+	ADDQ R10, R13
+	ADDQ R11, R14
+	ADDQ R12, R15
+	ADDQ $32, AX
+	ADDQ $32, BX
+	ADDQ $32, CX
+	ADDQ $32, DI
+	DECQ DX
+	JNZ and_many4_card_avx2_fixed_loop
+	ADDQ R13, R8
+	ADDQ R14, R8
+	ADDQ R15, R8
+	VZEROUPPER
+	MOVQ R8, ret+96(FP)
+	RET

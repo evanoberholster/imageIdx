@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/weaviate/sroar"
 )
@@ -168,6 +169,106 @@ func BenchmarkBuild(b *testing.B) {
 				b.ReportMetric(float64(len(benchSinkBytes)), "bytes")
 			})
 		}
+	}
+}
+
+func BenchmarkWriteDenseContainer(b *testing.B) {
+	const card = 50_000
+	sequential := make([]uint64, card)
+	for index := range sequential {
+		sequential[index] = uint64(index + 1)
+	}
+	randomValues := distinctValues(rand.New(rand.NewPCG(51, 52)), card)
+	random := make([]uint64, len(randomValues))
+	for index, value := range randomValues {
+		random[index] = uint64(value)
+	}
+
+	for _, input := range []struct {
+		name string
+		ids  []uint64
+	}{
+		{name: "sequential", ids: sequential},
+		{name: "random", ids: random},
+	} {
+		run := containerRun{start: 0, end: len(input.ids)}
+		b.Run(input.name+"/packed", func(b *testing.B) {
+			buffer := make([]byte, (1+BitmapWords)*8)
+			b.ReportAllocs()
+			for range b.N {
+				clear(buffer)
+				writeContainer(buffer, input.ids, run)
+			}
+		})
+		b.Run(input.name+"/per-bit", func(b *testing.B) {
+			buffer := make([]byte, (1+BitmapWords)*8)
+			b.ReportAllocs()
+			for range b.N {
+				clear(buffer)
+				writeBitmapContainerPerBit(buffer, input.ids, run)
+			}
+		})
+	}
+}
+
+func BenchmarkCombineThreeMixedBitmapRemove(b *testing.B) {
+	const key = uint64(1 << 16)
+	ids := func(lo, hi int) []uint64 {
+		out := make([]uint64, 0, hi-lo)
+		for value := lo; value < hi; value++ {
+			out = append(out, key|uint64(value))
+		}
+		return out
+	}
+	base, _ := FromSorted(ids(1, 50_000))
+	add, _ := FromSorted(ids(50_000, 50_032))
+	remove, _ := FromSorted(ids(10_000, 40_000))
+	containerAt := func(bitmap Bitmap) []byte {
+		entry := bitmap.keyEntries()[0]
+		return bitmap.data[entry.Offset:]
+	}
+	baseC, addC, removeC := containerAt(base), containerAt(add), containerAt(remove)
+
+	for _, benchmark := range []struct {
+		name string
+		fn   func(*Builder, uint64, []byte, []byte, []byte)
+	}{
+		{name: "kernel", fn: combineThreeInto},
+		{name: "scalar-remove", fn: combineThreeIntoScalarRemove},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			builder := NewBuilder(1)
+			builder.reserveData(ContainerHeaderSize + BitmapBytes)
+			b.ReportAllocs()
+			for range b.N {
+				builder.Reset()
+				benchmark.fn(builder, key, baseC, addC, removeC)
+			}
+		})
+	}
+}
+
+// combineThreeIntoScalarRemove preserves the previous bitmap-removal path as
+// a benchmark baseline. It differs only in the final scalar AND-NOT pass.
+func combineThreeIntoScalarRemove(dst *Builder, key uint64, base, add, remove []byte) {
+	words := dst.wordsScratch()
+	clear(words)
+	setContainerBits(words, base)
+	setContainerBits(words, add)
+	for index, removeWord := range bitmapWordsAt(remove) {
+		words[index] &^= removeWord
+	}
+	dst.emitWords(key, uint32(wordsCardinality(words)))
+}
+
+// writeBitmapContainerPerBit is the pre-word-packing construction loop kept
+// in benchmark code as a stable baseline for writeContainer.
+func writeBitmapContainerPerBit(dst []byte, ids []uint64, run containerRun) {
+	writeContainerHeader(dst, uint16(1+BitmapWords), ContainerBitmap, uint32(run.end-run.start))
+	words := unsafe.Slice((*uint64)(unsafe.Pointer(unsafe.SliceData(dst[ContainerHeaderSize:]))), BitmapWords)
+	for index := run.start; index < run.end; index++ {
+		value := lowValue(ids[index])
+		words[value>>6] |= uint64(1) << (value & 63)
 	}
 }
 

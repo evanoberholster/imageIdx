@@ -124,14 +124,32 @@ func TestEmptyOperandsShortCircuit(t *testing.T) {
 		t.Fatal("AndMany with empty is not empty")
 	}
 
-	m := NewMutableBitmapFrom(other)
+	m := NewDeltaBuilderFrom(other)
 	m.And(empty)
 	if !m.Freeze().IsEmpty() {
-		t.Fatal("MutableBitmap.And(empty) is not empty")
+		t.Fatal("DeltaBuilder.And(empty) is not empty")
 	}
-	m = NewMutableBitmapFrom(other)
+	m = NewDeltaBuilderFrom(other)
 	m.Or(empty)
 	if got := m.Freeze().AppendTo(nil); !slices.Equal(got, []uint64{1, 2, 3}) {
-		t.Fatalf("MutableBitmap.Or(empty) = %v", got)
+		t.Fatalf("DeltaBuilder.Or(empty) = %v", got)
+	}
+}
+
+func TestAndNotDisjointReturnsReceiver(t *testing.T) {
+	a, err := FromSorted([]uint64{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := FromSorted([]uint64{1<<16 + 1, 1<<16 + 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := AndNot(a, b)
+	if !slices.Equal(got.AppendTo(nil), []uint64{1, 2, 3}) {
+		t.Fatalf("AndNot(disjoint) = %v", got.AppendTo(nil))
+	}
+	if len(got.Bytes()) == 0 || &got.Bytes()[0] != &a.Bytes()[0] {
+		t.Fatal("AndNot(disjoint) copied instead of returning the receiver")
 	}
 }

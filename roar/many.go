@@ -21,21 +21,36 @@ func AndManyInto(dst *Builder, views ...Bitmap) {
 		copyAllInto(dst, views[0])
 		return
 	}
-	entries := make([][]keyEntry, len(views))
+	if len(views) == 2 {
+		AndInto(dst, views[0], views[1])
+		return
+	}
+	var stackEntries [maxStackViews][]keyEntry
+	var stackPositions [maxStackViews]int
+	var stackContainers [maxStackViews][]byte
+	entries := stackEntries[:0]
+	positions := stackPositions[:0]
+	containers := stackContainers[:0]
+	if len(views) > maxStackViews {
+		entries = make([][]keyEntry, len(views))
+		positions = make([]int, len(views))
+		containers = make([][]byte, len(views))
+	}
+	entries = entries[:len(views)]
+	positions = positions[:len(views)]
+	containers = containers[:len(views)]
 	for index, view := range views {
 		entries[index] = view.keyEntries()
 	}
-	positions := make([]int, len(views))
-	containers := make([][]byte, len(views))
 	for {
-		minKey, found := minEntryKey(entries, positions)
+		key, found := minKey(entries, positions, nil)
 		if !found {
 			return
 		}
 		allMatch := true
 		for index := range entries {
 			position := positions[index]
-			if position < len(entries[index]) && entries[index][position].Key == minKey {
+			if position < len(entries[index]) && entries[index][position].Key == key {
 				containers[index] = views[index].data[entries[index][position].Offset:]
 			} else {
 				containers[index] = nil
@@ -43,30 +58,87 @@ func AndManyInto(dst *Builder, views ...Bitmap) {
 			}
 		}
 		if allMatch {
-			andManyContainerInto(dst, minKey, containers)
+			andManyContainerInto(dst, key, containers)
 		}
 		for index := range entries {
 			position := positions[index]
-			if position < len(entries[index]) && entries[index][position].Key <= minKey {
+			if position < len(entries[index]) && entries[index][position].Key <= key {
 				positions[index] = position + 1
 			}
 		}
 	}
 }
 
-func minEntryKey(entries [][]keyEntry, positions []int) (uint64, bool) {
-	var minKey uint64
-	found := false
-	for index, list := range entries {
-		if positions[index] < len(list) {
-			key := list[positions[index]].Key
-			if !found || key < minKey {
-				minKey = key
-				found = true
+// OrManyInto appends the N-way union of views to dst without materializing
+// intermediate bitmaps. Distinct keys are visited once in order; containers
+// sharing a key are folded with the pairwise kernels for pairs and a dense
+// scratch accumulator for wider fan-ins.
+func OrManyInto(dst *Builder, views ...Bitmap) {
+	switch len(views) {
+	case 0:
+		return
+	case 1:
+		copyAllInto(dst, views[0])
+		return
+	case 2:
+		OrInto(dst, views[0], views[1])
+		return
+	}
+	var stackEntries [maxStackViews][]keyEntry
+	var stackPositions [maxStackViews]int
+	var stackMatched [maxStackViews][]byte
+	entries := stackEntries[:0]
+	positions := stackPositions[:0]
+	matched := stackMatched[:0]
+	if len(views) > maxStackViews {
+		entries = make([][]keyEntry, len(views))
+		positions = make([]int, len(views))
+		matched = make([][]byte, len(views))
+	}
+	entries = entries[:len(views)]
+	positions = positions[:len(views)]
+	for index, view := range views {
+		entries[index] = view.keyEntries()
+	}
+	for {
+		key, found := minKey(entries, positions, nil)
+		if !found {
+			return
+		}
+		matched = matched[:0]
+		for index := range entries {
+			position := positions[index]
+			if position < len(entries[index]) && entries[index][position].Key == key {
+				matched = append(matched, views[index].data[entries[index][position].Offset:])
+			}
+		}
+		orManyContainersInto(dst, key, matched)
+		for index := range entries {
+			position := positions[index]
+			if position < len(entries[index]) && entries[index][position].Key <= key {
+				positions[index] = position + 1
 			}
 		}
 	}
-	return minKey, found
+}
+
+// minKey returns the smallest key at the current positions, bounded by ends
+// when non-nil, and whether any view still has keys.
+func minKey(entries [][]keyEntry, positions []int, ends []int) (uint64, bool) {
+	var key uint64
+	found := false
+	for index, list := range entries {
+		end := len(list)
+		if ends != nil {
+			end = ends[index]
+		}
+		if positions[index] < end {
+			if candidate := list[positions[index]].Key; !found || candidate < key {
+				key, found = candidate, true
+			}
+		}
+	}
+	return key, found
 }
 
 func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
@@ -74,13 +146,13 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 	driver := 0
 	driverCard := ^uint32(0)
 	for index, container := range containers {
-		card := containerHeaderAt(container).Card
-		if ContainerType(containerHeaderAt(container).Type) != ContainerBitmap {
+		h := containerHeaderAt(container)
+		if ContainerType(h.Type) != ContainerBitmap {
 			allBitmap = false
 		}
-		if card < driverCard {
+		if h.Card < driverCard {
 			driver = index
-			driverCard = card
+			driverCard = h.Card
 		}
 	}
 
@@ -88,6 +160,8 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 		scratch := dst.wordsScratch()
 		var card uint32
 		switch len(containers) {
+		case 2:
+			card = andWords(scratch, bitmapWordsAt(containers[0]), bitmapWordsAt(containers[1]))
 		case 3:
 			card = bitmapkernel.AndMany3(scratch,
 				bitmapWordsAt(containers[0]), bitmapWordsAt(containers[1]), bitmapWordsAt(containers[2]))
@@ -95,7 +169,13 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 			card = bitmapkernel.AndMany4(scratch,
 				bitmapWordsAt(containers[0]), bitmapWordsAt(containers[1]), bitmapWordsAt(containers[2]), bitmapWordsAt(containers[3]))
 		default:
-			inputs := make([][]uint64, len(containers))
+			var stackInputs [maxStackViews][]uint64
+			var inputs [][]uint64
+			if len(containers) <= maxStackViews {
+				inputs = stackInputs[:len(containers)]
+			} else {
+				inputs = make([][]uint64, len(containers))
+			}
 			for index, container := range containers {
 				inputs[index] = bitmapWordsAt(container)
 			}
@@ -142,6 +222,26 @@ func andManyContainerInto(dst *Builder, key uint64, containers [][]byte) {
 	dst.appendBitmap(key, scratch, uint32(survivors))
 }
 
+// orManyContainersInto folds the containers sharing one key into dst.
+func orManyContainersInto(dst *Builder, key uint64, containers [][]byte) {
+	switch len(containers) {
+	case 0:
+		return
+	case 1:
+		copyContainerInto(dst, key, containers[0])
+		return
+	case 2:
+		orContainerInto(dst, key, containers[0], containers[1])
+		return
+	}
+	words := dst.wordsScratch()
+	clear(words)
+	for _, container := range containers {
+		setContainerBits(words, container)
+	}
+	dst.emitWords(key, uint32(wordsCardinality(words)))
+}
+
 func valuePresentInAll(value uint16, driver int, containers [][]byte) bool {
 	for index, container := range containers {
 		if index == driver {
@@ -183,14 +283,14 @@ func AndManyCardinality(views ...Bitmap) uint64 {
 
 	var total uint64
 	for {
-		minKey, found := minEntryKey(entries, positions)
+		key, found := minKey(entries, positions, nil)
 		if !found {
 			return total
 		}
 		allMatch := true
 		for index := range entries {
 			position := positions[index]
-			if position < len(entries[index]) && entries[index][position].Key == minKey {
+			if position < len(entries[index]) && entries[index][position].Key == key {
 				containers[index] = views[index].data[entries[index][position].Offset:]
 			} else {
 				containers[index] = nil
@@ -202,7 +302,7 @@ func AndManyCardinality(views ...Bitmap) uint64 {
 		}
 		for index := range entries {
 			position := positions[index]
-			if position < len(entries[index]) && entries[index][position].Key <= minKey {
+			if position < len(entries[index]) && entries[index][position].Key <= key {
 				positions[index] = position + 1
 			}
 		}
@@ -214,17 +314,27 @@ func andManyContainerCardinality(containers [][]byte) uint64 {
 	driver := 0
 	driverCard := ^uint32(0)
 	for index, container := range containers {
-		card := containerHeaderAt(container).Card
-		if ContainerType(containerHeaderAt(container).Type) != ContainerBitmap {
+		h := containerHeaderAt(container)
+		if ContainerType(h.Type) != ContainerBitmap {
 			allBitmap = false
 		}
-		if card < driverCard {
+		if h.Card < driverCard {
 			driver = index
-			driverCard = card
+			driverCard = h.Card
 		}
 	}
 
 	if allBitmap {
+		switch len(containers) {
+		case 2:
+			return bitmapkernel.AndCardinality(bitmapWordsAt(containers[0]), bitmapWordsAt(containers[1]))
+		case 3:
+			return bitmapkernel.AndMany3Cardinality(
+				bitmapWordsAt(containers[0]), bitmapWordsAt(containers[1]), bitmapWordsAt(containers[2]))
+		case 4:
+			return bitmapkernel.AndMany4Cardinality(
+				bitmapWordsAt(containers[0]), bitmapWordsAt(containers[1]), bitmapWordsAt(containers[2]), bitmapWordsAt(containers[3]))
+		}
 		var count uint64
 		for wordIndex := 0; wordIndex < BitmapWords; wordIndex++ {
 			word := bitmapWordsAt(containers[0])[wordIndex]

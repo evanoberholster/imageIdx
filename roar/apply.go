@@ -81,13 +81,10 @@ func combineThreeInto(dst *Builder, key uint64, base, add, remove []byte) {
 		for _, value := range arrayValuesAt(remove) {
 			words[value>>6] &^= uint64(1) << (value & 63)
 		}
-	} else {
-		removeWords := bitmapWordsAt(remove)
-		for index := range removeWords {
-			words[index] &^= removeWords[index]
-		}
+		dst.emitWords(key, uint32(wordsCardinality(words)))
+		return
 	}
-	dst.emitWords(key, uint32(wordsCardinality(words)))
+	dst.emitWords(key, bitmapkernel.AndNot(words, words, bitmapWordsAt(remove)))
 }
 
 // setContainerBits ORs the set bits of a container into words.

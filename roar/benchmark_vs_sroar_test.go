@@ -161,20 +161,20 @@ func BenchmarkVsSroarAndMany(b *testing.B) {
 	})
 }
 
-// BenchmarkMutableVsBitmap compares the same whole-set op run through the
-// immutable free function versus the single-owner MutableBitmap method.
-func BenchmarkMutableVsBitmap(b *testing.B) {
+// BenchmarkDeltaVsBitmap compares the same whole-set op run through the
+// immutable free function versus the single-owner DeltaBuilder method.
+func BenchmarkDeltaVsBitmap(b *testing.B) {
 	roarBm, _ := vsSroarData()
 	a, c := roarBm[0], roarBm[1]
 
 	ops := []struct {
-		name    string
-		bitmap  func(a, b Bitmap) Bitmap
-		mutable func(m *MutableBitmap, b Bitmap)
+		name   string
+		bitmap func(a, b Bitmap) Bitmap
+		delta  func(m *DeltaBuilder, b Bitmap)
 	}{
-		{"And", And, func(m *MutableBitmap, b Bitmap) { m.And(b) }},
-		{"Or", Or, func(m *MutableBitmap, b Bitmap) { m.Or(b) }},
-		{"AndNot", AndNot, func(m *MutableBitmap, b Bitmap) { m.AndNot(b) }},
+		{"And", And, func(m *DeltaBuilder, b Bitmap) { m.And(b) }},
+		{"Or", Or, func(m *DeltaBuilder, b Bitmap) { m.Or(b) }},
+		{"AndNot", AndNot, func(m *DeltaBuilder, b Bitmap) { m.AndNot(b) }},
 	}
 	for _, op := range ops {
 		b.Run(op.name+"/bitmap", func(b *testing.B) {
@@ -183,11 +183,11 @@ func BenchmarkMutableVsBitmap(b *testing.B) {
 				_ = op.bitmap(a, c)
 			}
 		})
-		b.Run(op.name+"/mutable", func(b *testing.B) {
+		b.Run(op.name+"/delta", func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
-				m := NewMutableBitmapFrom(a)
-				op.mutable(m, c)
+				m := NewDeltaBuilderFrom(a)
+				op.delta(m, c)
 				_ = m.Freeze()
 			}
 		})
@@ -195,14 +195,14 @@ func BenchmarkMutableVsBitmap(b *testing.B) {
 }
 
 // BenchmarkVsSroarAndChain compares building an N-way intersection as a
-// sequential fold: MutableBitmap (reused builder), chained And (fresh builder
+// sequential fold: DeltaBuilder (reused builder), chained And (fresh builder
 // per step), and AndMany (single pass).
 func BenchmarkVsSroarAndChain(b *testing.B) {
 	roarBm, sroarBm := vsSroarData()
-	b.Run("mutable", func(b *testing.B) {
+	b.Run("delta", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			m := NewMutableBitmapFrom(roarBm[0])
+			m := NewDeltaBuilderFrom(roarBm[0])
 			for _, bm := range roarBm[1:] {
 				m.And(bm)
 			}

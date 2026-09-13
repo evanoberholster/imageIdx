@@ -583,3 +583,154 @@ and_many4_fixed_loop:
 	CBNZ R5, and_many4_fixed_loop
 	MOVW R6, ret+120(FP)
 	RET
+
+// func cardinalityPrefixNEONAsm(words []uint64, vectorCount int) uint64
+// vectorCount is the number of four-vector (eight-word) groups to count.
+TEXT ·cardinalityPrefixNEONAsm(SB), NOSPLIT, $0-40
+	MOVD words_base+0(FP), R0
+	MOVD vectorCount+24(FP), R1
+	MOVD $0, R2
+cardinality_prefix_neon_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R3
+	ADD R2, R3, R2
+
+	VLD1.P 16(R0), [V1.B16]
+	VCNT V1.B16, V1.B16
+	VUADDLV V1.B16, V1
+	VMOV V1.H[0], R3
+	ADD R2, R3, R2
+
+	VLD1.P 16(R0), [V2.B16]
+	VCNT V2.B16, V2.B16
+	VUADDLV V2.B16, V2
+	VMOV V2.H[0], R3
+	ADD R2, R3, R2
+
+	VLD1.P 16(R0), [V3.B16]
+	VCNT V3.B16, V3.B16
+	VUADDLV V3.B16, V3
+	VMOV V3.H[0], R3
+	ADD R2, R3, R2
+
+	SUB $1, R1, R1
+	CBNZ R1, cardinality_prefix_neon_loop
+	MOVD R2, ret+32(FP)
+	RET
+
+// func andMany3CardinalityNEONFixedAsm(a, b, c []uint64) uint64
+TEXT ·andMany3CardinalityNEONFixedAsm(SB), NOSPLIT, $0-80
+	MOVD a_base+0(FP), R0
+	MOVD b_base+24(FP), R1
+	MOVD c_base+48(FP), R2
+	MOVD $128, R3
+	MOVD $0, R4
+and_many3_card_neon_fixed_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VLD1.P 16(R1), [V1.B16]
+	VAND V1.B16, V0.B16, V0.B16
+	VLD1.P 16(R2), [V2.B16]
+	VAND V2.B16, V0.B16, V0.B16
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R0), [V3.B16]
+	VLD1.P 16(R1), [V4.B16]
+	VAND V4.B16, V3.B16, V3.B16
+	VLD1.P 16(R2), [V5.B16]
+	VAND V5.B16, V3.B16, V3.B16
+	VCNT V3.B16, V3.B16
+	VUADDLV V3.B16, V3
+	VMOV V3.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R0), [V6.B16]
+	VLD1.P 16(R1), [V7.B16]
+	VAND V7.B16, V6.B16, V6.B16
+	VLD1.P 16(R2), [V8.B16]
+	VAND V8.B16, V6.B16, V6.B16
+	VCNT V6.B16, V6.B16
+	VUADDLV V6.B16, V6
+	VMOV V6.H[0], R5
+	ADD R4, R5, R4
+
+	VLD1.P 16(R0), [V9.B16]
+	VLD1.P 16(R1), [V10.B16]
+	VAND V10.B16, V9.B16, V9.B16
+	VLD1.P 16(R2), [V11.B16]
+	VAND V11.B16, V9.B16, V9.B16
+	VCNT V9.B16, V9.B16
+	VUADDLV V9.B16, V9
+	VMOV V9.H[0], R5
+	ADD R4, R5, R4
+
+	SUB $1, R3, R3
+	CBNZ R3, and_many3_card_neon_fixed_loop
+	MOVD R4, ret+72(FP)
+	RET
+
+// func andMany4CardinalityNEONFixedAsm(a, b, c, d []uint64) uint64
+TEXT ·andMany4CardinalityNEONFixedAsm(SB), NOSPLIT, $0-104
+	MOVD a_base+0(FP), R0
+	MOVD b_base+24(FP), R1
+	MOVD c_base+48(FP), R2
+	MOVD d_base+72(FP), R3
+	MOVD $128, R4
+	MOVD $0, R5
+and_many4_card_neon_fixed_loop:
+	VLD1.P 16(R0), [V0.B16]
+	VLD1.P 16(R1), [V1.B16]
+	VAND V1.B16, V0.B16, V0.B16
+	VLD1.P 16(R2), [V2.B16]
+	VAND V2.B16, V0.B16, V0.B16
+	VLD1.P 16(R3), [V3.B16]
+	VAND V3.B16, V0.B16, V0.B16
+	VCNT V0.B16, V0.B16
+	VUADDLV V0.B16, V0
+	VMOV V0.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R0), [V4.B16]
+	VLD1.P 16(R1), [V5.B16]
+	VAND V5.B16, V4.B16, V4.B16
+	VLD1.P 16(R2), [V6.B16]
+	VAND V6.B16, V4.B16, V4.B16
+	VLD1.P 16(R3), [V7.B16]
+	VAND V7.B16, V4.B16, V4.B16
+	VCNT V4.B16, V4.B16
+	VUADDLV V4.B16, V4
+	VMOV V4.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R0), [V8.B16]
+	VLD1.P 16(R1), [V9.B16]
+	VAND V9.B16, V8.B16, V8.B16
+	VLD1.P 16(R2), [V10.B16]
+	VAND V10.B16, V8.B16, V8.B16
+	VLD1.P 16(R3), [V11.B16]
+	VAND V11.B16, V8.B16, V8.B16
+	VCNT V8.B16, V8.B16
+	VUADDLV V8.B16, V8
+	VMOV V8.H[0], R6
+	ADD R5, R6, R5
+
+	VLD1.P 16(R0), [V12.B16]
+	VLD1.P 16(R1), [V13.B16]
+	VAND V13.B16, V12.B16, V12.B16
+	VLD1.P 16(R2), [V14.B16]
+	VAND V14.B16, V12.B16, V12.B16
+	VLD1.P 16(R3), [V15.B16]
+	VAND V15.B16, V12.B16, V12.B16
+	VCNT V12.B16, V12.B16
+	VUADDLV V12.B16, V12
+	VMOV V12.H[0], R6
+	ADD R5, R6, R5
+
+	SUB $1, R4, R4
+	CBNZ R4, and_many4_card_neon_fixed_loop
+	MOVD R5, ret+96(FP)
+	RET

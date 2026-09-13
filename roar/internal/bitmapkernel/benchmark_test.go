@@ -141,6 +141,40 @@ func BenchmarkAndMany4(b *testing.B) {
 	}
 }
 
+func BenchmarkAndManyCardinality(b *testing.B) {
+	rng := rand.New(rand.NewPCG(16, 17))
+	a, bb, c, _ := benchContainers(rng, true)
+	d := make([]uint64, testWords)
+	for i := range d {
+		d[i] = rng.Uint64()
+	}
+	b.Run("3", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_ = AndMany3Cardinality(a, bb, c)
+		}
+	})
+	b.Run("4", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_ = AndMany4Cardinality(a, bb, c, d)
+		}
+	})
+}
+
+func BenchmarkCardinalityPrefix(b *testing.B) {
+	rng := rand.New(rand.NewPCG(18, 19))
+	a, _, _, _ := benchContainers(rng, true)
+	for _, wordCount := range []int{512, testWords} {
+		b.Run(strconv.Itoa(wordCount), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = CardinalityPrefix(a, wordCount)
+			}
+		})
+	}
+}
+
 func BenchmarkAndManyVariadic4(b *testing.B) {
 	rng := rand.New(rand.NewPCG(17, 18))
 	a, bb, c, dst := benchContainers(rng, true)

@@ -17,8 +17,11 @@ func andCardinalityNEONFixedAsm(a, b []uint64) uint64
 func orCardinalityNEONFixedAsm(a, b []uint64) uint64
 func andNotCardinalityNEONFixedAsm(a, b []uint64) uint64
 func cardinalityNEONFixedAsm(words []uint64) uint64
+func cardinalityPrefixNEONAsm(words []uint64, vectorCount int) uint64
 func andMany3NEONFixedAsm(dst, a, b, c []uint64) uint32
 func andMany4NEONFixedAsm(dst, a, b, c, d []uint64) uint32
+func andMany3CardinalityNEONFixedAsm(a, b, c []uint64) uint64
+func andMany4CardinalityNEONFixedAsm(a, b, c, d []uint64) uint64
 
 // NEON is baseline on ARM64, so the SIMD backend is selected whenever the
 // simd experiment is enabled. Popcount uses NEON's byte-count instruction and
@@ -35,9 +38,12 @@ func init() {
 	orCardinalityKernel = orCardinalityNEON
 	andNotCardinalityKernel = andNotCardinalityNEON
 	cardinalityKernel = cardinalityNEON
+	cardinalityPrefixKernel = cardinalityPrefixNEON
 	andManyKernel = andManyNEON
 	andMany3Kernel = andMany3NEON
 	andMany4Kernel = andMany4NEON
+	andMany3CardinalityKernel = andMany3CardinalityNEON
+	andMany4CardinalityKernel = andMany4CardinalityNEON
 	applyKernel = applyNEON
 }
 
@@ -122,6 +128,15 @@ func cardinalityNEON(words []uint64) uint64 {
 		return cardinalityNEONFixedAsm(words)
 	}
 	return cardinalityScalar(words)
+}
+
+func cardinalityPrefixNEON(words []uint64, wordCount int) uint64 {
+	vectorWords := wordCount &^ 7
+	var card uint64
+	if vectorWords != 0 {
+		card = cardinalityPrefixNEONAsm(words, vectorWords/8)
+	}
+	return card + cardinalityPrefixScalar(words[vectorWords:], wordCount-vectorWords)
 }
 
 func andManyNEON(dst []uint64, inputs ...[]uint64) uint32 {
@@ -228,6 +243,20 @@ func andMany4NEON(dst, a, b, c, d []uint64) uint32 {
 		card += uint32(bits.OnesCount64(w))
 	}
 	return card
+}
+
+func andMany3CardinalityNEON(a, b, c []uint64) uint64 {
+	if len(a) == fixedBitmapWords {
+		return andMany3CardinalityNEONFixedAsm(a, b, c)
+	}
+	return andMany3CardinalityScalar(a, b, c)
+}
+
+func andMany4CardinalityNEON(a, b, c, d []uint64) uint64 {
+	if len(a) == fixedBitmapWords {
+		return andMany4CardinalityNEONFixedAsm(a, b, c, d)
+	}
+	return andMany4CardinalityScalar(a, b, c, d)
 }
 
 func applyNEON(dst, base, add, remove []uint64) uint32 {

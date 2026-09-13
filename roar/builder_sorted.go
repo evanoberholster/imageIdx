@@ -124,9 +124,7 @@ func (b *SortedBuilder) finishCurrent() {
 		start := len(b.data)
 		region := b.extend(int(blocks) * 8)
 		writeContainerHeader(region, blocks, ContainerArray, uint32(len(values)))
-		for index, value := range values {
-			binary.LittleEndian.PutUint16(region[ContainerHeaderSize+2*index:], value)
-		}
+		putUint16s(region[ContainerHeaderSize:], values)
 		b.keys = append(b.keys, b.currentKey)
 		b.offsets = append(b.offsets, uint64(start))
 		b.cardinality += uint64(len(values))
@@ -162,6 +160,56 @@ func FromSorted(ids []uint64) (Bitmap, error) {
 		return Bitmap{}, err
 	}
 	return Bitmap{data: data}, nil
+}
+
+// MustFromSorted is like FromSorted but panics on error. It is intended for
+// tests and startup paths with statically known valid inputs.
+func MustFromSorted(ids []uint64) Bitmap {
+	bitmap, err := FromSorted(ids)
+	if err != nil {
+		panic(err)
+	}
+	return bitmap
+}
+
+// FromUnsorted constructs an immutable Bitmap from ImageIDs in any order.
+// A strictly increasing, zero-free input is encoded directly without copying;
+// otherwise a copy is sorted, deduplicated, and stripped of the reserved zero
+// ID. The input is never retained or mutated. An empty result is an empty
+// Bitmap.
+func FromUnsorted(ids []uint64) Bitmap {
+	if len(ids) == 0 {
+		return Bitmap{}
+	}
+	values := ids
+	if !strictlyIncreasing(values) {
+		values = append([]uint64(nil), ids...)
+		slices.Sort(values)
+		values = slices.Compact(values)
+		if len(values) != 0 && values[0] == InvalidImageID {
+			values = values[1:]
+		}
+	}
+	bitmap, err := FromSorted(values)
+	if err != nil {
+		// Unreachable: values are strictly increasing and free of zero.
+		return Bitmap{}
+	}
+	return bitmap
+}
+
+// strictlyIncreasing reports whether values are strictly increasing with no
+// reserved zero ID, in which case FromSorted can encode them directly.
+func strictlyIncreasing(values []uint64) bool {
+	if len(values) == 0 || values[0] == InvalidImageID {
+		return false
+	}
+	for i := 1; i < len(values); i++ {
+		if values[i] <= values[i-1] {
+			return false
+		}
+	}
+	return true
 }
 
 // fromSorted builds the compact serialized representation of strictly
@@ -254,9 +302,25 @@ func writeContainer(dst []byte, ids []uint64, run containerRun) int {
 		blocks := int(1 + BitmapWords)
 		writeContainerHeader(dst, uint16(blocks), ContainerBitmap, uint32(card))
 		words := unsafe.Slice((*uint64)(unsafe.Pointer(unsafe.SliceData(dst[ContainerHeaderSize:]))), BitmapWords)
+		// Input values are sorted, so all bits for one word are adjacent. Build
+		// that word in a register and store it once instead of repeatedly
+		// reading and modifying the destination word.
+		wordIndex := -1
+		var word uint64
 		for index := run.start; index < run.end; index++ {
 			value := lowValue(ids[index])
-			words[value>>6] |= uint64(1) << (value & 63)
+			nextWordIndex := int(value >> 6)
+			if nextWordIndex != wordIndex {
+				if wordIndex >= 0 {
+					words[wordIndex] = word
+				}
+				wordIndex = nextWordIndex
+				word = 0
+			}
+			word |= uint64(1) << (value & 63)
+		}
+		if wordIndex >= 0 {
+			words[wordIndex] = word
 		}
 		return blocks
 	}

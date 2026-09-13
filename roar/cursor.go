@@ -26,6 +26,18 @@ func (b Bitmap) NewCursor() Cursor {
 	return Cursor{data: b.data, entries: b.keyEntries(), keyPos: -1}
 }
 
+// Reset rebinds the cursor to b, discarding any loaded container. It
+// allocates nothing and lets workspaces pool cursors across queries instead
+// of constructing a new cursor per filter call.
+func (c *Cursor) Reset(b Bitmap) {
+	c.data = b.data
+	c.entries = b.keyEntries()
+	c.keyPos = -1
+	c.base = 0
+	c.values = nil
+	c.words = nil
+}
+
 // load populates the cursor's container cache for entries[index].
 func (c *Cursor) load(index int) {
 	entry := c.entries[index]
@@ -158,4 +170,55 @@ func bitmapNextSet(words []uint64, x uint16) (uint16, bool) {
 		}
 		word = words[wordIndex]
 	}
+}
+
+// Contains reports whether id is present. It performs a key lookup followed
+// by an array search or a direct bitmap bit test and allocates nothing.
+// Single-container bitmaps skip the key-table search.
+func (v Bitmap) Contains(id uint64) bool {
+	if id == InvalidImageID || len(v.data) == 0 {
+		return false
+	}
+	if v.header().KeyCount == 1 {
+		entries := v.keyEntries()
+		if entries[0].Key != highKey(id) {
+			return false
+		}
+		return containsContainer(v.data[entries[0].Offset:], lowValue(id))
+	}
+	entry, ok := v.findEntry(highKey(id))
+	if !ok {
+		return false
+	}
+	return containsContainer(v.data[entry.Offset:], lowValue(id))
+}
+
+// FilterSorted appends the candidates present in b to dst. Candidates must
+// arrive in non-decreasing order (the order search plans produce after
+// sortUnique). A sticky cursor reuses the loaded container across runs of
+// IDs that share a key, so sorted probes avoid repeating the key-table
+// search that Contains pays per ID. It allocates nothing and supports
+// in-place filtering (dst may alias candidates' backing store).
+func (b Bitmap) FilterSorted(dst, candidates []uint64) []uint64 {
+	if len(candidates) == 0 || len(b.data) == 0 {
+		return dst
+	}
+	cursor := b.NewCursor()
+	return cursor.FilterSorted(dst, candidates)
+}
+
+// FilterSorted appends the candidates present in the cursor's bitmap to dst.
+// Candidates must arrive in non-decreasing order. Reusing the cursor across
+// calls avoids repeating the key-table setup that FilterSorted pays per call.
+// It allocates nothing and supports in-place filtering.
+func (c *Cursor) FilterSorted(dst, candidates []uint64) []uint64 {
+	for _, id := range candidates {
+		if id == InvalidImageID {
+			continue
+		}
+		if c.Contains(id) {
+			dst = append(dst, id)
+		}
+	}
+	return dst
 }

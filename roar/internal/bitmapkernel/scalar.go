@@ -82,6 +82,14 @@ func cardinalityScalar(w []uint64) uint64 {
 	return card
 }
 
+func cardinalityPrefixScalar(w []uint64, wordCount int) uint64 {
+	var card uint64
+	for _, x := range w[:wordCount] {
+		card += uint64(bits.OnesCount64(x))
+	}
+	return card
+}
+
 func andManyScalar(dst []uint64, inputs ...[]uint64) uint32 {
 	copy(dst, inputs[0])
 	for _, in := range inputs[1:] {
@@ -108,6 +116,22 @@ func andMany4Scalar(dst, a, b, c, d []uint64) uint32 {
 		w := a[i] & b[i] & c[i] & d[i]
 		dst[i] = w
 		card += uint32(bits.OnesCount64(w))
+	}
+	return card
+}
+
+func andMany3CardinalityScalar(a, b, c []uint64) uint64 {
+	var card uint64
+	for i := range a {
+		card += uint64(bits.OnesCount64(a[i] & b[i] & c[i]))
+	}
+	return card
+}
+
+func andMany4CardinalityScalar(a, b, c, d []uint64) uint64 {
+	var card uint64
+	for i := range a {
+		card += uint64(bits.OnesCount64(a[i] & b[i] & c[i] & d[i]))
 	}
 	return card
 }
