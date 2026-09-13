@@ -23,8 +23,8 @@ const (
 )
 
 // Storage selects the in-memory representation and lookup path for a field.
-// Both modes mutate and query identically; the distinction is reserved for
-// the persisted tier and currently changes no behavior.
+// Both modes currently share the same lookup and mmap persistence layout;
+// the distinction is reserved for future cache-policy tuning.
 type Storage uint8
 
 const (

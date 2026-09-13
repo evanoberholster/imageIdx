@@ -77,12 +77,13 @@ type queryKey struct {
 
 // MatchValues returns images holding every supplied value (logical AND). An
 // empty value list matches nothing.
-func (i *FieldIndex) MatchValues(values ...Value) (roar.Bitmap, error) {
+func (i *FieldIndex) MatchValues(values ...Value) (result roar.Bitmap, resultErr error) {
 	if len(values) == 0 {
 		return roar.Bitmap{}, nil
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
+	defer i.ownResult(&result)
 	view := i.view.Load()
 	if i.closed.Load() {
 		return roar.Bitmap{}, nil
@@ -153,7 +154,7 @@ func (i *FieldIndex) resolveValues(view *fieldView, values []Value, retain bool)
 			if canonical == nil {
 				canon = append(canon, nil)
 			} else {
-				canon = append(canon, append([]byte(nil), canonical...))
+				canon = append(canon, append([]byte{}, canonical...))
 			}
 		}
 		if canonical == nil {
@@ -225,7 +226,7 @@ func (i *FieldIndex) ValueIDs(dst []ImageID, value Value) ([]ImageID, error) {
 
 // Range returns images whose continuous value falls inside bounds. It unions
 // the effective postings of every occupied grid key in the span.
-func (i *FieldIndex) Range(bounds NumericRange) (roar.Bitmap, error) {
+func (i *FieldIndex) Range(bounds NumericRange) (result roar.Bitmap, resultErr error) {
 	field := i.Field()
 	if field.Kind != KindContinuous {
 		return roar.Bitmap{}, ErrInvalidRange
@@ -235,6 +236,7 @@ func (i *FieldIndex) Range(bounds NumericRange) (roar.Bitmap, error) {
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
+	defer i.ownResult(&result)
 	view := i.view.Load()
 	if i.closed.Load() {
 		return roar.Bitmap{}, nil

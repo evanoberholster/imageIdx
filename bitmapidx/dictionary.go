@@ -6,8 +6,8 @@ import (
 	"sort"
 )
 
-// Dictionary staging bounds. Values are copied into immutable chunks; chunks
-// are never mutated once published.
+// Dictionary staging bounds. Published descriptors and addressed bytes are
+// immutable. The writer may append beyond a published chunk's visible length.
 const (
 	dictChunkTargetBytes    = 1 << 20
 	dictActiveTargetEntries = 4096
@@ -202,7 +202,9 @@ type dictionaryWriter struct {
 }
 
 func (d *dictionaryWriter) view() *dictionaryView {
-	return &dictionaryView{base: d.base, active: d.active, chunks: d.chunks}
+	// The writer may extend its last chunk's slice header. Readers own an
+	// immutable descriptor list and can only address already-written bytes.
+	return &dictionaryView{base: d.base, active: d.active, chunks: slices.Clone(d.chunks)}
 }
 
 // appendBytes copies canonical bytes into the active chunk and returns their

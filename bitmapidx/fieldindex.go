@@ -270,6 +270,7 @@ type stagedChange struct {
 // after close; writes and maintenance report ErrClosed. The zero value is
 // not usable; construct with NewFieldIndex.
 type FieldIndex struct {
+	owner    *FieldStore // immutable before exposing the handle
 	view     atomic.Pointer[fieldView]
 	readers  *indexutil.ReaderTracker
 	writerMu sync.Mutex
@@ -435,6 +436,22 @@ func (i *FieldIndex) ReplaceText(changes ...TextReplacement) error {
 	if field.Kind != KindText {
 		return ErrFieldMismatch
 	}
+	if i.owner != nil {
+		remaining := MaxFieldBatchBytes
+		if len(changes) > MaxFieldBatchUpdates*16 {
+			return ErrBatchTooLarge
+		}
+		for _, change := range changes {
+			for _, docs := range [][]string{change.Before, change.After} {
+				for _, doc := range docs {
+					if len(doc) > remaining {
+						return ErrBatchTooLarge
+					}
+					remaining -= len(doc)
+				}
+			}
+		}
+	}
 	var mutation FieldMutation
 	for _, change := range changes {
 		if change.ImageID == 0 {
@@ -466,6 +483,13 @@ func (i *FieldIndex) ReplaceText(changes ...TextReplacement) error {
 
 // Compact synchronously merges all correction layers into a new Base.
 func (i *FieldIndex) Compact() error {
+	if i.owner != nil {
+		i.owner.writeMu.Lock()
+		defer i.owner.writeMu.Unlock()
+		if err := i.owner.writable(); err != nil {
+			return err
+		}
+	}
 	i.writerMu.Lock()
 	if i.closed.Load() {
 		i.writerMu.Unlock()
@@ -483,6 +507,13 @@ func (i *FieldIndex) Compact() error {
 // Vacuum compacts the field and drops dictionary values with no remaining
 // posting. It is the only operation that removes dead dictionary entries.
 func (i *FieldIndex) Vacuum() error {
+	if i.owner != nil {
+		i.owner.writeMu.Lock()
+		defer i.owner.writeMu.Unlock()
+		if err := i.owner.writable(); err != nil {
+			return err
+		}
+	}
 	i.writerMu.Lock()
 	if i.closed.Load() {
 		i.writerMu.Unlock()
@@ -499,6 +530,13 @@ func (i *FieldIndex) Vacuum() error {
 
 // Close marks the field closed, waits for compactions and prior readers.
 func (i *FieldIndex) Close() error {
+	if i.owner != nil {
+		return ErrOwnedIndex
+	}
+	return i.closeInternal()
+}
+
+func (i *FieldIndex) closeInternal() error {
 	i.writerMu.Lock()
 	i.closed.Store(true)
 	i.writerMu.Unlock()
@@ -589,6 +627,20 @@ func (i *FieldIndex) prepare(field Field, mutation FieldMutation) ([]stagedChang
 	if len(mutation.Add) == 0 && len(mutation.Remove) == 0 {
 		return nil, nil
 	}
+	if i.owner != nil {
+		if len(mutation.Add) > MaxFieldBatchUpdates*16 || len(mutation.Remove) > MaxFieldBatchUpdates*16-len(mutation.Add) {
+			return nil, ErrBatchTooLarge
+		}
+		remaining := MaxFieldBatchBytes
+		for _, entries := range [][]Entry{mutation.Add, mutation.Remove} {
+			for _, entry := range entries {
+				if len(entry.Value.Bytes) > remaining {
+					return nil, ErrBatchTooLarge
+				}
+				remaining -= len(entry.Value.Bytes)
+			}
+		}
+	}
 	position := make(map[FieldKey]int, len(mutation.Add)+len(mutation.Remove))
 	changes := make([]stagedChange, 0, len(mutation.Add)+len(mutation.Remove))
 	stage := func(entry Entry, add bool) error {
@@ -653,6 +705,9 @@ func (i *FieldIndex) keyForValue(field Field, value Value) (FieldKey, []byte, er
 		if len(canonical) > MaxValueBytes {
 			return FieldKey{}, nil, ErrValueTooLong
 		}
+		if canonical == nil {
+			canonical = []byte{}
+		}
 		return hashCanonical(field.Type, KindEnum, canonical), canonical, nil
 	case KindBool:
 		if value.Kind != KindBool {
@@ -693,51 +748,87 @@ func (i *FieldIndex) keyForValue(field Field, value Value) (FieldKey, []byte, er
 	}
 }
 
-// applyChanges composes and publishes one prepared batch. The writer lock is
-// held for publication only.
+// applyChanges composes and publishes one prepared batch. Canonicalization
+// runs before writer serialization; dictionary resolution, replacement
+// construction, WAL append (if owned), and root publication serialize here.
 func (i *FieldIndex) applyChanges(changes []stagedChange) error {
+	return i.applyChangesMode(changes, false)
+}
+
+func (i *FieldIndex) applyChangesReplay(changes []stagedChange) error {
+	return i.applyChangesMode(changes, true)
+}
+
+func (i *FieldIndex) applyChangesMode(changes []stagedChange, replay bool) error {
+	if i.owner != nil {
+		i.owner.writeMu.Lock()
+		defer i.owner.writeMu.Unlock()
+		if err := i.owner.writable(); err != nil {
+			return err
+		}
+	}
 	i.writerMu.Lock()
 	defer i.writerMu.Unlock()
 	if i.closed.Load() {
 		return ErrClosed
 	}
 	current := i.view.Load()
+	saved := i.dict
+	saved.chunks = slices.Clone(saved.chunks)
+	committed := false
+	defer func() {
+		if !committed {
+			i.dict = saved
+			i.dict.abort()
+		}
+	}()
 	resolved, err := i.resolveChanges(current, changes)
 	if err != nil {
 		i.dict.abort()
 		return err
 	}
-	if err := validateGeoChanges(current, resolved); err != nil {
-		i.dict.abort()
-		return err
+	if !replay {
+		if err := validateGeoChanges(current, resolved); err != nil {
+			return err
+		}
+	}
+	var walPayload []byte
+	var walUpdates uint32
+	if i.owner != nil {
+		// Bound and freeze the canonical frame before allocating replacement
+		// postings. Encoding also removes duplicate/conflicting memberships.
+		walPayload, walUpdates, err = encodeFieldChanges(resolved)
+		if err != nil {
+			return err
+		}
 	}
 	active := composeFieldDelta(current, resolved)
 	if active == nil && current.active == nil {
 		return nil // every requested change already matched published state
 	}
 
-	if active != nil && (active.ids > i.config.HardDeltaLimit || len(active.values) > i.config.MaxDeltaValues) {
-		base := current.effectiveTable(current.frozen, active)
-		i.dict.seal()
-		i.publishLocked(current, base, nil, nil)
-		return nil
+	base, frozen := current.base, current.frozen
+	rotate := false
+	if active != nil && (active.ids >= i.config.HardDeltaLimit || len(active.values) > i.config.MaxDeltaValues) {
+		base = current.effectiveTable(current.frozen, active)
+		frozen, active = nil, nil
+	} else if frozen == nil && active != nil && active.ids >= i.config.ActiveTarget {
+		frozen, active, rotate = active, nil, true
 	}
-
-	if current.frozen != nil && active != nil && active.ids >= i.config.HardDeltaLimit {
-		base := current.effectiveTable(current.frozen)
-		current = i.publishLocked(current, base, nil, current.active)
-		active = composeFieldDelta(current, resolved)
-	}
-
-	if active != nil && (active.ids > i.config.ActiveTarget || len(active.values) > i.config.MaxDeltaValues) {
-		i.dict.seal()
-		i.publishLocked(current, current.base, active, nil)
-		i.scheduleCompaction(active)
-		return nil
-	}
-
 	i.dict.seal()
-	i.publishLocked(current, current.base, current.frozen, active)
+	// Finish every fallible preparation before WAL append; the successful
+	// append is followed by exactly one non-fallible root publication.
+	next := i.nextView(current, base, frozen, active)
+	if i.owner != nil {
+		if err := i.owner.append(i, walPayload, uint32(len(resolved)), walUpdates); err != nil {
+			return err
+		}
+	}
+	i.view.Store(next)
+	committed = true
+	if rotate {
+		i.scheduleCompaction(frozen)
+	}
 	return nil
 }
 
@@ -939,7 +1030,13 @@ func mergeSortedIDs(first, second []ImageID) []ImageID {
 
 // publishLocked publishes a replacement field view. Caller holds writerMu.
 func (i *FieldIndex) publishLocked(old *fieldView, base postingTable, frozen, active *fieldDelta) *fieldView {
-	next := &fieldView{
+	next := i.nextView(old, base, frozen, active)
+	i.view.Store(next)
+	return next
+}
+
+func (i *FieldIndex) nextView(old *fieldView, base postingTable, frozen, active *fieldDelta) *fieldView {
+	return &fieldView{
 		field:      old.field,
 		base:       base,
 		frozen:     frozen,
@@ -948,8 +1045,6 @@ func (i *FieldIndex) publishLocked(old *fieldView, base postingTable, frozen, ac
 		dictGen:    i.dict.generation,
 		generation: old.generation + 1,
 	}
-	i.view.Store(next)
-	return next
 }
 
 // scheduleCompaction folds frozen into a replacement base in the background.
@@ -962,8 +1057,10 @@ func (i *FieldIndex) scheduleCompaction(frozen *fieldDelta) {
 		if i.config.CompactDelay != 0 {
 			time.Sleep(i.config.CompactDelay)
 		}
+		token := i.readers.Acquire()
 		initial := i.view.Load()
-		if initial.frozen != frozen {
+		if i.closed.Load() || initial.frozen != frozen {
+			i.readers.Release(token)
 			return
 		}
 		base := initial.effectiveTable(frozen)
@@ -973,6 +1070,7 @@ func (i *FieldIndex) scheduleCompaction(frozen *fieldDelta) {
 			i.publishLocked(current, base, nil, current.active)
 		}
 		i.writerMu.Unlock()
+		i.readers.Release(token)
 		i.readers.WaitForPriorReaders()
 	}()
 }

@@ -2,6 +2,7 @@ package bitmapidx
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,6 +28,8 @@ const (
 // OpenPersistent loads that segment and replays the WAL tail on top. Vacuum
 // checkpoints and removes obsolete segment generations.
 type Store struct {
+	lock       *os.File
+	failed     error // guarded by writeMu
 	directory  *Directory
 	dir        string
 	config     Config
@@ -57,6 +60,16 @@ func NewPersistent(dir string, specs []Spec, config Config, durability Durabilit
 	if err = os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	lock, err := lockStore(dir, true)
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			unlockStore(lock)
+		}
+	}()
 	readers := &indexutil.ReaderTracker{}
 	indexes := make([]*Index, 0, len(specs))
 	for _, spec := range specs {
@@ -82,6 +95,11 @@ func NewPersistent(dir string, specs []Spec, config Config, durability Durabilit
 		_ = store.Close()
 		return nil, err
 	}
+	store.lock = lock
+	for _, index := range indexes {
+		index.owner = store
+	}
+	ok = true
 	return store, nil
 }
 
@@ -94,6 +112,16 @@ func OpenPersistent(dir string, config Config, durability Durability) (*Store, e
 		}
 		return nil, ErrInvalidConfig
 	}
+	lock, err := lockStore(dir, false)
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			unlockStore(lock)
+		}
+	}()
 	manifest, err := readBitmapManifest(filepath.Join(dir, "manifest"))
 	if err != nil {
 		return nil, err
@@ -106,7 +134,12 @@ func OpenPersistent(dir string, config Config, durability Durability) (*Store, e
 		_ = segment.close()
 		return nil, ErrCorruptManifest
 	}
-	recovered, err := replayBitmapWAL(filepath.Join(dir, bitmapWALFilename), manifest.walOffset)
+	walPath := filepath.Join(dir, bitmapWALFilename)
+	if _, err = os.Stat(walPath); err != nil {
+		_ = segment.close()
+		return nil, err
+	}
+	recovered, end, err := replayBitmapWALEnd(walPath, manifest.walOffset)
 	if err != nil {
 		_ = segment.close()
 		return nil, err
@@ -127,10 +160,21 @@ func OpenPersistent(dir string, config Config, durability Durability) (*Store, e
 		_ = segment.close()
 		return nil, err
 	}
-	return &Store{
+	if err = wal.RepairTail(end); err != nil {
+		wal.Close()
+		segment.close()
+		return nil, err
+	}
+	store := &Store{
 		directory: segment.directory, dir: dir, config: config, durability: durability,
 		wal: wal, segment: segment, readers: segment.readers, generation: manifest.generation,
-	}, nil
+		lock: lock,
+	}
+	for _, index := range store.Indexes() {
+		index.owner = store
+	}
+	ok = true
+	return store, nil
 }
 
 // Lookup returns an index by logical predicate key.
@@ -152,14 +196,22 @@ func (s *Store) Apply(key Key, mutation Mutation) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	if s.failed != nil {
+		return s.failed
+	}
 	index, ok := s.directory.Lookup(key)
 	if !ok {
 		return ErrInvalidIndex
 	}
+	index.writerMu.Lock()
+	defer index.writerMu.Unlock()
+	if index.closed.Load() {
+		return ErrClosed
+	}
 	if err := s.wal.append(key, index.Metadata().IndexID, mutation, s.durability); err != nil {
 		return err
 	}
-	return index.Apply(mutation)
+	return index.applyLocked(mutation)
 }
 
 func (s *Store) Add(key Key, ids []ImageID) error {
@@ -173,11 +225,21 @@ func (s *Store) Remove(key Key, ids []ImageID) error {
 func (s *Store) Checkpoint() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.checkpointLocked()
+}
+
+func (s *Store) checkpointLocked() error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	if s.failed != nil {
+		return s.failed
+	}
 	if s.wal == nil || s.dir == "" {
 		return ErrNotPersistent
+	}
+	if err := s.wal.Sync(); err != nil {
+		return err
 	}
 	offset, err := s.wal.Offset()
 	if err != nil {
@@ -194,7 +256,8 @@ func (s *Store) Checkpoint() error {
 	}
 	manifest := bitmapManifest{generation: generation, walOffset: offset, count: uint64(s.directory.Len())}
 	if err = writeBitmapManifest(s.dir, manifest); err != nil {
-		return err
+		s.failed = errors.Join(ErrRecoveryRequired, err)
+		return s.failed
 	}
 	s.generation = generation
 	return nil
@@ -203,34 +266,34 @@ func (s *Store) Checkpoint() error {
 // Vacuum checkpoints live bases into physical key order and removes obsolete
 // immutable segment files. Existing mmaps remain valid until Store.Close.
 func (s *Store) Vacuum() error {
-	if err := s.Checkpoint(); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.checkpointLocked(); err != nil {
 		return err
 	}
-	s.readers.WaitForPriorReaders()
 	return persist.RemoveObsolete(s.dir, "segment-*.idx", segmentPath(s.dir, s.generation))
 }
 
 func (s *Store) Close() error {
 	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.closed.Swap(true) {
-		s.writeMu.Unlock()
 		return nil
 	}
 	var result error
 	if s.wal != nil {
 		result = s.wal.Close()
 	}
-	s.writeMu.Unlock()
 	if s.segment != nil {
 		if err := s.segment.close(); result == nil {
 			result = err
 		}
 	} else {
 		for _, index := range s.directory.Indexes() {
-			_ = index.Close()
+			_ = index.closeInternal()
 		}
 	}
-	return result
+	return errors.Join(result, unlockStore(s.lock))
 }
 
 func segmentPath(dir string, generation uint64) string {

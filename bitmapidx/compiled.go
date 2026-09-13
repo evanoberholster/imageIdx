@@ -94,13 +94,14 @@ func (q Query) resolve(view *fieldView) ([]FieldKey, bool) {
 }
 
 // Match returns images holding every compiled value.
-func (q Query) Match() (roar.Bitmap, error) {
+func (q Query) Match() (result roar.Bitmap, resultErr error) {
 	if q.index == nil {
 		return roar.Bitmap{}, nil
 	}
 	i := q.index
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
+	defer i.ownResult(&result)
 	view := i.view.Load()
 	if i.closed.Load() {
 		return roar.Bitmap{}, nil

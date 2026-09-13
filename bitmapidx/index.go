@@ -19,6 +19,7 @@ import (
 // locks. Writers serialize through writerMu and publish replacement views;
 // background compaction owns the Frozen->Base fold.
 type Index struct {
+	owner   *Store // immutable once the handle is exposed
 	view    atomic.Pointer[indexView]
 	readers *indexutil.ReaderTracker
 
@@ -124,13 +125,20 @@ func (i *Index) AppendTo(dst []ImageID) []ImageID {
 //     compaction is scheduled to fold it into the Base.
 //  4. Otherwise the batch simply extends the Active delta.
 func (i *Index) Apply(mutation Mutation) error {
-	if len(mutation.Add) == 0 && len(mutation.Remove) == 0 {
-		return nil
+	if i.owner != nil {
+		return i.owner.Apply(i.Metadata().Key, mutation)
 	}
 	i.writerMu.Lock()
 	defer i.writerMu.Unlock()
+	return i.applyLocked(mutation)
+}
+
+func (i *Index) applyLocked(mutation Mutation) error {
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	if len(mutation.Add) == 0 && len(mutation.Remove) == 0 {
+		return nil
 	}
 
 	current := i.view.Load()
@@ -304,6 +312,13 @@ func (i *Index) Compact() error {
 // Close marks the index closed, waits for background compactions to drain, and
 // waits for prior readers. Further Apply calls return ErrClosed.
 func (i *Index) Close() error {
+	if i.owner != nil {
+		return ErrOwnedIndex
+	}
+	return i.closeInternal()
+}
+
+func (i *Index) closeInternal() error {
 	i.writerMu.Lock()
 	i.closed.Store(true)
 	i.writerMu.Unlock()

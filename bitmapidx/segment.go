@@ -89,6 +89,10 @@ func writeSegment(path string, generation uint64, indexes []*Index) error {
 		view := index.view.Load()
 		effective := view.effectiveBitmap()
 		payload, _ := effective.MarshalBinary()
+		if uint64(len(payload)) > uint64(^uint32(0)) {
+			releaseReaders(tokens)
+			return ErrInvalidIndex
+		}
 		offset, seekErr := file.Seek(0, io.SeekEnd)
 		if seekErr != nil {
 			releaseReaders(tokens)
@@ -180,8 +184,8 @@ func openSegment(path string, config Config) (*segment, error) {
 	}
 	count := binary.LittleEndian.Uint64(header[16:24])
 	directoryOffset := binary.LittleEndian.Uint64(header[24:32])
-	directoryEnd := directoryOffset + count*segmentEntrySize
-	if directoryOffset%8 != 0 || directoryEnd < directoryOffset || directoryEnd > uint64(len(mapping)) {
+	directoryEnd, validEnd := indexutil.CheckedEnd(directoryOffset, count, segmentEntrySize, uint64(len(mapping)))
+	if !validEnd || directoryOffset != segmentHeaderSize {
 		return fail()
 	}
 	directoryBytes := mapping[directoryOffset:directoryEnd]

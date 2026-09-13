@@ -36,7 +36,7 @@ func (w *bitmapWAL) append(key Key, indexID uint64, mutation Mutation, durabilit
 		return nil
 	}
 	count := len(mutation.Add) + len(mutation.Remove)
-	if count > int(^uint32(0))/8 {
+	if count > (64<<20)/8 {
 		return ErrInvalidIndex
 	}
 	payload := w.Scratch(count * 8)
@@ -61,17 +61,23 @@ func (w *bitmapWAL) append(key Key, indexID uint64, mutation Mutation, durabilit
 }
 
 func replayBitmapWAL(path string, offset int64) ([]walMutation, error) {
+	records, _, err := replayBitmapWALEnd(path, offset)
+	return records, err
+}
+
+func replayBitmapWALEnd(path string, offset int64) ([]walMutation, int64, error) {
 	var records []walMutation
-	err := persist.Replay(path, offset, persist.FrameSpec{
+	end, err := persist.ReplayEnd(path, offset, persist.FrameSpec{
 		HeaderSize: bitmapWALHeaderSize,
 		Magic:      bitmapWALMagic,
 		Version:    bitmapWALVersion,
 		Corrupt:    ErrCorruptWAL,
+		MaxPayload: 64 << 20,
 	}, func(header []byte) (uint64, error) {
 		payloadSize := binary.LittleEndian.Uint32(header[12:16])
 		adds := binary.LittleEndian.Uint32(header[20:24])
 		removes := binary.LittleEndian.Uint32(header[24:28])
-		if uint64(payloadSize) != uint64(adds+removes)*8 {
+		if uint64(payloadSize) != (uint64(adds)+uint64(removes))*8 {
 			return 0, ErrCorruptWAL
 		}
 		return uint64(payloadSize), nil
@@ -97,7 +103,7 @@ func replayBitmapWAL(path string, offset int64) ([]walMutation, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, end, err
 	}
-	return records, nil
+	return records, end, nil
 }

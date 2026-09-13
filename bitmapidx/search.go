@@ -16,13 +16,14 @@ type readToken struct {
 // delta-carrying operands are materialized, and the combination runs as a
 // single N-way intersection. A nil index is an empty predicate and empties
 // the conjunction.
-func And(indexes ...*Index) roar.Bitmap {
+func And(indexes ...*Index) (result roar.Bitmap) {
 	if len(indexes) == 0 {
 		return roar.Bitmap{}
 	}
 	var tokenStack [8]readToken
 	tokens := acquireReaders(tokenStack[:0], indexes)
 	defer releaseReaders(tokens)
+	defer func() { result = ownStoreResult(result, indexes) }()
 
 	if len(indexes) <= 2 {
 		a, ok := andOperand(indexes, 0)
@@ -81,13 +82,14 @@ func andOperand(indexes []*Index, at int) (roar.Bitmap, bool) {
 // operand is corrected independently before the union is evaluated. Delta-free
 // operands are added without cloning their base. Nil indexes are skipped as
 // empty predicates.
-func Or(indexes ...*Index) roar.Bitmap {
+func Or(indexes ...*Index) (result roar.Bitmap) {
 	if len(indexes) == 0 {
 		return roar.Bitmap{}
 	}
 	var tokenStack [8]readToken
 	tokens := acquireReaders(tokenStack[:0], indexes)
 	defer releaseReaders(tokens)
+	defer func() { result = ownStoreResult(result, indexes) }()
 
 	if len(indexes) <= 2 {
 		var first, second roar.Bitmap

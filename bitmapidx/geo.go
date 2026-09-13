@@ -325,7 +325,7 @@ func geoBaseRangeIn(entries []FieldKey, keyRange GeoRange) (int, int) {
 
 // GeoRanges returns images inside any inclusive key range. Ranges may be
 // unnormalized and overlapping; the result is sorted and unique.
-func (i *FieldIndex) GeoRanges(ranges []GeoRange) (roar.Bitmap, error) {
+func (i *FieldIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr error) {
 	if i.Field().Kind != KindGeo {
 		return roar.Bitmap{}, ErrFieldMismatch
 	}
@@ -334,6 +334,7 @@ func (i *FieldIndex) GeoRanges(ranges []GeoRange) (roar.Bitmap, error) {
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
+	defer i.ownResult(&result)
 	view := i.view.Load()
 	if i.closed.Load() {
 		return roar.Bitmap{}, nil
