@@ -9,6 +9,15 @@ import (
 // periodically or when a size threshold is reached.  It is intended to
 // reduce the number of WAL append + publish cycles when many small
 // Apply calls arrive in quick succession.
+//
+// The writer maintains an internal buffered channel (capacity 256).  Callers
+// send mutations via Apply(); a goroutine collects them and flushes when
+// either the batch count `bat` is reached or the ticker interval elapses.
+// Flush() forces an immediate publish.  Close() stops the goroutine and
+// drains remaining entries.
+//
+// The zero value of BufferedWriter is not usable; use NewBufferedWriter.
+// After Close() the writer must not be used.
 type BufferedWriter struct {
 	idx   *Index
 	ch    chan []Entry
@@ -26,6 +35,8 @@ type BufferedWriter struct {
 
 // NewBufferedWriter returns a writer that flushes when either `bat` entries
 // have been accumulated or `interval` has elapsed, whichever comes first.
+// The channel has capacity 256; callers should not send massive bursts
+// without draining, or Apply will return ErrChannelFull.
 func NewBufferedWriter(idx *Index, bat int, interval time.Duration) *BufferedWriter {
 	bw := &BufferedWriter{
 		idx:  idx,
@@ -41,19 +52,18 @@ func NewBufferedWriter(idx *Index, bat int, interval time.Duration) *BufferedWri
 
 // Apply sends an entry slice into the buffer.  It blocks until the channel
 // has space (channel size is 256, so callers should not send massive bursts
-// without draining).
+// without draining).  Returns ErrChannelFull if the internal channel is full.
 func (bw *BufferedWriter) Apply(entries []Entry) error {
 	select {
 	case bw.ch <- entries:
 		return nil
 	default:
-		// Channel full; callers may retry or drop.  Returning an error avoids
-		// blocking the critical path unexpectedly.
 		return ErrChannelFull
 	}
 }
 
 // Flush forces an immediate flush of the buffered entries.
+// After calling Flush the internal buffer is empty and ready for new entries.
 func (bw *BufferedWriter) Flush() error {
 	bw.mu.Lock()
 	entries := bw.buf
@@ -86,7 +96,7 @@ func (bw *BufferedWriter) Flush() error {
 }
 
 // Stats returns the total number of flushes and entries flushed since the
-// writer was created.
+// writer was created.  Valid after construction and after any Flush call.
 func (bw *BufferedWriter) Stats() (flushes uint64, entries uint64) {
 	bw.mu.Lock()
 	defer bw.mu.Unlock()
@@ -94,12 +104,15 @@ func (bw *BufferedWriter) Stats() (flushes uint64, entries uint64) {
 }
 
 // Close stops the writer goroutine and drains any remaining entries.
+// After Close() the writer must not be used.
 func (bw *BufferedWriter) Close() error {
 	close(bw.stop)
 	bw.wg.Wait()
 	return bw.Flush()
 }
 
+// worker is the internal goroutine that consumes from the channel and
+// flushes according to batch size or tick interval.
 func (bw *BufferedWriter) worker() {
 	defer bw.wg.Done()
 	for {
@@ -138,6 +151,9 @@ func (bw *BufferedWriter) worker() {
 // ApplyBatch applies a slice of entry slices as a single batch to the
 // associated Index.  It merges all entries and calls Apply once, so the
 // whole batch publishes once rather than once per slice.
+//
+// This is useful for bulk operations where the caller already has the
+// entries collected and wants to minimise WAL/append overhead.
 func (i *Index) ApplyBatch(slices [][]Entry) error {
 	if len(slices) == 0 {
 		return nil

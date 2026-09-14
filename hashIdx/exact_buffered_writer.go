@@ -144,6 +144,16 @@ func (bw *ExactBufferedWriter) worker() {
 // index.  It merges all entries, canonicalizes once, and calls the index's
 // internal WAL append + publish path once, so the whole batch publishes
 // once rather than once per slice.
+// ApplyBatch applies a slice of mutations as a single batch to the exact index.
+// It merges all entries, canonicalizes once, and calls the internal WAL append
+// + publish path once, so the whole batch publishes once rather than once per slice.
+//
+// This is useful for bulk operations where the caller already has the
+// mutations collected and wants to minimise WAL/append overhead.
+//
+// The mutations slice is validated: each entry's ImageID must be non-zero.
+// Canonicalization drops pairs whose desired state already matches the current
+// view, and remove wins on conflict.
 func (i *ExactIndex) ApplyBatch(mutations []Mutation) error {
 	if len(mutations) == 0 {
 		return nil
