@@ -65,16 +65,24 @@ type CandidateSet interface {
 // logical page (8192 records, 384 KiB of SoA planes).
 const DefaultRecordsPerPage uint32 = 8192
 
+// DefaultMaxApplyEntries bounds one perceptual Apply batch by default:
+// 65536 records frame to ~3 MiB of WAL payload and publish once.
+const DefaultMaxApplyEntries uint32 = 65536
+
 const (
 	minRecordsPerPage = 8
 	maxRecordsPerPage = 1 << 20
 )
 
-// Config controls the logical page size. The zero value selects defaults.
-// RecordsPerPage is a persistent format property: the store records it in the
-// perceptual manifest, and OpenStore adopts the persisted size.
+// Config controls the logical page size and write batching. The zero
+// value selects defaults. RecordsPerPage is a persistent format property:
+// the store records it in the perceptual manifest, and OpenStore adopts
+// the persisted size. MaxBatchEntries is runtime policy only and is never
+// persisted: it bounds one Apply batch so a single call cannot frame an
+// unbounded WAL record and stall publication.
 type Config struct {
-	RecordsPerPage uint32
+	RecordsPerPage  uint32
+	MaxBatchEntries uint32
 }
 
 // Metadata is a copied summary of the current published view. PageCount
@@ -90,8 +98,14 @@ func (c Config) withDefaults() (Config, error) {
 	if c.RecordsPerPage == 0 {
 		c.RecordsPerPage = DefaultRecordsPerPage
 	}
+	// The multiple-of-8 rule keeps every plane's full-page span a multiple
+	// of 64 bytes (8 uint64 words), preserving the 64-byte page alignment
+	// the persisted layout promises.
 	if c.RecordsPerPage < minRecordsPerPage || c.RecordsPerPage > maxRecordsPerPage || c.RecordsPerPage%8 != 0 {
 		return Config{}, ErrInvalidConfig
+	}
+	if c.MaxBatchEntries == 0 {
+		c.MaxBatchEntries = DefaultMaxApplyEntries
 	}
 	return c, nil
 }
@@ -154,14 +168,19 @@ type ExactSpec struct {
 	Entries   []ExactEntry
 }
 
-// ExactMetadata is a copied summary of the current generation.
+// ExactMetadata is a copied summary of the current generation. BaseCount
+// counts base block records and deliberately excludes staged overlay
+// corrections; OverlayCount counts staged entries not yet folded. The
+// effective live count is BaseCount plus staged adds minus staged
+// removes (see LiveCount).
 type ExactMetadata struct {
-	IndexID    uint64
-	Flags      uint32
-	Algorithm  Algorithm
-	Generation uint64
-	BaseCount  uint64
-	BlockCount uint32
+	IndexID      uint64
+	Flags        uint32
+	Algorithm    Algorithm
+	Generation   uint64
+	BaseCount    uint64
+	BlockCount   uint32
+	OverlayCount uint64
 }
 
 // ExactConfig controls block sizing and write batching. The zero value selects
@@ -175,6 +194,12 @@ type ExactConfig struct {
 	// MaxBatchEntries bounds the number of logical entries (adds plus
 	// removes) accepted by one Apply call.
 	MaxBatchEntries uint32
+	// OverlayMaxEntries bounds staged overlay entries (adds plus
+	// removes) before a publish folds into the blocks. Small publishes
+	// stage and share the block slice; past this bound the batch folds
+	// synchronously, amortizing the O(#blocks) directory copy. It is
+	// runtime policy only and is never persisted.
+	OverlayMaxEntries uint32
 }
 
 const (
@@ -184,6 +209,11 @@ const (
 	DefaultTargetFillPct = 80
 	// DefaultMaxBatchEntries bounds one Apply batch by default.
 	DefaultMaxBatchEntries = 8_192
+	// DefaultOverlayMaxEntries stages up to 512 entries (~20 KiB) before
+	// folding. Overlay probes stay within a 9-step binary search, keeping
+	// steady-state reads near base cost while small publishes avoid the
+	// directory copy entirely.
+	DefaultOverlayMaxEntries = 512
 )
 
 var (
@@ -201,6 +231,9 @@ func (c ExactConfig) withDefaults() (ExactConfig, error) {
 	}
 	if c.MaxBatchEntries == 0 {
 		c.MaxBatchEntries = DefaultMaxBatchEntries
+	}
+	if c.OverlayMaxEntries == 0 {
+		c.OverlayMaxEntries = DefaultOverlayMaxEntries
 	}
 	if c.BlockSize < minBlockSize || c.BlockSize > maxBlockSize {
 		return ExactConfig{}, ErrInvalidConfig

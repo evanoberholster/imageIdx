@@ -813,7 +813,8 @@ func TestVacuumAndReopen(t *testing.T) {
 	if err := idx.Apply(Mutation{Remove: removes}); err != nil {
 		t.Fatal(err)
 	}
-	wantLive := idx.Metadata().BaseCount
+	// Effective count: removes stage into the overlay until vacuum folds.
+	wantLive := idx.LiveCount()
 	if err := idx.Vacuum(); err != nil {
 		t.Fatal(err)
 	}
@@ -821,8 +822,13 @@ func TestVacuumAndReopen(t *testing.T) {
 	if after > before {
 		t.Logf("vacuum bytes before=%d after=%d (dead storage reclaimed across generations)", before, after)
 	}
-	if got := idx.Metadata().BaseCount; got != wantLive {
+	if got := idx.LiveCount(); got != wantLive {
 		t.Fatalf("vacuum changed live count: %d -> %d", wantLive, got)
+	}
+	// Vacuum folds the overlay: base count now equals the live count and
+	// no staged entries remain.
+	if md := idx.Metadata(); md.BaseCount != wantLive || md.OverlayCount != 0 {
+		t.Fatalf("post-vacuum metadata = %+v, want base %d overlay 0", md, wantLive)
 	}
 	if err := checkViewInvariants(t, idx); err != nil {
 		t.Fatal(err)
@@ -834,8 +840,8 @@ func TestVacuumAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
-	if reopened.Metadata().BaseCount != wantLive {
-		t.Fatalf("reopen count = %d, want %d", reopened.Metadata().BaseCount, wantLive)
+	if reopened.LiveCount() != wantLive {
+		t.Fatalf("reopen count = %d, want %d", reopened.LiveCount(), wantLive)
 	}
 	_ = gen
 	// Only the current generation file should remain.

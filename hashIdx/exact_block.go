@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
-	"sort"
+	"slices"
 )
 
 const (
@@ -207,9 +207,10 @@ func compareEntry(a, b ExactEntry) int {
 	}
 }
 
-// sortEntries sorts entries by (Hash, ImageID).
+// sortEntries sorts entries by (Hash, ImageID) without the sort.Slice
+// interface overhead.
 func sortEntries(entries []ExactEntry) {
-	sort.Slice(entries, func(i, j int) bool { return compareEntry(entries[i], entries[j]) < 0 })
+	slices.SortFunc(entries, compareEntry)
 }
 
 // recordsSorted validates that records (a Count*RecordSize byte slice) are

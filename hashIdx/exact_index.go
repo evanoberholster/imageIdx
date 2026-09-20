@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -21,10 +22,20 @@ func (b blockHandle) count() int { return len(b.records) / RecordSize }
 
 // exactIndexView is one immutable, atomically published snapshot. Everything
 // reachable from it is immutable for its lifetime, so readers take no mutex.
+// liveCount counts base block records only; the effective live count adds
+// the overlay delta. The overlay stages recent publishes that have not yet
+// folded into the blocks.
 type exactIndexView struct {
 	generation uint64
 	liveCount  uint64
 	blocks     []blockHandle
+	overlay    *exactOverlay
+}
+
+// effectiveCount returns the view's logical live count: base records plus
+// staged adds minus staged removes.
+func (v *exactIndexView) effectiveCount() uint64 {
+	return uint64(int64(v.liveCount) + v.overlay.delta())
 }
 
 // ExactIndex maps exact 256-bit digests to image IDs with lock-free readers
@@ -92,7 +103,15 @@ func acquireExactBatch(adds, removes []ExactEntry) *exactBatch {
 	return batch
 }
 
+// maxPooledExactBatchEntries bounds pooled batch capacity. A batch that
+// grew past it is dropped instead of returned, so one huge write cannot
+// pin megabytes in the pool process-wide.
+const maxPooledExactBatchEntries = 4 * DefaultMaxBatchEntries
+
 func releaseExactBatch(batch *exactBatch) {
+	if cap(batch.adds)+cap(batch.removes) > maxPooledExactBatchEntries {
+		return
+	}
 	batch.adds = batch.adds[:0]
 	batch.removes = batch.removes[:0]
 	exactBatchPool.Put(batch)
@@ -154,25 +173,40 @@ func (i *ExactIndex) startWriterLoop() {
 	go i.writerLoop()
 }
 
-// Metadata returns a copied summary of the current generation.
+// Metadata returns a copied summary of the current generation, including
+// staged overlay depth for fold-pressure monitoring.
 func (i *ExactIndex) Metadata() ExactMetadata {
 	v := i.view.Load()
 	return ExactMetadata{
 		IndexID: i.indexID, Flags: i.flags, Algorithm: i.algorithm,
 		Generation: v.generation, BaseCount: v.liveCount, BlockCount: uint32(len(v.blocks)),
+		OverlayCount: uint64(v.overlay.ids()),
 	}
 }
 
-// LiveBytes reports live logical bytes (40 per entry).
-func (i *ExactIndex) LiveBytes() uint64 { return i.view.Load().liveCount * RecordSize }
+// LiveCount returns the effective number of live entries: base records
+// plus staged adds minus staged removes. Unlike Metadata BaseCount, it
+// reflects un-folded publishes.
+func (i *ExactIndex) LiveCount() uint64 {
+	return i.view.Load().effectiveCount()
+}
+
+// LiveBytes reports live logical bytes (40 per entry), including staged
+// overlay corrections.
+func (i *ExactIndex) LiveBytes() uint64 {
+	v := i.view.Load()
+	return v.effectiveCount() * RecordSize
+}
 
 // PhysicalBytes reports in-memory physical bytes including block payload,
-// directory descriptors, and headers. Persistent indexes should consult the
-// on-disk footprint via OnDiskBytes instead for amplification analysis.
+// directory descriptors, headers, and staged overlay entries. Persistent
+// indexes should consult the on-disk footprint via OnDiskBytes instead
+// for amplification analysis.
 func (i *ExactIndex) PhysicalBytes() uint64 {
 	v := i.view.Load()
 	total := uint64(len(v.blocks)) * (blockHeaderSize + dirEntrySize)
 	total += v.liveCount * RecordSize
+	total += uint64(v.overlay.ids()) * RecordSize
 	return total
 }
 
@@ -287,20 +321,49 @@ func (i *ExactIndex) Contains(hash Hash) bool {
 	return found
 }
 
+// viewContains reports whether hash is present. It probes only the start
+// block: the greatest block with first <= hash must hold the hash when
+// any block does, because a spanning run's every block opens at or below
+// the hash and the greatest such opener contains it.
 func viewContains(view *exactIndexView, hash Hash) bool {
-	if len(view.blocks) == 0 {
-		return false
+	if view.overlay == nil {
+		// Hot path: probe only the start block. The greatest block with
+		// first <= hash must hold the hash when any block does, because
+		// a spanning run's every block opens at or below the hash and
+		// the greatest such opener contains it. A single lower bound
+		// plus one compare touches exactly one block.
+		if len(view.blocks) == 0 {
+			return false
+		}
+		start := findStartBlock(view.blocks, hash)
+		if start < 0 {
+			return false
+		}
+		pos := blockLowerBound(view.blocks[start].records, hash)
+		return pos < view.blocks[start].count() &&
+			bytes.Equal(view.blocks[start].records[pos*RecordSize:pos*RecordSize+32], hash[:])
 	}
-	start := findStartBlock(view.blocks, hash)
-	if start < 0 {
-		return false
-	}
-	pos := blockLowerBound(view.blocks[start].records, hash)
-	if pos < view.blocks[start].count() &&
-		bytes.Equal(view.blocks[start].records[pos*RecordSize:pos*RecordSize+32], hash[:]) {
+	// Overlay adds settle membership without touching blocks: staged adds
+	// are absent from base by invariant, so any match is decisive.
+	if len(overlayGroup(view.overlay.adds, hash)) > 0 {
 		return true
 	}
-	return false
+	remGroup := overlayGroup(view.overlay.removes, hash)
+	// Walk the base run across spanning blocks, skipping staged removes.
+	// A fully removed run reports absent only after the walk.
+	it := newRunIterator(view.blocks, hash)
+	for {
+		_, rec, ok := it.next()
+		if !ok {
+			return false
+		}
+		if len(remGroup) == 0 {
+			return true
+		}
+		if !overlayContainsID(remGroup, ImageID(binary.LittleEndian.Uint64(rec[32:40]))) {
+			return true
+		}
+	}
 }
 
 // Lookup appends the sorted unique ImageIDs for hash to dst.
@@ -316,14 +379,58 @@ func (i *ExactIndex) Lookup(dst []ImageID, hash Hash) []ImageID {
 }
 
 func viewLookup(dst []ImageID, view *exactIndexView, hash Hash) []ImageID {
+	start := len(dst)
 	it := newRunIterator(view.blocks, hash)
 	for {
 		_, rec, ok := it.next()
 		if !ok {
-			return dst
+			break
 		}
 		dst = append(dst, ImageID(binary.LittleEndian.Uint64(rec[32:40])))
 	}
+	if view.overlay == nil {
+		return dst
+	}
+	addGroup := overlayGroup(view.overlay.adds, hash)
+	remGroup := overlayGroup(view.overlay.removes, hash)
+	if len(addGroup) == 0 && len(remGroup) == 0 {
+		return dst
+	}
+	// Filter staged removes in place, then merge staged adds. Both inputs
+	// are sorted and disjoint by overlay invariant, so one linear merge
+	// into scratch plus a copy-back emits the union with a single small
+	// transient allocation, only on overlay-hit hashes.
+	base := dst[start:]
+	kept := base[:0]
+	for _, id := range base {
+		if !overlayContainsID(remGroup, id) {
+			kept = append(kept, id)
+		}
+	}
+	if len(addGroup) == 0 {
+		return dst[:start+len(kept)]
+	}
+	merged := make([]ImageID, 0, len(kept)+len(addGroup))
+	i, j := 0, 0
+	for i < len(kept) && j < len(addGroup) {
+		switch {
+		case kept[i] < addGroup[j].ImageID:
+			merged = append(merged, kept[i])
+			i++
+		case kept[i] > addGroup[j].ImageID:
+			merged = append(merged, addGroup[j].ImageID)
+			j++
+		default:
+			merged = append(merged, kept[i])
+			i++
+			j++
+		}
+	}
+	merged = append(merged, kept[i:]...)
+	for ; j < len(addGroup); j++ {
+		merged = append(merged, addGroup[j].ImageID)
+	}
+	return append(dst[:start], merged...)
 }
 
 // Count returns the number of ImageIDs associated with hash.
@@ -344,10 +451,19 @@ func viewCount(view *exactIndexView, hash Hash) uint64 {
 	it := newRunIterator(view.blocks, hash)
 	for {
 		if _, _, ok := it.next(); !ok {
-			return n
+			break
 		}
 		n++
 	}
+	if view.overlay == nil {
+		return n
+	}
+	// Staged removes are a subset of the base run and staged adds are
+	// disjoint from it by overlay invariant, so arithmetic is exact with
+	// no per-ID work.
+	addGroup := overlayGroup(view.overlay.adds, hash)
+	remGroup := overlayGroup(view.overlay.removes, hash)
+	return n - uint64(len(remGroup)) + uint64(len(addGroup))
 }
 
 // Mutation is one atomically published batch. Entries appearing in both Add
@@ -481,15 +597,18 @@ func (i *ExactIndex) applyCoalesced(first *exactBatch) {
 
 // publishMerged canonicalizes the flattened batches once, appends one WAL
 // record, publishes one view, and completes every waiter with the result.
+// Small publishes stage into the overlay and share the block slice;
+// past OverlayMaxEntries staged IDs the batch folds into the blocks and
+// clears the overlay, amortizing the O(#blocks) directory copy.
 func (i *ExactIndex) publishMerged(pending []*exactBatch) {
 	adds, removes := flattenBatches(pending)
+	current := i.view.Load()
 	if len(adds)+len(removes) != 0 {
-		current := i.view.Load()
 		adds, removes = canonicalizeMutation(current, Mutation{Add: adds, Remove: removes})
 	}
 	var err error
 	if len(adds)+len(removes) != 0 {
-		err = i.publishBatch(adds, removes)
+		err = i.publishBatch(current, adds, removes)
 	}
 	i.publishes.Add(1)
 	if len(pending) > 1 {
@@ -503,7 +622,15 @@ func (i *ExactIndex) publishMerged(pending []*exactBatch) {
 }
 
 // flattenBatches concatenates pending batches preserving arrival order.
+// Both outputs are presized once so coalesced batches never regrow them.
 func flattenBatches(pending []*exactBatch) (adds, removes []ExactEntry) {
+	var nAdd, nRemove int
+	for _, batch := range pending {
+		nAdd += len(batch.adds)
+		nRemove += len(batch.removes)
+	}
+	adds = make([]ExactEntry, 0, nAdd)
+	removes = make([]ExactEntry, 0, nRemove)
 	for _, batch := range pending {
 		adds = append(adds, batch.adds...)
 		removes = append(removes, batch.removes...)
@@ -514,17 +641,36 @@ func flattenBatches(pending []*exactBatch) (adds, removes []ExactEntry) {
 // publishBatch appends one WAL record and publishes the resulting view. It
 // runs only on the writer loop, which is the sole WAL appender, so no lock
 // is needed here; maintenance paths coordinate through lifecycle and never
-// touch the WAL handle while the loop can append.
-func (i *ExactIndex) publishBatch(adds, removes []ExactEntry) error {
+// touch the WAL handle while the loop can append. The WAL append precedes
+// the view change, so every published state is durable first; a WAL error
+// publishes nothing and fails the waiters.
+//
+// Staging keeps the common path off the blocks: the new view shares the
+// current block slice and carries the merged overlay. Only past the
+// overlay bound does the batch fold through applyEffective. Either way
+// the generation advances, invalidating generation-gated caches.
+func (i *ExactIndex) publishBatch(current *exactIndexView, adds, removes []ExactEntry) error {
 	i.persistence.mu.Lock()
 	err := appendExactWAL(i.persistence.wal, adds, removes, i.persistence.durability, i.seq.Add(1))
 	i.persistence.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	current := i.view.Load()
-	next := applyEffective(current, adds, removes, i.config)
-	next.generation = current.generation + 1
+	staged := stageOverlay(current.overlay, adds, removes)
+	var next *exactIndexView
+	if staged == nil || staged.ids() <= int(i.config.OverlayMaxEntries) {
+		next = &exactIndexView{
+			generation: current.generation + 1,
+			liveCount:  current.liveCount,
+			blocks:     current.blocks,
+			overlay:    staged,
+		}
+	} else {
+		// Staged sets are canonical against base by construction, so the
+		// fold merges straight into the blocks with no re-canonicalization.
+		next = applyEffective(baseOnlyView(current), staged.adds, staged.removes, i.config)
+		next.generation = current.generation + 1
+	}
 	i.view.Store(next)
 	i.generation.Store(next.generation)
 	// No reader drain here: old blocks are Go-allocated and reclaimed by GC,
@@ -549,8 +695,13 @@ func (i *ExactIndex) applyWithoutWAL(adds, removes []ExactEntry) {
 }
 
 // canonicalizeMutation deduplicates the batch (remove wins on conflict) and
-// drops pairs whose desired state already matches the current view.
+// drops pairs whose desired state already matches the current view. Small
+// batches sort instead of hashing: no 40-byte-key map, and the outputs are
+// already ordered for the block merge.
 func canonicalizeMutation(view *exactIndexView, m Mutation) (adds, removes []ExactEntry) {
+	if len(m.Add)+len(m.Remove) <= 128 {
+		return canonicalizeMutationSorted(view, m)
+	}
 	desired := make(map[ExactEntry]int8, len(m.Add)+len(m.Remove))
 	for _, e := range m.Add {
 		desired[e] = 1
@@ -573,9 +724,69 @@ func canonicalizeMutation(view *exactIndexView, m Mutation) (adds, removes []Exa
 	return adds, removes
 }
 
+// exactOp tags one entry with its batch side: 1 for add, -1 for remove.
+type exactOp struct {
+	entry ExactEntry
+	op    int8
+}
+
+// canonicalizeMutationSorted is the map-free canonicalization for small
+// batches. Entries sort once; equal neighbors collapse with remove
+// winning, and each survivor probes the view once. Outputs emerge sorted,
+// ready for mergeBlockEntries without a second sort.
+func canonicalizeMutationSorted(view *exactIndexView, m Mutation) (adds, removes []ExactEntry) {
+	ops := make([]exactOp, 0, len(m.Add)+len(m.Remove))
+	for _, e := range m.Add {
+		ops = append(ops, exactOp{entry: e, op: 1})
+	}
+	for _, e := range m.Remove {
+		ops = append(ops, exactOp{entry: e, op: -1})
+	}
+	slices.SortFunc(ops, func(a, b exactOp) int {
+		if c := compareEntry(a.entry, b.entry); c != 0 {
+			return c
+		}
+		return int(a.op) - int(b.op)
+	})
+	adds = make([]ExactEntry, 0, len(m.Add))
+	removes = make([]ExactEntry, 0, len(m.Remove))
+	for i := 0; i < len(ops); {
+		j := i + 1
+		for j < len(ops) && ops[j].entry == ops[i].entry {
+			j++
+		}
+		op := int8(1)
+		for k := i; k < j; k++ {
+			if ops[k].op == -1 {
+				op = -1
+				break
+			}
+		}
+		present := viewContainsPair(view, ops[i].entry)
+		if op == 1 && !present {
+			adds = append(adds, ops[i].entry)
+		} else if op == -1 && present {
+			removes = append(removes, ops[i].entry)
+		}
+		i = j
+	}
+	return adds, removes
+}
+
+// viewContainsPair reports whether the exact pair is present in the
+// effective view: staged adds first, then staged removes (a staged remove
+// is absent even though its base record still exists), then base blocks.
 func viewContainsPair(view *exactIndexView, e ExactEntry) bool {
-	if view == nil || len(view.blocks) == 0 {
+	if view == nil {
 		return false
+	}
+	if view.overlay != nil {
+		if overlayContainsPair(view.overlay.adds, e) {
+			return true
+		}
+		if overlayContainsPair(view.overlay.removes, e) {
+			return false
+		}
 	}
 	return locatePair(view.blocks, e) >= 0
 }
@@ -625,31 +836,39 @@ func applyEffective(view *exactIndexView, adds, removes []ExactEntry, cfg ExactC
 		}
 		return &exactIndexView{liveCount: uint64(len(merged)), blocks: blocks}
 	}
-	// Decode affected blocks once, merge, re-split.
+	// Decode affected blocks once, merge, re-split. Adds routed to a block
+	// may sort before its previous first hash; the merge and re-partition
+	// absorb them there. Replacements expand in place, so the directory
+	// stays ordered without a re-sort.
+	if len(affected) == 1 {
+		var idx int
+		for idx = range affected {
+		}
+		oldEntries := decodeBlockEntriesPooled(view.blocks[idx].records)
+		merged := mergeBlockEntries(oldEntries, blockAdds[idx], blockRemoves[idx])
+		liveDelta := int64(len(merged) - len(oldEntries))
+		releaseExactEntries(oldEntries)
+		out := resplit(merged, maxRecords, target)
+		newBlocks := make([]blockHandle, 0, len(view.blocks)+len(out)-1)
+		newBlocks = append(newBlocks, view.blocks[:idx]...)
+		newBlocks = append(newBlocks, out...)
+		newBlocks = append(newBlocks, view.blocks[idx+1:]...)
+		liveCount := uint64(int64(view.liveCount) + liveDelta)
+		return &exactIndexView{blocks: newBlocks, liveCount: liveCount}
+	}
 	replacements := make(map[int][]blockHandle, len(affected))
 	var liveDelta int64
 	for idx := range affected {
 		old := view.blocks[idx]
-		oldEntries := decodeBlockEntries(old.records)
+		oldEntries := decodeBlockEntriesPooled(old.records)
 		merged := mergeBlockEntries(oldEntries, blockAdds[idx], blockRemoves[idx])
 		liveDelta += int64(len(merged) - len(oldEntries))
+		releaseExactEntries(oldEntries)
 		if len(merged) == 0 {
 			replacements[idx] = nil
 			continue
 		}
-		// Adds routed to block 0 may sort before its previous first hash;
-		// the merge and re-partition absorb them here. Replacements expand
-		// in place, so the directory stays ordered without a re-sort.
-		parts := partitionEntries(merged, maxRecords, target)
-		out := make([]blockHandle, len(parts))
-		for k, part := range parts {
-			rec := make([]byte, len(part)*RecordSize)
-			for j, e := range part {
-				encodeRecord(rec[j*RecordSize:(j+1)*RecordSize], e)
-			}
-			out[k] = blockHandle{first: part[0].Hash, records: rec}
-		}
-		replacements[idx] = out
+		replacements[idx] = resplit(merged, maxRecords, target)
 	}
 	// Handle adds for hashes beyond all blocks (routed to last block above,
 	// which covers them via split). Adds before the first block are also
@@ -667,6 +886,25 @@ func applyEffective(view *exactIndexView, adds, removes []ExactEntry, cfg ExactC
 	}
 	liveCount := uint64(int64(view.liveCount) + liveDelta)
 	return &exactIndexView{blocks: newBlocks, liveCount: liveCount}
+}
+
+// resplit partitions merged entries at target occupancy and encodes one
+// immutable block per part. Empty merges yield no blocks, which drops the
+// affected block during splicing.
+func resplit(merged []ExactEntry, maxRecords, target int) []blockHandle {
+	if len(merged) == 0 {
+		return nil
+	}
+	parts := partitionEntries(merged, maxRecords, target)
+	out := make([]blockHandle, len(parts))
+	for k, part := range parts {
+		rec := make([]byte, len(part)*RecordSize)
+		for j, e := range part {
+			encodeRecord(rec[j*RecordSize:(j+1)*RecordSize], e)
+		}
+		out[k] = blockHandle{first: part[0].Hash, records: rec}
+	}
+	return out
 }
 
 // locatePair finds the block holding an exact pair, or -1.
@@ -692,31 +930,47 @@ func decodeBlockEntries(records []byte) []ExactEntry {
 	return out
 }
 
+// decodeBlockEntriesPooled decodes records into pooled scratch for fold
+// paths that merge and release immediately. The caller must release the
+// result after merging; merged outputs are always freshly allocated, so
+// pooled memory never escapes into a view.
+func decodeBlockEntriesPooled(records []byte) []ExactEntry {
+	n := len(records) / RecordSize
+	out := acquireExactEntries(n)
+	for i := 0; i < n; i++ {
+		out[i] = decodeRecord(records[i*RecordSize : (i+1)*RecordSize])
+	}
+	return out
+}
+
+// mergeBlockEntries folds sorted adds and removes into a sorted old
+// block without re-sorting. Canonicalization guarantees adds miss old,
+// removes hit old, and every input is sorted unique; stale removes and
+// duplicate adds degrade to skips, never to duplicate output. One linear
+// pass, one output allocation.
 func mergeBlockEntries(old, adds, removes []ExactEntry) []ExactEntry {
 	if len(adds) == 0 && len(removes) == 0 {
 		return old
 	}
-	removeSet := make(map[ExactEntry]struct{}, len(removes))
-	for _, e := range removes {
-		removeSet[e] = struct{}{}
-	}
 	merged := make([]ExactEntry, 0, len(old)+len(adds))
-	for _, e := range old {
-		if _, ok := removeSet[e]; !ok {
-			merged = append(merged, e)
+	i, j, k := 0, 0, 0
+	for i < len(old) || j < len(adds) {
+		if k < len(removes) && i < len(old) && old[i] == removes[k] {
+			i++
+			k++
+			continue
 		}
-	}
-	merged = append(merged, adds...)
-	sortEntries(merged)
-	// Defensive de-duplication (canonicalization should already guarantee
-	// uniqueness, but merges across split boundaries must never emit dups).
-	out := merged[:0]
-	for i, e := range merged {
-		if i == 0 || e != merged[i-1] {
-			out = append(out, e)
+		if j < len(adds) && (i >= len(old) || compareEntry(adds[j], old[i]) < 0) {
+			merged = append(merged, adds[j])
+			j++
+			continue
 		}
+		if n := len(merged); n == 0 || merged[n-1] != old[i] {
+			merged = append(merged, old[i])
+		}
+		i++
 	}
-	return out
+	return merged
 }
 
 // PendingCompactions reports queued but unpublished write batches. Block

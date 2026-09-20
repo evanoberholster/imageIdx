@@ -42,12 +42,17 @@ func (i *Index) Metadata() Metadata {
 func (i *Index) Add(entry Entry) error { return i.Apply([]Entry{entry}) }
 
 // Apply appends one batch of entries. The whole batch publishes once: all
-// six planes advance together, so a reader observes either none or all of the
-// batch. Apply validates entries, appends the WAL batch first when the index
-// is persistent, then publishes the new immutable view.
+// six planes advance together, so a reader observes either none or all of
+// the batch. Batches past Config.MaxBatchEntries fail with ErrBatchTooLarge
+// before any WAL or view work. Apply validates entries, appends the WAL
+// batch first when the index is persistent, then publishes the new
+// immutable view.
 func (i *Index) Apply(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
+	}
+	if uint64(len(entries)) > uint64(i.config.MaxBatchEntries) {
+		return ErrBatchTooLarge
 	}
 	for k := range entries {
 		if entries[k].ImageID == 0 {
@@ -198,16 +203,23 @@ type activePage struct {
 	pdq      [4][]uint64
 }
 
+// newActivePage allocates one page in two allocations: the ID plane plus
+// one slab sliced into the five hash planes, keeping the planes adjacent
+// for scan locality. A sealed page retains its slab; nothing is shared
+// across pages.
 func newActivePage(recordsPerPage int) *activePage {
+	slab := make([]uint64, 5*recordsPerPage)
+	phash := slab[:recordsPerPage]
+	off := recordsPerPage
+	var pdq [4][]uint64
+	for w := 0; w < 4; w++ {
+		pdq[w] = slab[off : off+recordsPerPage]
+		off += recordsPerPage
+	}
 	return &activePage{
 		imageIDs: make([]ImageID, recordsPerPage),
-		phash64:  make([]uint64, recordsPerPage),
-		pdq: [4][]uint64{
-			make([]uint64, recordsPerPage),
-			make([]uint64, recordsPerPage),
-			make([]uint64, recordsPerPage),
-			make([]uint64, recordsPerPage),
-		},
+		phash64:  phash,
+		pdq:      pdq,
 	}
 }
 

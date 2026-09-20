@@ -136,7 +136,13 @@ func openIndex(dir string, cfg Config, durability Durability, readers ...*indexu
 			return nil, ErrInvalidConfig
 		}
 	}
-	cfg = Config{RecordsPerPage: manifest.recordsPerPage}
+	// RecordsPerPage is adopted from the manifest; MaxBatchEntries stays a
+	// caller runtime policy and is never persisted.
+	maxBatch := cfg.MaxBatchEntries
+	cfg = Config{RecordsPerPage: manifest.recordsPerPage, MaxBatchEntries: maxBatch}
+	if cfg.MaxBatchEntries == 0 {
+		cfg.MaxBatchEntries = DefaultMaxApplyEntries
+	}
 	mapping, err := persist.MapFile(generationPath(dir, manifest.generation), ErrCorrupt)
 	if err != nil {
 		return nil, err
@@ -290,8 +296,10 @@ func (i *Index) OnDiskBytes() uint64 {
 }
 
 // buildDenseView copies records admitted by live into fresh page planes.
+// The page slice is presized from the current page count so repacking
+// never regrows it; liveness still probes per record.
 func buildDenseView(current *indexView, recordsPerPage int, live CandidateSet) *indexView {
-	var pages []pageView
+	pages := make([]pageView, 0, len(current.pages)+1)
 	var active *activePage
 	activeCount := 0
 	var count uint64
@@ -414,7 +422,8 @@ func writePage(file *os.File, buffer []byte, imageIDs []ImageID, phash64 []uint6
 	for word := 0; word < 4; word++ {
 		crc = crcPlane(crc, buffer, pdq[word])
 	}
-	header := make([]byte, pageHeaderSize)
+	var headerBuf [pageHeaderSize]byte
+	header := headerBuf[:]
 	encodePageHeader(header, uint32(len(imageIDs)), crc)
 	if _, err := file.Write(header); err != nil {
 		return err
@@ -1035,18 +1044,29 @@ func (i *ExactIndex) checkpointLocked() error {
 	if view.generation == i.persistence.persistedGen {
 		return nil
 	}
+	// Checkpoint persists effective state: staged overlay sets fold into
+	// a file-only block set (the live view keeps its overlay). Staged
+	// sets are canonical against base by construction, so the fold merges
+	// straight in. The WAL offset below covers the staged batches, so
+	// reopen replays nothing twice and loses nothing.
+	fileView := view
+	if view.overlay.ids() > 0 {
+		folded := applyEffective(baseOnlyView(view), view.overlay.adds, view.overlay.removes, i.config)
+		folded.generation = view.generation
+		fileView = folded
+	}
 	walOffset, err := i.persistence.wal.Offset()
 	if err != nil {
 		return err
 	}
 	manifest := exactManifest{
-		generation: view.generation, indexID: i.indexID, liveCount: view.liveCount,
-		blockCount: uint64(len(view.blocks)), walOffset: walOffset,
+		generation: view.generation, indexID: i.indexID, liveCount: fileView.liveCount,
+		blockCount: uint64(len(fileView.blocks)), walOffset: walOffset,
 		flags: i.flags, blockSize: i.config.BlockSize,
 		algorithm: i.algorithm, targetFillPct: i.config.TargetFillPct,
 		walEpoch: uint32(i.persistence.walEpoch),
 	}
-	if err := writeExactGenerationFile(i.persistence.dir, manifest, view); err != nil {
+	if err := writeExactGenerationFile(i.persistence.dir, manifest, fileView); err != nil {
 		return err
 	}
 	if err := persist.WriteManifest(i.persistence.dir, encodeManifest(manifest)); err != nil {
@@ -1120,12 +1140,32 @@ func (i *ExactIndex) Vacuum() error {
 	if res := <-response; res.err != nil {
 		return res.err
 	}
-	// Repack live records at target occupancy.
+	// Repack live records at target occupancy, folding any staged
+	// overlay in: staged adds join the repack, staged removes drop out via
+	// a merge pointer (both sides ordered, so no map and no transient
+	// block decodes). The published view carries no overlay.
 	current := i.view.Load()
-	all := make([]ExactEntry, 0, current.liveCount)
-	for _, b := range current.blocks {
-		all = append(all, decodeBlockEntries(b.records)...)
+	var ovAdds, ovRemoves []ExactEntry
+	if current.overlay != nil {
+		ovAdds, ovRemoves = current.overlay.adds, current.overlay.removes
 	}
+	all := make([]ExactEntry, 0, current.liveCount+uint64(len(ovAdds)))
+	ri := 0
+	for _, b := range current.blocks {
+		n := len(b.records) / RecordSize
+		for k := 0; k < n; k++ {
+			e := decodeRecord(b.records[k*RecordSize : (k+1)*RecordSize])
+			for ri < len(ovRemoves) && compareEntry(ovRemoves[ri], e) < 0 {
+				ri++
+			}
+			if ri < len(ovRemoves) && ovRemoves[ri] == e {
+				ri++
+				continue
+			}
+			all = append(all, e)
+		}
+	}
+	all = append(all, ovAdds...)
 	sortEntries(all)
 	maxRecords := maxRecordsPerBlock(i.config.BlockSize)
 	target := targetRecordsPerBlock(i.config.BlockSize, i.config.TargetFillPct)

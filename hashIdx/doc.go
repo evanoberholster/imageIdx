@@ -62,11 +62,15 @@
 //	SearchPHashTopK(dst, query, k, candidates, ws)
 //	SearchPDQTopK(dst, query, k, candidates, ws)
 //
-// When candidates is nil the index performs a full sequential scan (distance
-// first, then liveness). When a candidate set is supplied it is applied after
-// the Hamming distance so dense live sets do not pay a bitmap lookup per
-// record. A future accelerator may invert this order based on candidate
-// density; V1 keeps the scalar, benchmarkable path.
+// Radius search is distance-first: records failing the Hamming bound never
+// pay a candidate lookup, so dense live sets cost one popcount per record
+// and nothing else. Top-K search is candidates-first instead, so sparse
+// candidate sets skip distance work per rejected record while dense sets
+// pay a lookup per record. When candidates is nil both perform a full
+// sequential scan. CountPHashRadius and CountPDQRadius run the radius
+// order without materializing matches for planners. A future accelerator
+// may pick the order from measured candidate density; V1 keeps the two
+// scalar, benchmarkable paths with the tradeoff documented here.
 //
 // # Exact content-hash index
 //
@@ -90,6 +94,21 @@
 // the same (Hash, ImageID) pair in one Mutation, and multiple ImageIDs may
 // share one hash. Hashing stays outside the index: SumSHA256, SumBLAKE3,
 // HashReaderSHA256, and HashReaderBLAKE3 compute digests before lookup.
+//
+// Small publishes stage into an immutable overlay instead of rewriting
+// blocks: the new view shares the block slice and carries the merged
+// staged sets, so a single-pair publish never copies the block directory.
+// Reads consult staged adds, then staged removes, then base blocks.
+// Past OverlayMaxEntries staged entries the batch folds into the blocks
+// and clears the overlay, amortizing the O(#blocks) directory copy.
+// Checkpoint and Vacuum fold the overlay into what they persist, so files
+// never contain staged state and the WAL tail replays onto folded
+// generations without duplication.
+//
+// Repeated point lookups compile once with CompileLookup: the hash
+// resolves against the current view and replays the cached IDs while the
+// view generation is stable, re-resolving exactly once per generation
+// change.
 //
 // # Persistence
 //

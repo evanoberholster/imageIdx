@@ -476,10 +476,33 @@ func checkViewInvariants(t *testing.T, idx *ExactIndex) error {
 	if total != view.liveCount {
 		return errf("liveCount %d != actual %d", view.liveCount, total)
 	}
-	// Global order: concatenating blocks must be sorted.
+	if err := checkOverlayInvariants(view); err != nil {
+		return err
+	}
+	// Effective set: base records plus staged adds minus staged removes.
+	// Spot checks below run against it, since reads observe the overlay.
 	var all []ExactEntry
 	for _, b := range view.blocks {
 		all = append(all, decodeBlockEntries(b.records)...)
+	}
+	if view.overlay != nil {
+		if rem := view.overlay.removes; len(rem) > 0 {
+			kept := all[:0]
+			ri := 0
+			for _, e := range all {
+				for ri < len(rem) && compareEntry(rem[ri], e) < 0 {
+					ri++
+				}
+				if ri < len(rem) && rem[ri] == e {
+					ri++
+					continue
+				}
+				kept = append(kept, e)
+			}
+			all = kept
+		}
+		all = append(all, view.overlay.adds...)
+		sortEntries(all)
 	}
 	for k := 1; k < len(all); k++ {
 		if compareEntry(all[k-1], all[k]) >= 0 {

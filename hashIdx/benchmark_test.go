@@ -734,3 +734,70 @@ func BenchmarkHashBLAKE3(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkPublishScalingVsBlocks times one add plus one remove of a
+// fresh pair (net-zero growth, so the directory size holds steady) at
+// several index sizes. Staged publishes share the block slice, so cost
+// must stay flat as the directory grows; only threshold folds scale with
+// block count.
+func BenchmarkPublishScalingVsBlocks(b *testing.B) {
+	for _, total := range []int{2_000, 20_000} {
+		b.Run(fmt.Sprintf("entries=%d", total), func(b *testing.B) {
+			entries := make([]ExactEntry, 0, total)
+			for i := 0; i < total; i++ {
+				entries = append(entries, ExactEntry{Hash: benchHash(uint64(i)), ImageID: ImageID(i + 1)})
+			}
+			idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries},
+				ExactConfig{BlockSize: 512}, DurabilityOS)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = idx.Close() }()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				n := uint64(total + i)
+				e := ExactEntry{Hash: benchHash(n), ImageID: ImageID(n + 1)}
+				if err := idx.Add(e.Hash, e.ImageID); err != nil {
+					b.Fatal(err)
+				}
+				if err := idx.Remove(e.Hash, e.ImageID); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkCompiledContains measures a generation-gated compiled lookup
+// against the one-shot path. The clean sub-bench replays a cached run;
+// the staged sub-bench holds ~400 overlay entries to price the probe.
+func BenchmarkCompiledContains(b *testing.B) {
+	idx, hashes := buildExactBenchIndex(b, 100_000, ExactConfig{}, 1)
+	h := hashes[7]
+	b.Run("clean", func(b *testing.B) {
+		c := idx.CompileLookup(h)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if !c.Contains() {
+				b.Fatal("miss")
+			}
+		}
+	})
+	b.Run("staged", func(b *testing.B) {
+		for i := 0; i < 400; i++ {
+			if err := idx.Add(benchHash(uint64(50_000_000+i)), ImageID(200_000+i)); err != nil {
+				b.Fatal(err)
+			}
+		}
+		c := idx.CompileLookup(h)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if !c.Contains() {
+				b.Fatal("miss")
+			}
+		}
+	})
+}

@@ -3,12 +3,38 @@ package hashidx
 import (
 	"math/bits"
 	"slices"
+	"sync"
 )
 
 // Workspace holds reusable search scratch. A Workspace is not safe for
 // concurrent use; one workspace belongs to one goroutine at a time.
 type Workspace struct {
 	heap []Result
+}
+
+// workspacePool serves TopK heaps for calls without a caller workspace.
+// Heaps that grew past maxPooledWorkspaceHeap are dropped instead of
+// returned, so one huge k cannot pin memory process-wide.
+var workspacePool = sync.Pool{New: func() any { return &Workspace{} }}
+
+const maxPooledWorkspaceHeap = 4096
+
+// acquireWorkspace returns a pooled workspace reset to an empty heap.
+func acquireWorkspace() *Workspace {
+	ws := workspacePool.Get().(*Workspace)
+	ws.heap = ws.heap[:0]
+	return ws
+}
+
+// releaseWorkspace returns a workspace to the pool, dropping oversized
+// heaps. The heap must hold no live results the caller retains; TopK
+// callers copy out through appendSorted before releasing.
+func releaseWorkspace(ws *Workspace) {
+	if cap(ws.heap) > maxPooledWorkspaceHeap {
+		return
+	}
+	ws.heap = ws.heap[:0]
+	workspacePool.Put(ws)
 }
 
 // SearchPHashRadius appends every record whose exact 64-bit Hamming distance
@@ -43,15 +69,18 @@ func (i *Index) SearchPDQRadius(dst []Result, query PDQHash, maxDistance uint16,
 
 // SearchPHashTopK appends up to k nearest records, ordered by ascending
 // Hamming distance with ImageID as a deterministic tie-break. The bounded
-// max-heap reuses ws scratch and, when ws is nil, allocates one internally.
+// max-heap reuses ws scratch and, when ws is nil, a pooled workspace
+// instead of allocating per call.
 func (i *Index) SearchPHashTopK(dst []Result, query uint64, k int, candidates CandidateSet, ws *Workspace) []Result {
 	if k <= 0 {
 		return dst
 	}
-	if ws == nil {
-		ws = &Workspace{}
+	pooled := ws == nil
+	if pooled {
+		ws = acquireWorkspace()
+	} else {
+		ws.heap = ws.heap[:0]
 	}
-	ws.heap = ws.heap[:0]
 	token := i.readers.Acquire()
 	if !i.closed.Load() {
 		if view := i.view.Load(); view != nil {
@@ -59,20 +88,27 @@ func (i *Index) SearchPHashTopK(dst []Result, query uint64, k int, candidates Ca
 		}
 	}
 	i.readers.Release(token)
-	return appendSorted(dst, ws.heap)
+	dst = appendSorted(dst, ws.heap)
+	if pooled {
+		releaseWorkspace(ws)
+	}
+	return dst
 }
 
 // SearchPDQTopK appends up to k nearest records, ordered by ascending
 // Hamming distance with ImageID as a deterministic tie-break. The bounded
-// max-heap reuses ws scratch and, when ws is nil, allocates one internally.
+// max-heap reuses ws scratch and, when ws is nil, a pooled workspace
+// instead of allocating per call.
 func (i *Index) SearchPDQTopK(dst []Result, query PDQHash, k int, candidates CandidateSet, ws *Workspace) []Result {
 	if k <= 0 {
 		return dst
 	}
-	if ws == nil {
-		ws = &Workspace{}
+	pooled := ws == nil
+	if pooled {
+		ws = acquireWorkspace()
+	} else {
+		ws.heap = ws.heap[:0]
 	}
-	ws.heap = ws.heap[:0]
 	token := i.readers.Acquire()
 	if !i.closed.Load() {
 		if view := i.view.Load(); view != nil {
@@ -80,7 +116,113 @@ func (i *Index) SearchPDQTopK(dst []Result, query PDQHash, k int, candidates Can
 		}
 	}
 	i.readers.Release(token)
-	return appendSorted(dst, ws.heap)
+	dst = appendSorted(dst, ws.heap)
+	if pooled {
+		releaseWorkspace(ws)
+	}
+	return dst
+}
+
+// CountPHashRadius returns the number of records within maxDistance of
+// query without materializing matches. It runs the same distance-first
+// scan as SearchPHashRadius for planners that need a count before paying
+// for results.
+func (i *Index) CountPHashRadius(query uint64, maxDistance uint8, candidates CandidateSet) uint64 {
+	token := i.readers.Acquire()
+	var n uint64
+	if !i.closed.Load() {
+		if view := i.view.Load(); view != nil {
+			n = countPHashRadius(view, query, maxDistance, candidates)
+		}
+	}
+	i.readers.Release(token)
+	return n
+}
+
+// CountPDQRadius returns the number of records within maxDistance of
+// query without materializing matches, mirroring SearchPDQRadius.
+func (i *Index) CountPDQRadius(query PDQHash, maxDistance uint16, candidates CandidateSet) uint64 {
+	token := i.readers.Acquire()
+	var n uint64
+	if !i.closed.Load() {
+		if view := i.view.Load(); view != nil {
+			n = countPDQRadius(view, query, maxDistance, candidates)
+		}
+	}
+	i.readers.Release(token)
+	return n
+}
+
+// countPHashRadius counts radius matches with the distance-first order:
+// records failing the Hamming bound never pay a candidate lookup.
+func countPHashRadius(view *indexView, query uint64, maxDistance uint8, candidates CandidateSet) uint64 {
+	maxDist := int(maxDistance)
+	var n uint64
+	countPlane := func(ids []ImageID, hashes []uint64) {
+		for k := range hashes {
+			if bits.OnesCount64(query^hashes[k]) > maxDist {
+				continue
+			}
+			if candidates != nil && !candidates.Contains(ids[k]) {
+				continue
+			}
+			n++
+		}
+	}
+	for pageIndex := range view.pages {
+		page := &view.pages[pageIndex]
+		countPlane(page.imageIDs, page.phash64)
+	}
+	if view.active != nil {
+		countPlane(view.active.imageIDs[:view.activeCount], view.active.phash64[:view.activeCount])
+	}
+	return n
+}
+
+// countPDQRadius counts radius matches with the scalar early-exit kernel,
+// mirroring searchPDQRadius without appending.
+func countPDQRadius(view *indexView, query PDQHash, maxDistance uint16, candidates CandidateSet) uint64 {
+	maxDist := int(maxDistance)
+	q0, q1, q2, q3 := query[0], query[1], query[2], query[3]
+	var n uint64
+	countPlane := func(ids []ImageID, pdq [4][]uint64) {
+		p0, p1, p2, p3 := pdq[0], pdq[1], pdq[2], pdq[3]
+		for k := range p0 {
+			distance := bits.OnesCount64(q0 ^ p0[k])
+			if distance > maxDist {
+				continue
+			}
+			distance += bits.OnesCount64(q1 ^ p1[k])
+			if distance > maxDist {
+				continue
+			}
+			distance += bits.OnesCount64(q2 ^ p2[k])
+			if distance > maxDist {
+				continue
+			}
+			distance += bits.OnesCount64(q3 ^ p3[k])
+			if distance > maxDist {
+				continue
+			}
+			if candidates != nil && !candidates.Contains(ids[k]) {
+				continue
+			}
+			n++
+		}
+	}
+	for pageIndex := range view.pages {
+		page := &view.pages[pageIndex]
+		countPlane(page.imageIDs, page.pdq)
+	}
+	if view.active != nil {
+		active := view.active
+		count := view.activeCount
+		countPlane(active.imageIDs[:count], [4][]uint64{
+			active.pdq[0][:count], active.pdq[1][:count],
+			active.pdq[2][:count], active.pdq[3][:count],
+		})
+	}
+	return n
 }
 
 // appendSorted sorts the bounded heap by ascending distance and ImageID and
@@ -105,8 +247,10 @@ func compareResult(a, b Result) int {
 	}
 }
 
-// searchPHashRadius scans sealed pages and then the active prefix, computing
-// the distance before consulting candidates.
+// searchPHashRadius scans sealed pages and then the active prefix,
+// computing the distance before consulting candidates. Distance-first
+// wins when most records fail the bound: rejected records never pay a
+// candidate lookup, which matters for dense live sets.
 func searchPHashRadius(dst []Result, view *indexView, query uint64, maxDistance uint8, candidates CandidateSet) []Result {
 	maxDist := int(maxDistance)
 	for pageIndex := range view.pages {
@@ -196,6 +340,11 @@ func searchPHashTopK(heap *[]Result, view *indexView, query uint64, k int, candi
 	}
 }
 
+// phashTopKPlane probes one plane with candidates-first order: records
+// outside the candidate set skip the distance computation entirely. This
+// wins for sparse candidate sets and loses for dense ones, the mirror of
+// the radius order; callers with dense sets and small k should prefer a
+// radius scan plus select.
 func phashTopKPlane(heap *[]Result, ids []ImageID, hashes []uint64, query uint64, k int, candidates CandidateSet) {
 	for j := range hashes {
 		id := ids[j]
@@ -230,6 +379,9 @@ func searchPDQTopK(heap *[]Result, view *indexView, query PDQHash, k int, candid
 	}
 }
 
+// pdqTopKPlane probes one plane with candidates-first order, mirroring
+// phashTopKPlane: sparse candidate sets skip distance work per rejected
+// record, dense sets pay a lookup per record.
 func pdqTopKPlane(heap *[]Result, ids []ImageID, pdq [4][]uint64, query PDQHash, k int, candidates CandidateSet) {
 	q0, q1, q2, q3 := query[0], query[1], query[2], query[3]
 	p0, p1, p2, p3 := pdq[0], pdq[1], pdq[2], pdq[3]

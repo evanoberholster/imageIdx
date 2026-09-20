@@ -125,8 +125,12 @@ func (s *Store) Perceptual() *Index { return s.perceptual }
 // Exact returns the store's exact-content index.
 func (s *Store) Exact() *ExactIndex { return s.exact }
 
-// Checkpoint persists both indexes as new generations and atomically
-// publishes their manifests.
+// Checkpoint persists both indexes as new generations and publishes
+// their manifests in order: perceptual first, then exact. Publication is
+// atomic per index but not across indexes: an exact failure after a
+// perceptual success leaves the generations diverged by one, which the
+// next Checkpoint repairs. Callers needing a joint snapshot should record
+// both Metadata generations around the call.
 func (s *Store) Checkpoint() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -176,7 +180,10 @@ func (s *Store) Close() error {
 	return result
 }
 
-// The lock file is never unlinked: every opener must lock the same inode.
+// lockStoreDir exclusively locks the store directory with flock, so it is
+// Unix-only and has no Windows fallback. The lock file is never unlinked:
+// every opener must lock the same inode. When create is true the directory
+// must otherwise be empty.
 func lockStoreDir(dir string, create bool) (*os.File, error) {
 	if create {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
