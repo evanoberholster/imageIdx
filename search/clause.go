@@ -19,15 +19,37 @@ type Clause interface {
 	searchClause()
 }
 
-type bitmapClause struct {
-	indexes []*bitmapidx.Index
+type fieldClauseKind uint8
+
+const (
+	fieldValues fieldClauseKind = iota + 1
+	fieldText
+	fieldRange
+)
+
+type fieldClause struct {
+	index  *bitmapidx.FieldIndex
+	kind   fieldClauseKind
+	values []bitmapidx.Value
+	text   string
+	bounds bitmapidx.NumericRange
 }
 
-func (bitmapClause) searchClause() {}
+func (fieldClause) searchClause() {}
 
-// AllBitmaps requires every supplied bitmap to contain an image.
-func AllBitmaps(indexes ...*bitmapidx.Index) Clause {
-	return bitmapClause{indexes: append([]*bitmapidx.Index(nil), indexes...)}
+// FieldValues requires every supplied value to be present in the field.
+func FieldValues(index *bitmapidx.FieldIndex, values ...bitmapidx.Value) Clause {
+	return fieldClause{index: index, kind: fieldValues, values: append([]bitmapidx.Value(nil), values...)}
+}
+
+// FieldText requires every analyzed token in text to be present.
+func FieldText(index *bitmapidx.FieldIndex, text string) Clause {
+	return fieldClause{index: index, kind: fieldText, text: text}
+}
+
+// FieldRange restricts a continuous field to bounds.
+func FieldRange(index *bitmapidx.FieldIndex, bounds bitmapidx.NumericRange) Clause {
+	return fieldClause{index: index, kind: fieldRange, bounds: bounds}
 }
 
 type timestampClause struct {

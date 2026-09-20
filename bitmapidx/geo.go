@@ -11,39 +11,49 @@ import (
 )
 
 const (
-	// GeoS2Level is the fixed cell level of a KindGeo field.
+	// GeoS2Level is the fixed cell level of a KindGeo field. All geo
+	// postings bucket by level-16 keys; coarser inputs expand and finer
+	// inputs snap to their level-16 ancestor.
 	GeoS2Level = 16
 	// DefaultGeoCoverCells bounds CoverRegion when MaxCells is zero.
+	// Thirty-two balances region fidelity against bucket fan-out.
 	DefaultGeoCoverCells = 32
 
 	geoKeyShift       = 28
 	earthRadiusMeters = 6_371_008.8
 )
 
-// GeoRange is an inclusive interval of level-16 S2 keys.
+// GeoRange is an inclusive interval of level-16 S2 keys. Ranges from
+// callers may be unnormalized and overlapping; query paths handle that,
+// while normalization merges overlap and exact adjacency only.
 type GeoRange struct {
 	Start uint64
 	End   uint64 // inclusive
 }
 
-// S2Key is a level-16 S2 cell key (a full cell ID shifted right by 28 bits).
+// S2Key is a level-16 S2 cell key: a full cell ID shifted right by
+// geoKeyShift (28 bits). Keys fit in int64 for Value transport.
 type S2Key = uint64
 
-// EncodeS2Key converts a full S2 cell ID to its level-16 key.
+// EncodeS2Key converts a full S2 cell ID to its level-16 key by shifting.
 func EncodeS2Key(cellID uint64) S2Key { return cellID >> geoKeyShift }
 
-// DecodeS2Key expands a level-16 S2 key back to its full cell ID.
+// DecodeS2Key expands a level-16 S2 key back to its full cell ID by
+// shifting. It does not validate level; use CellIDFromKey for that.
 func DecodeS2Key(key S2Key) uint64 { return uint64(key) << geoKeyShift }
 
-// GeoEntry is one image coordinate used to seed a KindGeo field.
+// GeoEntry is one image coordinate used to seed a KindGeo field via
+// NewGeoField.
 type GeoEntry struct {
 	ImageID   ImageID
 	Latitude  float64
 	Longitude float64
 }
 
-// NewGeoField constructs a KindGeo field index seeded with entries. Use
-// NewFieldIndex directly for full control of the field definition.
+// NewGeoField constructs a KindGeo field index seeded with entries. It
+// builds a StoragePerType definition with GeoCodec version 1 and converts
+// every coordinate through KeyFromLatLng. Use NewFieldIndex directly for
+// full control of the definition. Failures close the partial index.
 func NewGeoField(t IndexType, entries []GeoEntry, config FieldConfig) (*FieldIndex, error) {
 	field := Field{Type: t, Kind: KindGeo, Storage: StoragePerType, Geo: GeoCodec{Version: 1}}
 	index, err := NewFieldIndex(field, config)
@@ -70,7 +80,7 @@ func NewGeoField(t IndexType, entries []GeoEntry, config FieldConfig) (*FieldInd
 }
 
 // level16CellFromLatLng converts a coordinate to its level-16 S2 cell,
-// rejecting non-finite and out-of-range input.
+// rejecting non-finite and out-of-range input with ErrInvalidCoordinate.
 func level16CellFromLatLng(latitude, longitude float64) (s2.CellID, error) {
 	if math.IsNaN(latitude) || math.IsNaN(longitude) || math.IsInf(latitude, 0) || math.IsInf(longitude, 0) ||
 		latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180 {
@@ -79,9 +89,10 @@ func level16CellFromLatLng(latitude, longitude float64) (s2.CellID, error) {
 	return s2.CellIDFromLatLng(s2.LatLngFromDegrees(latitude, longitude)).Parent(GeoS2Level), nil
 }
 
-// CellIDFromLatLng converts a coordinate to its level-16 S2 cell ID, ready for
-// RangesFromCellIDs or search.WithinCells. Non-finite or out-of-range
-// coordinates return zero, which those APIs reject.
+// CellIDFromLatLng converts a coordinate to its level-16 S2 cell ID,
+// ready for RangesFromCellIDs or search.WithinCells. Non-finite or
+// out-of-range coordinates return zero, which those APIs reject as
+// ErrInvalidS2Cell.
 func CellIDFromLatLng(latitude, longitude float64) uint64 {
 	cell, err := level16CellFromLatLng(latitude, longitude)
 	if err != nil {
@@ -90,7 +101,8 @@ func CellIDFromLatLng(latitude, longitude float64) uint64 {
 	return uint64(cell)
 }
 
-// KeyFromLatLng converts a coordinate to its level-16 S2 key.
+// KeyFromLatLng converts a coordinate to its level-16 S2 key for GeoValue
+// and Move targets.
 func KeyFromLatLng(latitude, longitude float64) (uint64, error) {
 	cell, err := level16CellFromLatLng(latitude, longitude)
 	if err != nil {
@@ -99,7 +111,8 @@ func KeyFromLatLng(latitude, longitude float64) (uint64, error) {
 	return uint64(cell) >> geoKeyShift, nil
 }
 
-// KeyFromCellID converts a level-16 S2 cell ID to its key.
+// KeyFromCellID converts a level-16 S2 cell ID to its key, rejecting
+// invalid cells and wrong levels.
 func KeyFromCellID(cellID uint64) (uint64, error) {
 	cell := s2.CellID(cellID)
 	if !cell.IsValid() {
@@ -111,7 +124,9 @@ func KeyFromCellID(cellID uint64) (uint64, error) {
 	return uint64(cell) >> geoKeyShift, nil
 }
 
-// CellIDFromKey converts a level-16 S2 key back to its cell ID.
+// CellIDFromKey converts a level-16 S2 key back to its cell ID,
+// verifying the round-trip and level. It guards segment, WAL, and query
+// inputs against truncated or shifted keys.
 func CellIDFromKey(key uint64) (s2.CellID, error) {
 	cell := s2.CellID(key << geoKeyShift)
 	if (uint64(cell)>>geoKeyShift) != key || !cell.IsValid() {
@@ -123,8 +138,8 @@ func CellIDFromKey(key uint64) (s2.CellID, error) {
 	return cell, nil
 }
 
-// RangeOptions bounds an S2 range expansion. The zero value accepts every
-// level with no cell budget.
+// RangeOptions bounds an S2 range expansion in RangesFromCellIDs. The
+// zero value accepts every level with no cell budget.
 type RangeOptions struct {
 	// MaxLevel is the coarsest accepted input cell level (smallest number).
 	// Cells coarser than MaxLevel are rejected as too broad.
@@ -155,13 +170,14 @@ func (o RangeOptions) withDefaults() (RangeOptions, error) {
 	return o, nil
 }
 
-// RangesFromCellIDs appends normalized level-16 descendant ranges for cells.
-// Cells coarser than GeoS2Level expand to their level-16 descendants; finer
-// cells (for example a raw CellIDFromLatLng result) snap to their level-16
-// ancestor, which is a safe superset of the requested area. Overlapping or
-// adjacent ranges merge; ranges with a gap stay split, so the result covers
-// exactly the requested buckets. Pass RangeOptions to reject overly coarse
-// cells or to cap the number of buckets covered.
+// RangesFromCellIDs appends normalized level-16 descendant ranges for
+// cells, preserving dst's prefix and reordering only the appended tail in
+// place. Cells coarser than GeoS2Level expand to descendants; finer cells
+// snap to their level-16 ancestor, a safe superset. Overlap and exact
+// adjacency merge; any gap stays split, so the result covers exactly the
+// requested buckets. Budgets count descendants per input before
+// normalization, so overlapping inputs charge twice. Failures truncate dst
+// back to its prefix length.
 func RangesFromCellIDs(dst []GeoRange, cellIDs []uint64, options ...RangeOptions) ([]GeoRange, error) {
 	var opts RangeOptions
 	if len(options) != 0 {
@@ -211,10 +227,10 @@ func RangesFromCellIDs(dst []GeoRange, cellIDs []uint64, options ...RangeOptions
 	return normalizeGeoRanges(dst, start), nil
 }
 
-// geoRangesMerge reports whether the inclusive range ending at prevEnd absorbs
-// a range starting at nextStart: on overlap or exact adjacency. A gap of even
-// one key stays split, so normalization never covers buckets the caller did
-// not request.
+// geoRangesMerge reports whether the inclusive range ending at prevEnd
+// absorbs a range starting at nextStart: overlap or exact adjacency
+// merges, while a gap of even one key stays split. It saturates at
+// ^uint64(0) so MaxUint64 ranges never overflow.
 func geoRangesMerge(prevEnd, nextStart uint64) bool {
 	return prevEnd == ^uint64(0) || nextStart <= prevEnd+1
 }
@@ -242,7 +258,7 @@ func normalizeGeoRanges(ranges []GeoRange, start int) []GeoRange {
 	out := 1
 	for i := 1; i < len(ranges); i++ {
 		previous := &ranges[out-1]
-		if ranges[i].Start <= previous.End || geoRangesMerge(previous.End, ranges[i].Start) {
+		if geoRangesMerge(previous.End, ranges[i].Start) {
 			if ranges[i].End > previous.End {
 				previous.End = ranges[i].End
 			}
@@ -263,14 +279,16 @@ func geoRangesNormalized(ranges []GeoRange) bool {
 			continue
 		}
 		previous := ranges[index-1]
-		if current.Start <= previous.End || geoRangesMerge(previous.End, current.Start) {
+		if geoRangesMerge(previous.End, current.Start) {
 			return false
 		}
 	}
 	return true
 }
 
-// geoKeys returns the occupied keys inside ranges from every layer.
+// geoKeys returns the occupied keys inside ranges from base plus deltas,
+// sorted and deduplicated with one allocation. Prefer forEachGeoKey when
+// callers can tolerate duplicate keys and want no allocation.
 func (v *fieldView) geoKeys(ranges []GeoRange) []FieldKey {
 	var keys []FieldKey
 	collect := func(entries []FieldKey) {
@@ -293,7 +311,8 @@ func (v *fieldView) geoKeys(ranges []GeoRange) []FieldKey {
 	return slices.Compact(keys)
 }
 
-// allKeys returns one copy of every occupied key in the field.
+// allKeys returns one copy of every occupied key in the field, sorted
+// and deduplicated. Used by full scans such as AppendTo with deltas.
 func (v *fieldView) allKeys() []FieldKey {
 	var keys []FieldKey
 	keys = append(keys, v.base.keys...)
@@ -310,7 +329,9 @@ func (v *fieldView) allKeys() []FieldKey {
 	return slices.Compact(keys)
 }
 
-// geoBaseRangeIn returns the sorted index span inside an inclusive key range.
+// geoBaseRangeIn returns the index span of entries sorted by Hash inside
+// an inclusive key range, via two binary searches. Inverted ranges select
+// nothing.
 func geoBaseRangeIn(entries []FieldKey, keyRange GeoRange) (int, int) {
 	if keyRange.End < keyRange.Start {
 		return 0, 0
@@ -323,8 +344,10 @@ func geoBaseRangeIn(entries []FieldKey, keyRange GeoRange) (int, int) {
 	return start, end
 }
 
-// GeoRanges returns images inside any inclusive key range. Ranges may be
-// unnormalized and overlapping; the result is sorted and unique.
+// GeoRanges returns the images inside any inclusive key range, sorted
+// and unique. Ranges may be unnormalized and overlapping. The no-delta
+// path references base postings directly; the delta path unions effective
+// postings for occupied keys.
 func (i *FieldIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr error) {
 	if i.Field().Kind != KindGeo {
 		return roar.Bitmap{}, ErrFieldMismatch
@@ -365,9 +388,12 @@ func (i *FieldIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr
 	return unionPostings(*postings), nil
 }
 
-// FilterGeoRanges appends candidates inside any key range to dst. It probes
-// each candidate against the covered buckets instead of materializing the
-// union, so it allocates nothing.
+// FilterGeoRanges appends the candidates inside any key range to dst. It
+// probes each candidate against covered buckets instead of materializing
+// the union, so it allocates nothing beyond dst growth at O(candidates ×
+// buckets) probe cost. Prefer CollectGeoRanges plus bitmap probes when
+// buckets are many or the match will be reused; see CountGeoCells for the
+// planning probe.
 func (i *FieldIndex) FilterGeoRanges(dst, candidates []ImageID, ranges []GeoRange) ([]ImageID, error) {
 	if i.Field().Kind != KindGeo {
 		return dst, ErrFieldMismatch
@@ -385,8 +411,9 @@ func (i *FieldIndex) FilterGeoRanges(dst, candidates []ImageID, ranges []GeoRang
 	return dst, nil
 }
 
-// EstimateGeoRanges returns the effective candidate count for the occupied
-// buckets inside ranges. It is a planning hint, not a materialized count.
+// EstimateGeoRanges returns the effective candidate count for occupied
+// buckets inside ranges without materializing. Multi-valued overlap
+// makes it an upper bound; it is a planning hint, not an exact count.
 func (i *FieldIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
 	if i.Field().Kind != KindGeo {
 		return 0, ErrFieldMismatch
@@ -412,8 +439,9 @@ func (i *FieldIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
 	return estimate, nil
 }
 
-// CountGeoRanges returns the number of images inside any key range without
-// materializing the union.
+// CountGeoRanges returns the number of images inside any key range by
+// unioning bitmaps and counting, without appending IDs. The no-delta
+// path pre-sizes scratch once from the occupied bucket count.
 func (i *FieldIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
 	if i.Field().Kind != KindGeo {
 		return 0, ErrFieldMismatch
@@ -424,27 +452,31 @@ func (i *FieldIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
 	if i.closed.Load() {
 		return 0, nil
 	}
-	mutable := acquireMutable()
-	defer releaseMutable(mutable)
 	if !view.hasDeltas() {
+		bitmaps := acquireBitmaps(view.countGeoKeys(ranges))
+		defer releaseBitmaps(bitmaps)
 		for _, keyRange := range ranges {
 			start, end := geoBaseRangeIn(view.base.keys, keyRange)
 			for _, p := range view.base.postings[start:end] {
-				p.addTo(mutable)
+				*bitmaps = append(*bitmaps, p.bitmap())
 			}
 		}
-		return mutable.Cardinality(), nil
+		return roar.OrMany(*bitmaps...).Cardinality(), nil
 	}
-	view.forEachGeoKey(ranges, func(key FieldKey) {
+	keys := view.geoKeys(ranges)
+	bitmaps := acquireBitmaps(len(keys))
+	defer releaseBitmaps(bitmaps)
+	for _, key := range keys {
 		if p, ok := view.effective(key); ok {
-			p.addTo(mutable)
+			*bitmaps = append(*bitmaps, p.bitmap())
 		}
-	})
-	return mutable.Cardinality(), nil
+	}
+	return roar.OrMany(*bitmaps...).Cardinality(), nil
 }
 
-// CollectGeoRanges folds every effective posting inside ranges into m. The
-// caller resets m first and materializes once with AppendTo.
+// CollectGeoRanges folds every effective posting inside ranges into m.
+// The caller resets m first and materializes once with AppendTo. The
+// delta path uses deduplicated keys so each posting folds once.
 func (i *FieldIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) {
 	if m == nil || len(ranges) == 0 || i.Field().Kind != KindGeo {
 		return
@@ -470,9 +502,11 @@ func (i *FieldIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) 
 	i.readers.Release(token)
 }
 
-// CountGeoCells returns the number of occupied level-16 buckets inside any
-// key range. It is the geo verify-versus-collect planning probe; visible
-// corrections may be counted in more than one layer, so it is an upper bound.
+// CountGeoCells returns the number of occupied level-16 buckets inside
+// any key range without allocating. It is the verify-versus-collect
+// planning probe: small counts favor FilterGeoRanges probes, large counts
+// favor CollectGeoRanges materialization. Delta keys present in multiple
+// layers count twice, so it is an upper bound.
 func (i *FieldIndex) CountGeoCells(ranges []GeoRange) int {
 	if len(ranges) == 0 || i.Field().Kind != KindGeo {
 		return 0
@@ -488,7 +522,10 @@ func (i *FieldIndex) CountGeoCells(ranges []GeoRange) int {
 }
 
 // forEachGeoKey calls fn for every occupied key inside ranges without
-// allocating. Keys may repeat across layers; callers must be idempotent.
+// allocating. Keys present in multiple layers repeat; callers must be
+// idempotent (re-Oring into a mutable bitmap, counting at most once per
+// layer is caller's choice). Prefer geoKeys when duplicates cost more
+// than one allocation.
 func (v *fieldView) forEachGeoKey(ranges []GeoRange, fn func(FieldKey)) {
 	for _, keyRange := range ranges {
 		if keyRange.End < keyRange.Start {
@@ -518,6 +555,7 @@ func (v *fieldView) forEachGeoKey(ranges []GeoRange, fn func(FieldKey)) {
 }
 
 // countGeoKeys counts occupied keys inside ranges without allocating.
+// Delta keys present in multiple layers count twice; see CountGeoCells.
 func (v *fieldView) countGeoKeys(ranges []GeoRange) int {
 	count := 0
 	for _, keyRange := range ranges {
@@ -546,8 +584,9 @@ func (v *fieldView) countGeoKeys(ranges []GeoRange) int {
 	return count
 }
 
-// geoContains reports whether id holds any bucket inside ranges, walking the
-// view layers per key without materializing postings.
+// geoContains reports whether id holds any bucket inside ranges, walking
+// base spans and delta keys without materializing postings. Each key
+// resolves through the full active/frozen/base precedence.
 func (v *fieldView) geoContains(ranges []GeoRange, id ImageID) bool {
 	for _, keyRange := range ranges {
 		if keyRange.End < keyRange.Start {
@@ -592,9 +631,11 @@ func (v *fieldView) geoContains(ranges []GeoRange, id ImageID) bool {
 	return false
 }
 
-// AppendTo appends every indexed image ID in ascending order. Capacity is
-// reserved once from the effective estimate so per-key appends do not regrow
-// the destination.
+// AppendTo appends every indexed image ID in ascending order, preserving
+// dst's prefix. Capacity is reserved once from the cardinality estimate
+// so per-key appends do not regrow. Postings append per key, then the
+// tail sorts and compacts once; disjoint single-valued fields could merge
+// without a global sort, but one sort keeps the path simple and uniform.
 func (i *FieldIndex) AppendTo(dst []ImageID) []ImageID {
 	token := i.readers.Acquire()
 	view := i.view.Load()
@@ -636,9 +677,14 @@ func (i *FieldIndex) AppendTo(dst []ImageID) []ImageID {
 	return dst[:start+len(values)]
 }
 
-// validateGeoChanges enforces one cell per image before publication. Removals
-// are validated first so a stale From reports ErrInvalidMutation rather than
-// tripping the target-exists check.
+// validateGeoChanges enforces one cell per image within the batch before
+// publication. Removals validate first so a stale From reports
+// ErrInvalidMutation rather than tripping the target-exists check; then
+// each added image must be new to its target key and appear only once in
+// the batch. Cross-batch single-cell discipline has no reverse index:
+// successive Adds of different cells for one image are caller error (use
+// Move); only same-key duplicates and in-batch double-adds are rejected
+// here.
 func validateGeoChanges(view *fieldView, changes []stagedChange) error {
 	if view.field.Kind != KindGeo {
 		return nil
@@ -666,18 +712,20 @@ func validateGeoChanges(view *fieldView, changes []stagedChange) error {
 }
 
 // GeoCoordinateLookup supplies canonical coordinates for nearest search.
+// Images without coordinates report ok=false and are skipped.
 type GeoCoordinateLookup func(ImageID) (latitude, longitude float64, ok bool)
 
-// NearestResult is one named nearest match.
+// NearestResult is one nearest match with its haversine distance.
 type NearestResult struct {
 	ImageID        ImageID
 	DistanceMeters float64
 }
 
-// Nearest returns the exact top K among indexed images for which lookup
-// supplies canonical coordinates. It scans the whole effective set and sorts
-// every candidate, so cost is O(N log N) in the field size; it suits modest
-// fields, not full-catalog nearest search.
+// Nearest returns the exact top K among indexed images with coordinates.
+// It scans the whole effective set and sorts every candidate: O(N log N)
+// in field size. It suits modest fields, not full-catalog nearest search.
+// Invalid origins, non-positive k, nil lookups, and wrong kinds append
+// nothing.
 func (i *FieldIndex) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup GeoCoordinateLookup) []NearestResult {
 	if i.Field().Kind != KindGeo || k <= 0 || lookup == nil {
 		return dst
@@ -717,14 +765,17 @@ type geoCoverCandidate struct {
 	terminal bool
 }
 
-// GeoCoverWorkspace owns reusable covering scratch. It is not safe for
-// concurrent use and never grows during CoverRegion.
+// GeoCoverWorkspace owns reusable covering scratch across CoverRegion
+// calls. It is not safe for concurrent use and never grows during a
+// cover: undersized workspaces fail with ErrCoverWorkspaceFull instead of
+// allocating.
 type GeoCoverWorkspace struct {
 	candidates []geoCoverCandidate
 }
 
-// NewGeoCoverWorkspace allocates scratch for subsequent covers. Capacity
-// should be at least the requested MaxCells and six.
+// NewGeoCoverWorkspace allocates scratch for subsequent covers.
+// Capacity should be at least the requested MaxCells and six (one per
+// cube face); negative capacities clamp to zero.
 func NewGeoCoverWorkspace(capacity int) *GeoCoverWorkspace {
 	if capacity < 0 {
 		capacity = 0
@@ -732,15 +783,20 @@ func NewGeoCoverWorkspace(capacity int) *GeoCoverWorkspace {
 	return &GeoCoverWorkspace{candidates: make([]geoCoverCandidate, 0, capacity)}
 }
 
-// GeoCoverOptions controls region covering.
+// GeoCoverOptions controls region covering. MaxCells caps emitted cells
+// (zero selects DefaultGeoCoverCells); Workspace, when non-nil, supplies
+// bounded scratch and requires dst capacity for the result.
 type GeoCoverOptions struct {
 	MaxCells  int
 	Workspace *GeoCoverWorkspace
 }
 
-// CoverRegion appends sorted, normalized level-16 descendant ranges covering
-// region. With a sufficiently sized Workspace and dst the coverer allocates
-// nothing; a Region implementation may allocate inside its own methods.
+// CoverRegion appends sorted, normalized level-16 descendant ranges
+// covering region, preserving dst's prefix. With a caller workspace and
+// sufficient dst capacity it allocates nothing itself; the Region
+// implementation may allocate inside IntersectsCell/ContainsCell. A
+// caller workspace with insufficient dst capacity fails with
+// ErrCoverBufferFull instead of growing dst.
 func CoverRegion(dst []GeoRange, region s2.Region, options GeoCoverOptions) ([]GeoRange, error) {
 	if region == nil {
 		return dst, ErrInvalidRegion
@@ -774,7 +830,7 @@ func CoverRegion(dst []GeoRange, region s2.Region, options GeoCoverOptions) ([]G
 		keyRange := GeoRange{Start: uint64(first) >> geoKeyShift, End: uint64(last) >> geoKeyShift}
 		if len(dst) != start {
 			previous := &dst[len(dst)-1]
-			if keyRange.Start <= previous.End || geoRangesMerge(previous.End, keyRange.Start) {
+			if geoRangesMerge(previous.End, keyRange.Start) {
 				if keyRange.End > previous.End {
 					previous.End = keyRange.End
 				}
@@ -786,6 +842,12 @@ func CoverRegion(dst []GeoRange, region s2.Region, options GeoCoverOptions) ([]G
 	return dst, nil
 }
 
+// geoCoverCandidates refines the six cube faces into at most maxCells
+// terminal cells covering region, using only workspace capacity. The
+// returned slice aliases workspace backing and stays valid only until the
+// next cover on the same workspace; the workspace length resets to zero
+// on return, so callers must consume candidates (as CoverRegion does)
+// before reusing the workspace.
 func geoCoverCandidates(region s2.Region, maxCells int, workspace *GeoCoverWorkspace) ([]geoCoverCandidate, error) {
 	candidates := workspace.candidates[:0]
 	appendCandidate := func(candidate geoCoverCandidate) bool {

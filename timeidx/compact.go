@@ -1,6 +1,9 @@
 package timeidx
 
-import "sort"
+import (
+	"cmp"
+	"slices"
+)
 
 type compactionTask struct {
 	block    *block
@@ -20,13 +23,14 @@ type compactRecord struct {
 
 type compactRecords []compactRecord
 
-func (r compactRecords) Len() int      { return len(r) }
-func (r compactRecords) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
-func (r compactRecords) Less(i, j int) bool {
-	if r[i].marker != r[j].marker {
-		return r[i].marker < r[j].marker
+// compareCompactRecord orders by marker then image ID. slices.SortFunc
+// inlines this closure; the old sort.Interface dispatch showed up as the
+// top non-runtime cost in write-path CPU profiles.
+func compareCompactRecord(a, b compactRecord) int {
+	if result := cmp.Compare(a.marker, b.marker); result != 0 {
+		return result
 	}
-	return r[i].id < r[j].id
+	return cmp.Compare(a.id, b.id)
 }
 
 func (i *Index) compactorLoop() {
@@ -62,7 +66,7 @@ func compact(base *base, frozen *delta) *base {
 			records = append(records, compactRecord{marker: frozen.addMarkers[index], id: id})
 		}
 	}
-	sort.Sort(records)
+	slices.SortFunc(records, compareCompactRecord)
 	markers := make([]timemarker, len(records))
 	ids := make([]ImageID, len(records))
 	for index, record := range records {

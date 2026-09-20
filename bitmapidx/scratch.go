@@ -6,8 +6,14 @@ import (
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
-// Pooled scratch bounds. Buffers that grow beyond these caps are dropped
-// instead of returned, so one huge query cannot pin megabytes process-wide.
+// Pooled scratch for query paths. Buffers that grow beyond these caps are
+// dropped instead of returned, so one huge query cannot pin megabytes
+// process-wide. Pools hold slice headers only; bitmap payloads stay owned
+// by their postings or by freshly built results.
+//
+// Contract: every acquire must pair with its release. Contents are valid
+// only until release. Callers must not retain an acquired slice after
+// releasing it.
 const (
 	maxPooledPostings = 4096
 	maxPooledIDs      = 1 << 20
@@ -27,13 +33,10 @@ var (
 		s := make([]roar.Bitmap, 0, 64)
 		return &s
 	}}
-	mutablePool = sync.Pool{New: func() any {
-		return roar.NewMutableBitmap()
-	}}
 )
 
-// acquirePostings returns a scratch pointer slice sized for n entries. The
-// caller must release it; contents are only valid until release.
+// acquirePostings returns a scratch pointer slice with capacity for at
+// least n entries, reset to length zero.
 func acquirePostings(n int) *[]*posting {
 	p := postingPtrPool.Get().(*[]*posting)
 	if cap(*p) < n {
@@ -44,7 +47,8 @@ func acquirePostings(n int) *[]*posting {
 	return p
 }
 
-// releasePostings returns scratch, dropping oversized buffers.
+// releasePostings returns scratch to the pool, dropping buffers whose
+// capacity exceeds maxPooledPostings.
 func releasePostings(p *[]*posting) {
 	if cap(*p) > maxPooledPostings {
 		return
@@ -53,7 +57,8 @@ func releasePostings(p *[]*posting) {
 	postingPtrPool.Put(p)
 }
 
-// acquireIDs returns a scratch ID buffer sized for n entries.
+// acquireIDs returns a scratch ID buffer with capacity for at least n
+// entries, reset to length zero.
 func acquireIDs(n int) *[]uint64 {
 	p := idSlicePool.Get().(*[]uint64)
 	if cap(*p) < n {
@@ -64,8 +69,11 @@ func acquireIDs(n int) *[]uint64 {
 	return p
 }
 
-// releaseIDs returns scratch, dropping oversized buffers. The released slice
-// must not alias any retained bitmap: callers encode first, then release.
+// releaseIDs returns scratch to the pool, dropping buffers whose capacity
+// exceeds maxPooledIDs. The released slice must not alias any retained
+// bitmap: callers must materialize (for example via roar.FromUnsorted,
+// which copies unless the input is already strictly increasing) before
+// releasing.
 func releaseIDs(p *[]uint64) {
 	if cap(*p) > maxPooledIDs {
 		return
@@ -74,7 +82,9 @@ func releaseIDs(p *[]uint64) {
 	idSlicePool.Put(p)
 }
 
-// acquireBitmaps returns a scratch bitmap slice sized for n entries.
+// acquireBitmaps returns a scratch bitmap slice with capacity for at least
+// n entries, reset to length zero. The slice header is pooled; the bitmap
+// payloads it points at stay owned by their postings or results.
 func acquireBitmaps(n int) *[]roar.Bitmap {
 	p := bitmapSlicePool.Get().(*[]roar.Bitmap)
 	if cap(*p) < n {
@@ -85,25 +95,12 @@ func acquireBitmaps(n int) *[]roar.Bitmap {
 	return p
 }
 
-// releaseBitmaps returns scratch, dropping oversized buffers.
+// releaseBitmaps returns scratch to the pool, dropping buffers whose
+// capacity exceeds maxPooledBitmaps.
 func releaseBitmaps(p *[]roar.Bitmap) {
 	if cap(*p) > maxPooledBitmaps {
 		return
 	}
 	*p = (*p)[:0]
 	bitmapSlicePool.Put(p)
-}
-
-// acquireMutable returns a reset accumulator for one caller's exclusive use.
-func acquireMutable() *roar.MutableBitmap {
-	m := mutablePool.Get().(*roar.MutableBitmap)
-	m.Reset()
-	return m
-}
-
-// releaseMutable returns the accumulator. Callers must materialize first via
-// AppendTo plus FromUnsorted; a Freeze result aliases pooled scratch and must
-// never outlive the call.
-func releaseMutable(m *roar.MutableBitmap) {
-	mutablePool.Put(m)
 }

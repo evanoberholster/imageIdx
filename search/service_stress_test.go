@@ -28,7 +28,7 @@ const (
 
 type stressFixture struct {
 	service *Service
-	bitmap  *bitmapidx.Index
+	bitmap  *bitmapidx.FieldIndex
 	times   *timeidx.Index
 	geo     *bitmapidx.FieldIndex
 	cell    bitmapidx.S2Key
@@ -51,11 +51,17 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 		geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122})
 	}
 
-	bitmap, err := bitmapidx.New(bitmapidx.Spec{
-		Key:     bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1},
-		IndexID: 1, IDs: bitmapIDs,
-	}, bitmapidx.Config{})
+	bitmap, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
+		Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
+	}, bitmapidx.FieldConfig{})
 	if err != nil {
+		tb.Fatal(err)
+	}
+	initialEntries := make([]bitmapidx.Entry, len(bitmapIDs))
+	for n, id := range bitmapIDs {
+		initialEntries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("favorite")}
+	}
+	if err := bitmap.Add(initialEntries...); err != nil {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { _ = bitmap.Close() })
@@ -81,7 +87,7 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 		tb.Fatal(err)
 	}
 	plan, err := Compile(
-		AllBitmaps(bitmap),
+		FieldValues(bitmap, bitmapidx.StringValue("favorite")),
 		During(timeIndex, quantum, 20000*quantum),
 		geoClause,
 	)
@@ -155,7 +161,11 @@ func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize 
 				for k := 0; k < batchSize; k++ {
 					ids = append(ids, base+uint64(round*batchSize+k))
 				}
-				if err := fixture.bitmap.Apply(bitmapidx.Mutation{Add: ids}); err != nil {
+				entries := make([]bitmapidx.Entry, 0, len(ids))
+				for _, id := range ids {
+					entries = append(entries, bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("favorite")})
+				}
+				if err := fixture.bitmap.Add(entries...); err != nil {
 					errs <- err
 					return
 				}
@@ -339,7 +349,7 @@ func BenchmarkServiceStaleVsFreshPlan(b *testing.B) {
 		b.Fatal(err)
 	}
 	fresh, err := Compile(
-		AllBitmaps(fixture.bitmap),
+		FieldValues(fixture.bitmap, bitmapidx.StringValue("favorite")),
 		During(fixture.times, fixture.quantum, 20000*fixture.quantum),
 		geoClause,
 	)

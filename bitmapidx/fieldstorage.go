@@ -14,9 +14,10 @@ import (
 const fieldManifestMagic uint32 = 0x424d464d
 
 // FieldStore persists a fixed registry of fields with one serialized WAL
-// writer. Child Add/Apply/Move/ReplaceText calls automatically use that WAL.
-// Each batch is atomic within one field; cross-field transactions are not
-// provided. Reads remain lock-free. Close owns all child/mmap lifetimes.
+// writer. Child Add/Apply/Move/ReplaceText calls automatically append to
+// that WAL. Each batch is atomic within one field; cross-field
+// transactions are not provided. Reads remain lock-free across writes and
+// checkpoints. Close owns all child and mmap lifetimes.
 type FieldStore struct {
 	dir        string
 	fields     map[IndexType]*FieldIndex // immutable after construction
@@ -32,8 +33,11 @@ type FieldStore struct {
 	mapping    []byte
 }
 
-// NewPersistentFields creates a new mmap-backed field store. The directory
-// must be empty. Codec definitions are persisted; config is runtime policy.
+// NewPersistentFields creates a new mmap-backed field store. The
+// directory must be empty (besides the lock file). Field definitions are
+// validated, persisted in the first checkpoint, and immutable after;
+// config is runtime-only policy. Handles become store-owned on success
+// and must be closed via the store.
 func NewPersistentFields(dir string, fields []Field, config FieldConfig, durability Durability) (*FieldStore, error) {
 	config, err := config.withDefaults()
 	if err != nil {
@@ -70,8 +74,10 @@ func NewPersistentFields(dir string, fields []Field, config FieldConfig, durabil
 	return s, nil
 }
 
-// OpenPersistentFields validates the checkpoint, replays its WAL and repairs
-// only an incomplete terminal frame before making field handles available.
+// OpenPersistentFields opens a checkpoint, replays its WAL, and repairs
+// only an incomplete terminal frame before making field handles
+// available. Generation, field count, segment checksums, and WAL offsets
+// all validate; any other corruption fails the open for external recovery.
 func OpenPersistentFields(dir string, config FieldConfig, durability Durability) (*FieldStore, error) {
 	config, err := config.withDefaults()
 	if err != nil {
@@ -135,12 +141,17 @@ func OpenPersistentFields(dir string, config FieldConfig, durability Durability)
 	return s, nil
 }
 
-// Lookup returns a store-owned field. All mutations use the store WAL.
+// Lookup returns the store-owned field for t. All mutations append to the
+// store WAL. The handle must not be closed directly.
 func (s *FieldStore) Lookup(t IndexType) (*FieldIndex, bool) {
 	index, ok := s.fields[t]
 	return index, ok
 }
-func (s *FieldStore) Len() int              { return len(s.order) }
+// Len returns the number of fields in physical storage order.
+func (s *FieldStore) Len() int { return len(s.order) }
+
+// Fields returns store-owned handles in physical storage order. The slice
+// is a copy; the handles are shared and must not be closed directly.
 func (s *FieldStore) Fields() []*FieldIndex { return append([]*FieldIndex(nil), s.order...) }
 
 func (s *FieldStore) writable() error {
@@ -157,18 +168,20 @@ func (s *FieldStore) walPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("fields-%020d.wal", gen))
 }
 
-// Checkpoint blocks writers, not readers. It writes and validates a new mmap
-// snapshot and syncs an empty successor WAL before publishing the manifest.
-// Then it replaces field roots, drains prior readers/workers and unmaps the
-// old snapshot. A completed checkpoint bounds subsequent replay to its WAL.
+// Checkpoint blocks writers, not readers. It syncs the WAL, writes and
+// revalidates a new mmap snapshot, syncs an empty successor WAL and the
+// directory, then publishes the manifest. Afterwards it swaps field
+// roots, drains prior readers, and unmaps the old snapshot. A completed
+// checkpoint bounds subsequent replay to its WAL.
 func (s *FieldStore) Checkpoint() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.checkpointLocked(false)
 }
 
-// Vacuum also removes dead dictionary entries and obsolete snapshot/WAL
-// generations. Retirement is serialized with manifest publication.
+// Vacuum checkpoints with dead dictionary entries dropped, then removes
+// obsolete snapshot and WAL generations. Retirement serializes with
+// manifest publication; only the live generation's files remain.
 func (s *FieldStore) Vacuum() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -181,6 +194,13 @@ func (s *FieldStore) Vacuum() error {
 	return persist.RemoveObsolete(s.dir, "fields-*.wal", s.walPath(s.generation))
 }
 
+// checkpointLocked writes, validates, and publishes one generation. Crash
+// safety rests on the old manifest staying authoritative until the new
+// one publishes: segment and successor WAL writes precede it, directory
+// names sync before it, and an unpublished successor from a prior crash
+// is safe to truncate while the lock is held. Dictionary generations are
+// preserved on plain checkpoints so compiled queries keep their fast
+// path; vacuum advances them because dead values may leave the set.
 func (s *FieldStore) checkpointLocked(vacuum bool) error {
 	if err := s.writable(); err != nil {
 		return err
@@ -258,7 +278,11 @@ func (s *FieldStore) checkpointLocked(vacuum bool) error {
 		next := loaded[n].view.Load()
 		next.generation = old.generation + 1
 		index.dict = loaded[n].dict
-		index.dict.generation = old.dictGen + 1
+		if vacuum {
+			index.dict.generation = old.dictGen + 1
+		} else {
+			index.dict.generation = old.dictGen
+		}
 		next.dictGen = index.dict.generation
 		index.view.Store(next)
 	}
@@ -279,6 +303,8 @@ func (s *FieldStore) checkpointLocked(vacuum bool) error {
 		persist.RemoveObsolete(s.dir, "fields-*.wal", s.walPath(s.generation)))
 }
 
+// syncStoreDir fsyncs a directory so newly renamed segment names and the
+// truncated successor WAL are durable before the manifest publishes them.
 func syncStoreDir(dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
@@ -287,6 +313,9 @@ func syncStoreDir(dir string) error {
 	return errors.Join(f.Sync(), f.Close())
 }
 
+// Close marks the store closed, closes children without per-index
+// locks, then closes the WAL, unmaps the snapshot, and releases the
+// directory lock. It is idempotent.
 func (s *FieldStore) Close() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

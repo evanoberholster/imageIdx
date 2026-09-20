@@ -1,6 +1,5 @@
-// Command bitmaponly exercises the bitmap-only execution shapes: Search,
-// Count (which skips materialization via bitmapidx.Count), SearchLimit, and
-// Iterate.
+// Command bitmaponly exercises field-only execution shapes: Search, Count,
+// SearchLimit, and Iterate.
 //
 // Usage:
 //
@@ -10,29 +9,48 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 
-	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
-func mustIndex(key bitmapidx.Key, indexID uint64, ids []imageidx.ImageID) *bitmapidx.Index {
-	index, err := bitmapidx.New(bitmapidx.Spec{Key: key, IndexID: indexID, IDs: ids}, bitmapidx.Config{})
+func main() {
+	dir, err := os.MkdirTemp("", "imageidx-fields-")
 	if err != nil {
 		log.Fatal(err)
 	}
-	return index
-}
+	defer os.RemoveAll(dir)
+	store, err := bitmapidx.NewPersistentFields(dir, []bitmapidx.Field{
+		{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+		{Type: bitmapidx.IndexTypeAlbum, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+	}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer store.Close()
+	tags, _ := store.Lookup(bitmapidx.IndexTypeTag)
+	album, _ := store.Lookup(bitmapidx.IndexTypeAlbum)
+	if err := tags.Add(
+		bitmapidx.Entry{ImageID: 1, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 5, Value: bitmapidx.StringValue("favorite")},
+	); err != nil {
+		log.Fatal(err)
+	}
+	if err := album.Add(
+		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("holiday")},
+		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("holiday")},
+		bitmapidx.Entry{ImageID: 4, Value: bitmapidx.StringValue("holiday")},
+	); err != nil {
+		log.Fatal(err)
+	}
 
-func main() {
-	tags := mustIndex(bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 7}, 1,
-		[]imageidx.ImageID{1, 2, 3, 5})
-	defer tags.Close()
-	album := mustIndex(bitmapidx.Key{Type: bitmapidx.IndexTypeAlbum, ValueID: 8}, 2,
-		[]imageidx.ImageID{2, 3, 4})
-	defer album.Close()
-
-	plan, err := search.Compile(search.AllBitmaps(tags), search.AllBitmaps(album))
+	plan, err := search.Compile(
+		search.FieldValues(tags, bitmapidx.StringValue("favorite")),
+		search.FieldValues(album, bitmapidx.StringValue("holiday")),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}

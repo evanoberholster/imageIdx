@@ -913,6 +913,9 @@ func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*i
 	idx := &ExactIndex{
 		config:    cfg,
 		readers:   chooseReaders(readers),
+		writes:    make(chan *exactBatch, exactWriteQueue),
+		barriers:  make(chan chan barrierResult),
+		stop:      make(chan struct{}),
 		indexID:   manifest.indexID,
 		flags:     manifest.flags,
 		algorithm: manifest.algorithm,
@@ -947,6 +950,7 @@ func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*i
 		return nil, err
 	}
 	idx.persistence.wal = wal
+	idx.startWriterLoop()
 	return idx, nil
 }
 
@@ -1016,8 +1020,8 @@ func decodeExactGeneration(mapping []byte) (*exactIndexView, exactManifest, erro
 // Checkpoint persists the current view into a new generation file and
 // atomically publishes a manifest pointing at it.
 func (i *ExactIndex) Checkpoint() error {
-	i.writerMu.Lock()
-	defer i.writerMu.Unlock()
+	i.lifecycle.RLock()
+	defer i.lifecycle.RUnlock()
 	return i.checkpointLocked()
 }
 
@@ -1092,11 +1096,29 @@ func writeExactGenerationFile(dir string, manifest exactManifest, view *exactInd
 
 // Vacuum repacks live records densely, checkpoints, and reclaims obsolete
 // generations. Logical contents never change.
+//
+// Vacuum holds the exclusive lifecycle lock, so no new write batch can
+// arrive; the barrier first drains and applies everything already queued,
+// leaving the writer loop idle and the view stable for the repack. The fresh
+// WAL epoch therefore starts empty with a zero offset: every record ever
+// appended is already inside the repacked generation file.
 func (i *ExactIndex) Vacuum() error {
-	i.writerMu.Lock()
-	defer i.writerMu.Unlock()
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	i.lifecycle.Lock()
+	defer i.lifecycle.Unlock()
+	if i.closed.Load() {
+		return ErrClosed
+	}
+	response := make(chan barrierResult, 1)
+	select {
+	case i.barriers <- response:
+	case <-i.stop:
+		return ErrClosed
+	}
+	if res := <-response; res.err != nil {
+		return res.err
 	}
 	// Repack live records at target occupancy.
 	current := i.view.Load()
@@ -1148,10 +1170,14 @@ func (i *ExactIndex) Vacuum() error {
 		algorithm: i.algorithm, targetFillPct: i.config.TargetFillPct,
 	}
 	// Persist the repacked layout when it changed, then roll to a fresh WAL
-	// epoch and publish a manifest that references it with a zero offset. A
-	// crash before the manifest leaves the old generation and WAL
-	// authoritative; a crash after it leaves a trivially consistent empty
-	// WAL. The old WAL file is removed only after the new root is durable.
+	// epoch and publish a manifest that references it with a zero offset.
+	// The barrier above drained the loop and the exclusive lock admits no
+	// new batch, so the generation file holds every record ever appended
+	// and the new epoch legitimately starts empty. A crash before the
+	// manifest leaves the old generation and WAL authoritative; a crash
+	// after it leaves a trivially consistent empty WAL. The old WAL file is
+	// removed only after the new root is durable. The handle swap is direct
+	// because the writer loop is idle with no possible sender.
 	if view.generation != i.persistence.persistedGen {
 		if err := writeExactGenerationFile(i.persistence.dir, manifest, view); err != nil {
 			return err

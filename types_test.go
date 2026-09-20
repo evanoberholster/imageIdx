@@ -26,13 +26,6 @@ func TestIndexPackagesShareDomainTypes(t *testing.T) {
 		t.Fatalf("shared Durability = %d", durability)
 	}
 
-	bitmap, err := bitmapidx.New(bitmapidx.Spec{
-		Key: bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1}, IndexID: 101, Flags: 7,
-	}, bitmapidx.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = bitmap.Close() })
 	geo, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
 		Type:    bitmapidx.IndexTypeLocation,
 		Kind:    bitmapidx.KindGeo,
@@ -49,13 +42,7 @@ func TestIndexPackagesShareDomainTypes(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = times.Close() })
 
-	if bitmap.Metadata().IndexID != 101 || times.Metadata().IndexID != 103 {
-		t.Fatal("stable index identity is not exposed consistently")
-	}
-	if bitmap.Metadata().Flags != 7 || times.Metadata().Flags != 7 {
-		t.Fatal("index flags are not exposed consistently")
-	}
-	if bitmap.Metadata().Generation == 0 || geo.Metadata().Generation == 0 || times.Metadata().Generation == 0 {
+	if geo.Metadata().Generation == 0 || times.Metadata().Generation == 0 {
 		t.Fatal("index generations must be nonzero")
 	}
 

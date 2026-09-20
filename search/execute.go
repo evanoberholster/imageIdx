@@ -4,8 +4,6 @@ import (
 	"context"
 	"iter"
 	"slices"
-
-	"github.com/evanoberholster/imageIdx/bitmapidx"
 )
 
 // Search compiles clauses and immediately appends their sorted, unique matches
@@ -52,12 +50,18 @@ func (plan Plan) CountContext(ctx context.Context, workspace *Workspace) (int, e
 	if plan.IsEmpty() {
 		return 0, nil
 	}
-	// Bitmap-only plans count the intersection without materializing IDs.
-	if len(plan.stages) == 1 && plan.stages[0].kind == StageBitmap {
+	// Single-field plans can count directly without materializing IDs.
+	if len(plan.stages) == 1 && plan.stages[0].kind == StageField {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		return int(bitmapidx.Count(plan.stages[0].bitmaps...)), nil
+		stage := &plan.stages[0]
+		if stage.fieldKind == fieldRange {
+			count, err := stage.fieldIndex.CountRange(stage.fieldRange)
+			return int(count), err
+		}
+		count, err := stage.fieldQuery.Count()
+		return int(count), err
 	}
 	// Materialize into a private dst so it never aliases workspace scratch,
 	// which searchInto uses for per-stage collects.
@@ -127,7 +131,7 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 		return truncateLimit(dst, start, limit), nil
 	}
 
-	// Filter-first: apply all in-place filters (bitmap, exact-timestamp)
+	// Filter-first: apply all in-place filters (field, exact-timestamp)
 	// before any collect+intersect stage (lossy timestamp, geo).
 	for index := 1; index < len(plan.stages); index++ {
 		if err := ctx.Err(); err != nil {
@@ -170,8 +174,7 @@ func truncateLimit(dst []ImageID, start int, limit int) []ImageID {
 
 // collectStage appends one stage's sorted, unique candidates to dst. Geo
 // stages accumulate covered cells into the workspace-owned MutableBitmap and
-// materialize once, skipping the collect-then-sort round trip; other stages
-// collect ID lists and sort them.
+// materialize once; other stages collect ID lists and sort them.
 func collectStage(dst []ImageID, ws *Workspace, st *stage) []ImageID {
 	if st.kind == StageGeo && ws != nil {
 		m := ws.mutableBitmap()

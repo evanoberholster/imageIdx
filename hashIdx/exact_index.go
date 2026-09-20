@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
 )
 
 // blockHandle is one immutable sorted block. records holds Count*RecordSize
@@ -30,13 +28,26 @@ type exactIndexView struct {
 }
 
 // ExactIndex maps exact 256-bit digests to image IDs with lock-free readers
-// and one serialized writer. There is no in-memory mode: every ExactIndex owns
-// its directory and WAL.
+// and a single-owner writer loop. There is no in-memory mode: every
+// ExactIndex owns its directory and WAL.
+//
+// Writes serialize through the writer loop: each Apply hands a pooled batch
+// to the loop and waits for its result, so a call returns only after its
+// mutation is WAL-durable and published. Batches queued while the loop is
+// busy are coalesced into one WAL append and one publication. Maintenance
+// (Checkpoint, Vacuum, Close) coordinates through lifecycle: data calls take
+// the read lock, maintenance takes the exclusive lock.
 type ExactIndex struct {
 	view    atomic.Pointer[exactIndexView]
 	readers *indexutil.ReaderTracker
 
-	writerMu  sync.Mutex
+	writes    chan *exactBatch
+	barriers  chan chan barrierResult
+	lifecycle sync.RWMutex
+	workers   sync.WaitGroup
+	stop      chan struct{}
+	closeOnce sync.Once
+
 	config    ExactConfig
 	indexID   uint64
 	flags     uint32
@@ -45,8 +56,46 @@ type ExactIndex struct {
 	generation atomic.Uint64
 	closed     atomic.Bool
 	seq        atomic.Uint64
+	publishes  atomic.Uint64
+	coalesced  atomic.Uint64
 
 	persistence persistedState
+}
+
+// exactWriteQueue bounds queued write batches. Coalescing drains the queue,
+// so depth only reflects momentary burst pressure.
+const exactWriteQueue = 64
+
+// barrierResult reports the WAL end offset observed by the writer loop after
+// draining and applying every queued batch.
+type barrierResult struct {
+	walOffset int64
+	err       error
+}
+
+// exactBatch is one writer-owned mutation batch in flight through the
+// single-owner writer loop. Shells are pooled; done carries exactly one
+// result per cycle. The loop never retains batch memory past completion.
+type exactBatch struct {
+	adds, removes []ExactEntry
+	done          chan error
+}
+
+var exactBatchPool = sync.Pool{New: func() any {
+	return &exactBatch{done: make(chan error, 1)}
+}}
+
+func acquireExactBatch(adds, removes []ExactEntry) *exactBatch {
+	batch := exactBatchPool.Get().(*exactBatch)
+	batch.adds = append(batch.adds[:0], adds...)
+	batch.removes = append(batch.removes[:0], removes...)
+	return batch
+}
+
+func releaseExactBatch(batch *exactBatch) {
+	batch.adds = batch.adds[:0]
+	batch.removes = batch.removes[:0]
+	exactBatchPool.Put(batch)
 }
 
 // newExactIndex builds the initial immutable index from stable metadata and
@@ -85,10 +134,24 @@ func newExactIndex(spec ExactSpec, cfg ExactConfig, readers ...*indexutil.Reader
 		}
 		blocks[i] = blockHandle{first: part[0].Hash, records: rec}
 	}
-	idx := &ExactIndex{config: cfg, indexID: spec.IndexID, flags: spec.Flags, algorithm: spec.Algorithm, readers: chooseReaders(readers)}
+	idx := &ExactIndex{
+		config: cfg, indexID: spec.IndexID, flags: spec.Flags, algorithm: spec.Algorithm,
+		readers: chooseReaders(readers), writes: make(chan *exactBatch, exactWriteQueue),
+		barriers: make(chan chan barrierResult), stop: make(chan struct{}),
+	}
 	idx.generation.Store(1)
 	idx.view.Store(&exactIndexView{generation: 1, liveCount: uint64(len(entries)), blocks: blocks})
+	idx.workers.Add(1)
+	go idx.writerLoop()
 	return idx, nil
+}
+
+// startWriterLoop starts the single-owner writer loop. openExact builds its
+// index literally instead of through newExactIndex, so it calls this once
+// its WAL handle is installed.
+func (i *ExactIndex) startWriterLoop() {
+	i.workers.Add(1)
+	go i.writerLoop()
 }
 
 // Metadata returns a copied summary of the current generation.
@@ -308,6 +371,14 @@ func (i *ExactIndex) Remove(hash Hash, imageID ImageID) error {
 // Apply atomically publishes one mutation batch. A batch touching many
 // records in one block rewrites that block once; the whole batch publishes
 // once, so 1,000 images publish once, not 1,000 times.
+//
+// Apply hands its mutation to the single-owner writer loop and waits: it
+// returns only after the mutation is WAL-durable and published (or with the
+// publication error). Batches queued while the loop is busy are coalesced
+// into one WAL append and one publication; each waiter still observes its
+// own mutation on return, so calls stay linearizable. Slices are copied into
+// pooled buffers and never retained. A concurrent Close may fail the call
+// with ErrClosed instead of applying it.
 func (i *ExactIndex) Apply(m Mutation) error {
 	if len(m.Add) == 0 && len(m.Remove) == 0 {
 		return nil
@@ -325,29 +396,140 @@ func (i *ExactIndex) Apply(m Mutation) error {
 			return ErrInvalidEntry
 		}
 	}
-	i.writerMu.Lock()
-	defer i.writerMu.Unlock()
+	i.lifecycle.RLock()
+	defer i.lifecycle.RUnlock()
 	if i.closed.Load() {
 		return ErrClosed
 	}
-	current := i.view.Load()
-	adds, removes := canonicalizeMutation(current, m)
-	if len(adds) == 0 && len(removes) == 0 {
-		return nil
+	batch := acquireExactBatch(m.Add, m.Remove)
+	select {
+	case i.writes <- batch:
+	case <-i.stop:
+		releaseExactBatch(batch)
+		return ErrClosed
 	}
+	err := <-batch.done
+	releaseExactBatch(batch)
+	return err
+}
+
+// writerLoop is the sole publisher: it owns WAL appends and view
+// publication, so data batches never need a mutex between each other. It
+// exits only on stop, rejecting anything still queued with ErrClosed.
+func (i *ExactIndex) writerLoop() {
+	defer i.workers.Done()
+	for {
+		select {
+		case batch := <-i.writes:
+			i.applyCoalesced(batch)
+		case response := <-i.barriers:
+			// Drain first: the barrier then observes a quiesced loop, which
+			// Vacuum relies on. Callers must hold lifecycle.Lock so no new
+			// batch can arrive mid-drain.
+			pending := i.drainQueued()
+			if len(pending) != 0 {
+				i.publishMerged(pending)
+			}
+			var result barrierResult
+			result.walOffset, result.err = i.persistence.wal.Offset()
+			response <- result
+		case <-i.stop:
+			for {
+				select {
+				case batch := <-i.writes:
+					batch.done <- ErrClosed
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// drainQueued collects every batch waiting behind the one being handled.
+// The caller must guarantee no new batch can arrive (Vacuum's exclusive
+// lock), so the drain terminates.
+func (i *ExactIndex) drainQueued() []*exactBatch {
+	var pending []*exactBatch
+	for {
+		select {
+		case batch := <-i.writes:
+			pending = append(pending, batch)
+		default:
+			return pending
+		}
+	}
+}
+
+// applyCoalesced merges the received batch with whatever queued behind it
+// (bounded by MaxBatchEntries per publication) and publishes once.
+func (i *ExactIndex) applyCoalesced(first *exactBatch) {
+	pending := []*exactBatch{first}
+	total := len(first.adds) + len(first.removes)
+	for total < int(i.config.MaxBatchEntries) {
+		select {
+		case batch := <-i.writes:
+			pending = append(pending, batch)
+			total += len(batch.adds) + len(batch.removes)
+		default:
+			i.publishMerged(pending)
+			return
+		}
+	}
+	i.publishMerged(pending)
+}
+
+// publishMerged canonicalizes the flattened batches once, appends one WAL
+// record, publishes one view, and completes every waiter with the result.
+func (i *ExactIndex) publishMerged(pending []*exactBatch) {
+	adds, removes := flattenBatches(pending)
+	if len(adds)+len(removes) != 0 {
+		current := i.view.Load()
+		adds, removes = canonicalizeMutation(current, Mutation{Add: adds, Remove: removes})
+	}
+	var err error
+	if len(adds)+len(removes) != 0 {
+		err = i.publishBatch(adds, removes)
+	}
+	i.publishes.Add(1)
+	if len(pending) > 1 {
+		i.coalesced.Add(uint64(len(pending) - 1))
+	}
+	// Ownership returns to the waiters with the result: each Apply releases
+	// its own shell exactly once, so the loop must not release here.
+	for _, batch := range pending {
+		batch.done <- err
+	}
+}
+
+// flattenBatches concatenates pending batches preserving arrival order.
+func flattenBatches(pending []*exactBatch) (adds, removes []ExactEntry) {
+	for _, batch := range pending {
+		adds = append(adds, batch.adds...)
+		removes = append(removes, batch.removes...)
+	}
+	return adds, removes
+}
+
+// publishBatch appends one WAL record and publishes the resulting view. It
+// runs only on the writer loop, which is the sole WAL appender, so no lock
+// is needed here; maintenance paths coordinate through lifecycle and never
+// touch the WAL handle while the loop can append.
+func (i *ExactIndex) publishBatch(adds, removes []ExactEntry) error {
 	i.persistence.mu.Lock()
 	err := appendExactWAL(i.persistence.wal, adds, removes, i.persistence.durability, i.seq.Add(1))
 	i.persistence.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	current := i.view.Load()
 	next := applyEffective(current, adds, removes, i.config)
 	next.generation = current.generation + 1
 	i.view.Store(next)
 	i.generation.Store(next.generation)
 	// No reader drain here: old blocks are Go-allocated and reclaimed by GC,
 	// and mmap unmapping only happens in Vacuum/Close after an explicit
-	// WaitForPriorReaders. Waiting on every Apply would stall writers under
+	// WaitForPriorReaders. Waiting on every publish would stall writers under
 	// continuous read load and can deadlock a reader that holds a token
 	// across a write.
 	return nil
@@ -364,34 +546,6 @@ func (i *ExactIndex) applyWithoutWAL(adds, removes []ExactEntry) {
 	next.generation = current.generation + 1
 	i.view.Store(next)
 	i.generation.Store(next.generation)
-}
-
-// AppendWAL appends a canonicalized add/remove batch to the exact index WAL
-// and publishes a new generation view.  It is intended for use by the
-// ExactBufferedWriter so that many small Apply calls are coalesced into a
-// single WAL entry and publish cycle.
-func (i *ExactIndex) AppendWAL(adds, removes []ExactEntry) error {
-	if len(adds) == 0 && len(removes) == 0 {
-		return nil
-	}
-	i.writerMu.Lock()
-	defer i.writerMu.Unlock()
-	if i.closed.Load() {
-		return ErrClosed
-	}
-	current := i.view.Load()
-	adds, removes = canonicalizeMutation(current, Mutation{Add: adds, Remove: removes})
-	if len(adds) == 0 && len(removes) == 0 {
-		return nil
-	}
-	if err := appendExactWAL(i.persistence.wal, adds, removes, i.persistence.durability, i.seq.Add(1)); err != nil {
-		return err
-	}
-	next := applyEffective(current, adds, removes, i.config)
-	next.generation = current.generation + 1
-	i.view.Store(next)
-	i.generation.Store(next.generation)
-	return nil
 }
 
 // canonicalizeMutation deduplicates the batch (remove wins on conflict) and
@@ -565,77 +719,36 @@ func mergeBlockEntries(old, adds, removes []ExactEntry) []ExactEntry {
 	return out
 }
 
-// PendingCompactions reports in-flight background work. ExactIndex compacts
-// synchronously inside Apply, so this is always zero.
-func (i *ExactIndex) PendingCompactions() int64 { return 0 }
+// PendingCompactions reports queued but unpublished write batches. Block
+// rewrites happen synchronously on the writer loop, so this is only nonzero
+// while Apply calls are in flight.
+func (i *ExactIndex) PendingCompactions() int64 { return int64(len(i.writes)) }
 
-// CompactWAL compacts the exact index WAL between vacuums. It replays any
-// pending WAL batches to incorporate them into the published view, then
-// starts a fresh WAL epoch with an empty WAL file and updates the manifest
-// accordingly. This reduces WAL file size without changing the index data.
-// It is safe to call between Checkpoint calls as long as prior readers have
-// drained (or Close is used).
-func (i *ExactIndex) CompactWAL() error {
-	i.writerMu.Lock()
-	defer i.writerMu.Unlock()
-	if i.closed.Load() {
-		return ErrClosed
-	}
-	// Read the current manifest to get generation and WAL epoch.
-	manifest, err := readDiskManifest(filepath.Join(i.persistence.dir, "manifest"))
-	if err != nil {
-		return err
-	}
-	// Replay all WAL batches from the current offset to incorporate them
-	// into the view state. This is the same logic as during openExact.
-	batches, maxSeq, err := replayExactWAL(exactWALPath(i.persistence.dir, uint64(manifest.walEpoch)), manifest.walOffset)
-	if err != nil {
-		return err
-	}
-	for _, batch := range batches {
-		var adds, removes []ExactEntry
-		for _, rec := range batch {
-			e := ExactEntry{Hash: rec.hash, ImageID: rec.imageID}
-			if rec.op == exactWALOpAdd {
-				adds = append(adds, e)
-			} else {
-				removes = append(removes, e)
-			}
-		}
-		i.applyWithoutWAL(adds, removes)
-	}
-	idxSeq := maxSeq + 1
-	// Open a new WAL file for the same epoch (starting fresh) and update
-	// the manifest with walOffset = 0.
-	newWAL, err := openExactWAL(exactWALPath(i.persistence.dir, uint64(manifest.walEpoch)), int(i.config.MaxBatchEntries))
-	if err != nil {
-		return err
-	}
-	// Update manifest: walOffset = 0, keep same walEpoch.
-	manifest.walOffset = 0
-	if err := persist.WriteManifest(i.persistence.dir, encodeManifest(manifest)); err != nil {
-		_ = newWAL.Close()
-		return err
-	}
-	// Replace the WAL and advance sequence counter.
-	_ = i.persistence.wal.Close()
-	i.persistence.wal = newWAL
-	i.persistence.walEpoch = uint64(manifest.walEpoch)
-	i.seq.Store(idxSeq)
-	return nil
-}
-
-// WaitIdle returns immediately; there is no background work to drain.
+// WaitIdle returns immediately; every queued batch has a waiting owner, so
+// there is no detached background work to drain.
 func (i *ExactIndex) WaitIdle(_ context.Context) error { return nil }
 
-// Close marks the index closed, drains readers, and releases the WAL and mmap
-// regions. Further Apply calls return ErrClosed; reads return zero values.
+// WriteStats returns the total publications and the number of batches
+// coalesced into shared publications since construction. Consecutive
+// concurrent Applies sharing one WAL append and one view publish show up as
+// coalesced batches.
+func (i *ExactIndex) WriteStats() (publishes, coalesced uint64) {
+	return i.publishes.Load(), i.coalesced.Load()
+}
+
+// Close marks the index closed, stops the writer loop (queued batches fail
+// with ErrClosed), drains readers, and releases the WAL and mmap regions.
+// Further Apply calls return ErrClosed; reads return zero values.
 func (i *ExactIndex) Close() error {
-	i.writerMu.Lock()
-	defer i.writerMu.Unlock()
-	if i.closed.Swap(true) {
-		return nil
-	}
-	i.readers.WaitForPriorReaders()
-	return i.persistence.close()
+	var closeErr error
+	i.closeOnce.Do(func() {
+		i.lifecycle.Lock()
+		defer i.lifecycle.Unlock()
+		i.closed.Store(true)
+		close(i.stop)
+		i.workers.Wait()
+		i.readers.WaitForPriorReaders()
+		closeErr = i.persistence.close()
+	})
+	return closeErr
 }

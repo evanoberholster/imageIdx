@@ -15,15 +15,24 @@ import (
 
 const (
 	manifestMagic      uint32 = 0x54534d46 // TSMF
-	manifestVersion    uint16 = 2
-	manifestSize              = 80
+	manifestVersion    uint16 = 3
+	manifestSize              = 88
 	directoryEntrySize        = 64
 	storageAlignment          = 4_096
 	formatAlignment           = 8
-	walFilename               = "timestamp.wal"
+	walPattern                = "timestamp-%020d.wal"
+	walGlob                   = "timestamp-*.wal"
 )
 
 var ErrCorruptManifest = errors.New("timeidx: corrupt manifest")
+
+// walPath names the WAL for one epoch. Epochs make WAL rotation crash-safe:
+// the manifest references (epoch, offset), the old file is removed only
+// after the new root is durable, and a crash on either side of publication
+// leaves a replayable root behind.
+func walPath(dir string, epoch uint64) string {
+	return filepath.Join(dir, fmt.Sprintf(walPattern, epoch))
+}
 
 type diskManifest struct {
 	generation uint64
@@ -35,6 +44,7 @@ type diskManifest struct {
 	walOffset  int64
 	blockCount uint64
 	flags      uint32
+	walEpoch   uint64
 }
 
 type persistentState struct {
@@ -42,6 +52,7 @@ type persistentState struct {
 	dir        string
 	durability Durability
 	wal        *timestampWAL
+	walEpoch   uint64
 	mappings   [][]byte
 }
 
@@ -58,12 +69,12 @@ func NewPersistent(storeDir string, spec Spec, config Config, durability Durabil
 	if err != nil {
 		return nil, err
 	}
-	wal, err := openTimestampWAL(filepath.Join(storeDir, walFilename), config.DeltaCapacity)
+	wal, err := openTimestampWAL(walPath(storeDir, 1), config.DeltaCapacity)
 	if err != nil {
 		_ = index.Close()
 		return nil, err
 	}
-	index.persistence = &persistentState{dir: storeDir, durability: durability, wal: wal}
+	index.persistence = &persistentState{dir: storeDir, durability: durability, wal: wal, walEpoch: 1}
 	if err = index.Checkpoint(); err != nil {
 		_ = index.Close()
 		return nil, err
@@ -146,6 +157,7 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 		config:        config,
 		writes:        make(chan *Batch, config.WriteQueueCapacity),
 		barriers:      make(chan chan barrierResult),
+		rotate:        make(chan rotateRequest),
 		compactions:   make(chan compactionTask, max(config.CompactionQueue, len(directory.entries))),
 		compactDone:   make(chan compactionResult, max(config.CompactionQueue, len(directory.entries))),
 		stop:          make(chan struct{}),
@@ -153,6 +165,7 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 		writerTouched: make([]int, 0, 256),
 		persistence: &persistentState{
 			dir: storeDir, durability: durability,
+			walEpoch: manifest.walEpoch,
 			mappings: [][]byte{markersMapping, idsMapping},
 		},
 	}
@@ -163,7 +176,7 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 	go index.writerLoop()
 	go index.compactorLoop()
 
-	recovered, err := replayWAL(filepath.Join(storeDir, walFilename), manifest.walOffset)
+	recovered, err := replayWAL(walPath(storeDir, manifest.walEpoch), manifest.walOffset)
 	if err != nil {
 		_ = index.Close()
 		return nil, err
@@ -187,7 +200,7 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 			start = end
 		}
 	}
-	wal, err := openTimestampWAL(filepath.Join(storeDir, walFilename), config.DeltaCapacity)
+	wal, err := openTimestampWAL(walPath(storeDir, manifest.walEpoch), config.DeltaCapacity)
 	if err != nil {
 		_ = index.Close()
 		return nil, err
@@ -306,6 +319,7 @@ func (i *Index) Checkpoint() error {
 		walOffset:  barrier.walOffset,
 		blockCount: uint64(len(diskEntries)),
 		flags:      i.flags,
+		walEpoch:   i.persistence.walEpoch,
 	}
 	if err = writeManifestAtomic(i.persistence.dir, manifest); err != nil {
 		return err
@@ -315,9 +329,142 @@ func (i *Index) Checkpoint() error {
 	return nil
 }
 
-// Vacuum currently publishes a checkpoint; generation retention remains a
-// storage-owner policy.
-func (i *Index) Vacuum() error { return i.Checkpoint() }
+// Vacuum publishes a checkpoint, rolls the WAL to a fresh epoch carrying
+// over the post-checkpoint tail, and removes obsolete generations and WAL
+// epochs. Writers stall briefly on the lifecycle lock; readers never block.
+// Mappings are left alone: live views alias them, so only Close releases
+// them. Generation retention beyond the published generation remains a
+// storage-owner policy exercised by calling Vacuum.
+func (i *Index) Vacuum() error {
+	if i.persistence == nil || i.persistence.wal == nil {
+		return ErrNotPersistent
+	}
+	if i.closed.Load() {
+		return ErrClosed
+	}
+	if err := i.Checkpoint(); err != nil {
+		return err
+	}
+	// Exclusive lock blocks new Apply/Checkpoint calls. Batches already
+	// queued in the writer loop still drain, which is safe: the rotation
+	// request travels through the writerLoop itself, so batches handled
+	// before the swap land in the copied tail and batches after it append
+	// to the new epoch.
+	i.lifecycle.Lock()
+	defer i.lifecycle.Unlock()
+	if i.closed.Load() {
+		return ErrClosed
+	}
+	i.persistence.mu.Lock()
+	manifest, err := readManifest(filepath.Join(i.persistence.dir, "manifest"))
+	if err != nil {
+		i.persistence.mu.Unlock()
+		return err
+	}
+	epoch := manifest.walEpoch + 1
+	i.persistence.mu.Unlock()
+
+	result := make(chan rotateResult, 1)
+	select {
+	case i.rotate <- rotateRequest{oldEpoch: manifest.walEpoch, epoch: epoch, fromOffset: manifest.walOffset, result: result}:
+	case <-i.stop:
+		return ErrClosed
+	}
+	if res := <-result; res.err != nil {
+		_ = os.Remove(walPath(i.persistence.dir, epoch))
+		return res.err
+	}
+
+	i.persistence.mu.Lock()
+	defer i.persistence.mu.Unlock()
+	manifest.walOffset = 0
+	manifest.walEpoch = epoch
+	if err := writeManifestAtomic(i.persistence.dir, manifest); err != nil {
+		return err
+	}
+	i.persistence.walEpoch = epoch
+	markersPath, idsPath, blocksPath := generationPaths(i.persistence.dir, manifest.generation)
+	if err := persist.RemoveObsolete(i.persistence.dir, "markers.*.base", markersPath); err != nil {
+		return err
+	}
+	if err := persist.RemoveObsolete(i.persistence.dir, "ids.*.base", idsPath); err != nil {
+		return err
+	}
+	if err := persist.RemoveObsolete(i.persistence.dir, "blocks.*.idx", blocksPath); err != nil {
+		return err
+	}
+	if err := persist.RemoveObsolete(i.persistence.dir, walGlob, walPath(i.persistence.dir, epoch)); err != nil {
+		return err
+	}
+	matches, _ := filepath.Glob(filepath.Join(i.persistence.dir, "*.tmp"))
+	for _, path := range matches {
+		_ = os.Remove(path)
+	}
+	return nil
+}
+
+// rotateWAL runs on the writerLoop goroutine, the sole WAL appender: it
+// copies the complete tail frames at and after fromOffset of the old epoch
+// into a fresh epoch file and swaps the live WAL handle. Callers publish a
+// manifest referencing (epoch, 0) only after this returns success; a crash
+// before that leaves the old manifest and old WAL authoritative, a crash
+// after it leaves a trivially consistent new epoch.
+func (i *Index) rotateWAL(req rotateRequest) rotateResult {
+	oldPath := walPath(i.persistence.dir, req.oldEpoch)
+	newPath := walPath(i.persistence.dir, req.epoch)
+	end, err := replayWALEnd(oldPath, req.fromOffset)
+	if err != nil {
+		return rotateResult{err: err}
+	}
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		return rotateResult{err: err}
+	}
+	if req.fromOffset < 0 || end < req.fromOffset || end > int64(len(data)) {
+		return rotateResult{err: ErrCorruptWAL}
+	}
+	file, err := os.OpenFile(newPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return rotateResult{err: err}
+	}
+	if _, err = file.Write(data[req.fromOffset:end]); err != nil {
+		_ = file.Close()
+		return rotateResult{err: err}
+	}
+	if err = file.Sync(); err != nil {
+		_ = file.Close()
+		return rotateResult{err: err}
+	}
+	if err = file.Close(); err != nil {
+		return rotateResult{err: err}
+	}
+	wal, err := openTimestampWAL(newPath, i.config.DeltaCapacity)
+	if err != nil {
+		return rotateResult{err: err}
+	}
+	old := i.persistence.wal
+	i.persistence.wal = wal
+	_ = old.Close()
+	return rotateResult{}
+}
+
+// OnDiskBytes reports the bytes held by generation files, WAL files, and
+// the manifest.
+func (i *Index) OnDiskBytes() uint64 {
+	if i.persistence == nil {
+		return 0
+	}
+	var total uint64
+	for _, pattern := range []string{"markers.*.base", "ids.*.base", "blocks.*.idx", walGlob, "manifest"} {
+		matches, _ := filepath.Glob(filepath.Join(i.persistence.dir, pattern))
+		for _, path := range matches {
+			if info, err := os.Stat(path); err == nil {
+				total += uint64(info.Size())
+			}
+		}
+	}
+	return total
+}
 
 func snapshotBase(view *blockView) *base {
 	for {
@@ -467,7 +614,7 @@ func writeManifestAtomic(dir string, manifest diskManifest) error {
 }
 
 func encodeManifest(manifest diskManifest) []byte {
-	return persist.BuildManifest(manifestSize, manifestMagic, manifestVersion, 76, 76, func(data []byte) {
+	return persist.BuildManifest(manifestSize, manifestMagic, manifestVersion, 84, 84, func(data []byte) {
 		data[6] = TimestampShift
 		binary.LittleEndian.PutUint64(data[8:16], manifest.generation)
 		binary.LittleEndian.PutUint64(data[16:24], manifest.indexID)
@@ -478,6 +625,7 @@ func encodeManifest(manifest diskManifest) []byte {
 		binary.LittleEndian.PutUint64(data[56:64], uint64(manifest.walOffset))
 		binary.LittleEndian.PutUint64(data[64:72], manifest.blockCount)
 		binary.LittleEndian.PutUint32(data[72:76], manifest.flags)
+		binary.LittleEndian.PutUint64(data[76:84], manifest.walEpoch)
 	})
 }
 
@@ -486,13 +634,13 @@ func readManifest(path string) (diskManifest, error) {
 	if err != nil {
 		return diskManifest{}, err
 	}
-	if err := persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 76, 76); err != nil {
+	if err := persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 84, 84); err != nil {
 		return diskManifest{}, ErrCorruptManifest
 	}
 	if data[6] != TimestampShift {
 		return diskManifest{}, ErrCorruptManifest
 	}
-	return diskManifest{
+	manifest := diskManifest{
 		generation: binary.LittleEndian.Uint64(data[8:16]),
 		indexID:    binary.LittleEndian.Uint64(data[16:24]),
 		count:      binary.LittleEndian.Uint64(data[24:32]),
@@ -502,5 +650,10 @@ func readManifest(path string) (diskManifest, error) {
 		walOffset:  int64(binary.LittleEndian.Uint64(data[56:64])),
 		blockCount: binary.LittleEndian.Uint64(data[64:72]),
 		flags:      binary.LittleEndian.Uint32(data[72:76]),
-	}, nil
+		walEpoch:   binary.LittleEndian.Uint64(data[76:84]),
+	}
+	if manifest.generation == 0 || manifest.walOffset < 0 || manifest.walEpoch == 0 {
+		return diskManifest{}, ErrCorruptManifest
+	}
+	return manifest, nil
 }

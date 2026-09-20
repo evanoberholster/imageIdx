@@ -28,6 +28,34 @@ func benchmarkEnumField(tb testing.TB, values int, perValue int) (*FieldIndex, [
 	return index, names
 }
 
+// benchmarkEnumIntersectionField mirrors the legacy And4 fixture: each value
+// has its own arithmetic ID set, and one image may carry all four values.
+func benchmarkEnumIntersectionField(tb testing.TB) (*FieldIndex, []Value) {
+	tb.Helper()
+	index, err := NewFieldIndex(enumField(IndexTypeTag), FieldConfig{})
+	if err != nil {
+		tb.Fatalf("NewFieldIndex: %v", err)
+	}
+	tb.Cleanup(func() { _ = index.Close() })
+	const values, perValue = 4, 20_000
+	names := make([]Value, values)
+	entries := make([]Entry, 0, values*perValue)
+	for value := 0; value < values; value++ {
+		names[value] = StringValue(fmt.Sprintf("value-%d", value))
+		for n := 0; n < perValue; n++ {
+			id := n*(value+1) + value
+			if id == 0 { // ImageID zero is reserved by the field API.
+				continue
+			}
+			entries = append(entries, Entry{ImageID: ImageID(id), Value: names[value]})
+		}
+	}
+	if err := index.Add(entries...); err != nil {
+		tb.Fatalf("Add: %v", err)
+	}
+	return index, names
+}
+
 func BenchmarkFieldContainsKey(b *testing.B) {
 	index, _ := benchmarkEnumField(b, 1, 100_000)
 	key := hashCanonical(IndexTypeTag, KindEnum, []byte("value-0"))
@@ -49,7 +77,7 @@ func BenchmarkFieldContainsValue(b *testing.B) {
 }
 
 func BenchmarkFieldMatch4(b *testing.B) {
-	index, names := benchmarkEnumField(b, 4, 20_000)
+	index, names := benchmarkEnumIntersectionField(b)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -139,7 +167,7 @@ func BenchmarkFieldRange(b *testing.B) {
 }
 
 func BenchmarkFieldFilter(b *testing.B) {
-	index, names := benchmarkEnumField(b, 4, 20_000)
+	index, names := benchmarkEnumIntersectionField(b)
 	candidates := make([]ImageID, 10_000)
 	for n := range candidates {
 		candidates[n] = ImageID(n*7 + 1)
@@ -254,7 +282,7 @@ func BenchmarkFieldApplyChannel8(b *testing.B) {
 // Compiled queries resolve values once and execute repeatedly.
 
 func BenchmarkCompiledMatch4(b *testing.B) {
-	index, names := benchmarkEnumField(b, 4, 20_000)
+	index, names := benchmarkEnumIntersectionField(b)
 	compiled, err := index.Compile(names...)
 	if err != nil {
 		b.Fatal(err)
@@ -284,7 +312,7 @@ func BenchmarkCompiledCount4(b *testing.B) {
 }
 
 func BenchmarkCompiledFilter(b *testing.B) {
-	index, names := benchmarkEnumField(b, 4, 20_000)
+	index, names := benchmarkEnumIntersectionField(b)
 	compiled, err := index.Compile(names...)
 	if err != nil {
 		b.Fatal(err)

@@ -32,6 +32,7 @@ type Index struct {
 
 	writes        chan *Batch
 	barriers      chan chan barrierResult
+	rotate        chan rotateRequest
 	compactions   chan compactionTask
 	compactDone   chan compactionResult
 	stop          chan struct{}
@@ -82,6 +83,7 @@ func New(spec Spec, config Config) (*Index, error) {
 		config:        config,
 		writes:        make(chan *Batch, config.WriteQueueCapacity),
 		barriers:      make(chan chan barrierResult),
+		rotate:        make(chan rotateRequest),
 		compactions:   make(chan compactionTask, max(config.CompactionQueue, len(directory.entries))),
 		compactDone:   make(chan compactionResult, max(config.CompactionQueue, len(directory.entries))),
 		stop:          make(chan struct{}),

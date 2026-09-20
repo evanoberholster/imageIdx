@@ -516,6 +516,61 @@ func errf(format string, args ...interface{}) error {
 	return testError(fmt.Sprintf(format, args...))
 }
 
+func TestFlattenBatchesPreservesArrivalOrder(t *testing.T) {
+	b1 := &exactBatch{
+		adds:    []ExactEntry{{Hash: makeHash(2), ImageID: 2}},
+		removes: []ExactEntry{{Hash: makeHash(9), ImageID: 9}},
+		done:    make(chan error, 1),
+	}
+	b2 := &exactBatch{adds: []ExactEntry{{Hash: makeHash(1), ImageID: 1}}, done: make(chan error, 1)}
+	adds, removes := flattenBatches([]*exactBatch{b1, b2})
+	if len(adds) != 2 || adds[0].ImageID != 2 || adds[1].ImageID != 1 {
+		t.Fatalf("adds arrival order = %v, want [2 1]", adds)
+	}
+	if len(removes) != 1 || removes[0].ImageID != 9 {
+		t.Fatalf("removes = %v, want [9]", removes)
+	}
+}
+
+// TestConcurrentAppliesStayLinearizable hammers Apply from many goroutines:
+// every mutation must be visible on return, and the publish/coalesced
+// counters must account for exactly one batch per call.
+func TestConcurrentAppliesStayLinearizable(t *testing.T) {
+	idx := mustNewExactIndex(t, nil, ExactConfig{})
+	const writers, perWriter = 32, 25
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for k := 0; k < perWriter; k++ {
+				n := uint64(w*perWriter + k + 1)
+				if err := idx.Apply(Mutation{Add: []ExactEntry{{Hash: makeHash(n), ImageID: ImageID(n)}}}); err != nil {
+					t.Errorf("apply %d: %v", n, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	for n := uint64(1); n <= writers*perWriter; n++ {
+		if got := idx.Lookup(nil, makeHash(n)); len(got) != 1 || got[0] != ImageID(n) {
+			t.Fatalf("lookup %d = %v, want [%d]", n, got, n)
+		}
+	}
+	publishes, coalesced := idx.WriteStats()
+	t.Logf("publishes=%d coalesced=%d for %d calls", publishes, coalesced, writers*perWriter)
+	if publishes == 0 {
+		t.Fatal("no publications recorded")
+	}
+	if publishes+coalesced != writers*perWriter {
+		t.Fatalf("publishes(%d)+coalesced(%d) != calls(%d)", publishes, coalesced, writers*perWriter)
+	}
+	if err := checkViewInvariants(t, idx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAlgorithmsBehaveEquivalently(t *testing.T) {
 	payloads := []string{"alpha", "beta", "alpha", "gamma"}
 	for _, algo := range []Algorithm{AlgorithmSHA256, AlgorithmBLAKE3} {

@@ -20,14 +20,24 @@ const (
 
 // Snapshot entry (64 bytes): Type u16, Slot u16, reserved u32, Hash u64,
 // cardinality u64, bitmap offset/length u64, canonical offset/length u64,
-// reserved u64. All offsets are absolute. Zero-cardinality dictionary values
-// have no bitmap. Numeric/geo entries have no canonical bytes.
+// reserved u64. All offsets are absolute file offsets. Zero-cardinality
+// dictionary values persist with no bitmap so the value survives
+// checkpoints; numeric and geo entries persist with no canonical bytes.
+// Entries sort strictly by FieldKey with no gaps in the payload.
 type fieldSnapshotEntry struct {
 	key       FieldKey
 	posting   *posting
 	canonical []byte
 }
 
+// writeFieldSegment checkpoints effective postings and the dictionary to
+// path with generation gen. Vacuum drops dead dictionary values; plain
+// checkpoints preserve them. Layout: 64-byte header, registry, 64-byte
+// directory, then 4K-aligned payload. Bitmaps marshal per posting (tiny
+// postings materialize), canonical bytes follow each bitmap, each padded
+// to 8. The header CRC covers the header prefix and the payload CRC covers
+// everything after the header, so the fresh file re-reads once for
+// integrity before Sync. Temporary files must be renamed by the caller.
 func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bool) error {
 	registry := NewRegistry()
 	var entries []fieldSnapshotEntry
@@ -70,7 +80,7 @@ func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bo
 		return err
 	}
 	defer f.Close()
-	if err := indexutil.WriteFull(f, make([]byte, payloadOffset)); err != nil {
+	if err := writeZeros(f, payloadOffset); err != nil {
 		return err
 	}
 	position := payloadOffset
@@ -99,8 +109,11 @@ func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bo
 		}
 		position += uint64(len(entry.canonical))
 		pad := indexutil.Align(position, 8) - position
-		if err := indexutil.WriteFull(f, make([]byte, pad)); err != nil {
-			return err
+		if pad != 0 {
+			var zeros [8]byte
+			if err := indexutil.WriteFull(f, zeros[:pad]); err != nil {
+				return err
+			}
 		}
 		position += pad
 	}
@@ -132,6 +145,32 @@ func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bo
 	return f.Sync()
 }
 
+// writeZeros reserves n zero bytes with a small stack buffer instead of
+// one huge allocation, so large headers and directories do not spike the
+// heap on checkpoint.
+func writeZeros(f *os.File, n uint64) error {
+	var zeros [32 << 10]byte
+	for n > 0 {
+		chunk := uint64(len(zeros))
+		if chunk > n {
+			chunk = n
+		}
+		if err := indexutil.WriteFull(f, zeros[:chunk]); err != nil {
+			return err
+		}
+		n -= chunk
+	}
+	return nil
+}
+
+// openFieldSegment validates and memory-maps a checkpoint written by
+// writeFieldSegment. It checks magic, version, generation, header and
+// payload CRCs, registry shape, directory bounds and alignment, strict
+// key ordering, contiguous 8-aligned payload offsets, cardinality
+// agreement, hash agreement for hashed kinds, and geo key validity, with
+// no trailing bytes. Bitmaps and canonical values alias the mapping for
+// zero-copy reads; files past 4GB split values into extra chunks because
+// dictionary offsets are u32.
 func openFieldSegment(path string, gen uint64, config FieldConfig) ([]*FieldIndex, []byte, error) {
 	mapping, err := persist.MapFile(path, ErrCorruptSegment)
 	if err != nil {

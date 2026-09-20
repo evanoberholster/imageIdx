@@ -6,11 +6,11 @@ immutable zero-copy bitmap representation, used directly by the logical
 indexes in `bitmapidx`, `timeidx`, and `vectoridx`. The `search` package
 compiles and executes queries across them.
 
-- `bitmapidx` provides persistent caller-keyed predicate sets and an in-memory
-  unified field index for enum, bool, text, continuous and geo values.
+- `bitmapidx` provides persistent typed fields for enum, bool, text, continuous
+  and geo values.
 - `timeidx` indexes timestamps for range search.
 - `vectoridx` indexes fixed-dimension embeddings with persistent HNSW ANN search.
-- `search` combines bitmap, timestamp and geographic clauses with AND
+- `search` combines field, timestamp and geographic clauses with AND
   semantics.
 
 Pre-v1 note: `timestamp` and `geoindex` were renamed to `timeidx` and
@@ -112,82 +112,9 @@ if err := persistent.Vacuum(); err != nil {
 }
 ```
 
-## Bitmap index (predicate sets)
-
-The `bitmapidx` package implements the immutable snapshot design documented in
-`AGENTS/BitmapIndex.md`:
-
-- database-wide `uint64` image IDs and fixed-width predicate keys;
-- lock-free reads through one atomic immutable view per bitmap;
-- atomic batch additions/removals with Base + Frozen + Active bounds;
-- background copy-on-write compaction and internal reader-safe reclamation;
-- Base-cardinality AND planning and delta-correct AND/OR execution;
-- lock-free immutable key/ID directories;
-- page-aligned packed sroar segments with checksums and mmap reopen;
-- a global checksummed batch WAL, atomic manifests, checkpoints, and vacuum.
-
-```go
-paris, err := bitmapidx.New(
-	bitmapidx.Spec{
-		Key: bitmapidx.Key{Type: bitmapidx.IndexTypeLocation, ValueID: 10},
-		IndexID: 1,
-		IDs: []imageidx.ImageID{100, 200},
-	},
-	bitmapidx.Config{},
-)
-if err != nil {
-	log.Fatal(err)
-}
-defer paris.Close()
-
-if err := paris.Apply(bitmapidx.Mutation{
-	Add: []imageidx.ImageID{300, 400},
-}); err != nil {
-	log.Fatal(err)
-}
-matches := paris.AppendTo(nil)
-```
-
-For persistence, one `Store` owns a directory of predicates, a packed
-checksummed segment generation, and a global batch WAL. `Apply` is atomic per
-batch, `Checkpoint` publishes a new mmap generation, and `Vacuum` reclaims
-obsolete generations:
-
-```go
-store, err := bitmapidx.NewPersistent(
-	"./data/bitmaps",
-	[]bitmapidx.Spec{{
-		Key:     bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 10},
-		IndexID: 1,
-		IDs:     []imageidx.ImageID{100, 200},
-	}},
-	bitmapidx.Config{},
-	imageidx.DurabilityOS,
-)
-if err != nil {
-	log.Fatal(err)
-}
-defer store.Close()
-
-key := bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 10}
-if err := store.Apply(key, bitmapidx.Mutation{Add: []imageidx.ImageID{300}}); err != nil {
-	log.Fatal(err)
-}
-if err := store.Checkpoint(); err != nil {
-	log.Fatal(err)
-}
-if err := store.Vacuum(); err != nil {
-	log.Fatal(err)
-}
-```
-
-Reopen with `bitmapidx.OpenPersistent`, which maps the published generation and
-replays the WAL tail.
-
 ## Field index (enum, bool, text, continuous, geo)
 
-`bitmapidx` also provides an in-memory unified field index for metadata that
-does not fit a caller-assigned numeric predicate ID. One `FieldIndex` holds one
+`bitmapidx` provides a unified typed field index. One `FieldIndex` holds one
 field and supports five value shapes:
 
 | Kind | Values | Query |
@@ -202,8 +129,7 @@ Values are identified by a 64-bit xxh3 hash. Rare hash collisions claim a
 dictionary slot, so distinct values never share membership. The built-in Latin
 analyzer lowercases, accent-folds and tokenizes text.
 
-Declare fields as values and optionally validate or persist the definitions in
-a `Registry`:
+Declare fields as values and persist the registry with `NewPersistentFields`:
 
 ```go
 const (
@@ -232,6 +158,31 @@ title := bitmapidx.Field{
 
 registry := bitmapidx.NewRegistry()
 if err := registry.Register(tag, focal, title); err != nil {
+	log.Fatal(err)
+}
+```
+
+Create or reopen the persistent field store with `NewPersistentFields` and
+`OpenPersistentFields`. The store owns the field handles and their WAL; callers
+must close the store rather than individual fields:
+
+```go
+store, err := bitmapidx.NewPersistentFields(
+	"./data/fields", []bitmapidx.Field{tag, focal, title},
+	bitmapidx.FieldConfig{}, imageidx.DurabilityOS,
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer store.Close()
+
+tags, _ := store.Lookup(bitmapidx.IndexTypeTag)
+if err := tags.Add(bitmapidx.Entry{
+	ImageID: 100, Value: bitmapidx.StringValue("Trekking"),
+}); err != nil {
+	log.Fatal(err)
+}
+if err := store.Checkpoint(); err != nil {
 	log.Fatal(err)
 }
 ```
@@ -402,10 +353,11 @@ if err := tags.Vacuum(); err != nil {
 }
 ```
 
-Field indexes are in-memory only; persistence for the field model is not
-implemented yet. Geo fields are accepted as `search` clauses through
-`search.WithinCells`; enum, bool, text and continuous fields are queried
-directly and combined in the caller.
+`OpenPersistentFields` restores the persisted registry, mmap snapshot and WAL
+tail. `Checkpoint` publishes a new snapshot; `Vacuum` also removes obsolete
+generations and dead dictionary values. Field query results are immutable
+`roar.Bitmap` values. Mutable bitmaps are reserved for transient `search`
+workspace accumulation.
 
 ## Geographic index
 
@@ -462,8 +414,8 @@ cross-cell insert without `From` is caller discipline.
 allocation-free path; `Nearest` returns exact top-K using a caller-supplied
 coordinate lookup. Allocation behavior inside the caller-supplied region's
 `IntersectsCell` and `ContainsCell` methods remains the responsibility of that
-region implementation. Geo fields are in-memory like the other field kinds;
-persistence arrives with the field store.
+region implementation. Geo fields use the same persistent `FieldStore` as the
+other field kinds.
 
 ## Vector index
 
@@ -513,11 +465,10 @@ scratch for zero steady-state allocations.
 
 ## Combined search
 
-The `search` package compiles and executes clauses across the bitmap,
-timestamp and geographic indexes. Every clause is combined with AND semantics:
+The `search` package compiles and executes clauses across field, timestamp and
+geographic indexes. Every clause is combined with AND semantics:
 
-- all bitmap indexes must contain the image (`AllBitmaps` clauses merge into
-  one group);
+- all field clauses must contain the image;
 - every timestamp range must contain the image (lossy-only ranges on the same
   index coalesce by intersection; each `ExactTimestamp` range is separate);
 - every geographic range set must contain the image.
@@ -536,7 +487,8 @@ if err != nil {
 }
 
 plan, err := search.Compile(
-	search.AllBitmaps(paris, favorites),
+	search.FieldValues(tags, bitmapidx.StringValue("Trekking")),
+	search.FieldValues(favorites, bitmapidx.StringValue("favorite")),
 	search.During(
 		timeIndex,
 		start,
@@ -561,7 +513,7 @@ executes them immediately:
 
 ```go
 matches, err := search.Search(nil,
-	search.AllBitmaps(paris, favorites),
+	search.FieldValues(tags, bitmapidx.StringValue("Trekking")),
 	search.During(timeIndex, start, end),
 	geoClause,
 )
@@ -574,8 +526,7 @@ the combined search path performs zero heap allocations.
 A `Plan` exposes several execution shapes over the same compiled stages:
 
 ```go
-// Count matches without materializing IDs (bitmap-only plans skip
-// materialization via bitmapidx.Count).
+// Count matches without retaining IDs.
 count := plan.Count(workspace)
 
 // Stop after N sorted matches (truncation, not ranking).
@@ -607,13 +558,11 @@ batch := service.AcquireBatch() // sized for the plan's timestamp writer
 service.ReleaseBatch(batch)
 ```
 
-Clauses are conjunctive: `search.AllBitmaps` takes one or more `bitmapidx`
-predicate indexes, `search.During` a half-open timestamp range (optionally with
-`search.ExactTimestamp`), and `search.WithinCells` a `KindGeo` field index plus
-one or more S2 cell IDs. `WithinCells` is the only clause constructor that
-returns an error. Enum, bool, text and continuous field indexes are not
-yet clause sources; query them directly and combine results in the caller.
-`vectoridx` is not a clause source either.
+Clauses are conjunctive: `search.FieldValues`, `search.FieldText` and
+`search.FieldRange` query typed fields; `search.During` handles a half-open
+timestamp range (optionally with `search.ExactTimestamp`); and
+`search.WithinCells` queries a `KindGeo` field. `WithinCells` is the only clause
+constructor that returns an error. `vectoridx` is not a clause source.
 
 Timestamp ranges use the timestamp index's compressed candidate semantics.
 Add `search.ExactTimestamp` when exact boundary filtering is required; only
@@ -631,16 +580,14 @@ standalone index APIs. `search.Compile` and `search.Search` return
 `search.ErrEmptyQuery` when no clauses are supplied and `search.ErrInvalidClause`
 for a missing index.
 
-Reader lifetime tracking is automatic. Every index read registers with its
-own internal tracker, and `Close` waits for reads that could still reference
-retired or mmap-backed state. Callers create indexes with `New`, call search
-methods normally, and only need to `defer index.Close()`; no per-query guard is
-part of the public API. Bitmap indexes opened from one persistent `Store` share
-one private tracker, so a multi-bitmap search registers once for that store.
+Reader lifetime tracking is automatic. Every field read registers with its
+internal tracker, and `FieldStore.Close` waits for reads that could still
+reference retired or mmap-backed state. Callers open one persistent
+`FieldStore`, obtain fields with `Lookup`, and close the store after use.
 
 ## Runnable command
 
-`cmd/imageidx` constructs a small compatible bitmap, timestamp, and geographic
+`cmd/imageidx` constructs a small compatible field, timestamp, and geographic
 index set. Its default one-shot mode executes `search.Search` once and prints a
 JSON result:
 

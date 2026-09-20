@@ -11,8 +11,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 
-	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
 	"github.com/evanoberholster/imageIdx/search"
 	"github.com/evanoberholster/imageIdx/timeidx"
@@ -21,15 +21,28 @@ import (
 const quantum = uint64(1) << timeidx.TimestampShift
 
 func main() {
-	favorites, err := bitmapidx.New(bitmapidx.Spec{
-		Key:     bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1},
-		IndexID: 1,
-		IDs:     []imageidx.ImageID{100, 200, 300},
-	}, bitmapidx.Config{})
+	fieldDir, err := os.MkdirTemp("", "imageidx-fields-")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer favorites.Close()
+	fields, err := bitmapidx.NewPersistentFields(fieldDir, []bitmapidx.Field{{
+		Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
+	}}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = fields.Close(); _ = os.RemoveAll(fieldDir) }()
+	favorites, ok := fields.Lookup(bitmapidx.IndexTypeTag)
+	if !ok {
+		log.Fatal("tag field missing")
+	}
+	if err := favorites.Add(
+		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("favorite")},
+	); err != nil {
+		log.Fatal(err)
+	}
 
 	times, err := timeidx.New(timeidx.Spec{
 		IndexID: 2,
@@ -45,7 +58,7 @@ func main() {
 	defer times.Close()
 
 	plan, err := search.Compile(
-		search.AllBitmaps(favorites),
+		search.FieldValues(favorites, bitmapidx.StringValue("favorite")),
 		search.During(times, quantum, 3*quantum),
 	)
 	if err != nil {

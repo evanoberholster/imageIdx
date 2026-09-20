@@ -1,5 +1,5 @@
-// Package search plans and executes conjunctive queries across bitmap, geo,
-// and timestamp indexes.
+// Package search plans and executes conjunctive queries across field, geo, and
+// timestamp indexes.
 //
 // Geographic clauses accept S2 cell IDs through WithinCells; they do not
 // accept latitude/longitude bounds. Reused plans, result buffers, and

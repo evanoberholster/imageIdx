@@ -4,12 +4,12 @@ import (
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
-// Query is a compiled, reusable field conjunction. Values are canonicalized,
-// hashed, deduplicated and dictionary-resolved once at Compile time; each
-// execution reads the index's current published view, so writes made after
-// compiling are visible without recompiling. A Query is safe for concurrent
-// use; it holds no query scratch. The zero value is valid and matches
-// nothing.
+// Query is a compiled, reusable field conjunction. Values are
+// canonicalized, hashed, deduplicated, and dictionary-resolved once at
+// Compile time; each execution reads the index's current published view,
+// so writes made after compiling are visible without recompiling. A Query
+// is safe for concurrent use and holds no query scratch: execution uses
+// pooled buffers internally. The zero value is valid and matches nothing.
 type Query struct {
 	index    *FieldIndex
 	keys     []FieldKey
@@ -19,11 +19,12 @@ type Query struct {
 	complete bool
 }
 
-// Compile resolves values to a reusable Query with AND semantics: execution
-// matches images holding every value. An empty value list compiles to a Query
-// that matches nothing, mirroring MatchValues, as does compiling against a
-// closed index. Values absent from the dictionary resolve lazily at
-// execution, so images added after compiling are visible without recompiling.
+// Compile resolves values to a reusable Query with AND semantics:
+// execution matches images holding every value. An empty value list
+// compiles to a Query that matches nothing, mirroring MatchValues, as does
+// compiling against a closed index. Values absent from the dictionary keep
+// their base hash and canonical bytes and resolve lazily at execution, so
+// images added after compiling are visible without recompiling.
 func (i *FieldIndex) Compile(values ...Value) (Query, error) {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
@@ -45,8 +46,10 @@ func (i *FieldIndex) Compile(values ...Value) (Query, error) {
 	return q, nil
 }
 
-// CompileText analyzes query text once and compiles the resulting tokens.
-// Execution needs no analyzer and allocates no tokens.
+// CompileText analyzes query text once and compiles the resulting tokens
+// with AND semantics. Execution needs no analyzer and allocates no
+// tokens. A query producing no tokens compiles to a Query that matches
+// nothing.
 func (i *FieldIndex) CompileText(query string) (Query, error) {
 	if i.Field().Kind != KindText {
 		return Query{}, ErrFieldMismatch
@@ -65,10 +68,12 @@ func (i *FieldIndex) CompileText(query string) (Query, error) {
 	return i.Compile(values...)
 }
 
-// resolve returns the execution keys. Fully resolved queries reuse their keys
-// while the dictionary is unchanged; otherwise every value re-resolves
-// against the current view. ok is false when a hashed value no longer
-// resolves, which empties the conjunction.
+// resolve returns the execution keys for a view. Fully resolved queries
+// reuse their keys while the dictionary generation is unchanged; otherwise
+// every value re-resolves against the current view by base hash plus
+// canonical bytes. ok is false when a hashed value no longer resolves,
+// which empties the conjunction. Continuous values carry no canonical
+// bytes and pass through directly.
 func (q Query) resolve(view *fieldView) ([]FieldKey, bool) {
 	if len(q.bases) == 0 {
 		return nil, true
@@ -93,7 +98,8 @@ func (q Query) resolve(view *fieldView) ([]FieldKey, bool) {
 	return keys, true
 }
 
-// Match returns images holding every compiled value.
+// Match returns the images holding every compiled value, sorted and
+// unique. Store-owned results are detached from mmap state.
 func (q Query) Match() (result roar.Bitmap, resultErr error) {
 	if q.index == nil {
 		return roar.Bitmap{}, nil
@@ -113,7 +119,8 @@ func (q Query) Match() (result roar.Bitmap, resultErr error) {
 	return view.matchResolved(keys), nil
 }
 
-// Count returns the number of images holding every compiled value.
+// Count returns the number of images holding every compiled value
+// without materializing the intersection when possible.
 func (q Query) Count() (uint64, error) {
 	if q.index == nil {
 		return 0, nil
@@ -148,7 +155,9 @@ func (q Query) Count() (uint64, error) {
 	}
 }
 
-// Filter appends the candidates holding every compiled value to dst.
+// Filter appends the candidates holding every compiled value to dst. It
+// materializes the match once, then probes candidates with a cursor, so it
+// tolerates unsorted input.
 func (q Query) Filter(dst, candidates []ImageID) ([]ImageID, error) {
 	match, err := q.Match()
 	if err != nil {

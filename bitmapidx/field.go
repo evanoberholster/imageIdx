@@ -10,8 +10,10 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// Kind is the value shape of a field. It selects hashing, storage and query
-// behavior. Missing membership is distinct from an explicit Bool false.
+// Kind is the value shape of a field. It selects hashing, storage and
+// query behavior. Missing membership is distinct from an explicit Bool
+// false. A field's kind is immutable for the life of its index and is part
+// of the persisted definition.
 type Kind uint8
 
 const (
@@ -22,9 +24,10 @@ const (
 	KindGeo                        // S2 level-16 cell key, order preserving
 )
 
-// Storage selects the in-memory representation and lookup path for a field.
-// Both modes currently share the same lookup and mmap persistence layout;
-// the distinction is reserved for future cache-policy tuning.
+// Storage is a reserved policy hint for a field. Both values are accepted
+// and behave identically today: they share one lookup path and one mmap
+// persistence layout. The distinction is persisted so a future cache policy
+// can diverge without a format migration.
 type Storage uint8
 
 const (
@@ -32,7 +35,9 @@ const (
 	StoragePerType                     // one field handle over mmap entries
 )
 
-// Normalizer codes a field's enum canonicalization.
+// Normalizer codes for a field's enum canonicalization. Identity keeps
+// caller-supplied bytes; Lowercase folds UTF-8 enum bytes with Unicode
+// lowercase.
 const (
 	NormalizerIdentity  uint16 = 0 // caller-supplied canonical bytes
 	NormalizerLowercase uint16 = 1 // Unicode lowercase for UTF-8 enum bytes
@@ -53,21 +58,23 @@ const (
 	QuantLinear   uint16 = 2 // grid = (value - Offset) / Scale
 )
 
-// CodecSpec identifies an immutable, versioned configuration. Params uses a
-// deterministic encoding and is copied at registration.
+// CodecSpec identifies an immutable, versioned configuration. Params uses
+// a deterministic encoding and is deep-copied at registration and on every
+// Field return, so callers can never mutate registered state.
 type CodecSpec struct {
 	Code    uint16
 	Version uint16
 	Params  []byte
 }
 
-// clone returns a deep copy so callers cannot mutate registered state.
+// clone returns a deep copy of the spec, including its params.
 func (c CodecSpec) clone() CodecSpec {
 	c.Params = append([]byte(nil), c.Params...)
 	return c
 }
 
-// clone returns a deep copy of the field definition.
+// clone returns a deep copy of the field definition, including codec
+// params.
 func (f Field) clone() Field {
 	f.Normalizer = f.Normalizer.clone()
 	f.Analyzer = f.Analyzer.clone()
@@ -75,7 +82,9 @@ func (f Field) clone() Field {
 }
 
 // Quantizer describes conversion from source metadata into the int64 grid
-// domain of a continuous field.
+// domain of a continuous field. The index API takes already-converted grid
+// values; the quantizer is descriptive so reopen can validate that the
+// writer and reader agree on the conversion.
 type Quantizer struct {
 	Code    uint16 // QuantIdentity, QuantLinear, ...
 	Version uint16
@@ -83,15 +92,18 @@ type Quantizer struct {
 	Offset  int64
 }
 
-// GeoCodec identifies the S2 cell level of a KindGeo field. Level zero means
-// the default GeoS2Level; other levels are rejected until supported.
+// GeoCodec identifies the S2 cell level of a KindGeo field. Level zero
+// selects the default GeoS2Level. Any other explicit level but GeoS2Level
+// is rejected until smaller buckets are supported.
 type GeoCodec struct {
 	Version uint16
 	Level   uint8
 }
 
 // Field is one registered metadata field: its stable type, value shape,
-// storage strategy, and the codecs that interpret values.
+// reserved storage hint, and the codecs that interpret values. Only the
+// codecs for the field's kind are consulted; the rest must be zero.
+// Definitions are immutable once registered.
 type Field struct {
 	Type       IndexType
 	Kind       Kind
@@ -149,11 +161,22 @@ var (
 	ErrCoverBufferFull = errors.New("bitmapidx: cover destination capacity is insufficient")
 )
 
-// MaxValueBytes bounds one canonical value. Longer values are rejected before
-// hashing or staging.
+// MaxValueBytes bounds one canonical value. Longer values are rejected
+// before hashing or staging, so no oversized value ever reaches the
+// dictionary, WAL, or segment.
 const MaxValueBytes = 1 << 16
 
-// validateField reports whether f is a complete, supported definition.
+// batchFanoutBound is the conservative multiplier applied to entry counts
+// in owner pre-checks. One Entry can fan out during preparation: a text
+// replacement diffs Before/After through the analyzer and can stage many
+// token memberships per entry. The WAL encoder enforces the exact
+// MaxFieldBatchUpdates limit later; this bound only rejects batches that
+// cannot possibly fit, before doing analyzer work.
+const batchFanoutBound = 16
+
+// validateField checks that f is a complete, supported definition: known
+// kind and storage, valid codecs for the kind, sane quantizer and geo
+// levels, and no unknown flags.
 func validateField(f Field) error {
 	if f.Type == 0 || f.Flags&^fieldKnownFlags != 0 {
 		return ErrInvalidField
@@ -191,6 +214,9 @@ func validateField(f Field) error {
 }
 
 // normalizeEnum canonicalizes enum bytes under the field normalizer.
+// Identity returns the input slice borrowed; Lowercase allocates a
+// lowercased copy. Unknown codes and versions fail with
+// ErrUnsupportedCodec.
 func normalizeEnum(spec CodecSpec, value []byte) ([]byte, error) {
 	switch spec.Code {
 	case NormalizerIdentity:
@@ -208,34 +234,41 @@ func normalizeEnum(spec CodecSpec, value []byte) ([]byte, error) {
 	}
 }
 
-// FieldKey identifies one value within a field. Enum, Bool and Text keys use
-// a 64-bit xxh3 hash; Continuous keys store the order-preserving encoding of
-// the int64 grid value in Hash with Slot zero.
+// FieldKey identifies one value within a field.
 //
-// Slot disambiguates 64-bit hash collisions: the first value seen for a hash
-// claims slot zero, and a colliding value claims the next free slot. Slot is
-// always zero for continuous keys.
+// Enum, Bool, and Text keys carry a 64-bit xxh3 hash over the field type,
+// kind, length, and canonical bytes. Continuous and Geo keys carry an
+// order-preserving encoding in Hash with Slot zero: continuous stores the
+// int64 grid value biased to uint64 order, geo stores the level-16 S2 key,
+// so plain Hash order is numeric and geographic order respectively.
+//
+// Slot disambiguates 64-bit hash collisions: the first value seen for a
+// hash claims slot zero and each colliding value claims the next free slot.
+// Slot is always zero for continuous and geo keys, which never hash.
 type FieldKey struct {
 	Hash uint64
 	Type IndexType
 	Slot uint16
 }
 
-// orderKey maps a signed grid value onto an unsigned key whose natural order
-// matches numeric order.
+// orderKey maps a signed grid value onto an unsigned key whose natural
+// order matches numeric order, so byte/uint64 sorts are numeric sorts.
 func orderKey(grid int64) uint64 { return uint64(grid) ^ (1 << 63) }
 
 // decodeOrderKey inverts orderKey.
 func decodeOrderKey(key uint64) int64 { return int64(key ^ (1 << 63)) }
 
-// continuousKey builds the FieldKey for one int64 grid value.
+// continuousKey builds the FieldKey for one int64 grid value. The result
+// always has Slot zero and Type t.
 func continuousKey(t IndexType, grid int64) FieldKey {
 	return FieldKey{Hash: orderKey(grid), Type: t}
 }
 
-// hashCanonical builds a hashed key with domain separation over the field
-// type, kind, length and canonical bytes. It is a variable so tests can inject
-// collisions; production code must not replace it.
+// hashCanonical hashes canonical bytes with domain separation over the
+// field type, kind, and length. It is a variable so tests can inject
+// collisions by swapping in a constant hash. It is not safe for concurrent
+// use: tests must swap it serially and restore it with Cleanup, and
+// production code must never replace it.
 var hashCanonical = hashCanonicalValue
 
 func hashCanonicalValue(t IndexType, kind Kind, canonical []byte) FieldKey {
@@ -259,8 +292,10 @@ func hashCanonicalValue(t IndexType, kind Kind, canonical []byte) FieldKey {
 	return FieldKey{Hash: hash, Type: t}
 }
 
-// Value is one typed metadata value. The Kind discriminator must agree with
-// the target field.
+// Value is one typed metadata value. The Kind discriminator must agree
+// with the target field's Kind; every other arm is ignored. Bytes arms
+// borrow caller memory through preparation and are copied under the writer
+// lock only for genuinely new dictionary values.
 type Value struct {
 	Kind  Kind
 	Bytes []byte
@@ -268,44 +303,53 @@ type Value struct {
 	Bool  bool
 }
 
-// StringValue returns an enum value carrying caller-canonical bytes.
+// StringValue returns an enum value. The string is copied to a fresh byte
+// slice; the caller retains its string.
 func StringValue(value string) Value {
 	return Value{Kind: KindEnum, Bytes: []byte(value)}
 }
 
-// BytesValue returns an enum value carrying caller-owned bytes. The bytes are
-// not retained by the index without a copy.
+// BytesValue returns an enum value borrowing value. The slice is borrowed
+// through preparation and copied under the writer lock only if the value
+// is new to the dictionary; callers must not mutate it until the write
+// returns.
 func BytesValue(value []byte) Value {
 	return Value{Kind: KindEnum, Bytes: value}
 }
 
-// BoolValue returns an explicit boolean value. False is distinct from absent.
+// BoolValue returns an explicit boolean value. False is distinct from
+// absent: an image with no bool membership is neither true nor false.
 func BoolValue(value bool) Value { return Value{Kind: KindBool, Bool: value} }
 
 // IntValue returns a continuous value already converted into the field's
-// int64 grid domain.
+// int64 grid domain. No quantizer runs at write time.
 func IntValue(value int64) Value { return Value{Kind: KindContinuous, Int: value} }
 
 // GeoValue returns a KindGeo value carrying a level-16 S2 key. Keys fit in
-// int64; use KeyFromLatLng, KeyFromCellID or RangesFromCellIDs to build them.
+// int64; build them with KeyFromLatLng or KeyFromCellID and query them
+// with RangesFromCellIDs or CoverRegion.
 func GeoValue(key uint64) Value { return Value{Kind: KindGeo, Int: int64(key)} }
 
-// Entry is one ImageID to value membership change.
+// Entry is one ImageID to value membership change. ImageID zero is
+// reserved and rejected with ErrInvalidImageID.
 type Entry struct {
 	ImageID ImageID
 	Value   Value
 }
 
-// FieldMutation is one atomically applied membership batch. Remove wins over
-// Add for the same (key, ImageID).
+// FieldMutation is one atomically applied membership batch. Remove wins
+// over Add for the same (key, ImageID), both within the batch and against
+// staged state. An empty mutation is a no-op.
 type FieldMutation struct {
 	Add    []Entry
 	Remove []Entry
 }
 
-// Move is an explicit value transition: HasFrom=false inserts, HasTo=false
-// removes, both set moves. Flags resolve the zero-value ambiguity; for KindGeo
-// a zero key is absent, so the flags may be omitted there.
+// Move is an explicit value transition for continuous and geo fields:
+// HasFrom=false inserts, HasTo=false removes, both set moves. Flags
+// resolve the zero-value ambiguity. Continuous keeps explicit flags
+// because zero is a valid grid value; geo may omit them because a
+// level-16 S2 key is never zero, so zero is the absent sentinel.
 type Move struct {
 	ImageID ImageID
 	From    int64
@@ -314,19 +358,19 @@ type Move struct {
 	HasTo   bool
 }
 
-// TextReplacement replaces one image's complete logical text field. Callers
-// supply the old and new text so the index can diff token sets without a
-// reverse index.
+// TextReplacement replaces one image's complete logical text field.
+// Callers supply the old and new source strings so the index can diff
+// analyzer token sets without keeping a reverse index.
 type TextReplacement struct {
 	ImageID ImageID
 	Before  []string
 	After   []string
 }
 
-// Registry holds the field definitions known to a database. It is not safe
-// for concurrent use: register all fields during setup before sharing.
-// Returned definitions share no mutable state with the registry except codec
-// params, which callers must not mutate.
+// Registry holds the field definitions known to a database. It is not
+// safe for concurrent use: register all fields during setup before
+// sharing. Every returned definition is a deep copy and shares no mutable
+// state with the registry.
 type Registry struct {
 	fields map[IndexType]Field
 }
@@ -356,26 +400,30 @@ func (r *Registry) Register(fields ...Field) error {
 	return nil
 }
 
-// Field returns the registered definition for a type.
+// Field returns a copy of the registered definition for a type.
 func (r *Registry) Field(t IndexType) (Field, bool) {
 	field, ok := r.fields[t]
-	return field, ok
+	if !ok {
+		return Field{}, false
+	}
+	return field.clone(), true
 }
 
 // Len returns the number of registered fields.
 func (r *Registry) Len() int { return len(r.fields) }
 
-// Fields returns the registered definitions ordered by type.
+// Fields returns copies of the registered definitions ordered by type.
 func (r *Registry) Fields() []Field {
 	out := make([]Field, 0, len(r.fields))
 	for _, field := range r.fields {
-		out = append(out, field)
+		out = append(out, field.clone())
 	}
 	slices.SortFunc(out, func(a, b Field) int { return int(a.Type) - int(b.Type) })
 	return out
 }
 
-// sameField reports whether two definitions are identical.
+// sameField reports whether two definitions are identical, including
+// codec params.
 func sameField(a, b Field) bool {
 	if a.Type != b.Type || a.Kind != b.Kind || a.Storage != b.Storage ||
 		a.Flags != b.Flags || a.Quant != b.Quant || a.Geo != b.Geo ||
@@ -391,6 +439,8 @@ func sameField(a, b Field) bool {
 const registryVersion uint16 = 1
 
 // MarshalBinary encodes the registry deterministically by field type.
+// The output carries registryVersion and round-trips through
+// UnmarshalBinary, which re-validates every definition.
 func (r *Registry) MarshalBinary() ([]byte, error) {
 	fields := r.Fields()
 	size := 2 + 4
@@ -406,7 +456,9 @@ func (r *Registry) MarshalBinary() ([]byte, error) {
 	return out, nil
 }
 
-// UnmarshalBinary replaces the registry from MarshalBinary output.
+// UnmarshalBinary replaces the registry from MarshalBinary output. It
+// rejects trailing bytes, unknown versions, and definitions that fail
+// validation.
 func (r *Registry) UnmarshalBinary(data []byte) error {
 	if len(data) < 6 || binary.LittleEndian.Uint16(data[0:2]) != registryVersion {
 		return ErrInvalidField

@@ -34,3 +34,6 @@ opencode.json
 .context/query-context.md
 .context/session.json
 .context/usage.json.nudge.lock
+bitmapidx/field.go
+.github/context-cold.md
+.github/copilot-instructions.md

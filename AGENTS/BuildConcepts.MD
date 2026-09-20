@@ -33,7 +33,7 @@ Per-package benchmarks:
 
 ```sh
 go test ./timeidx  -run '^$' -bench 'Benchmark(Search|Update|DeltaCapacity|BlockSize)' -benchmem
-go test ./bitmapidx  -run '^$' -bench 'Benchmark(Contains|And4|ApplyBatch1000)' -benchmem
+go test ./bitmapidx  -run '^$' -bench 'Benchmark(Field|Compiled)' -benchmem
 go test ./geoidx   -run '^$' -bench 'Benchmark(SingleCell|BoundingBox|BatchIngest1000)' -benchmem
 go test ./search     -run '^$' -bench 'BenchmarkCombinedSearch' -benchmem
 go test ./roar       -run '^$' -bench . -benchmem
@@ -50,7 +50,7 @@ Every change must pass `go build ./...`, `go test ./...`, and
 ```text
 ./           imageidx: shared ImageID and durability domain types
 roar/        immutable zero-copy bitmap sets used directly by bitmapidx and geoidx
-bitmapidx/   logical bitmap predicates and bounded deltas
+bitmapidx/   persistent typed fields and bounded per-field deltas
 timeidx/   standalone block-local timestamp index
 geoidx/    S2 level-16 spatial index (dense cells are roar bitmaps)
 internal/indexutil/ shared non-domain mechanisms used by all three indexes
@@ -190,23 +190,18 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 ### bitmapidx
 
-- `New(Spec, Config)` is the only constructor. `Spec` contains the stable key,
-  index ID, flags, and initial IDs.
-- `Apply(Mutation)` is the canonical mutation API. A 1,000-ID mutation
-  publishes once, never 1,000 times.
-- If an ID appears in both `Mutation.Add` and `Mutation.Remove`, removal wins.
-- `And`/`Or` materialize per-operand corrections before the N-way combination.
-  `Count` skips materialization for delta-free operands via fused cardinality.
-- And-planning is private and orders by Base cardinality only; delta
-  cardinalities are ignored.
-- Reader-visible views, deltas, segment entries, and raw segment operations are
-  private. Public callers use `Metadata`, `Contains`, `AppendTo`, and the set
-  operations instead.
-- `Store` (`NewPersistent`/`OpenPersistent`) owns a private `Directory` and
-  segment. It forwards `Lookup`, `LookupID`, `Indexes`, and `Len` without
-  exposing internal storage fields; `Checkpoint`/`Vacuum` publish generations.
-  All indexes in one store share its private reader tracker; standalone indexes
-  own independent trackers.
+- `Field` is the only persisted bitmap abstraction. A fixed `Registry` defines
+  the typed enum, bool, text, continuous, and geo fields in a store.
+- `NewPersistentFields`/`OpenPersistentFields` create or reopen a
+  `FieldStore`. The store owns field handles, one WAL, checkpoint generations,
+  and all mmap lifetimes. Callers mutate through `Add`, `Remove`, `Move`,
+  `ReplaceText`, and `Apply` on the returned fields.
+- Field queries use typed operations such as `MatchValues`, `MatchText`,
+  `Range`, `GeoRanges`, and their count/filter variants. There is no generic
+  predicate `Index`, `Store`, `Mutation`, or bitmap-level `And`/`Or` API.
+- Reader-visible views, per-value deltas, segment entries, and raw segment
+  operations are private. Field results are immutable `roar.Bitmap` values;
+  transient mutable bitmap accumulation belongs to `search` only.
 
 ### timeidx
 
@@ -245,24 +240,22 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 ### search
 
-- `Compile(clauses...)` creates a conjunctive plan: every bitmap, timestamp,
+- `Compile(clauses...)` creates a conjunctive plan: every field, timestamp,
   and geo clause must match. No clauses is rejected rather than interpreted as
   every image.
-- Use `AllBitmaps`, `During`, and `WithinCells` to build sealed, validated
-  clause values instead of exposing a parallel-slice query struct. Geographic
-  query input is S2 cell IDs, never latitude/longitude bounds.
+- Use `FieldValues`, `FieldText`, `FieldRange`, `During`, and `WithinCells` to
+  build sealed, validated clause values. Geographic query input is S2 cell
+  IDs, never latitude/longitude bounds.
 - `During` accepts `ExactTimestamp`. Exact geographic verification remains in
   the canonical-data layer rather than the candidate-index scheduler.
-- `Compile` coalesces all bitmap clauses and orders typed execution stages by
+- `Compile` orders typed field, timestamp, and geo stages by
   live cardinality estimates. Estimates affect execution order only, never
   correctness.
-- Bitmap predicates remain one group. The first-stage path streams the
-  smallest bitmap into caller storage and filters it in place; after another
-  stage has produced candidates, `bitmapidx.Filter` tests them under
-  one registration per distinct private tracker. Timestamp exact clauses can
-  filter candidates in place; geographic stages accumulate cell ranges into
-  the workspace-owned `roar.MutableBitmap` and materialize once, and the
-  executor intersects.
+- The first-stage path streams the smallest field result into caller storage
+  and filters it in place; later field stages use their typed filter methods.
+  Timestamp exact clauses can filter candidates in place; geographic stages
+  accumulate cell ranges into the workspace-owned `roar.MutableBitmap` and
+  materialize once, and the executor intersects.
 - Combined results are sorted and unique. A caller-owned result slice and
   `Workspace` reuse all result/intermediate buffers, allowing zero-allocation
   steady-state searches when capacities are sufficient.
@@ -276,9 +269,9 @@ Every index follows the same conceptual skeleton. New code must conform.
 |---|---|---|---|
 | timeidx | manifest | `0x54534d46` TSMF | 2 |
 | timeidx | WAL | `0x5453574c` TSWL | 1 |
-| bitmapidx | segment | `0x424d5347` BMSG | 2 |
-| bitmapidx | manifest | `0x424d4d46` BMMF | 1 |
-| bitmapidx | WAL | `0x424d574c` BMWL | 1 |
+| bitmapidx | field segment | `0x424d4653` BMFS | 1 |
+| bitmapidx | field manifest | `0x424d464d` BMFM | 1 |
+| bitmapidx | field WAL | `0x424d4657` BMFW | 1 |
 | geoidx | storage generation | `0x47454f49` GEOI | 2 |
 | geoidx | manifest | `0x47454f4d` GEOM | 1 |
 | geoidx | WAL | `0x4745574c` GEWL | 1 |

@@ -4,18 +4,33 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/golang/geo/s2"
-
 	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/bitmapidx"
-
 	"github.com/evanoberholster/imageIdx/timeidx"
+	"github.com/golang/geo/s2"
 )
+
+func benchmarkEnumField(tb testing.TB, typ bitmapidx.IndexType, value string, ids []uint64) *bitmapidx.FieldIndex {
+	tb.Helper()
+	index, err := bitmapidx.NewFieldIndex(bitmapidx.Field{Type: typ, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType}, bitmapidx.FieldConfig{})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	entries := make([]bitmapidx.Entry, len(ids))
+	for n, id := range ids {
+		entries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue(value)}
+	}
+	if err := index.Add(entries...); err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { _ = index.Close() })
+	return index
+}
 
 func BenchmarkCombinedSearch(b *testing.B) {
 	const count = 10_000
 	quantum := uint64(1) << timeidx.TimestampShift
-	bitmapIDs := make([]uint64, 0, count/2)
+	fieldIDs := make([]uint64, 0, count/2)
 	records := make([]timeidx.Entry, count)
 	geoEntries := make([]bitmapidx.GeoEntry, count)
 	key, err := bitmapidx.KeyFromLatLng(37, -122)
@@ -25,24 +40,18 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	for index := range count {
 		id := uint64(index + 1)
 		if id%2 == 0 {
-			bitmapIDs = append(bitmapIDs, id)
+			fieldIDs = append(fieldIDs, id)
 		}
 		records[index] = timeidx.Entry{Timestamp: id * quantum, ImageID: imageidx.ImageID(id)}
 		geoEntries[index] = bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122}
 	}
-	bitmap, err := bitmapidx.New(bitmapidx.Spec{
-		Key: bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1}, IndexID: 1, IDs: bitmapIDs,
-	}, bitmapidx.Config{})
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = bitmap.Close() })
-	timeIndex, err := timeidx.New(timeidx.Spec{IndexID: 3, Entries: records}, timeidx.Config{})
+	field := benchmarkEnumField(b, bitmapidx.IndexTypeTag, "favorite", fieldIDs)
+	timeIndex, err := timeidx.New(timeidx.Spec{Entries: records}, timeidx.Config{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = timeIndex.Close() })
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(2), geoEntries, bitmapidx.FieldConfig{})
+	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(30), geoEntries, bitmapidx.FieldConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -51,9 +60,8 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-
 	plan, err := Compile(
-		AllBitmaps(bitmap),
+		FieldValues(field, bitmapidx.StringValue("favorite")),
 		During(timeIndex, 4_000*quantum, 6_000*quantum),
 		geoClause,
 	)
@@ -69,32 +77,21 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	}
 }
 
-// BenchmarkGeoCollectSearch forces the geo stage down the collect+intersect
-// path: 50k bitmap candidates against ~100k covered cells far exceed the
-// verify-vs-collect probe bound, so ranges accumulate into the
-// workspace-owned MutableBitmap. Steady state must allocate nothing.
+// BenchmarkGeoCollectSearch exercises the Search-only MutableBitmap path.
 func BenchmarkGeoCollectSearch(b *testing.B) {
 	const count = 100_000
-	bitmapIDs := make([]uint64, 0, count/2)
+	fieldIDs := make([]uint64, 0, count/2)
 	geoEntries := make([]bitmapidx.GeoEntry, 0, count)
 	for id := uint64(1); id <= count; id++ {
 		if id%2 == 0 {
-			bitmapIDs = append(bitmapIDs, id)
+			fieldIDs = append(fieldIDs, id)
 		}
 		geoEntries = append(geoEntries, bitmapidx.GeoEntry{
-			ImageID:   id,
-			Latitude:  30.0 + float64(id%200)*0.05,
-			Longitude: -120.0 + float64(id/200)*0.05,
+			ImageID: id, Latitude: 30 + float64(id%200)*0.05, Longitude: -120 + float64(id/200)*0.05,
 		})
 	}
-	bitmap, err := bitmapidx.New(bitmapidx.Spec{
-		Key: bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1}, IndexID: 1, IDs: bitmapIDs,
-	}, bitmapidx.Config{})
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = bitmap.Close() })
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(2), geoEntries, bitmapidx.FieldConfig{})
+	field := benchmarkEnumField(b, bitmapidx.IndexTypeTag, "favorite", fieldIDs)
+	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(31), geoEntries, bitmapidx.FieldConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -104,8 +101,7 @@ func BenchmarkGeoCollectSearch(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-
-	plan, err := Compile(AllBitmaps(bitmap), geoClause)
+	plan, err := Compile(FieldValues(field, bitmapidx.StringValue("favorite")), geoClause)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -118,53 +114,41 @@ func BenchmarkGeoCollectSearch(b *testing.B) {
 	}
 }
 
-// BenchmarkGeoCityPlan measures an end-to-end "photos in Paris" search: a
-// bitmap predicate intersected with a city geo clause through a reusable plan
-// and workspace. Steady state must allocate nothing.
 func BenchmarkGeoCityPlan(b *testing.B) {
 	cities := []struct {
 		name     string
 		lat, lng float64
 	}{
-		{"Paris", 48.8566, 2.3522},
-		{"London", 51.5074, -0.1278},
-		{"New York", 40.7128, -74.0060},
-		{"Tokyo", 35.6762, 139.6503},
+		{"Paris", 48.8566, 2.3522}, {"London", 51.5074, -0.1278},
+		{"New York", 40.7128, -74.0060}, {"Tokyo", 35.6762, 139.6503},
 	}
 	const perCity = 5_000
 	rng := rand.New(rand.NewSource(7))
 	total := perCity * len(cities)
 	geoEntries := make([]bitmapidx.GeoEntry, 0, total)
-	bitmapIDs := make([]uint64, 0, total/2)
+	fieldIDs := make([]uint64, 0, total/2)
 	for id := uint64(1); id <= uint64(total); id++ {
 		city := cities[(int(id)-1)/perCity]
-		latitude := city.lat + (rng.Float64()-0.5)*0.3
-		longitude := city.lng + (rng.Float64()-0.5)*0.3
-		geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: latitude, Longitude: longitude})
+		geoEntries = append(geoEntries, bitmapidx.GeoEntry{
+			ImageID: id, Latitude: city.lat + (rng.Float64()-0.5)*0.3, Longitude: city.lng + (rng.Float64()-0.5)*0.3,
+		})
 		if id%2 == 0 {
-			bitmapIDs = append(bitmapIDs, id)
+			fieldIDs = append(fieldIDs, id)
 		}
 	}
-	bitmap, err := bitmapidx.New(bitmapidx.Spec{
-		Key: bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1}, IndexID: 1, IDs: bitmapIDs,
-	}, bitmapidx.Config{})
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = bitmap.Close() })
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(2), geoEntries, bitmapidx.FieldConfig{})
+	field := benchmarkEnumField(b, bitmapidx.IndexTypeTag, "favorite", fieldIDs)
+	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(32), geoEntries, bitmapidx.FieldConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = geo.Close() })
-
 	for _, city := range cities {
-		cityCell := uint64(s2.CellID(bitmapidx.CellIDFromLatLng(city.lat, city.lng)).Parent(8))
+		cityCell := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(city.lat, city.lng)).Parent(8))
 		geoClause, err := WithinCells(geo, cityCell)
 		if err != nil {
 			b.Fatal(err)
 		}
-		plan, err := Compile(AllBitmaps(bitmap), geoClause)
+		plan, err := Compile(FieldValues(field, bitmapidx.StringValue("favorite")), geoClause)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -179,6 +163,5 @@ func BenchmarkGeoCityPlan(b *testing.B) {
 				results = plan.Search(results[:0], workspace)
 			}
 		})
-		_ = results
 	}
 }

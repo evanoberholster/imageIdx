@@ -36,7 +36,9 @@ type searchResponse struct {
 }
 
 type demoService struct {
-	favorites *bitmapidx.Index
+	fields    *bitmapidx.FieldStore
+	favorites *bitmapidx.FieldIndex
+	fieldDir  string
 	times     *timeidx.Index
 	geo       *bitmapidx.FieldIndex
 	canonical map[imageidx.ImageID]uint64
@@ -121,13 +123,58 @@ func runServer(ctx context.Context, address string) error {
 }
 
 func newDemoService() (*demoService, error) {
-	favorites, err := bitmapidx.New(bitmapidx.Spec{
-		Key:     bitmapidx.Key{Type: bitmapidx.IndexTypeTag, ValueID: 1},
-		IndexID: 1,
-		IDs:     []imageidx.ImageID{100, 200, 300},
-	}, bitmapidx.Config{})
+	fieldDir, err := os.MkdirTemp("", "imageidx-fields-")
 	if err != nil {
 		return nil, err
+	}
+	fields, err := bitmapidx.NewPersistentFields(fieldDir, []bitmapidx.Field{
+		{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+		{Type: bitmapidx.IndexTypeLocation, Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
+	}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	if err != nil {
+		_ = os.RemoveAll(fieldDir)
+		return nil, err
+	}
+	favorites, ok := fields.Lookup(bitmapidx.IndexTypeTag)
+	if !ok {
+		_ = fields.Close()
+		_ = os.RemoveAll(fieldDir)
+		return nil, bitmapidx.ErrInvalidField
+	}
+	if err := favorites.Add(
+		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("favorite")},
+	); err != nil {
+		_ = fields.Close()
+		_ = os.RemoveAll(fieldDir)
+		return nil, err
+	}
+	geo, ok := fields.Lookup(bitmapidx.IndexTypeLocation)
+	if !ok {
+		_ = fields.Close()
+		_ = os.RemoveAll(fieldDir)
+		return nil, bitmapidx.ErrInvalidField
+	}
+	for _, entry := range []struct {
+		id  imageidx.ImageID
+		lat float64
+		lng float64
+	}{
+		{100, 37.7749, -122.4194}, {200, 37.7749, -122.4194},
+		{300, 34.0522, -118.2437}, {400, 40.7128, -74.0060},
+	} {
+		key, err := bitmapidx.KeyFromLatLng(entry.lat, entry.lng)
+		if err != nil {
+			_ = fields.Close()
+			_ = os.RemoveAll(fieldDir)
+			return nil, err
+		}
+		if err := geo.Move(bitmapidx.Move{ImageID: entry.id, To: int64(key)}); err != nil {
+			_ = fields.Close()
+			_ = os.RemoveAll(fieldDir)
+			return nil, err
+		}
 	}
 
 	canonical := map[imageidx.ImageID]uint64{
@@ -146,33 +193,26 @@ func newDemoService() (*demoService, error) {
 		},
 	}, timeidx.Config{})
 	if err != nil {
-		_ = favorites.Close()
+		_ = fields.Close()
+		_ = os.RemoveAll(fieldDir)
 		return nil, err
 	}
 
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexTypeLocation, []bitmapidx.GeoEntry{
-		{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
-		{ImageID: 200, Latitude: 37.7749, Longitude: -122.4194},
-		{ImageID: 300, Latitude: 34.0522, Longitude: -118.2437},
-		{ImageID: 400, Latitude: 40.7128, Longitude: -74.0060},
-	}, bitmapidx.FieldConfig{})
-	if err != nil {
-		_ = times.Close()
-		_ = favorites.Close()
-		return nil, err
-	}
 	return &demoService{
-		favorites: favorites, times: times, geo: geo,
+		fields: fields, favorites: favorites, fieldDir: fieldDir, times: times, geo: geo,
 		canonical: canonical, demoCell: bitmapidx.CellIDFromLatLng(37.7749, -122.4194),
 	}, nil
 }
 
 func (service *demoService) Close() error {
 	var first error
-	for _, closeIndex := range []func() error{service.geo.Close, service.times.Close, service.favorites.Close} {
+	for _, closeIndex := range []func() error{service.geo.Close, service.times.Close, service.fields.Close} {
 		if err := closeIndex(); err != nil && first == nil {
 			first = err
 		}
+	}
+	if err := os.RemoveAll(service.fieldDir); err != nil && first == nil {
+		first = err
 	}
 	return first
 }
@@ -183,7 +223,7 @@ func (service *demoService) searchOnce(request searchRequest) ([]imageidx.ImageI
 		return nil, err
 	}
 	return search.Search(nil,
-		search.AllBitmaps(service.favorites),
+		search.FieldValues(service.favorites, bitmapidx.StringValue("favorite")),
 		search.During(service.times, request.Start, request.End,
 			search.ExactTimestamp(func(id imageidx.ImageID) (uint64, bool) {
 				value, ok := service.canonical[id]

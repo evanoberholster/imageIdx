@@ -19,11 +19,16 @@ const (
 	MaxFieldBatchBytes = 16 << 20
 )
 
+// ErrBatchTooLarge reports a batch exceeding MaxFieldBatchUpdates
+// memberships or MaxFieldBatchBytes encoded bytes.
 var ErrBatchTooLarge = errors.New("bitmapidx: atomic field batch exceeds persistence limits")
 
-// WAL groups store canonical bytes, not analyzer source or reverse values.
-// The group header is 24 bytes: hash u64, value length u32, add/remove counts
-// u32, reserved u32. Values and ID columns follow, padded to 8 bytes.
+// WAL groups store canonical bytes, not analyzer source or reverse
+// values, so replay never re-runs the analyzer. The group header is 24
+// bytes: hash u64, value length u32, add count u32, remove count u32,
+// reserved u32. Canonical bytes and ID columns follow, padded to 8 bytes.
+// ID columns are sorted ascending with remove-wins already applied, so
+// decode can validate ordering without re-sorting.
 func encodeFieldChanges(changes []stagedChange) ([]byte, uint32, error) {
 	var payload []byte
 	updates := 0
@@ -59,6 +64,11 @@ func encodeFieldChanges(changes []stagedChange) ([]byte, uint32, error) {
 	return payload, uint32(updates), nil
 }
 
+// append frames payload with magic, version, field type, byte/group/update
+// counts, generation, offset, and CRCs, then appends it. Zero updates
+// skip the WAL. DurabilitySync fsyncs per frame; other modes leave it to
+// the OS and checkpoint Sync. Failures mark the store failed so later
+// writes require recovery.
 func (s *FieldStore) append(index *FieldIndex, payload []byte, groups, updates uint32) error {
 	if updates == 0 {
 		return nil
@@ -86,6 +96,11 @@ func (s *FieldStore) append(index *FieldIndex, payload []byte, groups, updates u
 	return nil
 }
 
+// replay replays WAL frames into their fields and returns the valid tail
+// end for RepairTail. It validates header CRCs, generation, offsets,
+// counts, and payload CRCs. Changes apply with idempotent set semantics
+// and no live geo preconditions, because the WAL already validated once;
+// text needs no re-analysis since groups carry canonical bytes.
 func (s *FieldStore) replay(path string) (int64, error) {
 	position := uint64(0)
 	return persist.ReplayEnd(path, 0, persist.FrameSpec{HeaderSize: fieldWALHeaderSize, Magic: fieldWALMagic, Version: 1, Corrupt: ErrCorruptWAL, MaxPayload: MaxFieldBatchBytes}, func(header []byte) (uint64, error) {
@@ -122,6 +137,10 @@ func (s *FieldStore) replay(path string) (int64, error) {
 	})
 }
 
+// decodeFieldChanges validates and decodes a WAL payload into staged
+// changes. It checks group bounds, value lengths, hash agreement for
+// hashed kinds, geo key validity, strictly increasing non-zero IDs, no
+// add/remove overlap, and exact payload consumption.
 func decodeFieldChanges(field Field, payload []byte, groups uint32) ([]stagedChange, uint32, error) {
 	if uint64(groups)*24 > uint64(len(payload)) {
 		return nil, 0, ErrCorruptWAL
@@ -140,7 +159,7 @@ func decodeFieldChanges(field Field, payload []byte, groups uint32) ([]stagedCha
 		if n > MaxValueBytes || a+r > MaxFieldBatchUpdates || size > uint64(len(payload)) {
 			return nil, 0, ErrCorruptWAL
 		}
-		change := stagedChange{base: FieldKey{Type: field.Type, Hash: hash}}
+		change := stagedChange{base: FieldKey{Type: field.Type, Hash: hash}, next: -1}
 		if field.Kind == KindContinuous || field.Kind == KindGeo {
 			if n != 0 {
 				return nil, 0, ErrCorruptWAL

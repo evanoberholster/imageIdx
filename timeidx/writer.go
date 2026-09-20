@@ -7,6 +7,24 @@ type barrierResult struct {
 	err       error
 }
 
+// rotateRequest asks the single-owner writerLoop to roll the WAL to a fresh
+// epoch. fromOffset is the checkpoint barrier offset whose complete tail
+// must be carried into the new epoch; epoch names the new WAL file. The
+// writerLoop is the only goroutine that appends to the WAL, so performing
+// the tail copy and handle swap there keeps rotation atomic with respect to
+// concurrent write batches: batches handled before the swap land in the
+// copied tail, batches after it append to the new epoch.
+type rotateRequest struct {
+	oldEpoch   uint64
+	epoch      uint64
+	fromOffset int64
+	result     chan rotateResult
+}
+
+type rotateResult struct {
+	err error
+}
+
 type mutationKind uint8
 
 const (
@@ -153,6 +171,8 @@ func (i *Index) writerLoop() {
 				select {
 				case batch := <-i.writes:
 					batch.done <- ErrClosed
+				case req := <-i.rotate:
+					req.result <- rotateResult{err: ErrClosed}
 				default:
 					goto drained
 				}
@@ -179,6 +199,8 @@ func (i *Index) writerLoop() {
 				result.walOffset, result.err = i.persistence.wal.Offset()
 			}
 			response <- result
+		case req := <-i.rotate:
+			req.result <- i.rotateWAL(req)
 		case result := <-i.compactDone:
 			if result.reclaimed != nil {
 				result.block.spare = result.reclaimed

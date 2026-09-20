@@ -24,17 +24,23 @@ var (
 	ErrDuplicateImageID = errors.New("bitmapidx: duplicate image ID")
 )
 
-// FieldConfig controls field delta rotation and compaction. The zero value is
-// valid; defaults are filled in by NewFieldIndex.
+// FieldConfig controls field delta rotation and compaction. The zero
+// value is valid; NewFieldIndex fills defaults. ActiveTarget rotates
+// Active to Frozen and schedules background compaction; HardDeltaLimit
+// and MaxDeltaValues instead fold the batch directly into Base on the
+// write path, bounding every reader-visible delta.
 type FieldConfig struct {
-	// ActiveTarget is the Active size at which a write rotates the delta to
-	// Frozen and schedules background compaction.
+	// ActiveTarget is the Active ID count at which a write rotates the
+	// delta to Frozen and schedules background compaction.
 	ActiveTarget int
-	// HardDeltaLimit bounds each reader-visible delta.
+	// HardDeltaLimit bounds the IDs in one visible delta. Exceeding it
+	// folds the batch into Base synchronously.
 	HardDeltaLimit int
-	// MaxDeltaValues bounds distinct values touched in one visible delta.
+	// MaxDeltaValues bounds the distinct values touched in one visible
+	// delta. Exceeding it folds the batch into Base synchronously.
 	MaxDeltaValues int
-	// CompactDelay is primarily useful to tests and workload tuning.
+	// CompactDelay pauses background compaction, primarily for tests and
+	// workload tuning. Zero compacts immediately.
 	CompactDelay time.Duration
 }
 
@@ -66,15 +72,19 @@ func (c FieldConfig) withDefaults() (FieldConfig, error) {
 	return c, nil
 }
 
-// FieldMetadata is a copied summary of the current field snapshot.
+// FieldMetadata is a copied summary of the current field snapshot:
+// the immutable definition, the monotonically increasing view
+// generation, and the number of values in Base.
 type FieldMetadata struct {
 	Field      Field
 	Generation uint64
 	BaseValues uint64
 }
 
-// postingTable is the immutable base of one field: sorted keys and their
-// postings. Slices are shared across publications and never mutated.
+// postingTable is the immutable base of one field: keys sorted by
+// FieldKey and their postings at matching positions. Slices are shared
+// across publications and never mutated after publication; writers clone
+// before folding deltas.
 type postingTable struct {
 	keys     []FieldKey
 	postings []posting
@@ -117,7 +127,44 @@ func (t *postingTable) remove(key FieldKey) {
 	t.postings = slices.Delete(t.postings, index, index+1)
 }
 
-// fieldDelta is one immutable correction layer: per-key added/removed IDs.
+// bitmapDelta is one immutable correction for a single field value:
+// additions minus removals, already canonicalized so the sets are
+// disjoint. Values are roaring bitmaps shared across views.
+type bitmapDelta struct {
+	additions roar.Bitmap
+	removals  roar.Bitmap
+}
+
+// newBitmapDelta canonicalizes additions minus removals into an immutable
+// correction. It returns nil when the correction is empty, so callers can
+// keep delta maps sparse.
+func newBitmapDelta(additions, removals []ImageID) *bitmapDelta {
+	if len(additions) == 0 && len(removals) == 0 {
+		return nil
+	}
+	add := roar.FromUnsorted(additions)
+	remove := roar.FromUnsorted(removals)
+	builder := roar.NewDeltaBuilderFrom(add)
+	builder.AndNot(remove)
+	add = builder.Freeze()
+	if add.IsEmpty() && remove.IsEmpty() {
+		return nil
+	}
+	return &bitmapDelta{additions: add, removals: remove}
+}
+
+// len returns the IDs in the correction, safe on nil.
+func (d *bitmapDelta) len() int {
+	if d == nil {
+		return 0
+	}
+	return int(d.additions.Cardinality() + d.removals.Cardinality())
+}
+
+// fieldDelta is one immutable correction layer: per-key added/removed
+// IDs. values holds corrections by resolved key, keys is the sorted key
+// set for ordered scans, and ids is the total corrected ID count used for
+// rotation decisions. Untouched entries are shared across publications.
 type fieldDelta struct {
 	values map[FieldKey]*bitmapDelta
 	keys   []FieldKey
@@ -132,7 +179,9 @@ func (d *fieldDelta) delta(key FieldKey) (*bitmapDelta, bool) {
 	return bd, ok
 }
 
-// state reports the layer's correction for (key, id), if any.
+// state reports the layer's correction for (key, id), if any. Additions
+// win within the layer because newBitmapDelta canonicalizes remove-wins
+// before storage.
 func (d *fieldDelta) state(key FieldKey, id ImageID) (present, touched bool) {
 	if d == nil {
 		return false, false
@@ -151,7 +200,9 @@ func (d *fieldDelta) state(key FieldKey, id ImageID) (present, touched bool) {
 }
 
 // fieldView is one immutable, atomically published snapshot of a field.
-// Lookup precedence is active, then frozen, then base.
+// Lookup precedence is active, then frozen, then base. dictGen mirrors
+// the dictionary generation so compiled queries can fast-path when the
+// value set is unchanged; generation orders view publications.
 type fieldView struct {
 	field      Field
 	base       postingTable
@@ -194,7 +245,10 @@ func (v *fieldView) containsWithoutActive(key FieldKey, id ImageID) bool {
 }
 
 // effective returns the fully corrected posting for key. The fast path
-// returns the shared immutable base posting; corrected keys build a new one.
+// returns the shared immutable base posting with no allocation;
+// corrected keys fold frozen then active through a DeltaBuilder and demote
+// small results to tiny postings. The returned pointer aliases base or a
+// fresh heap posting valid while the view is retained.
 func (v *fieldView) effective(key FieldKey) (*posting, bool) {
 	base, hasBase := v.base.get(key)
 	frozen, hasFrozen := v.frozen.delta(key)
@@ -222,7 +276,9 @@ func (v *fieldView) effective(key FieldKey) (*posting, bool) {
 	return &corrected, true
 }
 
-// effectiveTable folds the supplied deltas into a replacement posting table.
+// effectiveTable folds the supplied deltas into a replacement posting
+// table. It clones Base once, then upserts or removes per touched key.
+// Used by compaction, checkpointing, and hard-limit folds.
 func (v *fieldView) effectiveTable(deltas ...*fieldDelta) postingTable {
 	table := v.base.clone()
 	for _, delta := range deltas {
@@ -249,26 +305,35 @@ func (v *fieldView) effectiveTable(deltas ...*fieldDelta) postingTable {
 	return table
 }
 
-// stagedChange is one prepared key-level change. base is the hash-level key
-// from canonicalization; key is the dictionary-resolved key including any
-// collision slot. next chains changes that share a base hash but differ in
-// canonical bytes, so grouping performs no per-entry allocation.
+// stagedChange is one prepared key-level change. base is the hash-level
+// key from canonicalization; key is the dictionary-resolved key including
+// any collision slot, filled under the writer lock. canonical borrows
+// caller input through preparation and is copied only for new dictionary
+// values. next chains changes sharing a base hash but differing in
+// canonical bytes (hash collisions in one batch). add and remove hold
+// unsorted caller IDs until compose/encode canonicalizes them.
 type stagedChange struct {
 	base      FieldKey
 	key       FieldKey
 	canonical []byte
-	next      int32
-	add       []ImageID
-	remove    []ImageID
+	// next chains collision siblings sharing a base hash; -1 ends the
+	// chain. An int avoids conversions on 64-bit platforms for a
+	// prepare-only structure.
+	next   int
+	add    []ImageID
+	remove []ImageID
 }
 
 // FieldIndex is one immutable-field, multi-value index. Readers load one
-// atomically published fieldView and take no locks. Writers serialize through
-// writerMu. One batch is published atomically across postings and dictionary.
+// atomically published fieldView and take no locks beyond the reader
+// tracker; writers serialize through writerMu. One batch publishes
+// atomically across postings and dictionary.
 //
-// Reads against a closed index report empty results, as do queries compiled
-// after close; writes and maintenance report ErrClosed. The zero value is
-// not usable; construct with NewFieldIndex.
+// Reads against a closed index report empty results, as do queries
+// compiled after close; writes and maintenance report ErrClosed. The zero
+// value is not usable; construct with NewFieldIndex. Store-owned indexes
+// (owner != nil) route writes through the store WAL and must be closed via
+// the store.
 type FieldIndex struct {
 	owner    *FieldStore // immutable before exposing the handle
 	view     atomic.Pointer[fieldView]
@@ -282,7 +347,10 @@ type FieldIndex struct {
 	analyzer *textanalyzer.Analyzer
 }
 
-// NewFieldIndex constructs an empty field index from a validated definition.
+// NewFieldIndex constructs an empty field index from a validated
+// definition. Config zero values take defaults. The definition is
+// deep-copied; text fields also build their analyzer here so writes and
+// queries never construct one per batch.
 func NewFieldIndex(field Field, config FieldConfig) (*FieldIndex, error) {
 	if err := validateField(field); err != nil {
 		return nil, err
@@ -304,24 +372,28 @@ func NewFieldIndex(field Field, config FieldConfig) (*FieldIndex, error) {
 	return index, nil
 }
 
-// Field returns a copy of the immutable field definition.
+// Field returns a deep copy of the immutable field definition.
 func (i *FieldIndex) Field() Field { return i.view.Load().field.clone() }
 
-// Metadata returns the current snapshot summary.
+// Metadata returns a copied summary of the current snapshot.
 func (i *FieldIndex) Metadata() FieldMetadata {
 	view := i.view.Load()
 	return FieldMetadata{Field: view.field.clone(), Generation: view.generation, BaseValues: uint64(len(view.base.keys))}
 }
 
-// PendingCompactions reports the number of in-flight background compactions.
+// PendingCompactions reports the number of in-flight background
+// compactions folding Frozen into Base.
 func (i *FieldIndex) PendingCompactions() int64 { return i.pending.Load() }
 
 // WaitIdle blocks until background compactions drain or ctx is cancelled.
+// It polls every 100µs via indexutil and never takes the writer lock.
 func (i *FieldIndex) WaitIdle(ctx context.Context) error {
 	return indexutil.WaitForCondition(ctx, func() bool { return i.pending.Load() == 0 })
 }
 
-// Contains reports whether id holds value in this field.
+// Contains reports whether id holds value in this field. Unknown values
+// report false with no error; kind mismatches and oversized values report
+// errors. Closed indexes report false.
 func (i *FieldIndex) Contains(id ImageID, value Value) (bool, error) {
 	base, canonical, err := i.keyForValue(i.Field(), value)
 	if err != nil {
@@ -347,7 +419,9 @@ func (i *FieldIndex) Contains(id ImageID, value Value) (bool, error) {
 	return present, nil
 }
 
-// ContainsKey reports whether id holds the posting named by key.
+// ContainsKey reports whether id holds the posting named by key,
+// including its collision slot. It skips canonicalization for callers
+// that already resolved keys.
 func (i *FieldIndex) ContainsKey(id ImageID, key FieldKey) bool {
 	token := i.readers.Acquire()
 	view := i.view.Load()
@@ -356,7 +430,8 @@ func (i *FieldIndex) ContainsKey(id ImageID, key FieldKey) bool {
 	return present
 }
 
-// Add applies membership additions.
+// Add applies membership additions atomically. Already-present memberships
+// are no-ops. Text fields reject Add; use ReplaceText.
 func (i *FieldIndex) Add(entries ...Entry) error {
 	if i.Field().Kind == KindText {
 		return ErrUnsupportedOperation
@@ -364,7 +439,9 @@ func (i *FieldIndex) Add(entries ...Entry) error {
 	return i.applyPrepared(FieldMutation{Add: entries})
 }
 
-// Remove applies membership removals. Unknown removals are no-ops.
+// Remove applies membership removals atomically. Unknown removals are
+// no-ops and never create dictionary entries. Text fields reject Remove;
+// use ReplaceText.
 func (i *FieldIndex) Remove(entries ...Entry) error {
 	if i.Field().Kind == KindText {
 		return ErrUnsupportedOperation
@@ -372,7 +449,9 @@ func (i *FieldIndex) Remove(entries ...Entry) error {
 	return i.applyPrepared(FieldMutation{Remove: entries})
 }
 
-// Apply atomically applies one membership batch.
+// Apply atomically applies one membership batch with remove-wins
+// semantics for the same (key, ImageID). Text fields reject Apply; use
+// ReplaceText.
 func (i *FieldIndex) Apply(mutation FieldMutation) error {
 	if i.Field().Kind == KindText {
 		return ErrUnsupportedOperation
@@ -380,9 +459,10 @@ func (i *FieldIndex) Apply(mutation FieldMutation) error {
 	return i.applyPrepared(mutation)
 }
 
-// Move applies explicit value transitions for continuous and geo fields. For
-// geo fields the presence flags may be omitted: a level-16 key is never zero,
-// so zero is the absent sentinel. Continuous fields keep explicit flags
+// Move applies explicit value transitions for continuous and geo fields.
+// It rejects duplicate images in one batch, no-op moves, and stale From
+// values (via validateGeoChanges for geo). Geo may omit presence flags
+// because a level-16 key is never zero; continuous keeps explicit flags
 // because zero is a valid grid value.
 func (i *FieldIndex) Move(moves ...Move) error {
 	field := i.Field()
@@ -429,8 +509,10 @@ func (i *FieldIndex) Move(moves ...Move) error {
 	return i.applyPrepared(mutation)
 }
 
-// ReplaceText replaces complete logical text fields by diffing old and new
-// token sets.
+// ReplaceText replaces complete logical text fields by diffing old and
+// new analyzer token sets. Unchanged tokens produce no membership churn.
+// Store-owned batches pre-check source bytes against a conservative
+// fanout bound; the WAL encoder enforces the exact membership limit.
 func (i *FieldIndex) ReplaceText(changes ...TextReplacement) error {
 	field := i.Field()
 	if field.Kind != KindText {
@@ -438,7 +520,7 @@ func (i *FieldIndex) ReplaceText(changes ...TextReplacement) error {
 	}
 	if i.owner != nil {
 		remaining := MaxFieldBatchBytes
-		if len(changes) > MaxFieldBatchUpdates*16 {
+		if len(changes) > MaxFieldBatchUpdates*batchFanoutBound {
 			return ErrBatchTooLarge
 		}
 		for _, change := range changes {
@@ -481,7 +563,9 @@ func (i *FieldIndex) ReplaceText(changes ...TextReplacement) error {
 	return i.applyPrepared(mutation)
 }
 
-// Compact synchronously merges all correction layers into a new Base.
+// Compact synchronously merges Frozen and Active into a new Base and
+// seals the dictionary. It preserves the visible value set, so only
+// posting storage moves.
 func (i *FieldIndex) Compact() error {
 	if i.owner != nil {
 		i.owner.writeMu.Lock()
@@ -504,8 +588,10 @@ func (i *FieldIndex) Compact() error {
 	return nil
 }
 
-// Vacuum compacts the field and drops dictionary values with no remaining
-// posting. It is the only operation that removes dead dictionary entries.
+// Vacuum compacts the field and drops dictionary values with no
+// remaining posting. It is the only operation that removes dead
+// dictionary entries, and the only one that advances the dictionary
+// generation without new values.
 func (i *FieldIndex) Vacuum() error {
 	if i.owner != nil {
 		i.owner.writeMu.Lock()
@@ -528,7 +614,9 @@ func (i *FieldIndex) Vacuum() error {
 	return nil
 }
 
-// Close marks the field closed, waits for compactions and prior readers.
+// Close marks a standalone field closed, waits for compactions and prior
+// readers, and rejects further writes. Store-owned indexes reject Close;
+// close the store instead.
 func (i *FieldIndex) Close() error {
 	if i.owner != nil {
 		return ErrOwnedIndex
@@ -545,8 +633,9 @@ func (i *FieldIndex) closeInternal() error {
 	return nil
 }
 
-// LookupValue appends the canonical bytes for key to dst. It reports hash-only
-// presence without collision verification; use KeyForValue to verify.
+// LookupValue appends the canonical bytes for key to dst. It reports
+// hash-plus-slot presence without byte verification; use KeyForValue to
+// resolve a value to its verified slot first.
 func (i *FieldIndex) LookupValue(dst []byte, key FieldKey) ([]byte, bool) {
 	token := i.readers.Acquire()
 	view := i.view.Load()
@@ -559,8 +648,9 @@ func (i *FieldIndex) LookupValue(dst []byte, key FieldKey) ([]byte, bool) {
 	return out, ok
 }
 
-// Iterate visits one dictionary value per key in key order. Returning false
-// stops.
+// Iterate visits one dictionary value per key in key order. Returning
+// false stops early. Values alias chunk/mmap storage valid only for the
+// call. It materializes merged state, so it allocates.
 func (i *FieldIndex) Iterate(fn func(key FieldKey, value []byte) bool) {
 	token := i.readers.Acquire()
 	view := i.view.Load()
@@ -570,7 +660,9 @@ func (i *FieldIndex) Iterate(fn func(key FieldKey, value []byte) bool) {
 	i.readers.Release(token)
 }
 
-// Prefix visits dictionary values starting with prefix in byte order.
+// Prefix visits dictionary values starting with prefix, in byte order of
+// canonical values. Values alias storage valid only for the call. It
+// re-sorts by value, so it is O(N log N); see dictionaryView.prefix.
 func (i *FieldIndex) Prefix(prefix []byte, fn func(key FieldKey, value []byte) bool) {
 	token := i.readers.Acquire()
 	view := i.view.Load()
@@ -580,9 +672,10 @@ func (i *FieldIndex) Prefix(prefix []byte, fn func(key FieldKey, value []byte) b
 	i.readers.Release(token)
 }
 
-// KeyForValue canonicalizes and hashes value, returning its dictionary key.
-// Absent values, and any value on a closed index, report ok=false; resolved
-// keys include any collision slot.
+// KeyForValue canonicalizes and hashes value, returning its dictionary
+// key including its collision slot. Absent values, and any value on a
+// closed index, report ok=false. Continuous values have no dictionary
+// entry and report their order key directly.
 func (i *FieldIndex) KeyForValue(value Value) (FieldKey, bool, error) {
 	field := i.Field()
 	key, canonical, err := i.keyForValue(field, value)
@@ -620,15 +713,19 @@ func (i *FieldIndex) applyPrepared(mutation FieldMutation) error {
 	return i.applyChanges(changes)
 }
 
-// prepare canonicalizes values, computes keys, and groups changes by key. It
-// runs before the writer lock; the returned canonical slices borrow caller
-// input and are copied under the lock for genuinely new values.
+// prepare canonicalizes values, computes hash-level keys, and groups
+// changes by (base hash, canonical bytes). It runs before the writer lock
+// so analyzer and hashing work stays concurrent. Returned canonical
+// slices borrow caller input and are copied under the lock only for
+// genuinely new dictionary values. Owner pre-checks are conservative:
+// entry counts scale by batchFanoutBound and byte budgets cap source
+// bytes; the WAL encoder enforces exact membership limits later.
 func (i *FieldIndex) prepare(field Field, mutation FieldMutation) ([]stagedChange, error) {
 	if len(mutation.Add) == 0 && len(mutation.Remove) == 0 {
 		return nil, nil
 	}
 	if i.owner != nil {
-		if len(mutation.Add) > MaxFieldBatchUpdates*16 || len(mutation.Remove) > MaxFieldBatchUpdates*16-len(mutation.Add) {
+		if len(mutation.Add) > MaxFieldBatchUpdates*batchFanoutBound || len(mutation.Remove) > MaxFieldBatchUpdates*batchFanoutBound-len(mutation.Add) {
 			return nil, ErrBatchTooLarge
 		}
 		remaining := MaxFieldBatchBytes
@@ -663,11 +760,11 @@ func (i *FieldIndex) prepare(field Field, mutation FieldMutation) ([]stagedChang
 				}
 				if changes[index].next < 0 {
 					changes = append(changes, stagedChange{base: key, canonical: canonical, next: -1})
-					changes[index].next = int32(len(changes) - 1)
+					changes[index].next = len(changes) - 1
 					index = len(changes) - 1
 					break
 				}
-				index = int(changes[index].next)
+				index = changes[index].next
 			}
 		}
 		if add {
@@ -690,8 +787,10 @@ func (i *FieldIndex) prepare(field Field, mutation FieldMutation) ([]stagedChang
 	return changes, nil
 }
 
-// keyForValue canonicalizes one value and returns its key. canonical is nil
-// for continuous values, which have no dictionary entry.
+// keyForValue canonicalizes one value and returns its hash-level key.
+// canonical is nil for continuous and geo values, which have no
+// dictionary entry; every other kind returns bytes that must resolve to a
+// slotted key. Empty enum bytes normalize to an empty non-nil slice.
 func (i *FieldIndex) keyForValue(field Field, value Value) (FieldKey, []byte, error) {
 	switch field.Kind {
 	case KindEnum:
@@ -748,17 +847,27 @@ func (i *FieldIndex) keyForValue(field Field, value Value) (FieldKey, []byte, er
 	}
 }
 
-// applyChanges composes and publishes one prepared batch. Canonicalization
-// runs before writer serialization; dictionary resolution, replacement
-// construction, WAL append (if owned), and root publication serialize here.
+// applyChanges composes and publishes one prepared batch on the live
+// path, with geo validation. See applyChangesMode for the ordering.
 func (i *FieldIndex) applyChanges(changes []stagedChange) error {
 	return i.applyChangesMode(changes, false)
 }
 
+// applyChangesReplay republishes WAL-decoded changes without live geo
+// preconditions: replay uses idempotent set semantics because the WAL
+// already validated the batch once.
 func (i *FieldIndex) applyChangesReplay(changes []stagedChange) error {
 	return i.applyChangesMode(changes, true)
 }
 
+// applyChangesMode serializes dictionary resolution, delta composition,
+// WAL append (if owned), and view publication. It finishes every fallible
+// step before the WAL append; the append is followed by exactly one
+// non-fallible publication. On failure the dictionary writer rolls back to
+// a chunk-cloned snapshot and aborts staged entries, so no phantom value
+// survives. Rotation policy: hard limits fold into Base synchronously,
+// ActiveTarget rotates Active to Frozen and schedules background
+// compaction.
 func (i *FieldIndex) applyChangesMode(changes []stagedChange, replay bool) error {
 	if i.owner != nil {
 		i.owner.writeMu.Lock()
@@ -832,9 +941,10 @@ func (i *FieldIndex) applyChangesMode(changes []stagedChange, replay bool) error
 	return nil
 }
 
-// resolveChanges maps prepared values to their dictionary keys. Additions
-// claim a collision slot when needed and stage their canonical bytes;
-// removal-only changes with no matching value are dropped as no-ops.
+// resolveChanges maps prepared values to dictionary keys with slots.
+// Additions claim a collision slot and stage bytes; removal-only changes
+// with no matching value are dropped as no-ops. Continuous and geo
+// changes (nil canonical) pass through with their base key.
 func (i *FieldIndex) resolveChanges(view *fieldView, changes []stagedChange) ([]stagedChange, error) {
 	out := changes[:0]
 	for index := range changes {
@@ -865,11 +975,12 @@ func (i *FieldIndex) resolveChanges(view *fieldView, changes []stagedChange) ([]
 	return out, nil
 }
 
-// composeFieldDelta resolves the batch against the current view. It shallow-
-// copies the Active map -- untouched deltas are shared -- and recomputes only
-// the keys the batch touches. Underlying membership is checked only for batch
-// IDs that are not already named in the key's existing delta; everything else
-// follows from the layer's existing canonical form.
+// composeFieldDelta resolves the batch against the current view. It
+// shallow-copies Active (untouched deltas stay shared) and recomputes
+// only touched keys. IDs already named in Active keep their staged state
+// without rechecking lower layers; only genuinely new IDs probe
+// containsWithoutActive. Remove wins within the batch. It returns nil when
+// the batch matches published state.
 func composeFieldDelta(view *fieldView, changes []stagedChange) *fieldDelta {
 	var values map[FieldKey]*bitmapDelta
 	var keys []FieldKey
@@ -964,20 +1075,22 @@ func composeFieldDelta(view *fieldView, changes []stagedChange) *fieldDelta {
 	return &fieldDelta{values: values, keys: keys, ids: ids}
 }
 
-// dedupeSortedIDs sorts ids in place and returns the unique prefix. The input
-// must be owned by the caller.
+// dedupeSortedIDs sorts ids in place and returns the unique prefix. The
+// input must be caller-owned; encode and compose both rely on sorted,
+// deduplicated columns.
 func dedupeSortedIDs(ids []ImageID) []ImageID {
 	slices.Sort(ids)
 	return slices.Compact(ids)
 }
 
-// containsSortedID reports whether id is present in the ascending slice.
+// containsSortedID binary-searches an ascending slice.
 func containsSortedID(ids []ImageID, id ImageID) bool {
 	_, ok := slices.BinarySearch(ids, id)
 	return ok
 }
 
-// subtractSortedIDs returns the ascending values minus the ascending minus.
+// subtractSortedIDs returns values minus minus, both ascending and
+// unique. It reuses values backing when possible; callers must own values.
 func subtractSortedIDs(values, minus []ImageID) []ImageID {
 	if len(values) == 0 || len(minus) == 0 {
 		return values
@@ -999,8 +1112,8 @@ func subtractSortedIDs(values, minus []ImageID) []ImageID {
 	return append(out, values[keep:]...)
 }
 
-// mergeSortedIDs returns the ascending union of two ascending, individually
-// unique slices, assigning nothing when both are empty.
+// mergeSortedIDs returns the ascending union of two ascending, unique
+// slices. Empty inputs are returned without allocating.
 func mergeSortedIDs(first, second []ImageID) []ImageID {
 	if len(first) == 0 {
 		return second
@@ -1028,7 +1141,7 @@ func mergeSortedIDs(first, second []ImageID) []ImageID {
 	return append(out, second[right:]...)
 }
 
-// publishLocked publishes a replacement field view. Caller holds writerMu.
+// publishLocked publishes a replacement view. The caller holds writerMu.
 func (i *FieldIndex) publishLocked(old *fieldView, base postingTable, frozen, active *fieldDelta) *fieldView {
 	next := i.nextView(old, base, frozen, active)
 	i.view.Store(next)
@@ -1047,7 +1160,9 @@ func (i *FieldIndex) nextView(old *fieldView, base postingTable, frozen, active 
 	}
 }
 
-// scheduleCompaction folds frozen into a replacement base in the background.
+// scheduleCompaction folds a rotated Frozen into Base in the background.
+// It captures the frozen pointer and publishes only if it is still
+// current, so superseded rotations are skipped safely.
 func (i *FieldIndex) scheduleCompaction(frozen *fieldDelta) {
 	i.workers.Add(1)
 	i.pending.Add(1)
@@ -1075,8 +1190,10 @@ func (i *FieldIndex) scheduleCompaction(frozen *fieldDelta) {
 	}()
 }
 
-// rebuildDictionary rewrites dictionary chunks with entries that still have a
-// posting in base. Caller holds writerMu.
+// rebuildDictionary rewrites dictionary chunks with only entries that
+// still have a posting in base. The caller holds writerMu. The local
+// rebuild stages, seals, and compacts, then swaps into the live writer
+// with one generation bump; the local seal's generation is discarded.
 func (i *FieldIndex) rebuildDictionary(view *fieldView, base postingTable) {
 	live := make(map[FieldKey]struct{}, len(base.keys))
 	for _, key := range base.keys {
@@ -1094,7 +1211,8 @@ func (i *FieldIndex) rebuildDictionary(view *fieldView, base postingTable) {
 	i.dict.rebuild(rebuilt.base, rebuilt.chunks)
 }
 
-// analyzeSet returns the deduplicated token set for a set of source strings.
+// analyzeSet returns the deduplicated analyzer token set for source
+// strings. The scratch token slice is reused across docs.
 func analyzeSet(analyzer *textanalyzer.Analyzer, docs []string) (map[string]struct{}, error) {
 	out := make(map[string]struct{})
 	var tokens []string

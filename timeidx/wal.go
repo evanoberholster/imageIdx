@@ -57,6 +57,29 @@ func (w *timestampWAL) appendBatch(writes []write, durability Durability) error 
 	return w.WriteRecord(record, durability == DurabilitySync)
 }
 
+// replayWALEnd is replayWAL plus the exclusive end of the last complete
+// frame, used by Vacuum to carry only complete frames into a fresh epoch.
+func replayWALEnd(path string, offset int64) (int64, error) {
+	return persist.ReplayEnd(path, offset, persist.FrameSpec{
+		HeaderSize: walHeaderSize,
+		Magic:      walMagic,
+		Version:    walVersion,
+		Corrupt:    ErrCorruptWAL,
+	}, func(header []byte) (uint64, error) {
+		count := int(binary.LittleEndian.Uint16(header[6:8]))
+		payloadSize := int(binary.LittleEndian.Uint32(header[8:12]))
+		if payloadSize != count*walWriteSize {
+			return 0, ErrCorruptWAL
+		}
+		return uint64(payloadSize), nil
+	}, func(header, payload []byte) error {
+		if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(header[12:16]) {
+			return ErrCorruptWAL
+		}
+		return nil
+	})
+}
+
 func replayWAL(path string, offset int64) ([]write, error) {
 	var writes []write
 	err := persist.Replay(path, offset, persist.FrameSpec{
