@@ -14,7 +14,8 @@ import (
 
 const (
 	fieldSegmentMagic      uint32 = 0x424d4653
-	fieldSegmentHeaderSize        = 64
+	fieldSegmentVersion           = 2
+	fieldSegmentHeaderSize        = 80
 	fieldSegmentEntrySize         = 64
 )
 
@@ -32,13 +33,13 @@ type fieldSnapshotEntry struct {
 
 // writeFieldSegment checkpoints effective postings and the dictionary to
 // path with generation gen. Vacuum drops dead dictionary values; plain
-// checkpoints preserve them. Layout: 64-byte header, registry, 64-byte
+// checkpoints preserve them. Layout: 80-byte header, registry, 64-byte
 // directory, then 4K-aligned payload. Bitmaps marshal per posting (tiny
 // postings materialize), canonical bytes follow each bitmap, each padded
 // to 8. The header CRC covers the header prefix and the payload CRC covers
 // everything after the header, so the fresh file re-reads once for
 // integrity before Sync. Temporary files must be renamed by the caller.
-func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bool) error {
+func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bool, storeID [16]byte) error {
 	registry := NewRegistry()
 	var entries []fieldSnapshotEntry
 	for _, index := range indexes {
@@ -90,10 +91,10 @@ func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bo
 		binary.LittleEndian.PutUint16(record[2:4], entry.key.Slot)
 		binary.LittleEndian.PutUint64(record[8:16], entry.key.Hash)
 		if entry.posting != nil {
-			payload, err := entry.posting.bitmap().MarshalBinary()
-			if err != nil {
-				return err
-			}
+			// The posting's serialized bytes are already assembled, and the
+			// checkpoint holds every writer lock, so write them directly
+			// instead of cloning through MarshalBinary.
+			payload := entry.posting.bitmap().Bytes()
 			binary.LittleEndian.PutUint64(record[16:24], entry.posting.cardinality())
 			binary.LittleEndian.PutUint64(record[24:32], position)
 			binary.LittleEndian.PutUint64(record[32:40], uint64(len(payload)))
@@ -117,28 +118,29 @@ func writeFieldSegment(path string, gen uint64, indexes []*FieldIndex, vacuum bo
 		}
 		position += pad
 	}
-	if _, err := f.WriteAt(defs, 64); err != nil {
+	if _, err := f.WriteAt(defs, fieldSegmentHeaderSize); err != nil {
 		return err
 	}
 	if _, err := f.WriteAt(directory, int64(dirOffset)); err != nil {
 		return err
 	}
 	checksum := crc32.NewIEEE()
-	if _, err := io.Copy(checksum, io.NewSectionReader(f, 64, int64(position)-64)); err != nil {
+	if _, err := io.Copy(checksum, io.NewSectionReader(f, fieldSegmentHeaderSize, int64(position)-fieldSegmentHeaderSize)); err != nil {
 		return err
 	}
-	var header [64]byte
+	var header [fieldSegmentHeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], fieldSegmentMagic)
-	binary.LittleEndian.PutUint16(header[4:6], 1)
-	binary.LittleEndian.PutUint16(header[6:8], 64)
+	binary.LittleEndian.PutUint16(header[4:6], fieldSegmentVersion)
+	binary.LittleEndian.PutUint16(header[6:8], fieldSegmentHeaderSize)
 	binary.LittleEndian.PutUint64(header[8:16], gen)
 	binary.LittleEndian.PutUint64(header[16:24], uint64(len(indexes)))
-	binary.LittleEndian.PutUint64(header[24:32], 64)
+	binary.LittleEndian.PutUint64(header[24:32], fieldSegmentHeaderSize)
 	binary.LittleEndian.PutUint64(header[32:40], uint64(len(defs)))
 	binary.LittleEndian.PutUint64(header[40:48], uint64(len(entries)))
 	binary.LittleEndian.PutUint64(header[48:56], dirOffset)
 	binary.LittleEndian.PutUint32(header[56:60], checksum.Sum32())
-	binary.LittleEndian.PutUint32(header[60:64], crc32.ChecksumIEEE(header[:60]))
+	copy(header[60:76], storeID[:])
+	binary.LittleEndian.PutUint32(header[76:80], crc32.ChecksumIEEE(header[:76]))
 	if _, err := f.WriteAt(header[:], 0); err != nil {
 		return err
 	}
@@ -164,31 +166,34 @@ func writeZeros(f *os.File, n uint64) error {
 }
 
 // openFieldSegment validates and memory-maps a checkpoint written by
-// writeFieldSegment. It checks magic, version, generation, header and
-// payload CRCs, registry shape, directory bounds and alignment, strict
-// key ordering, contiguous 8-aligned payload offsets, cardinality
+// writeFieldSegment. It checks magic, version, generation, store identity,
+// header and payload CRCs, registry shape, directory bounds and alignment,
+// strict key ordering, contiguous 8-aligned payload offsets, cardinality
 // agreement, hash agreement for hashed kinds, and geo key validity, with
 // no trailing bytes. Bitmaps and canonical values alias the mapping for
-// zero-copy reads; files past 4GB split values into extra chunks because
-// dictionary offsets are u32.
-func openFieldSegment(path string, gen uint64, config FieldConfig) ([]*FieldIndex, []byte, error) {
+// zero-copy reads; dictionary value offsets are 64-bit, so snapshots
+// beyond 4 GiB need no extra chunks.
+func openFieldSegment(path string, gen uint64, config FieldConfig, storeID [16]byte) ([]*FieldIndex, []byte, error) {
 	mapping, err := persist.MapFile(path, ErrCorruptSegment)
 	if err != nil {
 		return nil, nil, err
 	}
 	fail := func() ([]*FieldIndex, []byte, error) { persist.Unmap(mapping); return nil, nil, ErrCorruptSegment }
-	if len(mapping) < 64 || len(mapping)%8 != 0 {
+	if len(mapping) < fieldSegmentHeaderSize || len(mapping)%8 != 0 {
 		return fail()
 	}
-	h := mapping[:64]
-	if binary.LittleEndian.Uint32(h[0:4]) != fieldSegmentMagic || binary.LittleEndian.Uint16(h[4:6]) != 1 || binary.LittleEndian.Uint16(h[6:8]) != 64 ||
-		binary.LittleEndian.Uint64(h[8:16]) != gen || crc32.ChecksumIEEE(h[:60]) != binary.LittleEndian.Uint32(h[60:64]) || crc32.ChecksumIEEE(mapping[64:]) != binary.LittleEndian.Uint32(h[56:60]) {
+	h := mapping[:fieldSegmentHeaderSize]
+	if binary.LittleEndian.Uint32(h[0:4]) != fieldSegmentMagic || binary.LittleEndian.Uint16(h[4:6]) != fieldSegmentVersion || binary.LittleEndian.Uint16(h[6:8]) != fieldSegmentHeaderSize ||
+		binary.LittleEndian.Uint64(h[8:16]) != gen || crc32.ChecksumIEEE(h[:76]) != binary.LittleEndian.Uint32(h[76:80]) || crc32.ChecksumIEEE(mapping[fieldSegmentHeaderSize:]) != binary.LittleEndian.Uint32(h[56:60]) {
+		return fail()
+	}
+	if [16]byte(h[60:76]) != storeID {
 		return fail()
 	}
 	registryOffset := binary.LittleEndian.Uint64(h[24:32])
 	registryLen := binary.LittleEndian.Uint64(h[32:40])
 	registryEnd, ok := indexutil.CheckedEnd(registryOffset, registryLen, 1, uint64(len(mapping)))
-	if !ok || registryOffset != 64 {
+	if !ok || registryOffset != fieldSegmentHeaderSize {
 		return fail()
 	}
 	registry := NewRegistry()
@@ -248,7 +253,7 @@ func openFieldSegment(path string, gen uint64, config FieldConfig) ([]*FieldInde
 			}
 			v := index.view.Load()
 			v.base.keys = append(v.base.keys, key)
-			v.base.postings = append(v.base.postings, makePosting(bit))
+			v.base.postings = append(v.base.postings, makeBasePosting(bit))
 			position = end
 		} else if card != 0 || bitmapOffset != 0 {
 			return fail()
@@ -257,7 +262,7 @@ func openFieldSegment(path string, gen uint64, config FieldConfig) ([]*FieldInde
 		if !ok || valueOffset != position || valueLen > MaxValueBytes {
 			return fail()
 		}
-		field := index.Field()
+		field := index.field()
 		if field.Kind == KindContinuous || field.Kind == KindGeo {
 			if valueLen != 0 || key.Slot != 0 || card == 0 {
 				return fail()
@@ -272,16 +277,9 @@ func openFieldSegment(path string, gen uint64, config FieldConfig) ([]*FieldInde
 			if hashCanonical(field.Type, field.Kind, value).Hash != key.Hash {
 				return fail()
 			}
-			// Offsets inside one chunk use u32. Split the arena into independent
-			// mapped value chunks for files exceeding that addressable span.
-			chunk := uint32(0)
-			offset := uint32(valueOffset)
-			if end > uint64(^uint32(0)) {
-				chunk = uint32(len(index.dict.chunks))
-				offset = 0
-				index.dict.chunks = append(index.dict.chunks, mapping[valueOffset:end:end])
-			}
-			index.dict.base = append(index.dict.base, dictEntry{key: key, chunk: chunk, offset: offset, length: uint32(valueLen)})
+			// Canonical values alias the single mapping chunk at a 64-bit
+			// file offset, so snapshots beyond 4 GiB need no extra chunks.
+			index.dict.base = append(index.dict.base, dictEntry{key: key, chunk: 0, offset: valueOffset, length: uint32(valueLen)})
 		}
 		position = indexutil.Align(end, 8)
 		if position > uint64(len(mapping)) {

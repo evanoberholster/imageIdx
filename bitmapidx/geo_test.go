@@ -3,6 +3,7 @@ package bitmapidx
 import (
 	"math"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/golang/geo/s1"
@@ -522,6 +523,58 @@ func TestGeoCoverAndNearest(t *testing.T) {
 		t.Fatalf("k=0 returned %+v", got)
 	}
 	_ = keys
+}
+
+// TestGeoReadersSurviveVacuum stresses AppendTo, EstimateGeoRanges, and
+// GeoRanges against concurrent Vacuum generations. Each reader must hold its
+// tracker token until the last snapshot access, or a retired mmap can be
+// unmapped underneath it.
+func TestGeoReadersSurviveVacuum(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPersistentFields(dir, []Field{geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
+	if err != nil {
+		t.Fatalf("NewPersistentFields: %v", err)
+	}
+	index, _ := s.Lookup(IndexTypeLocation)
+	key := sfKey(t)
+	for id := 1; id <= 64; id++ {
+		if err := index.Move(Move{ImageID: ImageID(id), To: int64(key)}); err != nil {
+			t.Fatalf("Move: %v", err)
+		}
+	}
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	ranges := []GeoRange{{Start: key, End: key}}
+	var group sync.WaitGroup
+	stop := make(chan struct{})
+	for range 4 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					index.AppendTo(nil)
+					index.EstimateGeoRanges(ranges)
+					index.GeoRanges(ranges)
+				}
+			}
+		}()
+	}
+	for n := 0; n < 16; n++ {
+		if err := s.Vacuum(); err != nil {
+			t.Errorf("Vacuum: %v", err)
+			break
+		}
+	}
+	close(stop)
+	group.Wait()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }
 
 func TestGeoFieldDefinitionValidation(t *testing.T) {

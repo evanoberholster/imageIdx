@@ -11,7 +11,7 @@ import (
 
 const (
 	fieldWALMagic      uint32 = 0x424d4657
-	fieldWALHeaderSize        = 48
+	fieldWALHeaderSize        = 64
 	// MaxFieldBatchUpdates counts canonical (value, ImageID) memberships,
 	// not images. A move between two values counts twice.
 	MaxFieldBatchUpdates = 4096
@@ -29,6 +29,12 @@ var ErrBatchTooLarge = errors.New("bitmapidx: atomic field batch exceeds persist
 // reserved u32. Canonical bytes and ID columns follow, padded to 8 bytes.
 // ID columns are sorted ascending with remove-wins already applied, so
 // decode can validate ordering without re-sorting.
+//
+// The 64-byte frame header is: magic u32, version u16, field type u16,
+// payload length u64, group count u32, update count u32, generation u64,
+// offset u64, payload CRC u32, store ID [16]byte, header CRC u32 over the
+// preceding 60 bytes. The store ID binds frames to the owning store so
+// files mixed between a backup and restore are rejected.
 func encodeFieldChanges(changes []stagedChange) ([]byte, uint32, error) {
 	var payload []byte
 	updates := 0
@@ -80,15 +86,16 @@ func (s *FieldStore) append(index *FieldIndex, payload []byte, groups, updates u
 	}
 	var header [fieldWALHeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], fieldWALMagic)
-	binary.LittleEndian.PutUint16(header[4:6], 1)
-	binary.LittleEndian.PutUint16(header[6:8], uint16(index.Field().Type))
+	binary.LittleEndian.PutUint16(header[4:6], 2)
+	binary.LittleEndian.PutUint16(header[6:8], uint16(index.field().Type))
 	binary.LittleEndian.PutUint64(header[8:16], uint64(len(payload)))
 	binary.LittleEndian.PutUint32(header[16:20], groups)
 	binary.LittleEndian.PutUint32(header[20:24], updates)
 	binary.LittleEndian.PutUint64(header[24:32], s.generation)
 	binary.LittleEndian.PutUint64(header[32:40], uint64(start))
 	binary.LittleEndian.PutUint32(header[40:44], crc32.ChecksumIEEE(payload))
-	binary.LittleEndian.PutUint32(header[44:48], crc32.ChecksumIEEE(header[:44]))
+	copy(header[44:60], s.storeID[:])
+	binary.LittleEndian.PutUint32(header[60:64], crc32.ChecksumIEEE(header[:60]))
 	if err := s.wal.AppendFrame(header[:], payload, s.durability == DurabilitySync); err != nil {
 		s.failed = errors.Join(ErrRecoveryRequired, err)
 		return s.failed
@@ -103,9 +110,10 @@ func (s *FieldStore) append(index *FieldIndex, payload []byte, groups, updates u
 // text needs no re-analysis since groups carry canonical bytes.
 func (s *FieldStore) replay(path string) (int64, error) {
 	position := uint64(0)
-	return persist.ReplayEnd(path, 0, persist.FrameSpec{HeaderSize: fieldWALHeaderSize, Magic: fieldWALMagic, Version: 1, Corrupt: ErrCorruptWAL, MaxPayload: MaxFieldBatchBytes}, func(header []byte) (uint64, error) {
-		if crc32.ChecksumIEEE(header[:44]) != binary.LittleEndian.Uint32(header[44:48]) ||
-			binary.LittleEndian.Uint64(header[24:32]) != s.generation || binary.LittleEndian.Uint64(header[32:40]) != position {
+	return persist.ReplayEnd(path, 0, persist.FrameSpec{HeaderSize: fieldWALHeaderSize, Magic: fieldWALMagic, Version: 2, Corrupt: ErrCorruptWAL, MaxPayload: MaxFieldBatchBytes}, func(header []byte) (uint64, error) {
+		if crc32.ChecksumIEEE(header[:60]) != binary.LittleEndian.Uint32(header[60:64]) ||
+			binary.LittleEndian.Uint64(header[24:32]) != s.generation || binary.LittleEndian.Uint64(header[32:40]) != position ||
+			[16]byte(header[44:60]) != s.storeID {
 			return 0, ErrCorruptWAL
 		}
 		updates := binary.LittleEndian.Uint32(header[20:24])
@@ -123,7 +131,7 @@ func (s *FieldStore) replay(path string) (int64, error) {
 		if !ok {
 			return ErrCorruptWAL
 		}
-		changes, updates, err := decodeFieldChanges(index.Field(), payload, binary.LittleEndian.Uint32(header[16:20]))
+		changes, updates, err := decodeFieldChanges(index.field(), payload, binary.LittleEndian.Uint32(header[16:20]))
 		if err != nil || updates != binary.LittleEndian.Uint32(header[20:24]) {
 			return ErrCorruptWAL
 		}

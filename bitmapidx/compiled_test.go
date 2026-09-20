@@ -199,6 +199,38 @@ func TestZeroQueryMatchesNothing(t *testing.T) {
 	}
 }
 
+func TestCompiledQueryReResolveDoesNotAllocate(t *testing.T) {
+	index, names := benchmarkEnumField(t, 4, 20)
+	query, err := index.Compile(names[0])
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	// An unrelated value advances the dictionary generation, forcing every
+	// resolve through the re-resolution path rather than the compiled-key
+	// fast path.
+	if err := index.Add(Entry{ImageID: 1_000_000, Value: StringValue("unrelated-value")}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	view := index.view.Load()
+	if view.dictGen == query.dictGen {
+		t.Fatal("dictionary generation did not advance")
+	}
+	scratch := acquireFieldKeys(len(query.bases))
+	defer releaseFieldKeys(scratch)
+	if _, ok := query.resolveInto(view, scratch); !ok {
+		t.Fatal("resolve unexpectedly failed")
+	}
+	// Pooled FieldKey scratch keeps re-resolution allocation-free.
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, ok := query.resolveInto(view, scratch); !ok {
+			t.Error("resolve unexpectedly failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("re-resolve allocations = %v, want 0", allocs)
+	}
+}
+
 func TestCompiledQueryConcurrent(t *testing.T) {
 	index, names := benchmarkEnumField(t, 4, 1_000)
 	defer func() { _ = index.Close() }()

@@ -1,6 +1,7 @@
 package bitmapidx
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -18,12 +19,20 @@ const fieldManifestMagic uint32 = 0x424d464d
 // that WAL. Each batch is atomic within one field; cross-field
 // transactions are not provided. Reads remain lock-free across writes and
 // checkpoints. Close owns all child and mmap lifetimes.
+//
+// There is no automatic checkpoint trigger: the WAL grows with every write
+// until the caller invokes Checkpoint or Vacuum, and the prior snapshot
+// generation is retained until Vacuum retires it. Deployments must schedule
+// maintenance, bound WAL growth, and monitor free space themselves; the
+// package benchmark suite probes the checkpoint write stall and restart
+// budgets.
 type FieldStore struct {
 	dir        string
 	fields     map[IndexType]*FieldIndex // immutable after construction
 	order      []*FieldIndex
 	config     FieldConfig
 	durability Durability
+	storeID    [16]byte // binds manifest, snapshots, and WAL to one store
 	writeMu    sync.Mutex
 	closed     bool
 	failed     error
@@ -31,6 +40,17 @@ type FieldStore struct {
 	wal        *persist.WAL
 	generation uint64
 	mapping    []byte
+}
+
+// newStoreID returns a fresh random identity. Persisting it in the manifest
+// and every snapshot and WAL frame lets open detect files mixed between
+// different stores after a backup or restore.
+func newStoreID() ([16]byte, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return [16]byte{}, err
+	}
+	return id, nil
 }
 
 // NewPersistentFields creates a new mmap-backed field store. The
@@ -50,11 +70,15 @@ func NewPersistentFields(dir string, fields []Field, config FieldConfig, durabil
 	if err := registry.Register(fields...); err != nil {
 		return nil, err
 	}
+	storeID, err := newStoreID()
+	if err != nil {
+		return nil, err
+	}
 	lock, err := lockStore(dir, true)
 	if err != nil {
 		return nil, err
 	}
-	s := &FieldStore{dir: dir, config: config, durability: durability, lock: lock, fields: make(map[IndexType]*FieldIndex)}
+	s := &FieldStore{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, fields: make(map[IndexType]*FieldIndex)}
 	for _, field := range registry.Fields() {
 		index, err := NewFieldIndex(field, config)
 		if err != nil {
@@ -101,14 +125,18 @@ func OpenPersistentFields(dir string, config FieldConfig, durability Durability)
 	if err != nil {
 		return nil, err
 	}
-	if err := persist.VerifyManifest(data, 48, fieldManifestMagic, 1, 44, 44); err != nil {
+	if err := persist.VerifyManifest(data, 48, fieldManifestMagic, 2, 44, 44); err != nil {
+		return nil, ErrCorruptManifest
+	}
+	copy(s.storeID[:], data[24:40])
+	if s.storeID == ([16]byte{}) {
 		return nil, ErrCorruptManifest
 	}
 	s.generation = binary.LittleEndian.Uint64(data[8:16])
 	if s.generation == 0 {
 		return nil, ErrCorruptManifest
 	}
-	s.order, s.mapping, err = openFieldSegment(s.snapshotPath(s.generation), s.generation, config)
+	s.order, s.mapping, err = openFieldSegment(s.snapshotPath(s.generation), s.generation, config, s.storeID)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +145,7 @@ func OpenPersistentFields(dir string, config FieldConfig, durability Durability)
 	}
 	s.fields = make(map[IndexType]*FieldIndex, len(s.order))
 	for _, index := range s.order {
-		s.fields[index.Field().Type] = index
+		s.fields[index.field().Type] = index
 	}
 	walPath := s.walPath(s.generation)
 	if _, err := os.Stat(walPath); err != nil {
@@ -147,6 +175,7 @@ func (s *FieldStore) Lookup(t IndexType) (*FieldIndex, bool) {
 	index, ok := s.fields[t]
 	return index, ok
 }
+
 // Len returns the number of fields in physical storage order.
 func (s *FieldStore) Len() int { return len(s.order) }
 
@@ -227,13 +256,13 @@ func (s *FieldStore) checkpointLocked(vacuum bool) error {
 	}()
 	gen := s.generation + 1
 	target := s.snapshotPath(gen)
-	if err := writeFieldSegment(target+".tmp", gen, s.order, vacuum); err != nil {
+	if err := writeFieldSegment(target+".tmp", gen, s.order, vacuum, s.storeID); err != nil {
 		return err
 	}
 	if err := os.Rename(target+".tmp", target); err != nil {
 		return err
 	}
-	loaded, mapping, err := openFieldSegment(target, gen, s.config)
+	loaded, mapping, err := openFieldSegment(target, gen, s.config, s.storeID)
 	if err != nil {
 		return err
 	}
@@ -258,9 +287,10 @@ func (s *FieldStore) checkpointLocked(vacuum bool) error {
 	if err != nil {
 		return err
 	}
-	manifest := persist.BuildManifest(48, fieldManifestMagic, 1, 44, 44, func(data []byte) {
+	manifest := persist.BuildManifest(48, fieldManifestMagic, 2, 44, 44, func(data []byte) {
 		binary.LittleEndian.PutUint64(data[8:16], gen)
 		binary.LittleEndian.PutUint64(data[16:24], uint64(len(s.order)))
+		copy(data[24:40], s.storeID[:])
 	})
 	// Sync names before publishing their manifest reference.
 	if err = syncStoreDir(s.dir); err != nil {

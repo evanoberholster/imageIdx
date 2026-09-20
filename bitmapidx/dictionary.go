@@ -12,16 +12,18 @@ import (
 // never observe the tail.
 const (
 	dictChunkTargetBytes    = 1 << 20
+	dictChunkInitialBytes   = 4 << 10
 	dictActiveTargetEntries = 4096
 )
 
-// dictEntry locates one canonical value inside a dictionary view. chunk,
-// offset, and length index the view's chunk list. Entries are ordered by
-// FieldKey; layers are append-only once published.
+// dictEntry locates one canonical value inside a dictionary view. chunk
+// indexes the view's chunk list; offset is a byte offset within that chunk,
+// wide enough for snapshots beyond 4 GiB. Entries are ordered by FieldKey;
+// layers are append-only once published.
 type dictEntry struct {
 	key    FieldKey
 	chunk  uint32
-	offset uint32
+	offset uint64
 	length uint32
 }
 
@@ -49,7 +51,7 @@ func (v *dictionaryView) entry(key FieldKey) (dictEntry, bool) {
 // the reader tracker.
 func (v *dictionaryView) bytes(e dictEntry) []byte {
 	chunk := v.chunks[e.chunk]
-	return chunk[e.offset : e.offset+e.length]
+	return chunk[e.offset : e.offset+uint64(e.length)]
 }
 
 // lookup appends the canonical bytes for key to dst. It reports
@@ -223,17 +225,21 @@ type dictionaryWriter struct {
 // view snapshots the writer for publication. The outer chunk list is
 // cloned; the writer may extend its last chunk's slice header afterwards
 // while readers keep the older length and only address already-written
-// bytes.
+// bytes. The clone is O(chunks), and chunks accumulate dead bytes until
+// Vacuum rebuilds the writer, so schedules should vacuum large dictionaries
+// to bound per-publication allocation.
 func (d *dictionaryWriter) view() *dictionaryView {
 	return &dictionaryView{base: d.base, active: d.active, chunks: slices.Clone(d.chunks)}
 }
 
 // appendBytes copies canonical bytes into the active chunk and returns
-// their location. Callers must not mutate b afterwards. Chunks target
-// dictChunkTargetBytes; an oversized value gets its own chunk.
+// their location. Callers must not mutate b afterwards. The first chunk
+// starts small so a field with few values does not reserve the full target;
+// chunks grow toward dictChunkTargetBytes, after which a value that would
+// exceed it starts a fresh chunk. An oversized value gets its own chunk.
 func (d *dictionaryWriter) appendBytes(b []byte) (chunk uint32, offset uint32) {
 	if len(d.chunks) == 0 {
-		d.chunks = append(d.chunks, make([]byte, 0, dictChunkTargetBytes))
+		d.chunks = append(d.chunks, make([]byte, 0, max(dictChunkInitialBytes, len(b))))
 	}
 	last := len(d.chunks) - 1
 	if len(d.chunks[last]) > 0 && len(d.chunks[last])+len(b) > dictChunkTargetBytes {
@@ -250,7 +256,7 @@ func (d *dictionaryWriter) appendBytes(b []byte) (chunk uint32, offset uint32) {
 // so same-batch duplicates resolve without scanning.
 func (d *dictionaryWriter) stage(key FieldKey, canonical []byte) {
 	chunk, offset := d.appendBytes(canonical)
-	entry := dictEntry{key: key, chunk: chunk, offset: offset, length: uint32(len(canonical))}
+	entry := dictEntry{key: key, chunk: chunk, offset: uint64(offset), length: uint32(len(canonical))}
 	d.pending = append(d.pending, entry)
 	if d.pendingByHash == nil {
 		d.pendingByHash = make(map[FieldKey][]int)
@@ -262,7 +268,7 @@ func (d *dictionaryWriter) stage(key FieldKey, canonical []byte) {
 // pendingBytes returns the canonical bytes of one pending entry. The
 // result aliases writer chunk storage owned by the writer lock.
 func (d *dictionaryWriter) pendingBytes(entry dictEntry) []byte {
-	return d.chunks[entry.chunk][entry.offset : entry.offset+entry.length]
+	return d.chunks[entry.chunk][entry.offset : entry.offset+uint64(entry.length)]
 }
 
 // assign returns the key for canonical, reusing an existing slot when the

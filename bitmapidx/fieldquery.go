@@ -88,7 +88,6 @@ func (i *FieldIndex) MatchValues(values ...Value) (result roar.Bitmap, resultErr
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
-	defer i.ownResult(&result)
 	view := i.view.Load()
 	if i.closed.Load() {
 		return roar.Bitmap{}, nil
@@ -100,14 +99,16 @@ func (i *FieldIndex) MatchValues(values ...Value) (result roar.Bitmap, resultErr
 	if !ok {
 		return roar.Bitmap{}, nil
 	}
-	return view.matchResolved(keys), nil
+	result, owned := view.matchResolved(keys)
+	i.detachOwned(&result, owned)
+	return result, nil
 }
 
 // MatchText analyzes query text and returns the images holding every
 // resulting token (logical AND). A query producing no tokens matches
 // nothing.
 func (i *FieldIndex) MatchText(query string) (roar.Bitmap, error) {
-	field := i.Field()
+	field := i.field()
 	if field.Kind != KindText {
 		return roar.Bitmap{}, ErrFieldMismatch
 	}
@@ -125,47 +126,37 @@ func (i *FieldIndex) MatchText(query string) (roar.Bitmap, error) {
 	return i.MatchValues(values...)
 }
 
-// resolveQueryKeys maps query values to dictionary keys with slots. ok
-// is false when a hashed value is absent, which empties the conjunction.
-func (i *FieldIndex) resolveQueryKeys(view *fieldView, values []Value) ([]FieldKey, bool, error) {
-	keys, _, _, ok, err := i.resolveValues(view, values, false)
-	return keys, ok, err
+// canonicalizedValue pairs one value's hash-level base key with its
+// canonical bytes. canonical is nil for continuous and geo values, which
+// have no dictionary entry.
+type canonicalizedValue struct {
+	base      FieldKey
+	canonical []byte
 }
 
-// resolveValues maps query values to dictionary keys like
-// resolveQueryKeys. bases and canon cover every deduplicated value; keys
-// covers only resolved ones and is complete exactly when ok is true.
-// Canonical bytes are copied only when retain is set, for callers that
-// re-resolve later (compiled queries). Deduplication is a linear scan for
-// tiny queries with no allocation and a map for large ones.
-func (i *FieldIndex) resolveValues(view *fieldView, values []Value, retain bool) (keys, bases []FieldKey, canon [][]byte, ok bool, err error) {
-	field := i.Field()
-	keys = make([]FieldKey, 0, len(values))
-	bases = make([]FieldKey, 0, len(values))
-	if retain {
-		canon = make([][]byte, 0, len(values))
-	}
+// canonicalizeValues deduplicates values, canonicalizes them for field, and
+// returns each distinct value's base key and canonical bytes in first-seen
+// order. When retain is set the canonical bytes are copied so callers can
+// re-resolve later (compiled queries); otherwise they may alias caller input
+// and are valid only for the call. Deduplication is a linear scan for tiny
+// inputs and a map for larger ones.
+func (i *FieldIndex) canonicalizeValues(field Field, values []Value, retain bool) ([]canonicalizedValue, error) {
+	out := make([]canonicalizedValue, 0, len(values))
 	const linearDedupBound = 8
-	type linearSeen struct {
-		base FieldKey
-		canon []byte
-	}
-	var linear []linearSeen
-	var seen map[queryKey]struct{}
 	useLinear := len(values) <= linearDedupBound
+	var seen map[queryKey]struct{}
 	if !useLinear {
 		seen = make(map[queryKey]struct{}, len(values))
 	}
-	complete := true
 	for _, value := range values {
 		base, canonical, err := i.keyForValue(field, value)
 		if err != nil {
-			return nil, nil, nil, false, err
+			return nil, err
 		}
 		if useLinear {
 			duplicate := false
-			for _, prev := range linear {
-				if prev.base == base && bytes.Equal(prev.canon, canonical) {
+			for _, prev := range out {
+				if prev.base == base && bytes.Equal(prev.canonical, canonical) {
 					duplicate = true
 					break
 				}
@@ -173,7 +164,6 @@ func (i *FieldIndex) resolveValues(view *fieldView, values []Value, retain bool)
 			if duplicate {
 				continue
 			}
-			linear = append(linear, linearSeen{base: base, canon: canonical})
 		} else {
 			signature := queryKey{base: base, canonical: string(canonical)}
 			if _, ok := seen[signature]; ok {
@@ -181,57 +171,79 @@ func (i *FieldIndex) resolveValues(view *fieldView, values []Value, retain bool)
 			}
 			seen[signature] = struct{}{}
 		}
-		bases = append(bases, base)
-		if retain {
-			if canonical == nil {
-				canon = append(canon, nil)
-			} else {
-				canon = append(canon, append([]byte{}, canonical...))
-			}
+		if retain && canonical != nil {
+			canonical = append([]byte{}, canonical...)
 		}
-		if canonical == nil {
-			keys = append(keys, base)
+		out = append(out, canonicalizedValue{base: base, canonical: canonical})
+	}
+	return out, nil
+}
+
+// resolveKeysPartial resolves each canonicalized value to its dictionary
+// key, including any collision slot, and reports complete=false when a
+// hashed value is absent. Continuous and geo values pass through with their
+// base key.
+func resolveKeysPartial(view *fieldView, items []canonicalizedValue) (keys []FieldKey, complete bool) {
+	keys = make([]FieldKey, 0, len(items))
+	complete = true
+	for _, item := range items {
+		if item.canonical == nil {
+			keys = append(keys, item.base)
 			continue
 		}
-		key, ok := view.dict.resolve(base, canonical)
+		key, ok := view.dict.resolve(item.base, item.canonical)
 		if !ok {
 			complete = false
 			continue
 		}
 		keys = append(keys, key)
 	}
-	if !complete {
-		return nil, bases, canon, false, nil
-	}
-	return keys, bases, canon, true, nil
+	return keys, complete
 }
 
-// matchResolved intersects the effective posting of every resolved key.
-// Missing keys empty the conjunction. Uses pooled posting scratch.
-func (v *fieldView) matchResolved(keys []FieldKey) roar.Bitmap {
+// resolveQueryKeys maps query values to dictionary keys with slots. ok is
+// false when a hashed value is absent, which empties the conjunction.
+func (i *FieldIndex) resolveQueryKeys(view *fieldView, values []Value) ([]FieldKey, bool, error) {
+	items, err := i.canonicalizeValues(i.field(), values, false)
+	if err != nil {
+		return nil, false, err
+	}
+	keys, complete := resolveKeysPartial(view, items)
+	if !complete {
+		return nil, false, nil
+	}
+	return keys, true, nil
+}
+
+// matchResolved intersects the effective posting of every resolved key and
+// reports whether the result is heap-owned. Missing keys empty the
+// conjunction. Uses pooled posting scratch. A single operand is passed
+// through with its own ownership; multi-way intersections are freshly built.
+func (v *fieldView) matchResolved(keys []FieldKey) (result roar.Bitmap, owned bool) {
 	postings := acquirePostings(len(keys))
 	defer releasePostings(postings)
 	for _, key := range keys {
 		p, ok := v.effective(key)
 		if !ok {
-			return roar.Bitmap{}
+			return roar.Bitmap{}, true
 		}
 		*postings = append(*postings, p)
 	}
 	switch len(*postings) {
 	case 0:
-		return roar.Bitmap{}
+		return roar.Bitmap{}, true
 	case 1:
-		return (*postings)[0].bitmap()
+		p := (*postings)[0]
+		return p.bitmap(), p.owned
 	default:
-		return intersectPostings(*postings)
+		return intersectPostings(*postings), true
 	}
 }
 
 // ValueIDs appends every image holding value to dst in ascending order.
 // Unknown values append nothing. It materializes only the one posting.
 func (i *FieldIndex) ValueIDs(dst []ImageID, value Value) ([]ImageID, error) {
-	field := i.Field()
+	field := i.field()
 	base, canonical, err := i.keyForValue(field, value)
 	if err != nil {
 		return dst, err
@@ -263,7 +275,7 @@ func (i *FieldIndex) ValueIDs(dst []ImageID, value Value) ([]ImageID, error) {
 // the delta path collects occupied keys across all layers, then unions
 // their effective postings.
 func (i *FieldIndex) Range(bounds NumericRange) (result roar.Bitmap, resultErr error) {
-	field := i.Field()
+	field := i.field()
 	if field.Kind != KindContinuous {
 		return roar.Bitmap{}, ErrInvalidRange
 	}
@@ -272,7 +284,6 @@ func (i *FieldIndex) Range(bounds NumericRange) (result roar.Bitmap, resultErr e
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
-	defer i.ownResult(&result)
 	view := i.view.Load()
 	if i.closed.Load() {
 		return roar.Bitmap{}, nil
@@ -283,8 +294,9 @@ func (i *FieldIndex) Range(bounds NumericRange) (result roar.Bitmap, resultErr e
 		for index := start; index < end; index++ {
 			*postings = append(*postings, &view.base.postings[index])
 		}
-		out := unionPostings(*postings)
+		out, owned := unionPostings(*postings)
 		releasePostings(postings)
+		i.detachOwned(&out, owned)
 		return out, nil
 	}
 	keys := view.continuousKeys(field.Type, bounds)
@@ -298,14 +310,16 @@ func (i *FieldIndex) Range(bounds NumericRange) (result roar.Bitmap, resultErr e
 			*postings = append(*postings, p)
 		}
 	}
-	return unionPostings(*postings), nil
+	out, owned := unionPostings(*postings)
+	i.detachOwned(&out, owned)
+	return out, nil
 }
 
 // EstimateRange returns a planning hint for the occupied grid keys
 // inside bounds without materializing: base cardinality plus delta
 // additions minus removals. Multi-valued overlap makes it an upper bound.
 func (i *FieldIndex) EstimateRange(bounds NumericRange) (uint64, error) {
-	field := i.Field()
+	field := i.field()
 	if field.Kind != KindContinuous {
 		return 0, ErrInvalidRange
 	}
@@ -330,9 +344,13 @@ func (i *FieldIndex) EstimateRange(bounds NumericRange) (uint64, error) {
 }
 
 // estimateKeys returns the effective cardinality of keys without
-// materializing: base cardinality plus delta additions minus removals.
-// Single-valued fields are exact; multi-valued overlap makes it an upper
-// bound. It never underflows: removals clamp at zero.
+// materializing: base cardinality plus delta additions minus removals. A
+// single key is exact because composeFieldDelta admits an addition only when
+// the ID is absent from base+frozen and a removal only when it is present,
+// so CountValues uses this for one key; multiple keys can overlap, making the
+// sum an upper bound. The running total never underflows: a removal larger
+// than the current total clamps to zero, which can only make the multi-key
+// planning hint less exact, never break a query.
 func (v *fieldView) estimateKeys(keys []FieldKey) uint64 {
 	var estimate uint64
 	for _, key := range keys {
@@ -375,6 +393,14 @@ func (i *FieldIndex) CountValues(values ...Value) (uint64, error) {
 	if !ok {
 		return 0, nil
 	}
+	if len(keys) == 1 {
+		// estimateKeys is exact for a single key: composeFieldDelta admits an
+		// addition only when the ID is absent from base+frozen and a removal
+		// only when it is present, so base + additions - removals is the true
+		// corrected cardinality. This avoids materializing the posting just to
+		// count it.
+		return view.estimateKeys(keys), nil
+	}
 	postings := acquirePostings(len(keys))
 	defer releasePostings(postings)
 	for _, key := range keys {
@@ -384,21 +410,14 @@ func (i *FieldIndex) CountValues(values ...Value) (uint64, error) {
 		}
 		*postings = append(*postings, p)
 	}
-	switch len(*postings) {
-	case 0:
-		return 0, nil
-	case 1:
-		return (*postings)[0].cardinality(), nil
-	default:
-		return intersectPostingsCardinality(*postings), nil
-	}
+	return intersectPostingsCardinality(*postings), nil
 }
 
 // CountRange returns the number of images inside bounds by unioning
 // bitmaps and counting, without appending IDs. Scratch is pre-sized once
 // per call.
 func (i *FieldIndex) CountRange(bounds NumericRange) (uint64, error) {
-	field := i.Field()
+	field := i.field()
 	if field.Kind != KindContinuous {
 		return 0, ErrInvalidRange
 	}

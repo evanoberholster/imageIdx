@@ -737,3 +737,66 @@ func shortContext(t *testing.T) context.Context {
 	t.Cleanup(cancel)
 	return ctx
 }
+
+func TestReplaceTextRejectsDuplicateImage(t *testing.T) {
+	index := mustField(t, textField(IndexTypeTag), FieldConfig{})
+	if err := index.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha"}}); err != nil {
+		t.Fatalf("ReplaceText: %v", err)
+	}
+	// Two replacements for one image have ambiguous sequential semantics;
+	// they must be rejected rather than silently producing a wrong set.
+	err := index.ReplaceText(
+		TextReplacement{ImageID: 1, Before: []string{"alpha"}, After: []string{"beta"}},
+		TextReplacement{ImageID: 1, Before: []string{"beta"}, After: []string{"alpha"}},
+	)
+	if !errors.Is(err, ErrDuplicateImageID) {
+		t.Fatalf("duplicate ReplaceText error = %v, want ErrDuplicateImageID", err)
+	}
+	match, err := index.MatchText("alpha")
+	if err != nil {
+		t.Fatalf("MatchText: %v", err)
+	}
+	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1}) {
+		t.Fatalf("alpha membership = %v, want [1]", got)
+	}
+}
+
+// closeWithin runs Close on a goroutine so a leaked reader token surfaces as
+// a timeout instead of hanging the test binary.
+func closeWithin(t *testing.T, index *FieldIndex, what string) {
+	t.Helper()
+	closed := make(chan error, 1)
+	go func() { closed <- index.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close after %s: %v", what, err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Close blocked: %s leaked a reader token", what)
+	}
+}
+
+func TestIterateCallbackPanicReleasesReader(t *testing.T) {
+	index := mustField(t, textField(IndexTypeTag), FieldConfig{})
+	if err := index.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha"}}); err != nil {
+		t.Fatalf("ReplaceText: %v", err)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		index.Iterate(func(FieldKey, []byte) bool { panic("callback") })
+	}()
+	closeWithin(t, index, "Iterate callback panic")
+}
+
+func TestPrefixCallbackPanicReleasesReader(t *testing.T) {
+	index := mustField(t, textField(IndexTypeTag), FieldConfig{})
+	if err := index.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha"}}); err != nil {
+		t.Fatalf("ReplaceText: %v", err)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		index.Prefix([]byte("a"), func(FieldKey, []byte) bool { panic("callback") })
+	}()
+	closeWithin(t, index, "Prefix callback panic")
+}

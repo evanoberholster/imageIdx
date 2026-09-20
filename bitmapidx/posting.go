@@ -5,8 +5,9 @@ import (
 )
 
 // tinyCapacity is the maximum number of IDs stored inline in a tiny
-// posting. Four keeps the struct at 40 bytes and covers the long tail of
-// rare values without a bitmap allocation.
+// posting. Four keeps tinyPosting at 40 bytes (one length byte plus four
+// uint64 IDs) and covers the long tail of rare values without a bitmap
+// allocation; a posting adds the roaring bitmap header on top of that.
 const tinyCapacity = 4
 
 // tinyPosting stores up to tinyCapacity sorted IDs inline, avoiding a
@@ -32,9 +33,16 @@ func tinyContains(p *tinyPosting, id uint64) bool {
 // up to tinyCapacity IDs, otherwise a roaring bitmap. The zero value is
 // an empty posting (not tiny, empty bitmap). Bitmap postings always hold
 // more than tinyCapacity IDs; see makePosting.
+//
+// owned reports that bitmap() returns bytes this posting owns on the heap.
+// Base postings loaded from a mapped segment are not owned: their bitmap
+// aliases the mapping, which a checkpoint can unmap, so store-owned query
+// results must clone them. Corrected, tiny, and freshly built postings are
+// owned and can be handed to callers without a copy.
 type posting struct {
-	tiny tinyPosting
-	bit  roar.Bitmap
+	tiny  tinyPosting
+	bit   roar.Bitmap
+	owned bool
 }
 
 // isTiny reports whether the posting uses inline storage. Empty
@@ -93,20 +101,33 @@ func (p *posting) bitmap() roar.Bitmap {
 	return p.bit
 }
 
-// makePosting wraps a bitmap, demoting postings of at most tinyCapacity
-// IDs to the inline form. Empty bitmaps become the zero posting. The
-// bitmap is not retained in tiny form; its IDs are copied inline.
+// makePosting wraps a heap bitmap, demoting postings of at most
+// tinyCapacity IDs to the inline form. Empty bitmaps become the zero
+// posting. The bitmap is not retained in tiny form; its IDs are copied
+// inline. The result is owned: bitmap() never returns mapped bytes.
 func makePosting(bit roar.Bitmap) posting {
 	cardinality := bit.Cardinality()
 	if cardinality == 0 {
 		return posting{}
 	}
 	if cardinality > tinyCapacity {
-		return posting{bit: bit}
+		return posting{bit: bit, owned: true}
 	}
 	var p posting
 	p.tiny.n = uint8(cardinality)
 	bit.AppendTo(p.tiny.ids[:0])
+	p.owned = true
+	return p
+}
+
+// makeBasePosting wraps a bitmap loaded from a mapped segment. Bitmap-form
+// postings keep owned=false because their bytes alias the mapping; tiny
+// postings copy their IDs inline and are heap-owned.
+func makeBasePosting(bit roar.Bitmap) posting {
+	p := makePosting(bit)
+	if !p.isTiny() {
+		p.owned = false
+	}
 	return p
 }
 
@@ -194,16 +215,19 @@ func intersectPostingsCardinality(postings []*posting) uint64 {
 	return out
 }
 
-// unionPostings unions effective postings. All-tiny unions collect IDs
-// into pooled scratch and build once; other unions run the immutable
-// roaring N-way kernel over pooled scratch. Mutable bitmaps are reserved
-// for the caller-owned geo accumulation path (CollectGeoRanges).
-func unionPostings(postings []*posting) roar.Bitmap {
+// unionPostings unions effective postings and reports whether the result
+// is heap-owned. All-tiny unions collect IDs into pooled scratch and build
+// once; other unions run the immutable roaring N-way kernel over pooled
+// scratch. A single operand is returned as-is, so its ownership is passed
+// through. Mutable bitmaps are reserved for the caller-owned geo
+// accumulation path (CollectGeoRanges).
+func unionPostings(postings []*posting) (roar.Bitmap, bool) {
 	switch len(postings) {
 	case 0:
-		return roar.Bitmap{}
+		return roar.Bitmap{}, true
 	case 1:
-		return postings[0].bitmap()
+		p := postings[0]
+		return p.bitmap(), p.owned
 	}
 	allTiny, total := true, 0
 	for index := range postings {
@@ -220,7 +244,7 @@ func unionPostings(postings []*posting) roar.Bitmap {
 		}
 		out := roar.FromUnsorted(*ids)
 		releaseIDs(ids)
-		return out
+		return out, true
 	}
 	bitmaps := acquireBitmaps(len(postings))
 	for index := range postings {
@@ -228,5 +252,5 @@ func unionPostings(postings []*posting) roar.Bitmap {
 	}
 	out := roar.OrMany(*bitmaps...)
 	releaseBitmaps(bitmaps)
-	return out
+	return out, true
 }

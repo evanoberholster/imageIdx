@@ -261,7 +261,7 @@ func TestFieldWALTailAndValidation(t *testing.T) {
 			} else {
 				tail := append([]byte(nil), data[:fieldWALHeaderSize+1]...)
 				binary.LittleEndian.PutUint64(tail[32:40], uint64(len(data)))
-				binary.LittleEndian.PutUint32(tail[44:48], crc32.ChecksumIEEE(tail[:44]))
+				binary.LittleEndian.PutUint32(tail[60:64], crc32.ChecksumIEEE(tail[:60]))
 				data = append(data, tail...)
 			}
 			if err := os.WriteFile(path, data, 0600); err != nil {
@@ -449,4 +449,150 @@ func TestFieldStoreOwnershipAndSnapshotCorruption(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "manifest")); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestFieldStoreRejectsForeignFiles(t *testing.T) {
+	build := func(t *testing.T, dir string, id ImageID) (snapshot, wal string) {
+		t.Helper()
+		s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, _ := s.Lookup(100)
+		if err := index.Add(Entry{ImageID: id, Value: StringValue("v")}); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, wal = s.snapshotPath(s.generation), s.walPath(s.generation)
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot, wal
+	}
+	copyFile := func(t *testing.T, src, dst string) {
+		t.Helper()
+		data, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("wal", func(t *testing.T) {
+		dirA, dirB := t.TempDir(), t.TempDir()
+		_, walA := build(t, dirA, 1)
+		_, walB := build(t, dirB, 2)
+		copyFile(t, walB, walA)
+		s, err := OpenPersistentFields(dirA, FieldConfig{}, DurabilityOS)
+		if s != nil {
+			s.Close()
+		}
+		if !errors.Is(err, ErrCorruptWAL) {
+			t.Fatalf("foreign WAL error = %v, want ErrCorruptWAL", err)
+		}
+	})
+	t.Run("snapshot", func(t *testing.T) {
+		dirC, dirD := t.TempDir(), t.TempDir()
+		snapC, _ := build(t, dirC, 1)
+		snapD, _ := build(t, dirD, 2)
+		copyFile(t, snapD, snapC)
+		s, err := OpenPersistentFields(dirC, FieldConfig{}, DurabilityOS)
+		if s != nil {
+			s.Close()
+		}
+		if !errors.Is(err, ErrCorruptSegment) {
+			t.Fatalf("foreign snapshot error = %v, want ErrCorruptSegment", err)
+		}
+	})
+}
+
+// TestFieldCheckpointCrashBoundaries interrupts a checkpoint at each stage
+// that can leave partial successor state, verifying open ignores unpublished
+// generations and that a failed segment write stays recoverable.
+func TestFieldCheckpointCrashBoundaries(t *testing.T) {
+	t.Run("unpublished successor files ignored", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, _ := s.Lookup(100)
+		if err := index.Add(Entry{ImageID: 1, Value: StringValue("a")}); err != nil {
+			t.Fatal(err)
+		}
+		// Crash after successor files exist but before the manifest publishes
+		// them: a half-written successor segment, WAL, and temporary file.
+		successor := s.generation + 1
+		for _, path := range []string{
+			s.snapshotPath(successor),
+			s.walPath(successor),
+			s.snapshotPath(successor) + ".tmp",
+		} {
+			if err := os.WriteFile(path, []byte("garbage"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+		if err != nil {
+			t.Fatalf("open with unpublished successor: %v", err)
+		}
+		index, _ = s.Lookup(100)
+		if got := appendIDs(t, index, StringValue("a")); !slices.Equal(got, []ImageID{1}) {
+			t.Fatalf("recovered membership = %v, want [1]", got)
+		}
+		// The next checkpoint must replace the orphan generation.
+		if err := s.Checkpoint(); err != nil {
+			t.Fatalf("checkpoint after orphan: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("segment write failure recoverable", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, _ := s.Lookup(100)
+		if err := index.Add(Entry{ImageID: 1, Value: StringValue("a")}); err != nil {
+			t.Fatal(err)
+		}
+		// Block the temporary segment path so the checkpoint fails before any
+		// successor is published or the manifest is replaced.
+		blocked := s.snapshotPath(s.generation+1) + ".tmp"
+		if err := os.Mkdir(blocked, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Checkpoint(); err == nil {
+			t.Fatal("checkpoint with blocked temporary path succeeded")
+		}
+		// The live store stays usable and later writes replay.
+		if err := index.Add(Entry{ImageID: 2, Value: StringValue("b")}); err != nil {
+			t.Fatalf("write after failed checkpoint: %v", err)
+		}
+		if err := os.Remove(blocked); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Checkpoint(); err != nil {
+			t.Fatalf("checkpoint after unblocking: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		index, _ = s.Lookup(100)
+		if got := appendIDs(t, index, StringValue("b")); !slices.Equal(got, []ImageID{2}) {
+			t.Fatalf("recovered membership = %v, want [2]", got)
+		}
+	})
 }

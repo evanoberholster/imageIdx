@@ -18,6 +18,7 @@ const (
 	maxPooledPostings = 4096
 	maxPooledIDs      = 1 << 20
 	maxPooledBitmaps  = 1024
+	maxPooledKeys     = 4096
 )
 
 var (
@@ -31,6 +32,10 @@ var (
 	}}
 	bitmapSlicePool = sync.Pool{New: func() any {
 		s := make([]roar.Bitmap, 0, 64)
+		return &s
+	}}
+	fieldKeySlicePool = sync.Pool{New: func() any {
+		s := make([]FieldKey, 0, 64)
 		return &s
 	}}
 )
@@ -48,11 +53,13 @@ func acquirePostings(n int) *[]*posting {
 }
 
 // releasePostings returns scratch to the pool, dropping buffers whose
-// capacity exceeds maxPooledPostings.
+// capacity exceeds maxPooledPostings. Retained posting pointers are
+// cleared first so the pooled backing array cannot pin obsolete postings.
 func releasePostings(p *[]*posting) {
 	if cap(*p) > maxPooledPostings {
 		return
 	}
+	clear(*p)
 	*p = (*p)[:0]
 	postingPtrPool.Put(p)
 }
@@ -96,11 +103,36 @@ func acquireBitmaps(n int) *[]roar.Bitmap {
 }
 
 // releaseBitmaps returns scratch to the pool, dropping buffers whose
-// capacity exceeds maxPooledBitmaps.
+// capacity exceeds maxPooledBitmaps. Retained bitmap payloads are cleared
+// first so the pooled backing array cannot pin obsolete bitmaps.
 func releaseBitmaps(p *[]roar.Bitmap) {
 	if cap(*p) > maxPooledBitmaps {
 		return
 	}
+	clear(*p)
 	*p = (*p)[:0]
 	bitmapSlicePool.Put(p)
+}
+
+// acquireFieldKeys returns a scratch FieldKey buffer with capacity for at
+// least n entries, reset to length zero.
+func acquireFieldKeys(n int) *[]FieldKey {
+	p := fieldKeySlicePool.Get().(*[]FieldKey)
+	if cap(*p) < n {
+		*p = make([]FieldKey, 0, n)
+	} else {
+		*p = (*p)[:0]
+	}
+	return p
+}
+
+// releaseFieldKeys returns scratch to the pool, dropping buffers whose
+// capacity exceeds maxPooledKeys. FieldKey carries no pointers, so no
+// clearing is required.
+func releaseFieldKeys(p *[]FieldKey) {
+	if cap(*p) > maxPooledKeys {
+		return
+	}
+	*p = (*p)[:0]
+	fieldKeySlicePool.Put(p)
 }

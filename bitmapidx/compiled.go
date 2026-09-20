@@ -35,12 +35,19 @@ func (i *FieldIndex) Compile(values ...Value) (Query, error) {
 	if i.closed.Load() {
 		return q, nil
 	}
-	keys, bases, canon, ok, err := i.resolveValues(view, values, true)
+	items, err := i.canonicalizeValues(i.field(), values, true)
 	if err != nil {
 		return Query{}, err
 	}
+	bases := make([]FieldKey, len(items))
+	canon := make([][]byte, len(items))
+	for index, item := range items {
+		bases[index] = item.base
+		canon[index] = item.canonical
+	}
+	keys, complete := resolveKeysPartial(view, items)
 	q.bases, q.canon = bases, canon
-	if ok {
+	if complete {
 		q.keys, q.dictGen, q.complete = keys, view.dictGen, true
 	}
 	return q, nil
@@ -51,7 +58,7 @@ func (i *FieldIndex) Compile(values ...Value) (Query, error) {
 // tokens. A query producing no tokens compiles to a Query that matches
 // nothing.
 func (i *FieldIndex) CompileText(query string) (Query, error) {
-	if i.Field().Kind != KindText {
+	if i.field().Kind != KindText {
 		return Query{}, ErrFieldMismatch
 	}
 	tokens, err := i.analyzer.TokenSet(query, nil)
@@ -68,20 +75,34 @@ func (i *FieldIndex) CompileText(query string) (Query, error) {
 	return i.Compile(values...)
 }
 
-// resolve returns the execution keys for a view. Fully resolved queries
-// reuse their keys while the dictionary generation is unchanged; otherwise
-// every value re-resolves against the current view by base hash plus
-// canonical bytes. ok is false when a hashed value no longer resolves,
-// which empties the conjunction. Continuous values carry no canonical
-// bytes and pass through directly.
-func (q Query) resolve(view *fieldView) ([]FieldKey, bool) {
+// keysFor returns the execution keys for a view. Fully resolved queries
+// reuse their compiled keys while the dictionary generation is unchanged,
+// touching neither the heap nor the pool. Otherwise every value re-resolves
+// into pooled scratch, which is returned so the caller can hold it until the
+// last use of keys. keys aliases scratch when scratch is non-nil; the caller
+// must release scratch only after consuming keys. ok is false when a hashed
+// value no longer resolves, which empties the conjunction.
+func (q Query) keysFor(view *fieldView) (keys []FieldKey, scratch *[]FieldKey, ok bool) {
 	if len(q.bases) == 0 {
-		return nil, true
+		return nil, nil, true
 	}
 	if q.complete && view.dictGen == q.dictGen {
-		return q.keys, true
+		return q.keys, nil, true
 	}
-	keys := make([]FieldKey, 0, len(q.bases))
+	scratch = acquireFieldKeys(len(q.bases))
+	keys, ok = q.resolveInto(view, scratch)
+	if !ok {
+		releaseFieldKeys(scratch)
+		return nil, nil, false
+	}
+	return keys, scratch, true
+}
+
+// resolveInto writes re-resolved keys into scratch, whose capacity must hold
+// len(bases). The returned slice aliases scratch; the caller must not retain
+// it past release.
+func (q Query) resolveInto(view *fieldView, scratch *[]FieldKey) ([]FieldKey, bool) {
+	keys := (*scratch)[:0]
 	for index, base := range q.bases {
 		canonical := q.canon[index]
 		if canonical == nil {
@@ -107,16 +128,20 @@ func (q Query) Match() (result roar.Bitmap, resultErr error) {
 	i := q.index
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
-	defer i.ownResult(&result)
 	view := i.view.Load()
 	if i.closed.Load() {
 		return roar.Bitmap{}, nil
 	}
-	keys, ok := q.resolve(view)
+	keys, scratch, ok := q.keysFor(view)
+	if scratch != nil {
+		defer releaseFieldKeys(scratch)
+	}
 	if !ok {
 		return roar.Bitmap{}, nil
 	}
-	return view.matchResolved(keys), nil
+	result, owned := view.matchResolved(keys)
+	i.detachOwned(&result, owned)
+	return result, nil
 }
 
 // Count returns the number of images holding every compiled value
@@ -132,7 +157,10 @@ func (q Query) Count() (uint64, error) {
 	if i.closed.Load() {
 		return 0, nil
 	}
-	keys, ok := q.resolve(view)
+	keys, scratch, ok := q.keysFor(view)
+	if scratch != nil {
+		defer releaseFieldKeys(scratch)
+	}
 	if !ok {
 		return 0, nil
 	}

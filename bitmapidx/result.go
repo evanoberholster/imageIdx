@@ -2,14 +2,14 @@ package bitmapidx
 
 import "github.com/evanoberholster/imageIdx/roar"
 
-// ownResult detaches a query result from store-owned mmap state. Base
-// postings may alias the mapped segment, which a checkpoint can unmap; a
-// store-owned index therefore clones every result so callers never observe
-// unmapped memory. Fresh unions already own their bytes, so the clone is a
-// deliberate safety-for-copy tradeoff: one extra copy per query on
-// persistent stores in exchange for no lifetime coupling to checkpoints.
-func (i *FieldIndex) ownResult(result *roar.Bitmap) {
-	if i.owner != nil {
+// detachOwned clones a query result when it could alias store-owned mmap
+// state. Only a result whose bytes live in the mapped segment is not
+// heap-owned; corrected postings, tiny postings, and fresh unions and
+// intersections are heap-owned and are returned without copying. This keeps
+// the lifetime safety of the old unconditional clone while removing a full
+// posting copy from every query that materialized its own result.
+func (i *FieldIndex) detachOwned(result *roar.Bitmap, owned bool) {
+	if i.owner != nil && !owned {
 		*result = result.Clone()
 	}
 }
