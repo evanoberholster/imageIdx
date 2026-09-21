@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/evanoberholster/imageIdx/timeidx"
+	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
 
 // Service is a concurrency-safe front door for one compiled Plan.

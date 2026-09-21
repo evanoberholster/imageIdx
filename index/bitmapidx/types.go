@@ -10,7 +10,7 @@
 //
 // Concurrency: readers load one published view and take no locks; writers
 // serialize through one mutex per index (plus one WAL mutex per store).
-// Persistence: FieldStore checkpoints immutable segments over mmap and
+// Persistence: the Index checkpoints immutable segments over mmap and
 // replays a WAL tail. Reads stay lock-free across checkpoints.
 //
 // Engineering priorities, in order: correctness, predictable low allocation,

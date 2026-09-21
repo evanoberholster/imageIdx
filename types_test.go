@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	imageidx "github.com/evanoberholster/imageIdx"
-	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 
-	"github.com/evanoberholster/imageIdx/timeidx"
+	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
 
 func TestIndexPackagesShareDomainTypes(t *testing.T) {

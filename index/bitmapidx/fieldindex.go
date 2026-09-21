@@ -89,7 +89,7 @@ type FieldMetadata struct {
 // (owner != nil) route writes through the store WAL and must be closed via
 // the store.
 type FieldIndex struct {
-	owner    *FieldStore // immutable before exposing the handle
+	owner    *Index // immutable before exposing the handle
 	view     atomic.Pointer[fieldView]
 	readers  *indexutil.ReaderTracker
 	writerMu sync.Mutex

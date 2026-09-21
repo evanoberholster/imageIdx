@@ -17,10 +17,10 @@ import (
 	"time"
 
 	imageidx "github.com/evanoberholster/imageIdx"
-	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 
+	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/search"
-	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
 const demoQuantum = uint64(1) << timeidx.TimestampShift
@@ -36,7 +36,7 @@ type searchResponse struct {
 }
 
 type demoService struct {
-	fields    *bitmapidx.FieldStore
+	fields    *bitmapidx.Index
 	favorites *bitmapidx.FieldIndex
 	fieldDir  string
 	times     *timeidx.Index
@@ -127,7 +127,7 @@ func newDemoService() (*demoService, error) {
 	if err != nil {
 		return nil, err
 	}
-	fields, err := bitmapidx.NewPersistentFields(fieldDir, []bitmapidx.Field{
+	fields, err := bitmapidx.NewIndex(fieldDir, []bitmapidx.Field{
 		{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
 		{Type: bitmapidx.IndexTypeLocation, Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
 	}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)

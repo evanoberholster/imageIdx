@@ -8,9 +8,9 @@ import (
 // seedStore builds a persistent store with values distinct enum values,
 // each holding perValue images, adding in bounded batches. The newly added
 // memberships stay in the WAL until the caller checkpoints.
-func seedStore(b *testing.B, dir string, values, perValue int) *FieldStore {
+func seedStore(b *testing.B, dir string, values, perValue int) *Index {
 	b.Helper()
-	s, err := NewPersistentFields(dir, []Field{enumField(IndexTypeTag)}, FieldConfig{}, DurabilitySync)
+	s, err := NewIndex(dir, []Field{enumField(IndexTypeTag)}, FieldConfig{}, DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func BenchmarkFieldReopen(b *testing.B) {
 			}
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
-				opened, err := OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+				opened, err := OpenIndex(dir, FieldConfig{}, DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}

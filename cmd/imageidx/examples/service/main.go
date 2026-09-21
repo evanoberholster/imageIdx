@@ -13,9 +13,9 @@ import (
 	"log"
 	"os"
 
-	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/search"
-	"github.com/evanoberholster/imageIdx/timeidx"
 )
 
 const quantum = uint64(1) << timeidx.TimestampShift
@@ -25,7 +25,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fields, err := bitmapidx.NewPersistentFields(fieldDir, []bitmapidx.Field{{
+	fields, err := bitmapidx.NewIndex(fieldDir, []bitmapidx.Field{{
 		Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
 	}}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
 	if err != nil {

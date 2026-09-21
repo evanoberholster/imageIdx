@@ -29,7 +29,7 @@ tag := bitmapidx.Field{
     Normalizer: bitmapidx.CodecSpec{Code: bitmapidx.NormalizerIdentity},
 }
 
-store, err := bitmapidx.NewPersistentFields(
+store, err := bitmapidx.NewIndex(
     dir, []bitmapidx.Field{tag}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS,
 )
 if err != nil { /* handle */ }
@@ -42,9 +42,9 @@ err = tags.Add(bitmapidx.Entry{
 match, err := tags.MatchValues(bitmapidx.StringValue("Trekking"))
 ```
 
-`NewPersistentFields` creates a store with an empty fixed registry;
-`OpenPersistentFields` restores the persisted registry and WAL tail.
-`FieldStore.Lookup` returns store-owned handles. Close the store, not those
+`NewIndex` creates a store with an empty fixed registry;
+`OpenIndex` restores the persisted registry and WAL tail.
+`Index.Lookup` returns store-owned handles. Close the store, not those
 handles. A field batch is atomic; transactions across fields are not provided.
 
 Enum/bool/text queries use `MatchValues`, `MatchText`, `ValueIDs`, `CountValues`
@@ -75,7 +75,7 @@ presence flags may be omitted.
 
 ## Persistence
 
-`FieldStore` writes one fixed-registry snapshot generation and one active WAL
+`Index` writes one fixed-registry snapshot generation and one active WAL
 per generation. Checkpoint writes and validates a successor mmap snapshot,
 creates its successor WAL, and publishes the manifest last. Vacuum also removes
 obsolete generations and dead dictionary entries. Persisted codec definitions

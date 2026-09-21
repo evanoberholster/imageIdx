@@ -129,7 +129,7 @@ Values are identified by a 64-bit xxh3 hash. Rare hash collisions claim a
 dictionary slot, so distinct values never share membership. The built-in Latin
 analyzer lowercases, accent-folds and tokenizes text.
 
-Declare fields as values and persist the registry with `NewPersistentFields`:
+Declare fields as values and persist the registry with `NewIndex`:
 
 ```go
 const (
@@ -162,12 +162,12 @@ if err := registry.Register(tag, focal, title); err != nil {
 }
 ```
 
-Create or reopen the persistent field store with `NewPersistentFields` and
-`OpenPersistentFields`. The store owns the field handles and their WAL; callers
+Create or reopen the persistent field store with `NewIndex` and
+`OpenIndex`. The store owns the field handles and their WAL; callers
 must close the store rather than individual fields:
 
 ```go
-store, err := bitmapidx.NewPersistentFields(
+store, err := bitmapidx.NewIndex(
 	"./data/fields", []bitmapidx.Field{tag, focal, title},
 	bitmapidx.FieldConfig{}, imageidx.DurabilityOS,
 )
@@ -353,7 +353,7 @@ if err := tags.Vacuum(); err != nil {
 }
 ```
 
-`OpenPersistentFields` restores the persisted registry, mmap snapshot and WAL
+`OpenIndex` restores the persisted registry, mmap snapshot and WAL
 tail. `Checkpoint` publishes a new snapshot; `Vacuum` also removes obsolete
 generations and dead dictionary values. Field query results are immutable
 `roar.Bitmap` values. Mutable bitmaps are reserved for transient `search`
@@ -414,7 +414,7 @@ cross-cell insert without `From` is caller discipline.
 allocation-free path; `Nearest` returns exact top-K using a caller-supplied
 coordinate lookup. Allocation behavior inside the caller-supplied region's
 `IntersectsCell` and `ContainsCell` methods remains the responsibility of that
-region implementation. Geo fields use the same persistent `FieldStore` as the
+region implementation. Geo fields use the same persistent `Index` as the
 other field kinds.
 
 ## Vector index
@@ -581,9 +581,9 @@ standalone index APIs. `search.Compile` and `search.Search` return
 for a missing index.
 
 Reader lifetime tracking is automatic. Every field read registers with its
-internal tracker, and `FieldStore.Close` waits for reads that could still
+internal tracker, and `Index.Close` waits for reads that could still
 reference retired or mmap-backed state. Callers open one persistent
-`FieldStore`, obtain fields with `Lookup`, and close the store after use.
+`Index`, obtain fields with `Lookup`, and close the store after use.
 
 ## Runnable command
 

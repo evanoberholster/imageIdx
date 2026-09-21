@@ -5,9 +5,9 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 
-	"github.com/evanoberholster/imageIdx/timeidx"
+	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
 
 type StageKind uint8

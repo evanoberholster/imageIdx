@@ -39,4 +39,4 @@ zero-allocation steady-state execution when capacities are sufficient.
 `Workspace` owns intermediate ID scratch and the transient geo accumulator. It
 is reusable but not safe for concurrent searches. `Service` pools workspaces
 and timestamp write batches; each agent gets a private workspace and result
-buffer. Field writes serialize inside their owning `bitmapidx.FieldStore`.
+buffer. Field writes serialize inside their owning `bitmapidx.Index`.
