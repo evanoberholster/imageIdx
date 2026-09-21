@@ -3,38 +3,55 @@
 Persistent HNSW approximate-nearest-neighbor vector index implementing
 `AGENTS/VectorIdx.MD` phases 1–2 (scalar core, in-memory HNSW correctness),
 4 (WAL and tombstones), 5 (pooled search state), 6 (post-ANN filtering), and
-8 (explicit compact/rebuild). SIMD kernels (phase 7) plug into
-`resolveDistance`; the scalar kernels here are their correctness reference.
+8 (explicit compact/rebuild), plus Weaviate-inspired production features:
+multi-metric distance (L2/cosine/dot), dynamic `ef`, heuristic neighbor
+selection, dense O(1) locator, cost-based flat fallback, async writes, and
+lock-free reads. SIMD kernels (phase 7) plug into `resolveDistance`; the
+scalar kernels here are their correctness reference.
 
 ## Concepts
 
-- **Direct identity.** `NodeID` (`uint32`) is the application identifier
-  defined by the index `TypeID` (ImageID, FaceID, …). VectorIdx never
-  translates it. HNSW edges store NodeIDs, never pointers or ordinals.
+- **Direct identity.** `SpaceID` packs the index type (`IndexTypeImage`, `IndexTypeFace`,
+  `IndexTypeCustom`) in its high byte and the space number in its low byte. `NodeID`
+  (`uint32`) is the stored identifier; HNSW edges store NodeIDs, never
+  pointers or ordinals. Results widen the stored NodeID to
+  `imageidx.ImageID` (`Result{ImageID, Score}`).
 - **Dense physical data.** Vectors pack contiguously in insertion-ordinal
-  order even when NodeIDs are sparse. The sorted `NodeID → ordinal`
-  locator (binary search) resolves edges to vectors; scratch visited tags
-  are indexed by ordinal, so search memory scales with node count, never
-  `max(NodeID)`.
-- **One writer, shared readers.** `Add`/`Delete`/`Checkpoint`/`Compact`
-  serialize through a writer mutex; searches hold a read lock plus a
-  `ReaderTracker` token. File generations are immutable once published.
-- **Tombstone deletion.** `Delete` only records a tombstone. Deleted nodes
-  stay traversable but are never returned; `Compact` rebuilds the graph
-  from live vectors and never renumbers NodeIDs.
+  order even when NodeIDs are sparse. A dense O(1) table serves dense ID
+  ranges with atomic fills; the sorted `NodeID → ordinal` locator covers
+  sparse ranges. Scratch visited tags are indexed by ordinal, so search
+  memory scales with node count, never `max(NodeID)`.
+- **One writer, lock-free readers.** `Add`/`Delete`/`Checkpoint`/`Compact`
+  serialize through a writer mutex (plus an async queue: `AddAsync`,
+  `DeleteAsync`, `CompactAsync`, `WaitIdle`); searches acquire a
+  `ReaderTracker` token and load one atomically published snapshot, taking
+  no locks. File generations are immutable once published.
+- **Metrics.** One fixed metric per index: L2 (squared), cosine (`1-cos`),
+  or dot (`querySelfDot-dot`, zero for self). Persisted in the superblock.
+- **Tombstone deletion.** `Delete` records into an immutable roaring
+  tombstone bitmap. Deleted nodes stay traversable but are never returned;
+  `Compact` rebuilds the graph from live vectors and never renumbers
+  NodeIDs. `SetAutoCompact` enables background compaction on a tombstone
+  ratio.
+- **Search budget.** Static `EfSearch` or dynamic `ef`
+  (`clamp(k*DynamicEfFactor, Min, Max)`, Weaviate analogue) with
+  `OversampleFactor` scaling under filters and one iterative expansion round
+  before the exact-scan fallback.
+- **Flat fast path.** Indexes at/below `FlatThreshold` live nodes and filter
+  hints at/below `FlatSearchCutoff` run the pooled exact scan directly
+  (Weaviate flat/dynamic analogue); `SearchWithFilterHint` takes the hint.
 - **Post-ANN filtering.** A `CandidateFilter` applies after graph traversal
-  and never constrains it. Filtered search oversamples (`4×k`) and falls
-  back to the exact scan when ANN coverage is thin, giving
-  k-or-available semantics.
+  and never constrains it. Filtered search oversamples and falls back to
+  the exact scan when ANN coverage is thin, giving k-or-available semantics.
 
 ## Usage
 
 ```go
 idx, err := vectoridx.Create(path, vectoridx.Config{
-    TypeID:      1, // your image-embedding space
+    SpaceID:     vectoridx.NewSpaceID(vectoridx.IndexTypeImage, 1),
     Dimensions:  vectoridx.Dim512,
     ElementType: vectoridx.ElementFloat32,
-})
+}, vectoridx.DurabilitySync)
 if err != nil {
     log.Fatal(err)
 }
@@ -47,7 +64,8 @@ results, err := idx.SearchFloat32(query, nil, 10)
 if err != nil {
     log.Fatal(err)
 }
-// results are sorted by ascending Score (monotonic with squared L2).
+// results are []Result{ImageID, Score}, sorted by ascending Score
+// (monotonic with squared L2); ImageID is the widened NodeID.
 ```
 
 Reuse caller storage on hot paths:
@@ -87,32 +105,52 @@ One logical file per vector space plus a `<path>.wal` sidecar:
   replays records after `CheckpointLSN`, stops at the first torn tail,
   truncates it, and is idempotent across restarts.
 - `Checkpoint` writes the file atomically (temp + rename + dir sync) and
-  truncates the covered WAL tail. `Compact` rebuilds the graph from live
-  vectors in NodeID order, purges tombstones, and checkpoints.
+  truncates the covered WAL tail. `Compact` returns a `CompactionResult`
+  (nodes before/after, tombstones purged, bytes reclaimed, duration);
+  it rebuilds the graph from live vectors in NodeID order, purges
+  tombstones, and checkpoints. A concurrent `Compact` returns
+  `ErrCompactionInProgress`.
+- The index path is exclusively locked (`<path>.lock`) from `Create`/`Open`
+  until `Close`; a second handle returns `ErrStoreBusy`.
+- `Stats` reports generation, counts, checkpoint LSN, WAL counters, file
+  sizes, pending async ops, and the last compaction; `FileSize` returns
+  checkpoint plus WAL bytes.
 - `Verify` deep-checks in-memory structure; `VerifyFile` validates a file
   offline (header, bounds, checksums).
 
-Crash model: acknowledged mutations are WAL-synced before return;
-checkpoint publication is atomic; readers never see a partial generation.
+Crash model: `Create`/`Open` select a durability policy; with
+`DurabilitySync` acknowledged mutations are WAL-synced before return, with
+`DurabilityOS` they are in the OS page cache. `WithSyncInterval(d)` adds
+periodic group commit for `DurabilityOS`: fsync happens when the async queue
+drains and at least every `d`, so a write batch shares one fsync. `Sync`
+forces a durable boundary at any time; `Close` always syncs. Checkpoint
+publication is atomic; readers never see a partial generation.
 
 ## API rules worth knowing
 
-- Dimensions must be 512, 768, or 1024; element type is fixed for the
-  index lifetime. Mismatched vectors/queries return `ErrInvalidVector`.
-- Duplicate `Add` of any known NodeID (live **or** tombstoned) returns
-  `ErrDuplicateNodeID`. Re-adding after `Delete` requires `Compact` first,
-  keeping replacement semantics explicit in V1.
+- `Dimensions` is closed {512, 768, 1024} and element type is fixed for the
+  index lifetime; an invalid `SpaceID` or `Dimensions` returns
+  `ErrInvalidConfig`. Mismatched vectors/queries return `ErrInvalidVector`.
+- Duplicate `Add` of a live NodeID returns `ErrDuplicateNodeID`. Adding a
+  tombstoned NodeID replaces its vector and reconnects it, so `Delete`
+  followed by `Add` is an update; `Compact` purges tombstones and rebuilds.
+- `Create`/`Open` take a durability policy: `DurabilitySync` fsyncs every
+  acknowledged mutation, `DurabilityOS` leaves records to the OS page cache
+  (add `vectoridx.WithSyncInterval(d)` for periodic group commit). Invalid
+  values return `ErrInvalidConfig`.
 - `Delete` of an unknown ID returns `ErrNodeNotFound`; re-deleting a
   tombstoned ID is a no-op.
 - `Search` with `k <= 0` returns `ErrInvalidQuery`. Fewer than `k` live
   (or filter-passing) nodes returns what's available, not an error.
-- `Score` is `uint32` saturating: monotonic with squared L2, ties at
-  `math.MaxUint32` only for extremely distant pairs / NaN.
+- `Score` is `uint32` saturating: monotonic with the index metric distance
+  (L2, cosine, or dot), ties at `math.MaxUint32` only for extremely distant
+  pairs / NaN.
 
 ## Concurrency and allocation
 
-- One writer; concurrent readers share a read lock. `Close` waits for
-  prior readers. Run with `-race` in CI (covered by tests).
+- One writer (sync or async queue); lock-free concurrent readers.
+  `Close` drains the queue and waits for prior readers. Run with `-race`
+  in CI (covered by tests).
 - Steady state after pool warm-up: `SearchInto` performs **zero heap
   allocations** (`TestSearchSteadyStateAllocs`); `Search` allocates once
   for the caller-owned copy; distance kernels allocate nothing.
@@ -138,21 +176,22 @@ that degrade the graph fail loudly.
 | File | Contents |
 |---|---|
 | `doc.go` | Package overview, V1 scope and simplifications |
-| `types.go` | NodeID/TypeID/ElementType/Config/Result/CandidateFilter/errors |
-| `distance.go` | Scalar squared-L2 kernels, dispatch, `EncodeScore` |
+| `types.go` | IndexType/SpaceID/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
+| `distance.go` | Scalar L2/cosine/dot kernels, dispatch, `EncodeScore` |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
 | `hnsw.go` | Locator, greedy descent, layer search, assembly, exact oracle |
-| `index.go` | VectorIdx: typed Add/Search, Delete, Checkpoint/Compact/Verify |
+| `index.go` | VectorIdx: typed Add/Search, Delete, Checkpoint/Compact/Verify, async queue, policies |
+| `options.go` | Runtime `Option`s (WithSyncInterval) |
+| `stats.go` | `Stats`/`FileSize`/`CompactionResult` |
 | `format.go` | Single-file superblock + region encode/decode, `VerifyFile` |
 | `wal.go` | Framed WAL append and prefix recovery |
 
 ## Deliberate V1 simplifications (future work)
 
-- Readers take a shared mutex rather than fully lock-free mmap epochs;
-  generations on disk are already immutable, so the swap is API-safe.
+- Readers are lock-free over heap snapshots (tracker + atomic view), not
+  yet mmap epochs; generations on disk are already immutable, so the swap
+  is API-safe.
 - Heap-backed (copied) reads instead of retained mmaps; the format is
   offset/length-addressed for a compatible mmap upgrade.
-- Scalar distance only; `resolveDistance` is the AVX2/NEON plug point.
-- Closest-only neighbor selection, no diversity heuristic.
-- Sorted-locator binary search; dense/sparse locator alternatives await
-  end-to-end benchmarks per the design doc.
+- Scalar distance only; `resolveDistance` is the v2 AVX2/NEON plug point.
+- Stored vectors are never quantized (quantization deferred to v2).

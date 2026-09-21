@@ -2,7 +2,9 @@ package vectoridx
 
 import (
 	"math/rand"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func BenchmarkDistanceFloat32_512(b *testing.B) {
@@ -29,10 +31,10 @@ func BenchmarkDistanceUint16_1024(b *testing.B) {
 	benchDistance(b, ElementUint16, Dim1024)
 }
 
-func benchDistance(b *testing.B, elem ElementType, dims int) {
+func benchDistance(b *testing.B, elem ElementType, dims Dimensions) {
 	b.Helper()
 	rng := rand.New(rand.NewSource(77))
-	cfg := Config{Dimensions: uint16(dims), ElementType: elem}
+	cfg := Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: dims, ElementType: elem}
 	validated, err := cfg.withDefaults()
 	if err != nil {
 		b.Fatal(err)
@@ -58,7 +60,7 @@ func benchDistance(b *testing.B, elem ElementType, dims int) {
 func buildBenchIndex(b *testing.B, n int) (*VectorIdx, [][]float32) {
 	b.Helper()
 	idx, err := New(Config{
-		TypeID:         1,
+		SpaceID:        NewSpaceID(IndexTypeImage, 1),
 		Dimensions:     Dim512,
 		ElementType:    ElementFloat32,
 		M:              DefaultM,
@@ -126,7 +128,7 @@ func TestSearchSteadyStateAllocs(t *testing.T) {
 	if raceEnabled {
 		t.Skip("allocation counts are calibrated for non-race builds; the race detector adds bookkeeping allocs")
 	}
-	idx, err := New(Config{TypeID: 1, Dimensions: Dim512, ElementType: ElementFloat32})
+	idx, err := New(Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: Dim512, ElementType: ElementFloat32})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,5 +163,138 @@ func TestSearchSteadyStateAllocs(t *testing.T) {
 		}
 	}); n != 1 {
 		t.Fatalf("Search steady-state allocs = %v, want 1", n)
+	}
+}
+
+func benchPersistentIndex(b *testing.B, n int, durability Durability, opts ...Option) *VectorIdx {
+	b.Helper()
+	path := filepath.Join(b.TempDir(), "bench.idx")
+	idx, err := Create(path, testConfigFloat512(), durability, opts...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(79))
+	vec := randFloatVec(rng, Dim512)
+	for i := 0; i < n; i++ {
+		if err := idx.AddFloat32(NodeID(i+1), vec); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return idx
+}
+
+// BenchmarkWALAppendOS measures append cost without per-record fsync.
+func BenchmarkWALAppendOS(b *testing.B) {
+	idx := benchPersistentIndex(b, 500, DurabilityOS)
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(80))
+	vec := randFloatVec(rng, Dim512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := idx.AddFloat32(NodeID(1_000_000+i), vec); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkWALAppendSync measures append cost with per-record fsync.
+func BenchmarkWALAppendSync(b *testing.B) {
+	idx := benchPersistentIndex(b, 500, DurabilitySync)
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(81))
+	vec := randFloatVec(rng, Dim512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := idx.AddFloat32(NodeID(1_000_000+i), vec); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkWALAppendGroupCommit measures append cost with DurabilityOS plus a
+// sync interval: fsync cost is amortized across the write batch.
+func BenchmarkWALAppendGroupCommit(b *testing.B) {
+	idx := benchPersistentIndex(b, 500, DurabilityOS, WithSyncInterval(time.Millisecond))
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(82))
+	vec := randFloatVec(rng, Dim512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := idx.AddFloat32(NodeID(1_000_000+i), vec); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCheckpoint measures the full-file checkpoint cost.
+func BenchmarkCheckpoint(b *testing.B) {
+	idx := benchPersistentIndex(b, 2000, DurabilityOS)
+	defer idx.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := idx.Checkpoint(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCompact measures a full graph rebuild plus checkpoint.
+func BenchmarkCompact(b *testing.B) {
+	idx := benchPersistentIndex(b, 1000, DurabilityOS)
+	defer idx.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.Compact(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkOpen measures cold open of a checkpointed index (no WAL replay).
+func BenchmarkOpen(b *testing.B) {
+	idx := benchPersistentIndex(b, 2000, DurabilityOS)
+	path := idx.path
+	if err := idx.Checkpoint(); err != nil {
+		b.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		re, err := Open(path, DurabilityOS)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := re.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkOpenReplay measures open when the whole index is still in the WAL
+// (no checkpoint since Create): replay re-inserts every node.
+func BenchmarkOpenReplay(b *testing.B) {
+	idx := benchPersistentIndex(b, 1000, DurabilityOS)
+	path := idx.path
+	if err := idx.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		re, err := Open(path, DurabilityOS)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := re.Close(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

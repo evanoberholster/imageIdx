@@ -10,16 +10,52 @@ import (
 	"errors"
 
 	imageidx "github.com/evanoberholster/imageIdx"
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
 
-// NodeID is the identifier stored in HNSW edges and returned by search.
-// Its semantic meaning comes from the index TypeID (ImageID, FaceID, or a
-// future application identifier). VectorIdx never translates it.
+// NodeID is the identifier stored in HNSW edges. It is a compact uint32
+// widened to the database-wide identifier type in Result values. What the ID
+// refers to (image, face, or application-defined) comes from the index's
+// IndexType.
 type NodeID uint32
 
-// TypeID identifies the vector space and NodeID semantics. It does not imply
-// dimensions or element representation; those persist explicitly in the header.
-type TypeID uint16
+// ImageID is the database-wide identifier type shared by all index packages.
+type ImageID = imageidx.ImageID
+
+// IndexType identifies the entity domain an index addresses (images, faces,
+// or an application-defined domain), mirroring bitmapidx.IndexType naming.
+// It is the high byte of SpaceID. Zero is reserved and never valid; the set
+// of constants is closed.
+type IndexType uint8
+
+const (
+	IndexTypeImage  IndexType = iota + 1 // database-wide image identifier
+	IndexTypeFace                        // face identifier
+	IndexTypeCustom                      // application-defined identifier
+)
+
+// Valid reports whether t is a recognized index type.
+func (t IndexType) Valid() bool { return t >= IndexTypeImage && t <= IndexTypeCustom }
+
+// SpaceID is the single identity of one vector space: the high byte is the
+// IndexType and the low byte is the space number within that type. NodeIDs
+// are stored as compact uint32 values and widened to the database-wide
+// identifier in Result values.
+type SpaceID uint16
+
+// NewSpaceID packs an index type and a within-type space number.
+func NewSpaceID(indexType IndexType, space uint8) SpaceID {
+	return SpaceID(uint16(indexType)<<8 | uint16(space))
+}
+
+// Type returns the index type encoded in s.
+func (s SpaceID) Type() IndexType { return IndexType(uint8(s >> 8)) }
+
+// Space returns the within-type space number encoded in s.
+func (s SpaceID) Space() uint8 { return uint8(s) }
+
+// Valid reports whether s carries a recognized index type.
+func (s SpaceID) Valid() bool { return s.Type().Valid() }
 
 // ElementType selects the fixed per-index vector representation.
 type ElementType uint8
@@ -33,16 +69,30 @@ const (
 	ElementFloat32
 )
 
-// Supported fixed dimensions. An index has exactly one for its lifetime.
+// Dimensions is a supported fixed vector width. The set is closed: an index
+// has exactly one for its lifetime, persisted in the header.
+type Dimensions uint16
+
 const (
-	Dim512  = 512
-	Dim768  = 768
-	Dim1024 = 1024
+	Dim512  Dimensions = 512
+	Dim768  Dimensions = 768
+	Dim1024 Dimensions = 1024
 )
 
-// Metric identifiers persisted in the superblock. V1 supports L2 only.
+// Valid reports whether d is a supported fixed width.
+func (d Dimensions) Valid() bool {
+	switch d {
+	case Dim512, Dim768, Dim1024:
+		return true
+	}
+	return false
+}
+
+// Metric identifiers persisted in the superblock.
 const (
-	MetricL2 uint8 = 1
+	MetricL2     uint8 = 1
+	MetricCosine uint8 = 2
+	MetricDot    uint8 = 3
 )
 
 // HNSW baseline defaults. These are benchmark starting points, not format
@@ -52,26 +102,79 @@ const (
 	DefaultM0             = 32
 	DefaultEfConstruction = 128
 	DefaultEfSearch       = 64
+
+	// Dynamic-ef defaults mirror Weaviate's dynamicEf behaviour:
+	// ef = clamp(k*DynamicEfFactor, DynamicEfMin, DynamicEfMax).
+	DefaultDynamicEfFactor = 8
+	DefaultDynamicEfMin    = 16
+	DefaultDynamicEfMax    = 512
+
+	// DefaultFlatSearchCutoff mirrors Weaviate's flatSearchCutoff: when a
+	// filter's estimated match count is at or below the cutoff, an exact
+	// scan beats ANN traversal. Negative disables the flat fallback.
+	DefaultFlatSearchCutoff = 4000
+	// DefaultFlatThreshold is the index size at or below which exact search
+	// replaces HNSW entirely (Weaviate flat/dynamic index analogue).
+	DefaultFlatThreshold = 2000
+	// DefaultOversampleFactor scales ef for filtered queries.
+	DefaultOversampleFactor = 8
 )
 
-// Config describes one vector space. The zero value is invalid: Dimensions
-// and ElementType must be set explicitly. M/M0/Ef fields default when zero.
+// Config describes one vector space. The zero value is invalid: SpaceID and
+// Dimensions must identify a supported space and ElementType must be set
+// explicitly. M/M0/Ef fields default when zero. Metric defaults to L2 when
+// zero. Dynamic-ef is disabled unless DynamicEfFactor != 0; FlatSearchCutoff
+// and FlatThreshold default when zero, negative FlatSearchCutoff forces ANN.
 type Config struct {
-	TypeID         TypeID
-	Dimensions     uint16
+	SpaceID        SpaceID
+	Dimensions     Dimensions
 	ElementType    ElementType
+	Metric         uint8
 	M              uint16
 	M0             uint16
 	EfConstruction uint32
 	EfSearch       uint32
+	// Dynamic ef: ef = clamp(k*Factor, Min, Max). Zero Factor disables.
+	DynamicEfFactor uint32
+	DynamicEfMin    uint32
+	DynamicEfMax    uint32
+	// FlatSearchCutoff bounds the estimated filter matches that justify an
+	// exact scan. Negative forces ANN. Zero takes the default.
+	FlatSearchCutoff int
+	// FlatThreshold uses exact search when live count <= threshold.
+	// Negative disables. Zero takes the default.
+	FlatThreshold int
+	// OversampleFactor scales ef for filtered queries. Zero takes default.
+	OversampleFactor uint32
+	// UseHeuristic selects diversity-based neighbor selection (hnswlib
+	// heuristic) instead of closest-only. Default true unless explicitly
+	// disabled via DisableHeuristic.
+	UseHeuristic     bool
+	DisableHeuristic bool
+	// FilterAware keeps filter-passing nodes in the result heap while still
+	// traversing through all nodes (ACORN-lite). Default true.
+	FilterAware        bool
+	DisableFilterAware bool
+	// AutoCompactRatio triggers async Compact when tombstones/live exceeds
+	// the ratio (0 disables). CompactMinNodes gates small indexes.
+	AutoCompactRatio float64
+	CompactMinNodes  int
 }
 
 func (c Config) withDefaults() (Config, error) {
-	if c.Dimensions != Dim512 && c.Dimensions != Dim768 && c.Dimensions != Dim1024 {
+	if !c.SpaceID.Valid() || !c.Dimensions.Valid() {
 		return Config{}, ErrInvalidConfig
 	}
 	switch c.ElementType {
 	case ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32:
+	default:
+		return Config{}, ErrInvalidConfig
+	}
+	if c.Metric == 0 {
+		c.Metric = MetricL2
+	}
+	switch c.Metric {
+	case MetricL2, MetricCosine, MetricDot:
 	default:
 		return Config{}, ErrInvalidConfig
 	}
@@ -96,6 +199,45 @@ func (c Config) withDefaults() (Config, error) {
 	if c.EfSearch < 1 || c.EfSearch > 4096 {
 		return Config{}, ErrInvalidConfig
 	}
+	if c.DynamicEfFactor > 0 {
+		if c.DynamicEfMin == 0 {
+			c.DynamicEfMin = DefaultDynamicEfMin
+		}
+		if c.DynamicEfMax == 0 {
+			c.DynamicEfMax = DefaultDynamicEfMax
+		}
+		if c.DynamicEfMin < 1 || c.DynamicEfMax < c.DynamicEfMin || c.DynamicEfMax > 4096 {
+			return Config{}, ErrInvalidConfig
+		}
+	}
+	if c.FlatSearchCutoff == 0 {
+		c.FlatSearchCutoff = DefaultFlatSearchCutoff
+	}
+	if c.FlatThreshold == 0 {
+		c.FlatThreshold = DefaultFlatThreshold
+	}
+	if c.OversampleFactor == 0 {
+		c.OversampleFactor = DefaultOversampleFactor
+	}
+	if c.OversampleFactor < 1 || c.OversampleFactor > 64 {
+		return Config{}, ErrInvalidConfig
+	}
+	if !c.DisableHeuristic {
+		c.UseHeuristic = true
+	} else {
+		c.UseHeuristic = false
+	}
+	if !c.DisableFilterAware {
+		c.FilterAware = true
+	} else {
+		c.FilterAware = false
+	}
+	if c.AutoCompactRatio < 0 || c.AutoCompactRatio > 1 {
+		return Config{}, ErrInvalidConfig
+	}
+	if c.CompactMinNodes < 0 {
+		return Config{}, ErrInvalidConfig
+	}
 	return c, nil
 }
 
@@ -116,13 +258,19 @@ func (c Config) ElementSize() int {
 // VectorBytes returns Dimensions*ElementSize for a validated Config.
 func (c Config) VectorBytes() int { return int(c.Dimensions) * c.ElementSize() }
 
-// Result is one nearest-neighbor match. Score is monotonic with squared L2
-// distance: a smaller distance always yields a smaller-or-equal Score.
-// See EncodeScore for the saturation rule at the uint32 boundary.
+// Result is one nearest-neighbor match. ImageID is the stored NodeID widened
+// to the database-wide identifier type; its semantics come from
+// Config.SpaceID.Type(). Score is monotonic with the index metric distance:
+// a smaller distance always yields a smaller-or-equal Score. For L2 it tracks
+// squared L2; for cosine it tracks (1-cos)*2^30; for dot it tracks
+// querySelfDot-dot (zero for self). See EncodeScore for the saturation rule.
 type Result struct {
-	NodeID NodeID
-	Score  uint32
+	ImageID ImageID
+	Score   uint32
 }
+
+// widenedID converts a stored NodeID to the database-wide identifier type.
+func widenedID(id NodeID) ImageID { return ImageID(id) }
 
 // CandidateFilter restricts which live nodes may be returned. A nil filter
 // accepts every live, non-tombstoned node. Filtering is applied after ANN
@@ -135,7 +283,10 @@ type Result struct {
 //	})
 type CandidateFilter func(NodeID) bool
 
-// Durability controls when a mutation is acknowledged relative to WAL sync.
+// Durability controls persistent WAL synchronization. DurabilityOS returns
+// once the frame is visible to the OS; DurabilitySync fsyncs before
+// returning. It is a runtime policy passed to Create/Open, not part of the
+// persisted format.
 type Durability = imageidx.Durability
 
 const (
@@ -145,7 +296,6 @@ const (
 
 var (
 	ErrInvalidConfig   = errors.New("vectoridx: invalid configuration")
-	ErrInvalidNodeID   = errors.New("vectoridx: invalid node ID")
 	ErrInvalidVector   = errors.New("vectoridx: vector dimension or type mismatch")
 	ErrDuplicateNodeID = errors.New("vectoridx: duplicate live node ID")
 	ErrNodeNotFound    = errors.New("vectoridx: node not found")
@@ -155,4 +305,9 @@ var (
 	ErrNotPersistent   = errors.New("vectoridx: index is not persistent")
 	ErrInvalidQuery    = errors.New("vectoridx: invalid query")
 	ErrUnsupportedHost = errors.New("vectoridx: storage format requires a little-endian host")
+	// ErrStoreBusy reports another handle holding the index lock. It
+	// aliases indexutil.ErrBusy; see internal/indexutil.
+	ErrStoreBusy = indexutil.ErrBusy
+	// ErrCompactionInProgress reports a second Compact while one is running.
+	ErrCompactionInProgress = errors.New("vectoridx: compaction already in progress")
 )

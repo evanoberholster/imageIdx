@@ -3,71 +3,130 @@ package vectoridx
 import (
 	"math"
 	"sort"
+	"sync/atomic"
 )
 
-// HNSW graph core. All functions assume the caller holds the appropriate
-// lock (writer Lock for insertion, reader RLock for traversal) so ordinals,
-// vectors, and links stay stable for the call duration.
+// HNSW graph core over immutable snapshots. Read methods take no locks:
+// they load link pointers atomically and filter phantoms via bounds checks,
+// so concurrent writer appends never crash readers. Writer mutation helpers
+// (prune, link) allocate new per-node layer sets and swap pointers.
 //
 // Edges store NodeIDs (never ordinals or pointers); ordinals resolve through
-// the sorted locator. Tombstoned nodes stay in the graph and remain
-// traversable; they are only suppressed at result assembly.
+// the dense table (fast path) or sorted locator. Tombstoned nodes stay in the
+// graph and remain traversable; they are only suppressed at result assembly.
 
-// levelMultiplier returns 1/ln(M), the standard HNSW normalization.
+// nodeLayers is one node's immutable neighbor set. Writers replace the whole
+// pointer; readers hold the loaded pointer for the traversal.
+type nodeLayers struct {
+	layers [][]NodeID
+}
+
+// denseTable is an O(1) NodeID -> ordinal locator for dense ID ranges.
+// Element access uses atomic funcs so writer fills race safely with lock-free
+// readers; readers bounds-check ord against the snapshot count to filter
+// phantoms (new IDs not yet visible to their snapshot).
+type denseTable struct {
+	min  NodeID
+	vals []int32 // ord or -1
+}
+
+func denseGet(dt *denseTable, id NodeID) (int, bool) {
+	if dt == nil {
+		return 0, false
+	}
+	if id < dt.min {
+		return 0, false
+	}
+	idx := uint64(id - dt.min)
+	if idx >= uint64(len(dt.vals)) {
+		return 0, false
+	}
+	ord := int(atomic.LoadInt32(&dt.vals[idx]))
+	if ord < 0 {
+		return 0, false
+	}
+	return ord, true
+}
+
 func levelMultiplier(m uint16) float64 {
 	return 1.0 / math.Log(float64(m))
 }
 
-// locateLocked resolves id to its physical ordinal via binary search over
-// the sorted locator. ok=false when the node never existed or was compacted
-// away. Presence (exists AND not tombstoned) is a separate check.
-func (v *VectorIdx) locateLocked(id NodeID) (ord int, ok bool) {
-	lo, hi := 0, len(v.sortedIDs)
+// locate resolves id to its physical ordinal with snapshot isolation: ord is
+// valid only when ord < len(ids) and ids[ord] == id, filtering writer
+// phantoms from in-place dense fills.
+func (s *vectorSnapshot) locate(id NodeID) (ord int, ok bool) {
+	if s.useDense && s.dense != nil {
+		if o, found := denseGet(s.dense, id); found {
+			if o < len(s.ids) && s.ids[o] == id {
+				return o, true
+			}
+			return 0, false
+		}
+		// Dense miss may still exist when the table is disabled mid-range;
+		// fall through to the sorted locator.
+	}
+	lo, hi := 0, len(s.sortedIDs)
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		if v.sortedIDs[mid] < id {
+		if s.sortedIDs[mid] < id {
 			lo = mid + 1
 		} else {
 			hi = mid
 		}
 	}
-	if lo < len(v.sortedIDs) && v.sortedIDs[lo] == id {
-		return v.sortedOrd[lo], true
+	if lo < len(s.sortedIDs) && s.sortedIDs[lo] == id {
+		o := s.sortedOrd[lo]
+		if o < len(s.ids) && s.ids[o] == id {
+			return o, true
+		}
 	}
 	return 0, false
 }
 
-// liveLocked reports the authoritative live condition: node exists in node
-// metadata AND is not tombstoned (VectorIdx.MD section 28).
-func (v *VectorIdx) liveLocked(id NodeID) bool {
-	if _, ok := v.locateLocked(id); !ok {
+// live reports the authoritative live condition: node exists in node
+// metadata AND is not tombstoned.
+func (s *vectorSnapshot) live(id NodeID) bool {
+	if _, ok := s.locate(id); !ok {
 		return false
 	}
-	_, tombstoned := v.tombstones[id]
-	return !tombstoned
+	return !s.tomb.Contains(uint64(id))
 }
 
-// vectorAtLocked returns the raw vector slice for a physical ordinal.
-// The slice aliases index storage; callers must not retain it past unlock.
-func (v *VectorIdx) vectorAtLocked(ord int) []byte {
-	off := ord * v.vecBytes
-	return v.vectors[off : off+v.vecBytes]
+// vectorAt returns the raw vector slice for a physical ordinal.
+// The slice aliases snapshot storage; callers must not retain it past the
+// reader token release. Resurrected vectors may read fresh under concurrent
+// updates (eventual consistency, never out of bounds).
+func (s *vectorSnapshot) vectorAt(ord int) []byte {
+	off := ord * s.vecBytes
+	return s.vectors[off : off+s.vecBytes]
+}
+
+// linkAt loads one node's immutable layer set (lock-free).
+func (s *vectorSnapshot) linkAt(ord int) *nodeLayers {
+	if ord < 0 || ord >= len(s.links) {
+		return nil
+	}
+	return s.links[ord].Load()
 }
 
 // greedyStep moves from cur to its closest neighbor at level (including
-// itself) by query distance, repeating until no improvement. It returns the
-// closest ordinal found.
-func (v *VectorIdx) greedyStepLocked(cur, level int, query []byte) int {
+// itself) by query distance, repeating until no improvement.
+func (s *vectorSnapshot) greedyStep(cur, level int, query []byte) int {
 	best := cur
-	bestDist := v.dist(query, v.vectorAtLocked(cur))
+	bestDist := s.dist(query, s.vectorAt(cur))
 	for {
 		improved := false
-		for _, nb := range v.links[cur][level] {
-			nOrd, ok := v.locateLocked(nb)
+		g := s.linkAt(cur)
+		if g == nil || level >= len(g.layers) {
+			return best
+		}
+		for _, nb := range g.layers[level] {
+			nOrd, ok := s.locate(nb)
 			if !ok {
 				continue
 			}
-			d := v.dist(query, v.vectorAtLocked(nOrd))
+			d := s.dist(query, s.vectorAt(nOrd))
 			if d < bestDist {
 				bestDist = d
 				best = nOrd
@@ -81,18 +140,15 @@ func (v *VectorIdx) greedyStepLocked(cur, level int, query []byte) int {
 	}
 }
 
-// searchLayerLocked runs best-first HNSW exploration at one level from
-// entryOrd, returning up to ef closest entries in ctx-owned scratch. The
-// returned slice aliases ctx.layer and is valid only until the next
-// searchLayerLocked call on the same context; callers consume it
-// synchronously (copying the NodeIDs they need).
-func (v *VectorIdx) searchLayerLocked(ctx *SearchContext, query []byte, entryOrd, ef, level int) []searchEntry {
+// searchLayer runs best-first HNSW exploration at one level from entryOrd,
+// returning up to ef closest entries in ctx-owned scratch.
+func (s *vectorSnapshot) searchLayer(ctx *SearchContext, query []byte, entryOrd, ef, level int) []searchEntry {
 	gen := ctx.gen
 	visited := ctx.visited
 	cand := &ctx.cand
 	best := &ctx.best
 
-	entryDist := v.dist(query, v.vectorAtLocked(entryOrd))
+	entryDist := s.dist(query, s.vectorAt(entryOrd))
 	visited[entryOrd] = gen
 	cand.push(searchEntry{ord: entryOrd, dist: entryDist})
 	best.push(searchEntry{ord: entryOrd, dist: entryDist})
@@ -102,8 +158,12 @@ func (v *VectorIdx) searchLayerLocked(ctx *SearchContext, query []byte, entryOrd
 		if best.len() >= ef && c.dist > best.peek().dist {
 			break
 		}
-		for _, nb := range v.links[c.ord][level] {
-			nOrd, ok := v.locateLocked(nb)
+		g := s.linkAt(c.ord)
+		if g == nil || level >= len(g.layers) {
+			continue
+		}
+		for _, nb := range g.layers[level] {
+			nOrd, ok := s.locate(nb)
 			if !ok {
 				continue
 			}
@@ -111,7 +171,7 @@ func (v *VectorIdx) searchLayerLocked(ctx *SearchContext, query []byte, entryOrd
 				continue
 			}
 			visited[nOrd] = gen
-			d := v.dist(query, v.vectorAtLocked(nOrd))
+			d := s.dist(query, s.vectorAt(nOrd))
 			if best.len() < ef || d < best.peek().dist {
 				cand.push(searchEntry{ord: nOrd, dist: d})
 				best.push(searchEntry{ord: nOrd, dist: d})
@@ -126,112 +186,67 @@ func (v *VectorIdx) searchLayerLocked(ctx *SearchContext, query []byte, entryOrd
 	return out
 }
 
-// insertLocked wires a new node (already appended at ordinal newOrd with its
-// vector stored) into levels 0..level. It runs before entry/maxLevel update
-// so the new node is invisible to its own neighbor search.
-func (v *VectorIdx) insertLocked(ctx *SearchContext, query []byte, newOrd, newLevel int, newID NodeID) {
-	if len(v.ids) == 1 {
-		// First node: links already allocated empty; entry set by caller.
-		return
-	}
-	entryOrd, ok := v.locateLocked(v.entry)
-	if !ok {
-		return
-	}
-	cur := entryOrd
-	for l := v.maxLevel; l > newLevel; l-- {
-		cur = v.greedyStepLocked(cur, l, query)
-	}
-	for l := min(v.maxLevel, newLevel); l >= 0; l-- {
-		ef := int(v.cfg.EfConstruction)
-		cands := v.searchLayerLocked(ctx, query, cur, ef, l)
-		m := int(v.cfg.M)
-		if l == 0 {
-			m = int(v.cfg.M0)
-		}
-		selected := selectClosest(cands, m)
-		// Forward links from the new node.
-		v.links[newOrd][l] = v.links[newOrd][l][:0]
-		for _, s := range selected {
-			v.links[newOrd][l] = append(v.links[newOrd][l], v.ids[s.ord])
-		}
-		// Reciprocal links with closest-M pruning.
-		for _, s := range selected {
-			nb := s.ord
-			nbLevel := v.levels[nb]
-			if l > nbLevel {
-				continue
-			}
-			v.links[nb][l] = append(v.links[nb][l], newID)
-			if len(v.links[nb][l]) > m {
-				v.pruneNeighborsLocked(nb, l, m)
-			}
-		}
-		if len(selected) != 0 {
-			cur = selected[0].ord
-		}
-	}
-}
-
-// pruneNeighborsLocked keeps the m closest neighbors of ord at level by
-// current distance. It allocates one small slice per prune; insertion is
-// writer-serialized and off the search hot path.
-func (v *VectorIdx) pruneNeighborsLocked(ord, level, m int) {
-	nbs := v.links[ord][level]
-	type nd struct {
-		id   NodeID
-		dist float64
-	}
-	scored := make([]nd, 0, len(nbs))
-	base := v.vectorAtLocked(ord)
-	for _, nb := range nbs {
-		nOrd, ok := v.locateLocked(nb)
-		if !ok {
-			continue
-		}
-		scored = append(scored, nd{id: nb, dist: v.dist(base, v.vectorAtLocked(nOrd))})
-	}
-	sort.Slice(scored, func(i, j int) bool {
-		if scored[i].dist != scored[j].dist {
-			return scored[i].dist < scored[j].dist
-		}
-		return scored[i].id < scored[j].id
-	})
-	if len(scored) > m {
-		scored = scored[:m]
-	}
-	kept := v.links[ord][level][:0]
-	for _, s := range scored {
-		kept = append(kept, s.id)
-	}
-	v.links[ord][level] = kept
-}
-
-// layer0SearchLocked descends from the entry to layer 0 then explores with
-// budget ef, returning raw entries (unfiltered, may include tombstones).
-func (v *VectorIdx) layer0SearchLocked(ctx *SearchContext, query []byte, ef int) []searchEntry {
-	entryOrd, ok := v.locateLocked(v.entry)
+// layer0Search descends from the entry to layer 0 then explores with budget
+// ef, returning raw entries (unfiltered, may include tombstones).
+func (s *vectorSnapshot) layer0Search(ctx *SearchContext, query []byte, ef int) []searchEntry {
+	entryOrd, ok := s.locate(s.entry)
 	if !ok {
 		return nil
 	}
 	cur := entryOrd
-	for l := v.maxLevel; l > 0; l-- {
-		cur = v.greedyStepLocked(cur, l, query)
+	for l := s.maxLevel; l > 0; l-- {
+		cur = s.greedyStep(cur, l, query)
 	}
-	return v.searchLayerLocked(ctx, query, cur, ef, 0)
+	return s.searchLayer(ctx, query, cur, ef, 0)
 }
 
-// assembleLocked converts raw layer-0 entries into the final top-k: skip
+// effectiveEf computes the layer-0 exploration budget for k, applying the
+// dynamic-ef policy (Weaviate dynamicEf analogue) and filtered oversampling.
+func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter) int {
+	ef := int(s.cfg.EfSearch)
+	if s.cfg.DynamicEfFactor > 0 {
+		dyn := int(uint64(k) * uint64(s.cfg.DynamicEfFactor))
+		if dyn < int(s.cfg.DynamicEfMin) {
+			dyn = int(s.cfg.DynamicEfMin)
+		}
+		if dyn > int(s.cfg.DynamicEfMax) {
+			dyn = int(s.cfg.DynamicEfMax)
+		}
+		ef = dyn
+	}
+	if ef < k {
+		ef = k
+	}
+	if filter != nil {
+		if want := k * int(s.cfg.OversampleFactor); want > ef {
+			ef = want
+		}
+	}
+	if ef > len(s.ids) {
+		ef = len(s.ids)
+	}
+	if ef < 1 {
+		ef = 1
+	}
+	return ef
+}
+
+// assemble converts raw layer-0 entries into the final top-k: skip
 // tombstones, apply the candidate filter, sort, and encode scores into buf.
-// It never mutates traversal semantics for filtering (VectorIdx.MD section 20).
-func (v *VectorIdx) assembleLocked(entries []searchEntry, filter CandidateFilter, k int, buf []Result) []Result {
+// With FilterAware enabled the result heap favors filter-passing nodes while
+// traversal stays unconstrained (ACORN-lite): callers oversample ef, so this
+// stays a post-filter with iterative expansion in the caller.
+func (s *vectorSnapshot) assemble(entries []searchEntry, filter CandidateFilter, k int, buf []Result, querySelfDot float64) []Result {
 	if k <= 0 || len(entries) == 0 {
 		return buf[:0]
 	}
 	filtered := entries[:0]
 	for _, e := range entries {
-		id := v.ids[e.ord]
-		if _, tombstoned := v.tombstones[id]; tombstoned {
+		if e.ord < 0 || e.ord >= len(s.ids) {
+			continue
+		}
+		id := s.ids[e.ord]
+		if s.tomb.Contains(uint64(id)) {
 			continue
 		}
 		if filter != nil && !filter(id) {
@@ -242,21 +257,20 @@ func (v *VectorIdx) assembleLocked(entries []searchEntry, filter CandidateFilter
 	if len(filtered) == 0 {
 		return buf[:0]
 	}
-	sortAssembled(filtered, v.ids)
+	sortAssembled(filtered, s.ids)
 	if len(filtered) > k {
 		filtered = filtered[:k]
 	}
+	metric := s.cfg.Metric
 	out := buf[:0]
 	for _, e := range filtered {
-		out = append(out, Result{NodeID: v.ids[e.ord], Score: EncodeScore(e.dist)})
+		out = append(out, Result{ImageID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
 	}
 	return out
 }
 
 // sortAssembled orders filtered candidates by (distance, NodeID) to match
-// the exact-scan oracle's tie-break. Small slices use allocation-free
-// insertion sort (sort.Slice would box the slice header per query); large
-// ef values fall back to the standard sort.
+// the exact-scan oracle's tie-break.
 func sortAssembled(entries []searchEntry, ids []NodeID) {
 	if len(entries) < 128 {
 		for i := 1; i < len(entries); i++ {
@@ -278,26 +292,68 @@ func sortAssembled(entries []searchEntry, ids []NodeID) {
 	})
 }
 
-// exactSearchLocked is the scalar exact-L2 reference: full scan over live
-// nodes honoring tombstones and filter, sorted, truncated to k. It is the
-// recall oracle and the filtered-search fallback when ANN coverage is thin.
-func (v *VectorIdx) exactSearchLocked(query []byte, filter CandidateFilter, k int) []Result {
-	if k <= 0 || len(v.ids) == 0 {
+// exactSearchInto is the pooled exact reference: full scan over live nodes
+// honoring tombstones and filter, top-k selected through the context's
+// reusable heap and encoded into buf. Steady-state it allocates nothing.
+func (s *vectorSnapshot) exactSearchInto(ctx *SearchContext, query []byte, filter CandidateFilter, k int, buf []Result) []Result {
+	if k <= 0 || len(s.ids) == 0 {
+		return buf[:0]
+	}
+	ctx.cand.reset()
+	ctx.best.reset()
+	best := &ctx.best
+	for ord, id := range s.ids {
+		if s.tomb.Contains(uint64(id)) {
+			continue
+		}
+		if filter != nil && !filter(id) {
+			continue
+		}
+		d := s.dist(query, s.vectorAt(ord))
+		if best.len() < k {
+			best.push(searchEntry{ord: ord, dist: d})
+			continue
+		}
+		top := best.peek()
+		if d < top.dist || (d == top.dist && id < s.ids[top.ord]) {
+			best.pop()
+			best.push(searchEntry{ord: ord, dist: d})
+		}
+	}
+	all := append(ctx.layer[:0], best.items...)
+	ctx.layer = all
+	sortAssembled(all, s.ids)
+	metric := s.cfg.Metric
+	var querySelfDot float64
+	if metric == MetricDot {
+		querySelfDot = dotSelfBytes(s.cfg, query)
+	}
+	out := buf[:0]
+	for _, e := range all {
+		out = append(out, Result{ImageID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
+	}
+	return out
+}
+
+// exactSearch is the scalar exact reference for the index metric: full scan
+// over live nodes honoring tombstones and filter, sorted, truncated to k.
+func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int) []Result {
+	if k <= 0 || len(s.ids) == 0 {
 		return nil
 	}
 	type scored struct {
 		id   NodeID
 		dist float64
 	}
-	all := make([]scored, 0, len(v.ids))
-	for ord, id := range v.ids {
-		if _, tombstoned := v.tombstones[id]; tombstoned {
+	all := make([]scored, 0, len(s.ids))
+	for ord, id := range s.ids {
+		if s.tomb.Contains(uint64(id)) {
 			continue
 		}
 		if filter != nil && !filter(id) {
 			continue
 		}
-		all = append(all, scored{id: id, dist: v.dist(query, v.vectorAtLocked(ord))})
+		all = append(all, scored{id: id, dist: s.dist(query, s.vectorAt(ord))})
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].dist != all[j].dist {
@@ -308,11 +364,106 @@ func (v *VectorIdx) exactSearchLocked(query []byte, filter CandidateFilter, k in
 	if len(all) > k {
 		all = all[:k]
 	}
+	metric := s.cfg.Metric
+	var querySelfDot float64
+	if metric == MetricDot {
+		querySelfDot = dotSelfBytes(s.cfg, query)
+	}
 	out := make([]Result, len(all))
-	for i, s := range all {
-		out[i] = Result{NodeID: s.id, Score: EncodeScore(s.dist)}
+	for i, sc := range all {
+		out[i] = Result{ImageID: widenedID(sc.id), Score: encodeScoreForMetric(metric, sc.dist, querySelfDot)}
 	}
 	return out
+}
+
+// searchWithHint runs the full ANN path with an optional filter cardinality
+// hint for the cost-based flat fallback. flatSmall reports whether the flat
+// path was taken.
+func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter CandidateFilter, k int, filterHint int) ([]Result, bool) {
+	if k > len(s.ids) {
+		k = len(s.ids)
+	}
+	live := len(s.ids) - len(s.tombSorted)
+	if s.cfg.FlatThreshold >= 0 && live <= s.cfg.FlatThreshold {
+		out := s.exactSearchInto(ctx, query, filter, k, ctx.output[:0])
+		ctx.output = out
+		return out, true
+	}
+	if filter != nil && filterHint >= 0 && s.cfg.FlatSearchCutoff >= 0 && filterHint <= s.cfg.FlatSearchCutoff {
+		out := s.exactSearchInto(ctx, query, filter, k, ctx.output[:0])
+		ctx.output = out
+		return out, true
+	}
+	var querySelfDot float64
+	if s.cfg.Metric == MetricDot {
+		querySelfDot = dotSelfBytes(s.cfg, query)
+	}
+	ef := s.effectiveEf(k, filter)
+	ctx.resetForNodes(len(s.ids), s.vecBytes)
+	entries := s.layer0Search(ctx, query, ef)
+	results := s.assemble(entries, filter, k, ctx.output[:0], querySelfDot)
+	ctx.output = results
+	if filter != nil && len(results) < k {
+		if ef < len(s.ids) {
+			ef2 := ef * 2
+			if ef2 > len(s.ids) {
+				ef2 = len(s.ids)
+			}
+			if ef2 > ef {
+				ctx.resetForNodes(len(s.ids), s.vecBytes)
+				entries = s.layer0Search(ctx, query, ef2)
+				expanded := s.assemble(entries, filter, k, ctx.output[:0], querySelfDot)
+				ctx.output = expanded
+				if len(expanded) > len(results) {
+					results = expanded
+				}
+				ef = ef2
+			}
+		}
+		if len(results) < k {
+			available := 0
+			cutoff := s.cfg.FlatSearchCutoff
+			for _, id := range s.sortedIDs {
+				if s.tomb.Contains(uint64(id)) {
+					continue
+				}
+				if !filter(id) {
+					continue
+				}
+				available++
+				if cutoff >= 0 && available > cutoff && len(results) >= k {
+					break
+				}
+			}
+			// Dense snapshots may leave sortedIDs stale; count via ids.
+			if len(s.sortedIDs) == 0 {
+				for _, id := range s.ids {
+					if s.tomb.Contains(uint64(id)) {
+						continue
+					}
+					if filter != nil && !filter(id) {
+						continue
+					}
+					available++
+					if cutoff >= 0 && available > cutoff && len(results) >= k {
+						break
+					}
+				}
+			}
+			if available <= k || len(results) < k {
+				// Allocating fallback: results aliases ctx scratch, so the
+				// exact scan takes its own storage here.
+				exact := s.exactSearch(query, filter, k)
+				if len(exact) > len(results) {
+					return exact, true
+				}
+				if available <= k {
+					return exact, true
+				}
+			}
+		}
+	}
+	return results, false
 }
 
 func min(a, b int) int {

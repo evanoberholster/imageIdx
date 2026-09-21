@@ -6,7 +6,7 @@
 
 The initial target is up to approximately **10 million vectors per VectorIdx** while keeping the implementation simple enough to benchmark, reason about, recover, compact, and optimize incrementally.
 
-The design deliberately avoids a second application-level ID mapping. A VectorIdx `TypeID` defines the meaning of its `NodeID`:
+The design deliberately avoids a second application-level ID mapping. A VectorIdx `SpaceID` defines the meaning of its `NodeID`:
 
 - Image vector index: `NodeID == ImageID`
 - Face vector index: `NodeID == FaceID`
@@ -68,21 +68,26 @@ type NodeID uint32
 
 NodeID is the identifier stored in HNSW edges and returned by search.
 
-Its semantic meaning comes from the VectorIdx `TypeID`; VectorIdx does not translate it into another application ID.
+Its semantic meaning comes from the VectorIdx `SpaceID`; VectorIdx does not translate it into another application ID.
 
 NodeIDs are not required to be dense.
 
 The implementation MUST NOT assume that allocating memory proportional to `max(NodeID)` is always acceptable. Dense-ID optimizations may be implemented when benchmarks demonstrate they are worthwhile, but sparse IDs must remain a supported property of the format.
 
-### 4.2 TypeID
+### 4.2 SpaceID
 
 ```go
-type TypeID uint16
+type IndexType uint8
+type SpaceID uint16
 ```
 
-`TypeID` identifies the vector space and NodeID semantics. Examples might include image semantic embeddings, face embeddings, landmark embeddings, or future model-specific vector spaces.
+`SpaceID` packs an IndexType (`IndexTypeImage`, `IndexTypeFace`, `IndexTypeCustom`) in its high byte
+and a within-type space number in its low byte. It identifies the vector
+space and the meaning of its NodeIDs: examples include image semantic
+embeddings, face embeddings, landmark embeddings, or future model-specific
+vector spaces.
 
-TypeID does not imply vector dimensions or element representation by itself. Those properties are persisted explicitly in the VectorIdx header.
+SpaceID does not imply vector dimensions or element representation by itself. Those properties are persisted explicitly in the VectorIdx header.
 
 ### 4.3 Dimensions
 
@@ -229,7 +234,7 @@ type Superblock struct {
     HeaderSize    uint32
 
     Generation    uint64
-    TypeID        uint16
+    SpaceID        uint16
     ElementType   uint8
     Metric        uint8
     Dimensions    uint16
@@ -502,7 +507,7 @@ Deletion records only need the NodeID plus WAL framing metadata.
 
 ### 13.1 Durability
 
-An acknowledged durable mutation should have its WAL record safely persisted according to the database's durability contract.
+An acknowledged durable mutation should have its WAL record safely persisted according to the database's durability contract. `Create` and `Open` take a `Durability` (`DurabilityOS` or `DurabilitySync`); it is a runtime policy and is not persisted in the file format. `DurabilitySync` fsyncs each acknowledged mutation; `DurabilityOS` leaves the record to the OS page cache, optionally with `WithSyncInterval(d)` periodic group commit. `Sync` forces a durable boundary; the index path is exclusively locked until `Close`.
 
 Graph/vector checkpointing may lag WAL persistence.
 
@@ -1071,7 +1076,7 @@ Exact API details can evolve, but keep the public surface small.
 
 ```go
 type Config struct {
-    TypeID         TypeID
+    SpaceID         SpaceID
     Dimensions     uint16
     ElementType    ElementType
 
@@ -1090,8 +1095,8 @@ type VectorIdx struct {
     // private implementation
 }
 
-func Create(path string, cfg Config) (*VectorIdx, error)
-func Open(path string) (*VectorIdx, error)
+func Create(path string, cfg Config, durability Durability) (*VectorIdx, error)
+func Open(path string, durability Durability) (*VectorIdx, error)
 func (v *VectorIdx) Close() error
 
 func (v *VectorIdx) Add(nodeID NodeID, vector any) error
@@ -1409,8 +1414,8 @@ Only after the above is stable, investigate:
 
 The implementation should document and test these invariants explicitly.
 
-1. A VectorIdx has one TypeID, dimension, element type, and metric.
-2. NodeID is `uint32` and has application semantics defined by TypeID.
+1. A VectorIdx has one SpaceID, dimension, element type, and metric.
+2. NodeID is `uint32` and has application semantics defined by SpaceID.
 3. HNSW edges contain NodeIDs, not pointers.
 4. Compaction never changes NodeID.
 5. Physical vector locations may change between generations.
@@ -1511,7 +1516,7 @@ When implementing this design:
 
 VectorIdx should begin as a deliberately straightforward persistent HNSW implementation built around five principles:
 
-**Direct identity.** `NodeID` is the ImageID, FaceID, or other application identifier defined by the VectorIdx TypeID. VectorIdx does not maintain redundant semantic ID lists.
+**Direct identity.** `NodeID` is the ImageID, FaceID, or other application identifier defined by the VectorIdx SpaceID. VectorIdx does not maintain redundant semantic ID lists.
 
 **Dense physical data.** Vectors and graph records remain physically compact even when NodeIDs are sparse. Physical storage locations are implementation details and can change during compaction.
 

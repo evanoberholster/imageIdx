@@ -6,9 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
 )
+
+var _ = atomic.LoadInt32
 
 // Single-file multi-region format (VectorIdx.MD section 8).
 //
@@ -48,7 +51,7 @@ var vectorMagic = [8]byte{
 
 type fileHeader struct {
 	generation     uint64
-	typeID         TypeID
+	spaceID        SpaceID
 	elem           ElementType
 	metric         uint8
 	dims           uint16
@@ -77,7 +80,7 @@ func encodeHeader(dst []byte, h fileHeader) {
 	binary.LittleEndian.PutUint32(dst[8:12], vectorFormatVersion)
 	binary.LittleEndian.PutUint32(dst[12:16], vectorHeaderSize)
 	binary.LittleEndian.PutUint64(dst[16:24], h.generation)
-	binary.LittleEndian.PutUint16(dst[24:26], uint16(h.typeID))
+	binary.LittleEndian.PutUint16(dst[24:26], uint16(h.spaceID))
 	dst[26] = byte(h.elem)
 	dst[27] = h.metric
 	binary.LittleEndian.PutUint16(dst[28:30], h.dims)
@@ -123,7 +126,7 @@ func decodeHeader(data []byte) (fileHeader, error) {
 		return h, ErrCorruptStorage
 	}
 	h.generation = binary.LittleEndian.Uint64(data[16:24])
-	h.typeID = TypeID(binary.LittleEndian.Uint16(data[24:26]))
+	h.spaceID = SpaceID(binary.LittleEndian.Uint16(data[24:26]))
 	h.elem = ElementType(data[26])
 	h.metric = data[27]
 	h.dims = binary.LittleEndian.Uint16(data[28:30])
@@ -143,7 +146,7 @@ func decodeHeader(data []byte) (fileHeader, error) {
 		return h, ErrCorruptStorage
 	}
 	h.checkpointLSN = binary.LittleEndian.Uint64(data[78:86])
-	if h.metric != vectorMetricL2 {
+	if h.metric != vectorMetricL2 && h.metric != MetricCosine && h.metric != MetricDot {
 		return h, ErrCorruptStorage
 	}
 	switch h.elem {
@@ -151,7 +154,7 @@ func decodeHeader(data []byte) (fileHeader, error) {
 	default:
 		return h, ErrCorruptStorage
 	}
-	if h.dims != Dim512 && h.dims != Dim768 && h.dims != Dim1024 {
+	if !Dimensions(h.dims).Valid() {
 		return h, ErrCorruptStorage
 	}
 	return h, nil
@@ -219,7 +222,9 @@ func decodeFile(data []byte) (fileHeader, [][]byte, error) {
 	return h, regions, nil
 }
 
-// loadRegions populates index state from validated region payloads.
+// loadRegions populates the published snapshot from validated region payloads.
+// Caller holds no snapshot yet (construction/recovery); the built snapshot is
+// stored directly.
 func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 	nodeMeta, vectors, graph, tombstones := regions[0], regions[1], regions[2], regions[3]
 	if len(nodeMeta)%8 != 0 {
@@ -233,12 +238,10 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 	if len(vectors) != count*vecBytes {
 		return ErrCorruptStorage
 	}
-	v.ids = make([]NodeID, 0, count)
-	v.vectors = make([]byte, 0, len(vectors))
-	v.levels = make([]int, 0, count)
-	v.links = make([][][]NodeID, 0, count)
-	v.sortedIDs = make([]NodeID, 0, count)
-	v.sortedOrd = make([]int, 0, count)
+	snap := v.view.Load()
+	ids := make([]NodeID, 0, count)
+	levels := make([]int, 0, count)
+	linkHolders := make([]*atomic.Pointer[nodeLayers], 0, count)
 	for i := range count {
 		off := i * 8
 		id := NodeID(binary.LittleEndian.Uint32(nodeMeta[off : off+4]))
@@ -246,11 +249,13 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 		if level < 0 || level > 64 {
 			return ErrCorruptStorage
 		}
-		v.ids = append(v.ids, id)
-		v.levels = append(v.levels, level)
-		v.links = append(v.links, make([][]NodeID, level+1))
+		ids = append(ids, id)
+		levels = append(levels, level)
+		holder := &atomic.Pointer[nodeLayers]{}
+		holder.Store(&nodeLayers{layers: make([][]NodeID, level+1)})
+		linkHolders = append(linkHolders, holder)
 	}
-	v.vectors = append(v.vectors, vectors...)
+	vec := append([]byte(nil), vectors...)
 	// Graph payload: per node u16 numLevels then per level u16 degree + ids.
 	pos := 0
 	for ord := range count {
@@ -259,7 +264,7 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 		}
 		numLevels := int(binary.LittleEndian.Uint16(graph[pos : pos+2]))
 		pos += 2
-		if numLevels != v.levels[ord]+1 {
+		if numLevels != levels[ord]+1 {
 			return ErrCorruptStorage
 		}
 		for l := range numLevels {
@@ -276,7 +281,7 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 				nbs[j] = NodeID(binary.LittleEndian.Uint32(graph[pos+j*4 : pos+j*4+4]))
 			}
 			pos += deg * 4
-			v.links[ord][l] = nbs
+			linkHolders[ord].Load().layers[l] = nbs
 		}
 	}
 	if pos != len(graph) {
@@ -292,17 +297,42 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 	if tombCount != h.tombstoneCount {
 		return ErrCorruptStorage
 	}
+	tombSorted := make([]NodeID, 0, tombCount)
 	for i := range tombCount {
 		id := NodeID(binary.LittleEndian.Uint32(tombstones[8+i*4:]))
-		v.tombstones[id] = struct{}{}
+		tombSorted = append(tombSorted, id)
 	}
-	// Rebuild the sorted locator from node IDs.
+	if !sort.SliceIsSorted(tombSorted, func(i, j int) bool { return tombSorted[i] < tombSorted[j] }) {
+		return ErrCorruptStorage
+	}
+	tomb, tombSorted := rebuildTombeset(tombSorted)
+	if uint64(len(tombSorted)) != tombCount {
+		return ErrCorruptStorage
+	}
+	// Rebuild the locator from node IDs: dense when feasible, else sorted.
+	ns := &vectorSnapshot{
+		cfg:        snap.cfg,
+		dist:       v.dist,
+		vecBytes:   v.vecBytes,
+		elemSize:   v.elemSize,
+		dims:       v.dims,
+		ids:        ids,
+		vectors:    vec,
+		levels:     levels,
+		links:      linkHolders,
+		tomb:       tomb,
+		tombSorted: tombSorted,
+		entry:      h.entry,
+		hasEntry:   h.hasEntry,
+		maxLevel:   int(h.maxLevel),
+		gen:        h.generation + 1,
+	}
 	type pair struct {
 		id  NodeID
 		ord int
 	}
 	pairs := make([]pair, count)
-	for ord, id := range v.ids {
+	for ord, id := range ids {
 		pairs[ord] = pair{id: id, ord: ord}
 	}
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i].id < pairs[j].id })
@@ -311,45 +341,56 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 			return ErrCorruptStorage
 		}
 	}
-	for _, p := range pairs {
-		v.sortedIDs = append(v.sortedIDs, p.id)
-		v.sortedOrd = append(v.sortedOrd, p.ord)
+	var lo, hi NodeID
+	if count > 0 {
+		lo, hi = pairs[0].id, pairs[len(pairs)-1].id
 	}
-	v.entry = h.entry
-	v.hasEntry = h.hasEntry
-	v.maxLevel = int(h.maxLevel)
-	if v.hasEntry {
-		if _, ok := v.locateLocked(v.entry); !ok {
+	if count > 0 && denseFeasible(lo, hi, count) {
+		ns.rebuildDenseWith(lo, hi)
+	} else {
+		ns.sortedIDs = make([]NodeID, 0, count)
+		ns.sortedOrd = make([]int, 0, count)
+		for _, p := range pairs {
+			ns.sortedIDs = append(ns.sortedIDs, p.id)
+			ns.sortedOrd = append(ns.sortedOrd, p.ord)
+		}
+	}
+	if ns.hasEntry {
+		if _, ok := ns.locate(ns.entry); !ok {
 			return ErrCorruptStorage
 		}
 	}
+	v.view.Store(ns)
 	return nil
 }
 
-// checkpointLocked serializes the current state and atomically publishes it.
-// Caller holds the writer lock.
+// checkpointLocked serializes the published snapshot and atomically publishes
+// it to disk. Caller holds the writer lock.
 func (v *VectorIdx) checkpointLocked() error {
+	snap := v.view.Load()
 	// NodeMeta region: 8 bytes per node (id u32, level u16, reserved u16).
-	nodeMeta := make([]byte, len(v.ids)*8)
-	for i, id := range v.ids {
+	nodeMeta := make([]byte, len(snap.ids)*8)
+	for i, id := range snap.ids {
 		binary.LittleEndian.PutUint32(nodeMeta[i*8:], uint32(id))
-		binary.LittleEndian.PutUint16(nodeMeta[i*8+4:], uint16(v.levels[i]))
+		binary.LittleEndian.PutUint16(nodeMeta[i*8+4:], uint16(snap.levels[i]))
 	}
 	// Graph region.
 	graphSize := 0
-	for _, layerLinks := range v.links {
+	for _, holder := range snap.links {
+		g := holder.Load()
 		graphSize += 2
-		for _, nbs := range layerLinks {
+		for _, nbs := range g.layers {
 			graphSize += 2 + len(nbs)*4
 		}
 	}
 	graph := make([]byte, 0, graphSize)
 	var u16buf [2]byte
 	var u32buf [4]byte
-	for _, layerLinks := range v.links {
-		binary.LittleEndian.PutUint16(u16buf[:], uint16(len(layerLinks)))
+	for _, holder := range snap.links {
+		g := holder.Load()
+		binary.LittleEndian.PutUint16(u16buf[:], uint16(len(g.layers)))
 		graph = append(graph, u16buf[:]...)
-		for _, nbs := range layerLinks {
+		for _, nbs := range g.layers {
 			binary.LittleEndian.PutUint16(u16buf[:], uint16(len(nbs)))
 			graph = append(graph, u16buf[:]...)
 			for _, nb := range nbs {
@@ -359,35 +400,32 @@ func (v *VectorIdx) checkpointLocked() error {
 		}
 	}
 	// Tombstones region: u64 count + sorted u32 ids.
-	tombIDs := make([]NodeID, 0, len(v.tombstones))
-	for id := range v.tombstones {
-		tombIDs = append(tombIDs, id)
-	}
-	sortNodeIDs(tombIDs)
+	tombIDs := snap.tombSorted
 	tomb := make([]byte, 8+len(tombIDs)*4)
 	binary.LittleEndian.PutUint64(tomb[0:8], uint64(len(tombIDs)))
 	for i, id := range tombIDs {
 		binary.LittleEndian.PutUint32(tomb[8+i*4:], uint32(id))
 	}
 	v.checkpointLSN = v.lsn
+	v.checkpointLSNPub.Store(v.checkpointLSN)
 	h := fileHeader{
 		generation:     v.gen.Load(),
-		typeID:         v.cfg.TypeID,
-		elem:           v.cfg.ElementType,
-		metric:         vectorMetricL2,
-		dims:           v.cfg.Dimensions,
-		m:              v.cfg.M,
-		m0:             v.cfg.M0,
-		efConstruction: v.cfg.EfConstruction,
-		efSearch:       v.cfg.EfSearch,
-		entry:          v.entry,
-		hasEntry:       v.hasEntry,
-		maxLevel:       uint16(v.maxLevel),
-		liveCount:      uint64(len(v.ids) - len(v.tombstones)),
-		tombstoneCount: uint64(len(v.tombstones)),
+		spaceID:        snap.cfg.SpaceID,
+		elem:           snap.cfg.ElementType,
+		metric:         snap.cfg.Metric,
+		dims:           uint16(snap.cfg.Dimensions),
+		m:              snap.cfg.M,
+		m0:             snap.cfg.M0,
+		efConstruction: snap.cfg.EfConstruction,
+		efSearch:       snap.cfg.EfSearch,
+		entry:          snap.entry,
+		hasEntry:       snap.hasEntry,
+		maxLevel:       uint16(snap.maxLevel),
+		liveCount:      uint64(len(snap.ids) - len(snap.tombSorted)),
+		tombstoneCount: uint64(len(snap.tombSorted)),
 		checkpointLSN:  v.checkpointLSN,
 	}
-	payloads := [][]byte{nodeMeta, append([]byte(nil), v.vectors...), graph, tomb}
+	payloads := [][]byte{nodeMeta, append([]byte(nil), snap.vectors...), graph, tomb}
 	kinds := []uint16{regionKindNodeMeta, regionKindVectors, regionKindGraph, regionKindTombstones}
 	dirOff := uint64(vectorHeaderSize)
 	total := dirOff + uint64(4*regionEntrySize)

@@ -6,10 +6,10 @@ import (
 )
 
 func testConfigFloat512() Config {
-	return Config{TypeID: 1, Dimensions: Dim512, ElementType: ElementFloat32}
+	return Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: Dim512, ElementType: ElementFloat32}
 }
 
-func randFloatVec(rng *rand.Rand, dims int) []float32 {
+func randFloatVec(rng *rand.Rand, dims Dimensions) []float32 {
 	v := make([]float32, dims)
 	for i := range v {
 		v[i] = rng.Float32()*4 - 2
@@ -17,7 +17,7 @@ func randFloatVec(rng *rand.Rand, dims int) []float32 {
 	return v
 }
 
-func randInt8Vec(rng *rand.Rand, dims int) []int8 {
+func randInt8Vec(rng *rand.Rand, dims Dimensions) []int8 {
 	v := make([]int8, dims)
 	for i := range v {
 		v[i] = int8(rng.Intn(256) - 128)
@@ -32,17 +32,17 @@ func mustAddFloat(t *testing.T, idx *VectorIdx, id NodeID, vec []float32) {
 	}
 }
 
-func resultIDs(results []Result) []NodeID {
-	ids := make([]NodeID, len(results))
+func resultIDs(results []Result) []ImageID {
+	ids := make([]ImageID, len(results))
 	for i, r := range results {
-		ids[i] = r.NodeID
+		ids[i] = r.ImageID
 	}
 	return ids
 }
 
-func containsResult(results []Result, id NodeID) bool {
+func containsResult(results []Result, id ImageID) bool {
 	for _, r := range results {
-		if r.NodeID == id {
+		if r.ImageID == id {
 			return true
 		}
 	}

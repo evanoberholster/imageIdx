@@ -215,13 +215,58 @@ func sortEntries(entries []searchEntry) {
 }
 
 // selectClosest returns the m closest candidates for the writer (insertion)
-// path. V1 deliberately uses closest-only selection without a diversity heuristic
-// (VectorIdx.MD section 23); the heuristic stays isolated here for later
-// benchmarking.
+// path.
 func selectClosest(cands []searchEntry, m int) []searchEntry {
 	if len(cands) > m {
 		sortEntries(cands)
 		cands = cands[:m]
 	}
 	return cands
+}
+
+// selectHeuristic implements the hnswlib diversity heuristic: candidates
+// sorted by distance to the query are kept when closer to the query than to
+// any already-selected neighbor, spreading edges across directions instead
+// of collapsing onto one cluster. distFn measures raw-vector distance;
+// vectorAt resolves ordinals. It returns at most m entries.
+func selectHeuristic(cands []searchEntry, m int, query []byte, s *vectorSnapshot) []searchEntry {
+	if len(cands) <= m {
+		return cands
+	}
+	sortEntries(cands)
+	selected := cands[:0]
+	for _, c := range cands {
+		if len(selected) >= m {
+			break
+		}
+		cVec := s.vectorAt(c.ord)
+		keep := true
+		for _, kept := range selected {
+			d := s.dist(cVec, s.vectorAt(kept.ord))
+			if d < c.dist {
+				keep = false
+				break
+			}
+		}
+		_ = query
+		if keep {
+			selected = append(selected, c)
+		}
+	}
+	// If diversity pruned too aggressively, backfill closest remainder.
+	if len(selected) < m {
+		inSel := make(map[int]bool, len(selected))
+		for _, c := range selected {
+			inSel[c.ord] = true
+		}
+		for _, c := range cands {
+			if len(selected) >= m {
+				break
+			}
+			if !inSel[c.ord] {
+				selected = append(selected, c)
+			}
+		}
+	}
+	return selected
 }

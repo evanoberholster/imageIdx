@@ -19,7 +19,7 @@ func TestConfigValidation(t *testing.T) {
 			t.Fatalf("cfg %+v: expected ErrInvalidConfig, got %v", cfg, err)
 		}
 	}
-	idx, err := New(Config{Dimensions: Dim512, ElementType: ElementFloat32})
+	idx, err := New(Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: Dim512, ElementType: ElementFloat32})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestAddSearchSingleFloat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].NodeID != 42 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ImageID != 42 || results[0].Score != 0 {
 		t.Fatalf("single search = %+v, want [{42 0}]", results)
 	}
 	if got := idx.LiveCount(); got != 1 {
@@ -68,20 +68,18 @@ func TestAddDuplicateRejected(t *testing.T) {
 	if err := idx.Delete(1); err != nil {
 		t.Fatal(err)
 	}
-	// Re-adding a tombstoned ID stays rejected until Compact (explicit V1 rule).
-	if err := idx.AddFloat32(1, vec); !errors.Is(err, ErrDuplicateNodeID) {
-		t.Fatalf("re-add after delete = %v, want ErrDuplicateNodeID", err)
-	}
-	if err := idx.Compact(); err != nil {
+	// Re-adding a tombstoned ID replaces its vector; Delete+Add is an update.
+	updated := randFloatVec(rng, Dim512)
+	mustAddFloat(t, idx, 1, updated)
+	if _, err := idx.Compact(); err != nil {
 		t.Fatal(err)
 	}
-	mustAddFloat(t, idx, 1, vec)
-	results, err := idx.SearchFloat32(vec, nil, 1)
+	results, err := idx.SearchFloat32(updated, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].NodeID != 1 {
-		t.Fatalf("post-compact re-add search = %+v", results)
+	if len(results) != 1 || results[0].ImageID != 1 || results[0].Score != 0 {
+		t.Fatalf("re-add search = %+v", results)
 	}
 }
 
@@ -131,7 +129,7 @@ func TestDeleteSemantics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].NodeID != NodeID(i+1) {
+		if len(results) != 1 || results[0].ImageID != uint64(i+1) {
 			t.Fatalf("node %d self-search = %+v", i+1, results)
 		}
 	}
@@ -159,7 +157,7 @@ func TestSparseNodeIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].NodeID != id {
+		if len(results) != 1 || results[0].ImageID != uint64(id) {
 			t.Fatalf("sparse id %d self-search = %+v", id, results)
 		}
 	}
@@ -195,10 +193,10 @@ func TestTypedAPIMismatchRejected(t *testing.T) {
 func TestAllElementTypesRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(12))
 	cfgs := []Config{
-		{TypeID: 2, Dimensions: Dim512, ElementType: ElementInt8},
-		{TypeID: 3, Dimensions: Dim512, ElementType: ElementUint8},
-		{TypeID: 4, Dimensions: Dim512, ElementType: ElementInt16},
-		{TypeID: 5, Dimensions: Dim512, ElementType: ElementUint16},
+		{SpaceID: NewSpaceID(IndexTypeImage, 2), Dimensions: Dim512, ElementType: ElementInt8},
+		{SpaceID: NewSpaceID(IndexTypeImage, 3), Dimensions: Dim512, ElementType: ElementUint8},
+		{SpaceID: NewSpaceID(IndexTypeImage, 4), Dimensions: Dim512, ElementType: ElementInt16},
+		{SpaceID: NewSpaceID(IndexTypeImage, 5), Dimensions: Dim512, ElementType: ElementUint16},
 	}
 	v8 := randInt8Vec(rng, Dim512)
 	vu := make([]uint8, Dim512)
@@ -217,7 +215,7 @@ func TestAllElementTypesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err := idx8.SearchInt8(v8, nil, 1)
-	if err != nil || len(res) != 1 || res[0].NodeID != 5 || res[0].Score != 0 {
+	if err != nil || len(res) != 1 || res[0].ImageID != 5 || res[0].Score != 0 {
 		t.Fatalf("int8 round trip = %+v, %v", res, err)
 	}
 	idxU, _ := New(cfgs[1])
@@ -226,7 +224,7 @@ func TestAllElementTypesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err = idxU.SearchUint8(vu, nil, 1)
-	if err != nil || len(res) != 1 || res[0].NodeID != 6 {
+	if err != nil || len(res) != 1 || res[0].ImageID != 6 {
 		t.Fatalf("uint8 round trip = %+v, %v", res, err)
 	}
 	idx16, _ := New(cfgs[2])
@@ -235,7 +233,7 @@ func TestAllElementTypesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err = idx16.SearchInt16(vi16, nil, 1)
-	if err != nil || len(res) != 1 || res[0].NodeID != 7 {
+	if err != nil || len(res) != 1 || res[0].ImageID != 7 {
 		t.Fatalf("int16 round trip = %+v, %v", res, err)
 	}
 	idxU16, _ := New(cfgs[3])
@@ -244,7 +242,7 @@ func TestAllElementTypesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err = idxU16.SearchUint16(vu16, nil, 1)
-	if err != nil || len(res) != 1 || res[0].NodeID != 8 {
+	if err != nil || len(res) != 1 || res[0].ImageID != 8 {
 		t.Fatalf("uint16 round trip = %+v, %v", res, err)
 	}
 }
@@ -276,15 +274,15 @@ func TestSearchIntoReusesCallerBuffer(t *testing.T) {
 	first := append([]Result(nil), dst...)
 	// Second call reuses the same backing array without aliasing pooled memory:
 	// mutating the first copy must not affect the next result.
-	first[0].NodeID = 999999
+	first[0].ImageID = 999999
 	dst2, err := idx.SearchIntoFloat32(dst[:0], query, nil, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dst2[0].NodeID == 999999 {
+	if dst2[0].ImageID == 999999 {
 		t.Fatalf("pooled memory aliased caller buffer")
 	}
-	if len(dst2) != 5 || dst2[0].NodeID != 1 {
+	if len(dst2) != 5 || dst2[0].ImageID != 1 {
 		t.Fatalf("second SearchInto = %+v", dst2)
 	}
 }
@@ -357,5 +355,119 @@ func TestClosedIndexErrors(t *testing.T) {
 	}
 	if _, err := idx.SearchFloat32(make([]float32, Dim512), nil, 1); !errors.Is(err, ErrClosed) {
 		t.Fatalf("search after close = %v", err)
+	}
+}
+
+func TestReAddAfterDeleteReplacesVector(t *testing.T) {
+	idx, err := New(testConfigFloat512())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(41))
+	old := randFloatVec(rng, Dim512)
+	for i := NodeID(1); i <= 48; i++ {
+		vec := randFloatVec(rng, Dim512)
+		if i == 7 {
+			vec = old
+		}
+		mustAddFloat(t, idx, i, vec)
+	}
+	if err := idx.AddFloat32(7, old); !errors.Is(err, ErrDuplicateNodeID) {
+		t.Fatalf("duplicate live add = %v, want ErrDuplicateNodeID", err)
+	}
+	if err := idx.Delete(7); err != nil {
+		t.Fatal(err)
+	}
+	updated := make([]float32, Dim512)
+	for i := range updated {
+		updated[i] = old[i] + 1
+	}
+	if err := idx.AddFloat32(7, updated); err != nil {
+		t.Fatalf("re-add after delete: %v", err)
+	}
+	if got := idx.LiveCount(); got != 48 {
+		t.Fatalf("LiveCount after re-add = %d, want 48", got)
+	}
+	if err := idx.Verify(); err != nil {
+		t.Fatalf("Verify after re-add: %v", err)
+	}
+	results, err := idx.SearchFloat32(updated, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ImageID != 7 || results[0].Score != 0 {
+		t.Fatalf("self-search after re-add = %+v", results)
+	}
+}
+
+func TestReAddEntryAfterDelete(t *testing.T) {
+	idx, err := New(testConfigFloat512())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(42))
+	for i := NodeID(1); i <= 64; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	entry := idx.Metadata().Entry
+	if err := idx.Delete(entry); err != nil {
+		t.Fatal(err)
+	}
+	updated := randFloatVec(rng, Dim512)
+	mustAddFloat(t, idx, entry, updated)
+	if err := idx.Verify(); err != nil {
+		t.Fatalf("Verify after entry re-add: %v", err)
+	}
+	results, err := idx.SearchFloat32(updated, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ImageID != ImageID(entry) || results[0].Score != 0 {
+		t.Fatalf("entry self-search after re-add = %+v", results)
+	}
+}
+
+func TestCompactResultAndBusy(t *testing.T) {
+	idx, err := New(testConfigFloat512())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(71))
+	for i := NodeID(1); i <= 30; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	for i := NodeID(1); i <= 10; i++ {
+		if err := idx.Delete(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idx.compactMu.Lock()
+	if _, err := idx.Compact(); !errors.Is(err, ErrCompactionInProgress) {
+		idx.compactMu.Unlock()
+		t.Fatalf("concurrent Compact = %v, want ErrCompactionInProgress", err)
+	}
+	idx.compactMu.Unlock()
+	res, err := idx.Compact()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.NodesBefore != 30 || res.NodesAfter != 20 || res.TombstonesPurged != 10 {
+		t.Fatalf("compaction counts = %+v", res)
+	}
+	want := int64(10) * int64(Dim512*4)
+	if res.BytesReclaimed != want {
+		t.Fatalf("BytesReclaimed = %d, want %d", res.BytesReclaimed, want)
+	}
+	if res.Duration <= 0 {
+		t.Fatalf("Duration = %s, want > 0", res.Duration)
+	}
+	if got := idx.Stats().LastCompaction; got != res {
+		t.Fatalf("Stats.LastCompaction = %+v, want %+v", got, res)
+	}
+	if got := idx.LiveCount(); got != 20 {
+		t.Fatalf("LiveCount = %d, want 20", got)
 	}
 }

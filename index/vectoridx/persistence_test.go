@@ -1,11 +1,13 @@
 package vectoridx
 
 import (
+	"context"
 	"errors"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func tempPath(t *testing.T) string {
@@ -15,7 +17,7 @@ func tempPath(t *testing.T) string {
 
 func TestCreateCheckpointReopen(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512())
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +35,7 @@ func TestCreateCheckpointReopen(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path)
+	reopened, err := Open(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +48,7 @@ func TestCreateCheckpointReopen(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].NodeID != id {
+		if len(results) != 1 || results[0].ImageID != uint64(id) {
 			t.Fatalf("node %d self-search after reopen = %+v", id, results)
 		}
 	}
@@ -60,7 +62,7 @@ func TestCreateCheckpointReopen(t *testing.T) {
 
 func TestWALReplayWithoutCheckpoint(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512())
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +80,7 @@ func TestWALReplayWithoutCheckpoint(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path)
+	reopened, err := Open(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +92,7 @@ func TestWALReplayWithoutCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].NodeID != 2 {
+	if len(results) != 1 || results[0].ImageID != 2 {
 		t.Fatalf("WAL-replayed search = %+v", results)
 	}
 	if got := reopened.TombstoneCount(); got != 1 {
@@ -100,7 +102,7 @@ func TestWALReplayWithoutCheckpoint(t *testing.T) {
 
 func TestCrashTornTailRecovery(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512())
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +128,7 @@ func TestCrashTornTailRecovery(t *testing.T) {
 	if err := os.Truncate(walPath, info.Size()-1); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path)
+	reopened, err := Open(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +144,7 @@ func TestCrashTornTailRecovery(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	again, err := Open(path)
+	again, err := Open(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +156,7 @@ func TestCrashTornTailRecovery(t *testing.T) {
 
 func TestCorruptFileDetected(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512())
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +180,7 @@ func TestCorruptFileDetected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path); !errors.Is(err, ErrCorruptStorage) {
+	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
 		t.Fatalf("open corrupt file = %v, want ErrCorruptStorage", err)
 	}
 	if err := VerifyFile(path); !errors.Is(err, ErrCorruptStorage) {
@@ -189,14 +191,14 @@ func TestCorruptFileDetected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path); !errors.Is(err, ErrCorruptStorage) {
+	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
 		t.Fatalf("open bad-magic file = %v, want ErrCorruptStorage", err)
 	}
 }
 
 func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512())
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +216,7 @@ func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := idx.Compact(); err != nil {
+	if _, err := idx.Compact(); err != nil {
 		t.Fatal(err)
 	}
 	if got := idx.TombstoneCount(); got != 0 {
@@ -229,7 +231,7 @@ func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].NodeID != id {
+		if len(results) != 1 || results[0].ImageID != uint64(id) {
 			t.Fatalf("live node %d after compact = %+v", id, results)
 		}
 	}
@@ -240,7 +242,7 @@ func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path)
+	reopened, err := Open(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,14 +258,14 @@ func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].NodeID != id {
+		if len(results) != 1 || results[0].ImageID != uint64(id) {
 			t.Fatalf("node %d after reopen post-compact = %+v", id, results)
 		}
 	}
 }
 
 func TestOpenMissingFile(t *testing.T) {
-	if _, err := Open(filepath.Join(t.TempDir(), "nope.idx")); !os.IsNotExist(err) {
+	if _, err := Open(filepath.Join(t.TempDir(), "nope.idx"), DurabilitySync); !os.IsNotExist(err) {
 		t.Fatalf("open missing = %v, want not-exist", err)
 	}
 }
@@ -276,5 +278,211 @@ func TestCheckpointInMemoryFails(t *testing.T) {
 	defer idx.Close()
 	if err := idx.Checkpoint(); !errors.Is(err, ErrNotPersistent) {
 		t.Fatalf("in-memory Checkpoint = %v, want ErrNotPersistent", err)
+	}
+}
+
+func TestReAddAfterDeleteReopen(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(43))
+	for i := NodeID(1); i <= 24; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Delete(5); err != nil {
+		t.Fatal(err)
+	}
+	updated := randFloatVec(rng, Dim512)
+	mustAddFloat(t, idx, 5, updated)
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.LiveCount(); got != 24 {
+		t.Fatalf("LiveCount after reopen = %d, want 24", got)
+	}
+	if err := reopened.Verify(); err != nil {
+		t.Fatalf("Verify after reopen: %v", err)
+	}
+	results, err := reopened.SearchFloat32(updated, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ImageID != 5 || results[0].Score != 0 {
+		t.Fatalf("re-added node after reopen = %+v", results)
+	}
+}
+
+func TestDurabilityValidation(t *testing.T) {
+	path := tempPath(t)
+	if _, err := Create(path, testConfigFloat512(), Durability(200)); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Create invalid durability = %v, want ErrInvalidConfig", err)
+	}
+	if _, err := Open(path, Durability(200)); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Open invalid durability = %v, want ErrInvalidConfig", err)
+	}
+}
+
+func TestOpenDurabilityIsRuntimePolicy(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAddFloat(t, idx, 1, randFloatVec(rand.New(rand.NewSource(44)), Dim512))
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilityOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAddFloat(t, reopened, 2, randFloatVec(rand.New(rand.NewSource(45)), Dim512))
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if got := again.LiveCount(); got != 2 {
+		t.Fatalf("LiveCount after OS-durability reopen = %d, want 2", got)
+	}
+}
+
+func TestStoreLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vec.idx")
+	first, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrStoreBusy) {
+		t.Fatalf("second Open = %v, want ErrStoreBusy", err)
+	}
+	if _, err := Create(path, testConfigFloat512(), DurabilitySync); !errors.Is(err, ErrStoreBusy) {
+		t.Fatalf("second Create = %v, want ErrStoreBusy", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatalf("Open after Close: %v", err)
+	}
+	// Distinct index paths in the same directory take distinct locks.
+	other, err := Create(filepath.Join(dir, "other.idx"), testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatalf("Create sibling index: %v", err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStatsAndFileSize(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(61))
+	for i := NodeID(1); i <= 10; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	st := idx.Stats()
+	if st.LiveCount != 10 || st.TombstoneCount != 0 {
+		t.Fatalf("counts = %d/%d, want 10/0", st.LiveCount, st.TombstoneCount)
+	}
+	if st.FileBytes == 0 || st.WALBytes == 0 {
+		t.Fatalf("file sizes = %d/%d, want both > 0", st.FileBytes, st.WALBytes)
+	}
+	if st.TotalBytes != st.FileBytes+st.WALBytes {
+		t.Fatalf("TotalBytes = %d, want %d", st.TotalBytes, st.FileBytes+st.WALBytes)
+	}
+	if st.WALRecords != 10 || st.WALBytesWritten == 0 {
+		t.Fatalf("WAL counters = %d/%d", st.WALRecords, st.WALBytesWritten)
+	}
+	if st.WALSegments != 1 {
+		t.Fatalf("WALSegments = %d, want 1", st.WALSegments)
+	}
+	if st.Generation == 0 {
+		t.Fatal("Generation is zero")
+	}
+	if st.SyncInterval != 0 {
+		t.Fatalf("SyncInterval = %s, want 0", st.SyncInterval)
+	}
+	size, err := idx.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint64(size) != st.TotalBytes {
+		t.Fatalf("FileSize = %d, Stats.TotalBytes = %d", size, st.TotalBytes)
+	}
+}
+
+func TestSyncIntervalGroupCommit(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilityOS, WithSyncInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(62))
+	for i := NodeID(1); i <= 20; i++ {
+		idx.AddAsync(i, randFloatVec(rng, Dim512))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := idx.WaitIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for idx.Stats().WALSyncs == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if st := idx.Stats(); st.WALSyncs == 0 {
+		t.Fatalf("group commit did not fsync: %+v", st)
+	}
+	if err := idx.Sync(); err != nil {
+		t.Fatalf("explicit Sync: %v", err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilityOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.Stats().LiveCount; got != 20 {
+		t.Fatalf("LiveCount after reopen = %d, want 20", got)
+	}
+}
+
+func TestSyncInMemoryReturnsNotPersistent(t *testing.T) {
+	idx, err := New(testConfigFloat512())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	if err := idx.Sync(); !errors.Is(err, ErrNotPersistent) {
+		t.Fatalf("in-memory Sync = %v, want ErrNotPersistent", err)
+	}
+}
+
+func TestCreateRejectsNegativeSyncInterval(t *testing.T) {
+	if _, err := Create(tempPath(t), testConfigFloat512(), DurabilityOS, WithSyncInterval(-time.Second)); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("negative sync interval = %v, want ErrInvalidConfig", err)
 	}
 }

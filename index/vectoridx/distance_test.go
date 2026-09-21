@@ -32,7 +32,7 @@ func TestTypedKernelsHandComputed(t *testing.T) {
 
 func TestRawKernelsMatchTyped(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
-	for _, dims := range []int{Dim512, Dim768, Dim1024} {
+	for _, dims := range []int{int(Dim512), int(Dim768), int(Dim1024)} {
 		// int8
 		a8 := make([]int8, dims)
 		b8 := make([]int8, dims)
@@ -99,7 +99,7 @@ func TestRawKernelsMatchTyped(t *testing.T) {
 }
 
 func TestAccumulatorHeadroom1024D(t *testing.T) {
-	n := Dim1024
+	n := int(Dim1024)
 	// int8/uint8 worst case: every diff is 255.
 	a := make([]int8, n)
 	b := make([]int8, n)
@@ -165,7 +165,7 @@ func TestEncodeScoreMonotonicAndSaturating(t *testing.T) {
 
 func TestResolveDistanceCoversMatrix(t *testing.T) {
 	for _, elem := range []ElementType{ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32} {
-		for _, dims := range []uint16{Dim512, Dim768, Dim1024} {
+		for _, dims := range []Dimensions{Dim512, Dim768, Dim1024} {
 			fn := resolveDistance(Config{Dimensions: dims, ElementType: elem})
 			if fn == nil {
 				t.Fatalf("no kernel for elem %d dim %d", elem, dims)
@@ -180,7 +180,7 @@ func TestResolveDistanceCoversMatrix(t *testing.T) {
 func TestConfigVectorBytesTable(t *testing.T) {
 	cases := []struct {
 		elem ElementType
-		dims uint16
+		dims Dimensions
 		want int
 	}{
 		{ElementInt8, Dim512, 512},
@@ -192,7 +192,7 @@ func TestConfigVectorBytesTable(t *testing.T) {
 		{ElementFloat32, Dim1024, 4096},
 	}
 	for _, c := range cases {
-		cfg, err := Config{Dimensions: c.dims, ElementType: c.elem}.withDefaults()
+		cfg, err := Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: c.dims, ElementType: c.elem}.withDefaults()
 		if err != nil {
 			t.Fatalf("elem %d dim %d: %v", c.elem, c.dims, err)
 		}

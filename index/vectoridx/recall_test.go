@@ -11,7 +11,7 @@ import (
 func buildRecallIndex(t *testing.T, n int, seed int64) (*VectorIdx, [][]float32) {
 	t.Helper()
 	idx, err := New(Config{
-		TypeID:         9,
+		SpaceID:        NewSpaceID(IndexTypeImage, 9),
 		Dimensions:     Dim512,
 		ElementType:    ElementFloat32,
 		M:              DefaultM,
@@ -51,10 +51,10 @@ func recallAtK(t *testing.T, idx *VectorIdx, vecs [][]float32, queries int, k in
 		assertSortedByScore(t, approx)
 		exactSet := make(map[NodeID]bool, k)
 		for _, r := range exact {
-			exactSet[r.NodeID] = true
+			exactSet[NodeID(r.ImageID)] = true
 		}
 		for _, r := range approx {
-			if exactSet[r.NodeID] {
+			if exactSet[NodeID(r.ImageID)] {
 				hits++
 			}
 			total++
@@ -92,7 +92,7 @@ func TestHNSWRecallAfterCompact(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := idx.Compact(); err != nil {
+	if _, err := idx.Compact(); err != nil {
 		t.Fatal(err)
 	}
 	if got := idx.TombstoneCount(); got != 0 {
@@ -121,21 +121,22 @@ func TestExactSearchIsGroundTruth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Brute-force in the test itself with the scalar kernel.
-	idx.mu.RLock()
-	expected := make(map[NodeID]float64, len(idx.ids))
+	// Brute-force in the test itself with the scalar kernel (lock-free).
+	token := idx.readers.Acquire()
+	snap := idx.view.Load()
+	expected := make(map[NodeID]float64, len(snap.ids))
 	rawQ := encodeRawFloat32(nil, q)
-	for ord, id := range idx.ids {
-		expected[id] = idx.dist(rawQ, idx.vectorAtLocked(ord))
+	for ord, id := range snap.ids {
+		expected[id] = snap.dist(rawQ, snap.vectorAt(ord))
 	}
-	idx.mu.RUnlock()
+	idx.readers.Release(token)
 	if len(expected) != 30 {
 		t.Fatalf("scanned %d nodes, want 30", len(expected))
 	}
 	for i, r := range exact {
-		d, ok := expected[r.NodeID]
+		d, ok := expected[NodeID(r.ImageID)]
 		if !ok {
-			t.Fatalf("result %d unknown node %d", i, r.NodeID)
+			t.Fatalf("result %d unknown node %d", i, r.ImageID)
 		}
 		if r.Score != EncodeScore(d) {
 			t.Fatalf("result %d score mismatch", i)

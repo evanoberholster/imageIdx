@@ -40,8 +40,8 @@ func TestFilterEvenIDs(t *testing.T) {
 			t.Fatalf("filtered results = %d, want 10", len(results))
 		}
 		for _, r := range results {
-			if r.NodeID%2 != 0 {
-				t.Fatalf("odd node %d passed even filter: %+v", r.NodeID, results)
+			if r.ImageID%2 != 0 {
+				t.Fatalf("odd node %d passed even filter: %+v", r.ImageID, results)
 			}
 		}
 		assertSortedByScore(t, results)
@@ -51,8 +51,8 @@ func TestFilterEvenIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if exact[0].NodeID != results[0].NodeID {
-			t.Logf("top-1 differs: ann=%d exact=%d (acceptable occasionally)", results[0].NodeID, exact[0].NodeID)
+		if exact[0].ImageID != results[0].ImageID {
+			t.Logf("top-1 differs: ann=%d exact=%d (acceptable occasionally)", results[0].ImageID, exact[0].ImageID)
 		}
 	}
 }
@@ -73,15 +73,15 @@ func TestFilterHighlySelective(t *testing.T) {
 		t.Fatalf("selective filter results = %d, want 2 (all available)", len(results))
 	}
 	for _, r := range results {
-		if r.NodeID%100 != 0 {
-			t.Fatalf("node %d passed selective filter", r.NodeID)
+		if r.ImageID%100 != 0 {
+			t.Fatalf("node %d passed selective filter", r.ImageID)
 		}
 	}
 	exact, err := idx.ExactSearchFloat32(q, selective, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(exact) != 2 || exact[0].NodeID != results[0].NodeID || exact[1].NodeID != results[1].NodeID {
+	if len(exact) != 2 || exact[0].ImageID != results[0].ImageID || exact[1].ImageID != results[1].ImageID {
 		t.Fatalf("selective fallback != exact: ann=%+v exact=%+v", results, exact)
 	}
 }
@@ -142,8 +142,8 @@ func TestFilterWithTombstones(t *testing.T) {
 		t.Fatalf("odd-filtered results = %d, want 10", len(results))
 	}
 	for _, r := range results {
-		if r.NodeID%2 != 1 {
-			t.Fatalf("even node %d in odd-filtered results", r.NodeID)
+		if r.ImageID%2 != 1 {
+			t.Fatalf("even node %d in odd-filtered results", r.ImageID)
 		}
 	}
 }

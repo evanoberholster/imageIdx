@@ -1,64 +1,105 @@
 package vectoridx
 
 import (
-	"errors"
+	"context"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 // VectorIdx is a persistent HNSW approximate-nearest-neighbor index over one
-// fixed vector space (TypeID, Dimensions, ElementType, L2 metric).
+// fixed vector space (SpaceID, Dimensions, ElementType, metric).
 //
-// Concurrency: one writer serializes Add/Delete/Checkpoint/Compact through
-// mu. Readers hold mu read-locked plus a ReaderTracker token for the whole
-// search, so published state is never mutated under them. V1 readers take a
-// shared lock rather than fully lock-free mmap epoch reads; the file
-// generations they read remain immutable. See doc.go.
-type VectorIdx struct {
-	cfg  Config
-	path string // empty for in-memory indexes (New)
-
-	mu      sync.RWMutex
-	readers *indexutil.ReaderTracker
-	closed  atomic.Bool
-	gen     atomic.Uint64 // published generation, bumped per mutation
-
-	lsn           uint64 // last applied WAL sequence
-	checkpointLSN uint64 // LSN covered by the published file generation
-
-	// Dense physical storage in insertion-ordinal order.
-	ids     []NodeID
-	vectors []byte // len == len(ids)*vecBytes, contiguous
-	levels  []int
-	links   [][][]NodeID // links[ord][level] = neighbor NodeIDs
-
-	// Sorted storage locator: sortedIDs/sortedOrd resolve NodeID -> ordinal.
-	sortedIDs []NodeID
-	sortedOrd []int
-
-	tombstones map[NodeID]struct{}
-
-	entry    NodeID
-	hasEntry bool
-	maxLevel int
-
-	rng *rand.Rand
-	mL  float64
-
+// Concurrency: reads are lock-free — they acquire a ReaderTracker token and
+// load one atomically published snapshot, taking no mutex. One writer
+// serializes Add/Delete/Checkpoint/Compact through writeMu (plus an async
+// queue for background work). Published snapshots share backing arrays with
+// copy-on-write rules: appends beyond the published length are safe in place,
+// middle inserts copy, dense fills filter via bounds checks, link rewrites
+// clone short inner slices, and tombstones swap an immutable roar bitmap.
+// See doc.go.
+type vectorSnapshot struct {
+	cfg      Config
 	dist     distRaw
 	vecBytes int
 	elemSize int
 	dims     int
 
-	walPath string
-	wal     *os.File
+	// Dense physical storage in insertion-ordinal order.
+	ids     []NodeID
+	vectors []byte // len == len(ids)*vecBytes, contiguous
+	levels  []int
+	links   []*atomic.Pointer[nodeLayers] // links[ord] -> per-node layers
+
+	// Storage locators. sortedIDs/sortedOrd resolve NodeID -> ordinal via
+	// binary search; dense holds an O(1) table when useDense.
+	sortedIDs []NodeID
+	sortedOrd []int
+	dense     *denseTable
+	useDense  bool
+
+	tomb       roar.Bitmap
+	tombSorted []NodeID
+
+	entry    NodeID
+	hasEntry bool
+	maxLevel int
+	gen      uint64
+}
+
+type asyncOp struct {
+	fn   func()
+	done chan struct{}
+}
+
+type VectorIdx struct {
+	cfgBase    Config // persisted identity (SpaceID/Dims/Elem/Metric/M/M0/Ef*), immutable
+	durability Durability
+	path       string // empty for in-memory indexes (New)
+
+	view    atomic.Pointer[vectorSnapshot]
+	readers *indexutil.ReaderTracker
+	writeMu sync.Mutex
+	closed  atomic.Bool
+	gen     atomic.Uint64 // published generation, bumped per mutation
+
+	lsn              uint64        // writer-only under writeMu
+	checkpointLSN    uint64        // writer-only under writeMu
+	checkpointLSNPub atomic.Uint64 // published for Stats without the writer lock
+
+	rng *rand.Rand // writer-exclusive
+	mL  float64    // immutable
+
+	dist     distRaw // immutable (metric fixed for lifetime)
+	vecBytes int
+	elemSize int
+	dims     int
+
+	walPath      string
+	wal          *os.File // writer-only under writeMu
+	lock         *os.File // exclusive store lock held until Close
+	syncInterval time.Duration
+	syncMu       sync.Mutex // serializes flushWAL fsync calls
+	walDirty     atomic.Bool
+	walRecords   atomic.Uint64
+	walBytes     atomic.Uint64
+	walSyncs     atomic.Uint64
+
+	compactMu   sync.Mutex
+	lastCompact atomic.Pointer[CompactionResult]
+
+	asyncCh      chan asyncOp
+	asyncWg      sync.WaitGroup
+	asyncPending atomic.Int64
 }
 
 // New returns an in-memory index with no persistence. It is the fastest path
@@ -73,88 +114,137 @@ func New(cfg Config) (*VectorIdx, error) {
 	if !indexutil.HostIsLittleEndian() {
 		return nil, ErrUnsupportedHost
 	}
-	v := &VectorIdx{
-		cfg:        validated,
-		readers:    &indexutil.ReaderTracker{},
-		tombstones: make(map[NodeID]struct{}),
-		rng:        rand.New(rand.NewSource(1)),
-		mL:         levelMultiplier(validated.M),
-		vecBytes:   validated.VectorBytes(),
-		elemSize:   validated.ElementSize(),
-		dims:       int(validated.Dimensions),
+	dist := resolveDistance(validated)
+	if dist == nil {
+		return nil, ErrInvalidConfig
 	}
-	v.dist = resolveDistance(validated)
+	v := &VectorIdx{
+		cfgBase:  validated,
+		readers:  &indexutil.ReaderTracker{},
+		rng:      rand.New(rand.NewSource(1)),
+		mL:       levelMultiplier(validated.M),
+		dist:     dist,
+		vecBytes: validated.VectorBytes(),
+		elemSize: validated.ElementSize(),
+		dims:     int(validated.Dimensions),
+	}
+	v.view.Store(&vectorSnapshot{
+		cfg:      validated,
+		dist:     dist,
+		vecBytes: v.vecBytes,
+		elemSize: v.elemSize,
+		dims:     v.dims,
+		gen:      1,
+	})
 	v.gen.Store(1)
+	v.startAsyncWorker()
 	return v, nil
 }
 
 // Create creates (truncating) a persistent index at path and checkpoints an
-// empty generation so Open can recover it later.
-func Create(path string, cfg Config) (*VectorIdx, error) {
+// empty generation so Open can recover it later. Durability selects whether
+// each acknowledged mutation is fsynced (DurabilitySync) or left to the OS
+// page cache (DurabilityOS). WithSyncInterval adds periodic group commit for
+// DurabilityOS. The path is exclusively locked until Close.
+func Create(path string, cfg Config, durability Durability, opts ...Option) (*VectorIdx, error) {
 	validated, err := cfg.withDefaults()
 	if err != nil {
 		return nil, err
 	}
-	if path == "" {
+	if path == "" || !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
 	if !indexutil.HostIsLittleEndian() {
 		return nil, ErrUnsupportedHost
+	}
+	runtimeOpts, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
 	}
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
 	}
+	lock, err := indexutil.AcquireLock(filepath.Dir(path), filepath.Base(path)+".lock", false)
+	if err != nil {
+		return nil, err
+	}
 	v := &VectorIdx{
-		cfg:        validated,
-		path:       path,
-		readers:    &indexutil.ReaderTracker{},
-		tombstones: make(map[NodeID]struct{}),
-		rng:        rand.New(rand.NewSource(1)),
-		mL:         levelMultiplier(validated.M),
-		vecBytes:   validated.VectorBytes(),
-		elemSize:   validated.ElementSize(),
-		dims:       int(validated.Dimensions),
-		walPath:    path + ".wal",
+		cfgBase:      validated,
+		durability:   durability,
+		path:         path,
+		readers:      &indexutil.ReaderTracker{},
+		rng:          rand.New(rand.NewSource(1)),
+		mL:           levelMultiplier(validated.M),
+		vecBytes:     validated.VectorBytes(),
+		elemSize:     validated.ElementSize(),
+		dims:         int(validated.Dimensions),
+		walPath:      path + ".wal",
+		lock:         lock,
+		syncInterval: runtimeOpts.syncInterval,
 	}
 	v.dist = resolveDistance(validated)
+	v.view.Store(&vectorSnapshot{
+		cfg:      validated,
+		dist:     v.dist,
+		vecBytes: v.vecBytes,
+		elemSize: v.elemSize,
+		dims:     v.dims,
+		gen:      1,
+	})
 	v.gen.Store(1)
 	wal, err := os.OpenFile(v.walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	v.wal = wal
 	if err := v.checkpointLocked(); err != nil {
 		_ = wal.Close()
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
+	v.startAsyncWorker()
 	return v, nil
 }
 
 // Open opens an index created by Create, validates its superblock and region
 // checksums, then replays WAL records after CheckpointLSN. Recovery stops at
 // the first incomplete trailing record and truncates the torn tail so the
-// next open is deterministic.
-func Open(path string) (*VectorIdx, error) {
-	if path == "" {
+// next open is deterministic. Durability and options are runtime policy and
+// need not match the values used at Create time. The path is exclusively
+// locked until Close.
+func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error) {
+	if path == "" || !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
 	if !indexutil.HostIsLittleEndian() {
 		return nil, ErrUnsupportedHost
 	}
+	runtimeOpts, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := indexutil.AcquireLock(filepath.Dir(path), filepath.Base(path)+".lock", false)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	header, regions, err := decodeFile(data)
 	if err != nil {
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	cfg := Config{
-		TypeID:         header.typeID,
-		Dimensions:     header.dims,
+		SpaceID:        header.spaceID,
+		Dimensions:     Dimensions(header.dims),
 		ElementType:    header.elem,
+		Metric:         header.metric,
 		M:              header.m,
 		M0:             header.m0,
 		EfConstruction: header.efConstruction,
@@ -165,10 +255,10 @@ func Open(path string) (*VectorIdx, error) {
 		return nil, ErrCorruptStorage
 	}
 	v := &VectorIdx{
-		cfg:           validated,
+		cfgBase:       validated,
+		durability:    durability,
 		path:          path,
 		readers:       &indexutil.ReaderTracker{},
-		tombstones:    make(map[NodeID]struct{}),
 		rng:           rand.New(rand.NewSource(1)),
 		mL:            levelMultiplier(validated.M),
 		vecBytes:      validated.VectorBytes(),
@@ -177,59 +267,84 @@ func Open(path string) (*VectorIdx, error) {
 		walPath:       path + ".wal",
 		checkpointLSN: header.checkpointLSN,
 		lsn:           header.checkpointLSN,
+		lock:          lock,
+		syncInterval:  runtimeOpts.syncInterval,
 	}
+	v.checkpointLSNPub.Store(header.checkpointLSN)
 	v.dist = resolveDistance(validated)
+	v.view.Store(&vectorSnapshot{
+		cfg:      validated,
+		dist:     v.dist,
+		vecBytes: v.vecBytes,
+		elemSize: v.elemSize,
+		dims:     v.dims,
+		gen:      header.generation + 1,
+	})
 	if err := v.loadRegions(header, regions); err != nil {
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	v.gen.Store(header.generation + 1)
 	wal, err := os.OpenFile(v.walPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	v.wal = wal
 	if err := v.replayWAL(); err != nil {
 		_ = wal.Close()
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
+	v.startAsyncWorker()
 	return v, nil
 }
 
-// Close marks the index closed, checkpoints no state, and waits for prior
-// readers. Further mutations return ErrClosed; searches on a closed index
-// return ErrClosed.
+// Close marks the index closed, stops the async worker, checkpoints no state,
+// and waits for prior readers. Further mutations return ErrClosed; searches
+// on a closed index return ErrClosed. It is idempotent.
 func (v *VectorIdx) Close() error {
-	v.mu.Lock()
+	v.writeMu.Lock()
 	if v.closed.Load() {
-		v.mu.Unlock()
+		v.writeMu.Unlock()
 		return nil
 	}
 	v.closed.Store(true)
 	wal := v.wal
 	v.wal = nil
-	v.mu.Unlock()
+	ch := v.asyncCh
+	v.asyncCh = nil
+	if ch != nil {
+		close(ch)
+	}
+	v.writeMu.Unlock()
+	v.asyncWg.Wait()
 	if wal != nil {
-		_ = wal.Sync()
+		if err := wal.Sync(); err == nil {
+			v.walSyncs.Add(1)
+		}
 		_ = wal.Close()
 	}
 	v.readers.WaitForPriorReaders()
-	return nil
+	lock := v.lock
+	v.lock = nil
+	return indexutil.ReleaseLock(lock)
 }
 
 // Config returns the validated index configuration.
 func (v *VectorIdx) Config() Config {
-	return v.cfg
+	return v.view.Load().cfg
 }
 
 // Generation returns the current published generation number.
 func (v *VectorIdx) Generation() uint64 { return v.gen.Load() }
 
 // LiveCount returns the number of live (present, non-tombstoned) nodes.
+// It is lock-free: one snapshot load plus a tracker token.
 func (v *VectorIdx) LiveCount() int {
 	token := v.readers.Acquire()
-	v.mu.RLock()
-	n := len(v.ids) - len(v.tombstones)
-	v.mu.RUnlock()
+	snap := v.view.Load()
+	n := len(snap.ids) - len(snap.tombSorted)
 	v.readers.Release(token)
 	return n
 }
@@ -237,17 +352,16 @@ func (v *VectorIdx) LiveCount() int {
 // TombstoneCount returns the number of tombstoned nodes awaiting Compact.
 func (v *VectorIdx) TombstoneCount() int {
 	token := v.readers.Acquire()
-	v.mu.RLock()
-	n := len(v.tombstones)
-	v.mu.RUnlock()
+	snap := v.view.Load()
+	n := len(snap.tombSorted)
 	v.readers.Release(token)
 	return n
 }
 
 // Metadata is a copied summary of the current generation.
 type Metadata struct {
-	TypeID         TypeID
-	Dimensions     uint16
+	SpaceID        SpaceID
+	Dimensions     Dimensions
 	ElementType    ElementType
 	Generation     uint64
 	LiveCount      uint64
@@ -257,27 +371,26 @@ type Metadata struct {
 	MaxLevel       int
 }
 
-// Metadata returns a copy of current index metadata.
+// Metadata returns a copy of current index metadata. Lock-free.
 func (v *VectorIdx) Metadata() Metadata {
 	token := v.readers.Acquire()
-	v.mu.RLock()
+	snap := v.view.Load()
 	m := Metadata{
-		TypeID:         v.cfg.TypeID,
-		Dimensions:     v.cfg.Dimensions,
-		ElementType:    v.cfg.ElementType,
+		SpaceID:        snap.cfg.SpaceID,
+		Dimensions:     snap.cfg.Dimensions,
+		ElementType:    snap.cfg.ElementType,
 		Generation:     v.gen.Load(),
-		LiveCount:      uint64(len(v.ids) - len(v.tombstones)),
-		TombstoneCount: uint64(len(v.tombstones)),
-		Entry:          v.entry,
-		HasEntry:       v.hasEntry,
-		MaxLevel:       v.maxLevel,
+		LiveCount:      uint64(len(snap.ids) - len(snap.tombSorted)),
+		TombstoneCount: uint64(len(snap.tombSorted)),
+		Entry:          snap.entry,
+		HasEntry:       snap.hasEntry,
+		MaxLevel:       snap.maxLevel,
 	}
-	v.mu.RUnlock()
 	v.readers.Release(token)
 	return m
 }
 
-// ---- mutation ----
+// ---- writer helpers (writeMu exclusive) ----
 
 // sampleLevelLocked draws an HNSW level. Caller holds the writer lock; the
 // RNG is writer-exclusive.
@@ -304,127 +417,450 @@ func logFloat(x float64) float64 {
 	return math.Log(x)
 }
 
-// appendNodeLocked stores the raw vector and empty graph slots at a new
-// physical ordinal, returning it. The caller wires graph links afterwards.
-func (v *VectorIdx) appendNodeLocked(id NodeID, raw []byte, level int) int {
-	ord := len(v.ids)
-	v.ids = append(v.ids, id)
-	v.vectors = append(v.vectors, raw...)
-	v.levels = append(v.levels, level)
-	layerLinks := make([][]NodeID, level+1)
-	v.links = append(v.links, layerLinks)
-	// Insert into the sorted locator.
-	pos := sort.Search(len(v.sortedIDs), func(i int) bool { return v.sortedIDs[i] >= id })
-	v.sortedIDs = append(v.sortedIDs, 0)
-	v.sortedOrd = append(v.sortedOrd, 0)
-	copy(v.sortedIDs[pos+1:], v.sortedIDs[pos:])
-	copy(v.sortedOrd[pos+1:], v.sortedOrd[pos:])
-	v.sortedIDs[pos] = id
-	v.sortedOrd[pos] = ord
-	return ord
+// cloneSnapshot shallow-copies slice headers sharing backing arrays.
+// Appends beyond the published length are safe in place; middle inserts copy.
+func cloneSnapshot(s *vectorSnapshot) *vectorSnapshot {
+	c := *s
+	return &c
 }
 
-func (v *VectorIdx) addRawLocked(id NodeID, raw []byte) error {
-	if _, exists := v.locateLocked(id); exists {
-		return ErrDuplicateNodeID
+// pickNeighbors selects up to m candidates using the configured policy.
+func pickNeighbors(s *vectorSnapshot, cands []searchEntry, m int, query []byte) []searchEntry {
+	if s.cfg.UseHeuristic {
+		return selectHeuristic(cands, m, query, s)
 	}
+	return selectClosest(cands, m)
+}
+
+// sortedInsert inserts id->ord into the snapshot's sorted locator. Appends at
+// the end reuse backing safely; middle inserts allocate new arrays so
+// published readers never see a shifted range.
+func sortedInsert(s *vectorSnapshot, id NodeID, ord int) {
+	if s.useDense {
+		return
+	}
+	pos := sort.Search(len(s.sortedIDs), func(i int) bool { return s.sortedIDs[i] >= id })
+	if pos == len(s.sortedIDs) {
+		s.sortedIDs = append(s.sortedIDs, id)
+		s.sortedOrd = append(s.sortedOrd, ord)
+		return
+	}
+	newIDs := make([]NodeID, len(s.sortedIDs)+1)
+	newOrd := make([]int, len(s.sortedOrd)+1)
+	copy(newIDs, s.sortedIDs[:pos])
+	copy(newOrd, s.sortedOrd[:pos])
+	newIDs[pos] = id
+	newOrd[pos] = ord
+	copy(newIDs[pos+1:], s.sortedIDs[pos:])
+	copy(newOrd[pos+1:], s.sortedOrd[pos:])
+	s.sortedIDs = newIDs
+	s.sortedOrd = newOrd
+}
+
+const maxDenseEntries = 1 << 26
+
+// denseFeasible reports whether [min,max] fits a dense table at count nodes.
+func denseFeasible(min, max NodeID, count int) bool {
+	if max < min {
+		return true
+	}
+	rng := uint64(max-min) + 1
+	if rng > maxDenseEntries {
+		return false
+	}
+	if rng <= uint64(count)*4+1024 {
+		return true
+	}
+	return false
+}
+
+// denseEnsure makes the dense table cover id when feasible, building it from
+// the snapshot on first use. It returns false when the index stays sparse.
+func denseEnsure(s *vectorSnapshot, id NodeID, count int) bool {
+	if s.useDense && s.dense != nil {
+		min, mx := s.dense.min, s.dense.min+NodeID(len(s.dense.vals))-1
+		lo, hi := min, mx
+		if id < lo {
+			lo = id
+		}
+		if id > hi {
+			hi = id
+		}
+		if !denseFeasible(lo, hi, count) {
+			s.dense = nil
+			s.useDense = false
+			s.rebuildSorted()
+			// rebuildSorted already included id: report the locator as
+			// updated so the caller does not insert it a second time.
+			return true
+		}
+		if id < s.dense.min {
+			gap := uint64(s.dense.min-id) + uint64(len(s.dense.vals))
+			_ = gap
+			// Prepend requires rebase: rebuild (rare).
+			s.rebuildDenseWith(lo, hi)
+			return true
+		}
+		if want := uint64(id-s.dense.min) + 1; want > uint64(len(s.dense.vals)) {
+			need := int(want) - len(s.dense.vals)
+			s.dense.vals = append(s.dense.vals, make([]int32, need)...)
+			for i := len(s.dense.vals) - need; i < len(s.dense.vals); i++ {
+				s.dense.vals[i] = -1
+			}
+		}
+		return true
+	}
+	// Sparse: check feasibility including id.
+	var lo, hi NodeID
+	if len(s.ids) == 0 {
+		lo, hi = id, id
+	} else {
+		lo, hi = s.ids[0], s.ids[0]
+		for _, x := range s.ids {
+			if x < lo {
+				lo = x
+			}
+			if x > hi {
+				hi = x
+			}
+		}
+		if id < lo {
+			lo = id
+		}
+		if id > hi {
+			hi = id
+		}
+	}
+	_ = hi
+	if !denseFeasible(lo, hi, count) {
+		return false
+	}
+	s.rebuildDenseWith(lo, hi)
+	return true
+}
+
+// rebuildDenseWith builds a fresh dense table over [lo,hi] from current ids.
+func (s *vectorSnapshot) rebuildDenseWith(lo, hi NodeID) {
+	n := int(uint64(hi-lo) + 1)
+	vals := make([]int32, n)
+	for i := range vals {
+		vals[i] = -1
+	}
+	for ord, id := range s.ids {
+		if id >= lo && id <= hi {
+			vals[uint64(id-lo)] = int32(ord)
+		}
+	}
+	s.dense = &denseTable{min: lo, vals: vals}
+	s.useDense = true
+	s.sortedIDs = nil
+	s.sortedOrd = nil
+}
+
+// rebuildSorted rebuilds the sorted locator from ids (sparse fallback).
+func (s *vectorSnapshot) rebuildSorted() {
+	n := len(s.ids)
+	s.sortedIDs = make([]NodeID, n)
+	s.sortedOrd = make([]int, n)
+	for ord, id := range s.ids {
+		s.sortedIDs[ord] = id
+		s.sortedOrd[ord] = ord
+	}
+	sort.Slice(s.sortedIDs, func(i, j int) bool { return s.sortedIDs[i] < s.sortedIDs[j] })
+	pos := make(map[NodeID]int, n)
+	for ord, id := range s.ids {
+		pos[id] = ord
+	}
+	for i, id := range s.sortedIDs {
+		s.sortedOrd[i] = pos[id]
+	}
+}
+
+// denseSet records id->ord with atomic stores safe for lock-free readers.
+func denseSet(s *vectorSnapshot, id NodeID, ord int) {
+	dt := s.dense
+	if dt == nil || id < dt.min {
+		return
+	}
+	idx := uint64(id - dt.min)
+	if idx >= uint64(len(dt.vals)) {
+		return
+	}
+	atomic.StoreInt32(&dt.vals[idx], int32(ord))
+}
+
+// rebuildTombeset publishes a new immutable tomb bitmap from a sorted list.
+func rebuildTombeset(sorted []NodeID) (roar.Bitmap, []NodeID) {
+	cp := append([]NodeID(nil), sorted...)
+	if len(cp) == 0 {
+		return roar.Bitmap{}, cp
+	}
+	u64 := make([]uint64, len(cp))
+	for i, id := range cp {
+		u64[i] = uint64(id)
+	}
+	bm, err := roar.FromSorted(u64)
+	if err != nil {
+		return roar.Bitmap{}, cp
+	}
+	return bm, cp
+}
+
+// insertTombSorted returns sorted with id inserted (copy).
+func insertTombSorted(sorted []NodeID, id NodeID) []NodeID {
+	pos := sort.Search(len(sorted), func(i int) bool { return sorted[i] >= id })
+	if pos < len(sorted) && sorted[pos] == id {
+		return sorted
+	}
+	out := make([]NodeID, len(sorted)+1)
+	copy(out, sorted[:pos])
+	out[pos] = id
+	copy(out[pos+1:], sorted[pos:])
+	return out
+}
+
+// removeTombSorted returns sorted without id (copy).
+func removeTombSorted(sorted []NodeID, id NodeID) []NodeID {
+	pos := sort.Search(len(sorted), func(i int) bool { return sorted[i] >= id })
+	if pos >= len(sorted) || sorted[pos] != id {
+		return sorted
+	}
+	out := make([]NodeID, len(sorted)-1)
+	copy(out, sorted[:pos])
+	copy(out[pos:], sorted[pos+1:])
+	return out
+}
+
+func (v *VectorIdx) addRawLocked(cur *vectorSnapshot, id NodeID, raw []byte) (*vectorSnapshot, error) {
 	if len(raw) != v.vecBytes {
-		return ErrInvalidVector
+		return nil, ErrInvalidVector
+	}
+	if ord, exists := cur.locate(id); exists {
+		_ = ord
+		if !cur.tomb.Contains(uint64(id)) {
+			return nil, ErrDuplicateNodeID
+		}
+		return v.resurrectLocked(cur, ord, id, raw)
 	}
 	if v.wal != nil {
 		if err := v.appendWALRecord(walTypeAdd, id, raw); err != nil {
-			return err
+			return nil, err
 		}
 		v.lsn++
 	}
 	level := v.sampleLevelLocked()
 	// Neighbor search runs before the node becomes visible: search the graph
 	// without the new node, then append and wire.
-	var selected [][]NodeID
-	var entryPath []int
-	if v.hasEntry {
+	type fwdLinks struct {
+		level int
+		ids   []NodeID
+	}
+	var fwds []fwdLinks
+	if cur.hasEntry {
 		ctx := acquireSearchContext()
-		ctx.resetForNodes(len(v.ids), v.vecBytes)
-		entryOrd, ok := v.locateLocked(v.entry)
-		cur := -1
+		ctx.resetForNodes(len(cur.ids), v.vecBytes)
+		entryOrd, ok := cur.locate(cur.entry)
+		curBest := -1
 		if ok {
-			cur = entryOrd
-			for l := v.maxLevel; l > level; l-- {
-				cur = v.greedyStepLocked(cur, l, raw)
+			curBest = entryOrd
+			for l := cur.maxLevel; l > level; l-- {
+				curBest = cur.greedyStep(curBest, l, raw)
 			}
-			selected = make([][]NodeID, 0)
-			entryPath = make([]int, 0)
-			for l := min(v.maxLevel, level); l >= 0; l-- {
-				ef := int(v.cfg.EfConstruction)
-				cands := v.searchLayerLocked(ctx, raw, cur, ef, l)
-				m := int(v.cfg.M)
+			for l := min(cur.maxLevel, level); l >= 0; l-- {
+				ef := int(cur.cfg.EfConstruction)
+				cands := cur.searchLayer(ctx, raw, curBest, ef, l)
+				m := int(cur.cfg.M)
 				if l == 0 {
-					m = int(v.cfg.M0)
+					m = int(cur.cfg.M0)
 				}
-				picked := selectClosest(cands, m)
+				picked := pickNeighbors(cur, cands, m, raw)
 				fwd := make([]NodeID, len(picked))
 				for i, p := range picked {
-					fwd[i] = v.ids[p.ord]
+					fwd[i] = cur.ids[p.ord]
 				}
-				selected = append(selected, fwd)
+				fwds = append(fwds, fwdLinks{level: l, ids: fwd})
 				if len(picked) != 0 {
-					cur = picked[0].ord
+					curBest = picked[0].ord
 				}
-				entryPath = append(entryPath, cur)
 			}
 		}
 		releaseSearchContext(ctx)
 	}
-	ord := v.appendNodeLocked(id, raw, level)
+	ns := cloneSnapshot(cur)
+	ord := len(ns.ids)
+	ns.ids = append(ns.ids, id)
+	ns.vectors = append(ns.vectors, raw...)
+	ns.levels = append(ns.levels, level)
+	holder := &atomic.Pointer[nodeLayers]{}
+	holder.Store(&nodeLayers{layers: make([][]NodeID, level+1)})
+	ns.links = append(ns.links, holder)
+	// Locator: dense fast path when feasible, else sorted insert.
+	newCount := len(ns.ids)
+	if denseEnsure(ns, id, newCount) {
+		denseSet(ns, id, ord)
+	} else {
+		sortedInsert(ns, id, ord)
+	}
 	// Wire forward links captured above (ordinals pre-append are still valid
 	// because append never shifts existing ordinals).
-	li := 0
-	for l := min(v.maxLevel, level); l >= 0; l-- {
-		if li < len(selected) {
-			v.links[ord][l] = append(v.links[ord][l][:0], selected[li]...)
-			for _, nb := range selected[li] {
-				nOrd, ok := v.locateLocked(nb)
-				if !ok || nOrd == ord {
-					continue
-				}
-				if l > v.levels[nOrd] {
-					continue
-				}
-				m := int(v.cfg.M)
-				if l == 0 {
-					m = int(v.cfg.M0)
-				}
-				v.links[nOrd][l] = append(v.links[nOrd][l], id)
-				if len(v.links[nOrd][l]) > m {
-					v.pruneNeighborsLocked(nOrd, l, m)
-				}
+	for _, fw := range fwds {
+		l := fw.level
+		g := ns.links[ord].Load()
+		g.layers[l] = append(g.layers[l][:0], fw.ids...)
+		for _, nb := range fw.ids {
+			nOrd, ok := ns.locate(nb)
+			if !ok || nOrd == ord {
+				continue
 			}
+			if l > ns.levels[nOrd] {
+				continue
+			}
+			m := int(ns.cfg.M)
+			if l == 0 {
+				m = int(ns.cfg.M0)
+			}
+			v.linkAppend(ns, nOrd, l, id, m)
 		}
-		li++
 	}
-	if !v.hasEntry || level > v.maxLevel {
-		v.entry = id
-		v.hasEntry = true
-		v.maxLevel = level
+	if !ns.hasEntry || level > ns.maxLevel {
+		ns.entry = id
+		ns.hasEntry = true
+		ns.maxLevel = level
 	}
-	v.gen.Add(1)
-	return nil
+	ns.gen = v.gen.Add(1)
+	return ns, nil
+}
+
+// linkAppend adds id to ord's layer-l neighbors with closest/heuristic
+// pruning. It clones the node's layer set so published readers keep theirs.
+func (v *VectorIdx) linkAppend(s *vectorSnapshot, ord, l int, id NodeID, m int) {
+	old := s.links[ord].Load()
+	if old == nil || l >= len(old.layers) {
+		return
+	}
+	nl := &nodeLayers{layers: make([][]NodeID, len(old.layers))}
+	copy(nl.layers, old.layers)
+	nl.layers[l] = append(append([]NodeID(nil), old.layers[l]...), id)
+	if len(nl.layers[l]) > m {
+		nl.layers[l] = v.pruneList(s, ord, nl.layers[l], m)
+	}
+	s.links[ord].Store(nl)
+}
+
+// pruneList keeps the m best neighbors of ord from nbs by current distance.
+func (v *VectorIdx) pruneList(s *vectorSnapshot, ord int, nbs []NodeID, m int) []NodeID {
+	type nd struct {
+		id   NodeID
+		dist float64
+		ord  int
+	}
+	base := s.vectorAt(ord)
+	scored := make([]nd, 0, len(nbs))
+	for _, nb := range nbs {
+		nOrd, ok := s.locate(nb)
+		if !ok {
+			continue
+		}
+		scored = append(scored, nd{id: nb, dist: s.dist(base, s.vectorAt(nOrd)), ord: nOrd})
+	}
+	if s.cfg.UseHeuristic {
+		// Heuristic on neighbor-neighbor diversity with base as query.
+		cands := make([]searchEntry, len(scored))
+		for i, sc := range scored {
+			cands[i] = searchEntry{ord: sc.ord, dist: sc.dist}
+		}
+		picked := selectHeuristic(cands, m, base, s)
+		out := make([]NodeID, len(picked))
+		for i, p := range picked {
+			out[i] = s.ids[p.ord]
+		}
+		return out
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].dist != scored[j].dist {
+			return scored[i].dist < scored[j].dist
+		}
+		return scored[i].id < scored[j].id
+	})
+	if len(scored) > m {
+		scored = scored[:m]
+	}
+	out := make([]NodeID, len(scored))
+	for i, sc := range scored {
+		out[i] = sc.id
+	}
+	return out
+}
+
+// resurrectLocked replaces the vector of a tombstoned node and reconnects it
+// to the graph. The node keeps its ordinal and HNSW level. The vector write
+// is in-place (concurrent readers may observe it fresh); links swap via new
+// per-node layer sets. Caller holds the writer lock.
+func (v *VectorIdx) resurrectLocked(cur *vectorSnapshot, ord int, id NodeID, raw []byte) (*vectorSnapshot, error) {
+	if len(raw) != v.vecBytes {
+		return nil, ErrInvalidVector
+	}
+	if v.wal != nil {
+		if err := v.appendWALRecord(walTypeAdd, id, raw); err != nil {
+			return nil, err
+		}
+		v.lsn++
+	}
+	ns := cloneSnapshot(cur)
+	copy(ns.vectorAt(ord), raw)
+	ns.tombSorted = removeTombSorted(ns.tombSorted, id)
+	ns.tomb, ns.tombSorted = rebuildTombeset(ns.tombSorted)
+	if len(ns.ids) > 1 && ns.hasEntry {
+		if seed, ok := wiringSeed(ns, id); ok {
+			level := ns.levels[ord]
+			fresh := &nodeLayers{layers: make([][]NodeID, level+1)}
+			ns.links[ord].Store(fresh)
+			ctx := acquireSearchContext()
+			ctx.resetForNodes(len(ns.ids), v.vecBytes)
+			restoreEntry := ns.entry
+			ns.entry = seed
+			v.wireRebuilt(ctx, ns, raw, ord, level, id)
+			ns.entry = restoreEntry
+			releaseSearchContext(ctx)
+		}
+	}
+	ns.gen = v.gen.Add(1)
+	return ns, nil
+}
+
+// wiringSeed returns a traversal seed other than exclude that reaches
+// maxLevel. Only the entry is guaranteed to have maxLevel; when exclude is
+// the entry and no other node shares that level, rewiring is skipped.
+func wiringSeed(s *vectorSnapshot, exclude NodeID) (NodeID, bool) {
+	ids := s.sortedIDs
+	if len(ids) == 0 {
+		ids = s.ids
+	}
+	for _, id := range ids {
+		if id == exclude {
+			continue
+		}
+		ord, ok := s.locate(id)
+		if ok && s.levels[ord] == s.maxLevel {
+			return id, true
+		}
+	}
+	return 0, false
 }
 
 // Delete tombstones id. Tombstoned nodes stay traversable but are never
 // returned; Compact purges them. Delete is idempotent for tombstoned nodes.
 func (v *VectorIdx) Delete(id NodeID) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
 		return ErrClosed
 	}
-	ord, ok := v.locateLocked(id)
-	_ = ord
-	if !ok {
+	cur := v.view.Load()
+	if _, ok := cur.locate(id); !ok {
 		return ErrNodeNotFound
 	}
-	if _, tombstoned := v.tombstones[id]; tombstoned {
+	if cur.tomb.Contains(uint64(id)) {
 		return nil
 	}
 	if v.wal != nil {
@@ -433,171 +869,191 @@ func (v *VectorIdx) Delete(id NodeID) error {
 		}
 		v.lsn++
 	}
-	v.tombstones[id] = struct{}{}
-	v.gen.Add(1)
+	ns := cloneSnapshot(cur)
+	ns.tombSorted = insertTombSorted(ns.tombSorted, id)
+	ns.tomb, ns.tombSorted = rebuildTombeset(ns.tombSorted)
+	ns.gen = v.gen.Add(1)
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
 	return nil
+}
+
+// maybeAutoCompactLocked enqueues background compaction when the tombstone
+// ratio exceeds policy. Caller holds writeMu.
+func (v *VectorIdx) maybeAutoCompactLocked(snap *vectorSnapshot) {
+	ratio := snap.cfg.AutoCompactRatio
+	if ratio <= 0 || v.closed.Load() {
+		return
+	}
+	live := len(snap.ids) - len(snap.tombSorted)
+	if live < snap.cfg.CompactMinNodes && snap.cfg.CompactMinNodes > 0 {
+		return
+	}
+	if live == 0 {
+		return
+	}
+	if float64(len(snap.tombSorted))/float64(live) < ratio {
+		return
+	}
+	v.asyncPending.Add(1)
+	ch := v.asyncCh
+	if ch == nil {
+		v.asyncPending.Add(-1)
+		return
+	}
+	select {
+	case ch <- asyncOp{fn: func() {
+		_, _ = v.Compact()
+		v.asyncPending.Add(-1)
+	}}:
+	default:
+		v.asyncPending.Add(-1)
+	}
 }
 
 // ---- typed Add/Search wrappers ----
 
-// AddInt8 inserts one int8 vector. It rejects duplicate NodeIDs (live or
-// tombstoned); re-adding after Delete requires Compact first.
+// AddInt8 inserts one int8 vector. A live duplicate NodeID returns
+// ErrDuplicateNodeID; re-adding a tombstoned NodeID replaces its vector and
+// reconnects it, so Delete followed by Add is an update.
 func (v *VectorIdx) AddInt8(id NodeID, vec []int8) error {
-	if v.cfg.ElementType != ElementInt8 {
+	if v.cfgBase.ElementType != ElementInt8 {
 		return ErrInvalidVector
 	}
 	if len(vec) != v.dims {
 		return ErrInvalidVector
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
 		return ErrClosed
 	}
 	raw := make([]byte, v.vecBytes)
 	copy(bytesAsInt8(raw, len(vec)), vec)
-	return v.addRawLocked(id, raw)
+	cur := v.view.Load()
+	ns, err := v.addRawLocked(cur, id, raw)
+	if err != nil {
+		return err
+	}
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
+	return nil
 }
 
 // AddUint8 inserts one uint8 vector.
 func (v *VectorIdx) AddUint8(id NodeID, vec []uint8) error {
-	if v.cfg.ElementType != ElementUint8 {
+	if v.cfgBase.ElementType != ElementUint8 {
 		return ErrInvalidVector
 	}
 	if len(vec) != v.dims {
 		return ErrInvalidVector
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
 		return ErrClosed
 	}
 	raw := make([]byte, v.vecBytes)
 	copy(raw, vec)
-	return v.addRawLocked(id, raw)
+	cur := v.view.Load()
+	ns, err := v.addRawLocked(cur, id, raw)
+	if err != nil {
+		return err
+	}
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
+	return nil
 }
 
 // AddInt16 inserts one int16 vector.
 func (v *VectorIdx) AddInt16(id NodeID, vec []int16) error {
-	if v.cfg.ElementType != ElementInt16 {
+	if v.cfgBase.ElementType != ElementInt16 {
 		return ErrInvalidVector
 	}
 	if len(vec) != v.dims {
 		return ErrInvalidVector
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
 		return ErrClosed
 	}
 	raw := encodeRawInt16(nil, vec)
-	return v.addRawLocked(id, raw)
+	cur := v.view.Load()
+	ns, err := v.addRawLocked(cur, id, raw)
+	if err != nil {
+		return err
+	}
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
+	return nil
 }
 
 // AddUint16 inserts one uint16 vector.
 func (v *VectorIdx) AddUint16(id NodeID, vec []uint16) error {
-	if v.cfg.ElementType != ElementUint16 {
+	if v.cfgBase.ElementType != ElementUint16 {
 		return ErrInvalidVector
 	}
 	if len(vec) != v.dims {
 		return ErrInvalidVector
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
 		return ErrClosed
 	}
 	raw := encodeRawUint16(nil, vec)
-	return v.addRawLocked(id, raw)
+	cur := v.view.Load()
+	ns, err := v.addRawLocked(cur, id, raw)
+	if err != nil {
+		return err
+	}
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
+	return nil
 }
 
 // AddFloat32 inserts one float32 vector.
 func (v *VectorIdx) AddFloat32(id NodeID, vec []float32) error {
-	if v.cfg.ElementType != ElementFloat32 {
+	if v.cfgBase.ElementType != ElementFloat32 {
 		return ErrInvalidVector
 	}
 	if len(vec) != v.dims {
 		return ErrInvalidVector
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
 		return ErrClosed
 	}
 	raw := encodeRawFloat32(nil, vec)
-	return v.addRawLocked(id, raw)
-}
-
-// searchRawLocked runs the full ANN path for an encoded query. Caller holds
-// at least the read lock and owns ctx (reset by this function).
-func (v *VectorIdx) searchRawLocked(ctx *SearchContext, query []byte, filter CandidateFilter, k int) []Result {
-	if !v.hasEntry || len(v.ids) == 0 {
-		return nil
+	cur := v.view.Load()
+	ns, err := v.addRawLocked(cur, id, raw)
+	if err != nil {
+		return err
 	}
-	if k <= 0 {
-		return nil
-	}
-	if k > len(v.ids) {
-		k = len(v.ids)
-	}
-	ef := int(v.cfg.EfSearch)
-	if ef < k {
-		ef = k
-	}
-	if filter != nil {
-		// Oversample so post-filtering still fills k where reachable.
-		if want := k * 4; want > ef {
-			ef = want
-		}
-	}
-	if ef > len(v.ids) {
-		ef = len(v.ids)
-	}
-	if ef < 1 {
-		ef = 1
-	}
-	ctx.resetForNodes(len(v.ids), v.vecBytes)
-	entries := v.layer0SearchLocked(ctx, query, ef)
-	results := v.assembleLocked(entries, filter, k, ctx.output[:0])
-	ctx.output = results
-	if filter != nil && len(results) < k {
-		// ANN coverage fell short under filtering; the exact scan is the
-		// ground-truth fallback and guarantees k-or-available semantics.
-		available := 0
-		for _, id := range v.sortedIDs {
-			if _, tombstoned := v.tombstones[id]; tombstoned {
-				continue
-			}
-			if !filter(id) {
-				continue
-			}
-			available++
-		}
-		if available <= k {
-			return v.exactSearchLocked(query, filter, k)
-		}
-		if len(results) < k {
-			exact := v.exactSearchLocked(query, filter, k)
-			if len(exact) > len(results) {
-				return exact
-			}
-		}
-	}
-	return results
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
+	return nil
 }
 
 // queryEncoder writes the typed query into dst (reusing pooled capacity)
-// and returns the raw encoding. It runs under the read lock with ctx alive.
+// and returns the raw encoding. It runs lock-free with ctx alive.
 type queryEncoder func(dst []byte) []byte
 
 func (v *VectorIdx) searchEncoded(filter CandidateFilter, k int, encode queryEncoder) ([]Result, error) {
+	return v.searchEncodedWithHint(filter, k, -1, encode)
+}
+
+// searchEncodedWithHint is searchEncoded with a filter cardinality hint for
+// the cost-based flat fallback (Weaviate flatSearchCutoff analogue).
+func (v *VectorIdx) searchEncodedWithHint(filter CandidateFilter, k int, filterHint int, encode queryEncoder) ([]Result, error) {
 	if k <= 0 {
 		return nil, ErrInvalidQuery
 	}
 	token := v.readers.Acquire()
-	v.mu.RLock()
+	snap := v.view.Load()
 	if v.closed.Load() {
-		v.mu.RUnlock()
 		v.readers.Release(token)
 		return nil, ErrClosed
 	}
@@ -607,23 +1063,33 @@ func (v *VectorIdx) searchEncoded(filter CandidateFilter, k int, encode queryEnc
 	}
 	query := encode(ctx.queryBuf[:0])
 	ctx.queryBuf = query
-	results := v.searchRawLocked(ctx, query, filter, k)
+	var results []Result
+	if !snap.hasEntry || len(snap.ids) == 0 {
+		results = nil
+	} else {
+		if k > len(snap.ids) {
+			k = len(snap.ids)
+		}
+		results, _ = snap.searchWithHint(ctx, query, filter, k, filterHint)
+	}
 	out := make([]Result, len(results))
 	copy(out, results)
 	releaseSearchContext(ctx)
-	v.mu.RUnlock()
 	v.readers.Release(token)
 	return out, nil
 }
 
 func (v *VectorIdx) searchIntoEncoded(dst []Result, filter CandidateFilter, k int, encode queryEncoder) ([]Result, error) {
+	return v.searchIntoEncodedWithHint(dst, filter, k, -1, encode)
+}
+
+func (v *VectorIdx) searchIntoEncodedWithHint(dst []Result, filter CandidateFilter, k int, filterHint int, encode queryEncoder) ([]Result, error) {
 	if k <= 0 {
 		return nil, ErrInvalidQuery
 	}
 	token := v.readers.Acquire()
-	v.mu.RLock()
+	snap := v.view.Load()
 	if v.closed.Load() {
-		v.mu.RUnlock()
 		v.readers.Release(token)
 		return nil, ErrClosed
 	}
@@ -633,17 +1099,21 @@ func (v *VectorIdx) searchIntoEncoded(dst []Result, filter CandidateFilter, k in
 	}
 	query := encode(ctx.queryBuf[:0])
 	ctx.queryBuf = query
-	results := v.searchRawLocked(ctx, query, filter, k)
-	dst = append(dst, results...)
+	if snap.hasEntry && len(snap.ids) != 0 {
+		if k > len(snap.ids) {
+			k = len(snap.ids)
+		}
+		results, _ := snap.searchWithHint(ctx, query, filter, k, filterHint)
+		dst = append(dst, results...)
+	}
 	releaseSearchContext(ctx)
-	v.mu.RUnlock()
 	v.readers.Release(token)
 	return dst, nil
 }
 
 // SearchInt8 returns up to k nearest live neighbors of an int8 query.
 func (v *VectorIdx) SearchInt8(query []int8, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementInt8 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementInt8 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchEncoded(filter, k, func(dst []byte) []byte {
@@ -659,7 +1129,7 @@ func (v *VectorIdx) SearchInt8(query []int8, filter CandidateFilter, k int) ([]R
 
 // SearchUint8 returns up to k nearest live neighbors of a uint8 query.
 func (v *VectorIdx) SearchUint8(query []uint8, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementUint8 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementUint8 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchEncoded(filter, k, func(dst []byte) []byte {
@@ -669,7 +1139,7 @@ func (v *VectorIdx) SearchUint8(query []uint8, filter CandidateFilter, k int) ([
 
 // SearchInt16 returns up to k nearest live neighbors of an int16 query.
 func (v *VectorIdx) SearchInt16(query []int16, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementInt16 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementInt16 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchEncoded(filter, k, func(dst []byte) []byte {
@@ -679,7 +1149,7 @@ func (v *VectorIdx) SearchInt16(query []int16, filter CandidateFilter, k int) ([
 
 // SearchUint16 returns up to k nearest live neighbors of a uint16 query.
 func (v *VectorIdx) SearchUint16(query []uint16, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementUint16 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementUint16 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchEncoded(filter, k, func(dst []byte) []byte {
@@ -689,7 +1159,7 @@ func (v *VectorIdx) SearchUint16(query []uint16, filter CandidateFilter, k int) 
 
 // SearchFloat32 returns up to k nearest live neighbors of a float32 query.
 func (v *VectorIdx) SearchFloat32(query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementFloat32 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchEncoded(filter, k, func(dst []byte) []byte {
@@ -699,7 +1169,7 @@ func (v *VectorIdx) SearchFloat32(query []float32, filter CandidateFilter, k int
 
 // SearchIntoInt8 appends up to k matches to dst, reusing caller storage.
 func (v *VectorIdx) SearchIntoInt8(dst []Result, query []int8, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementInt8 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementInt8 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchIntoEncoded(dst, filter, k, func(scratch []byte) []byte {
@@ -715,7 +1185,7 @@ func (v *VectorIdx) SearchIntoInt8(dst []Result, query []int8, filter CandidateF
 
 // SearchIntoUint8 appends up to k matches to dst, reusing caller storage.
 func (v *VectorIdx) SearchIntoUint8(dst []Result, query []uint8, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementUint8 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementUint8 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchIntoEncoded(dst, filter, k, func(scratch []byte) []byte {
@@ -725,7 +1195,7 @@ func (v *VectorIdx) SearchIntoUint8(dst []Result, query []uint8, filter Candidat
 
 // SearchIntoInt16 appends up to k matches to dst, reusing caller storage.
 func (v *VectorIdx) SearchIntoInt16(dst []Result, query []int16, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementInt16 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementInt16 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchIntoEncoded(dst, filter, k, func(scratch []byte) []byte {
@@ -735,7 +1205,7 @@ func (v *VectorIdx) SearchIntoInt16(dst []Result, query []int16, filter Candidat
 
 // SearchIntoUint16 appends up to k matches to dst, reusing caller storage.
 func (v *VectorIdx) SearchIntoUint16(dst []Result, query []uint16, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementUint16 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementUint16 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchIntoEncoded(dst, filter, k, func(scratch []byte) []byte {
@@ -745,7 +1215,7 @@ func (v *VectorIdx) SearchIntoUint16(dst []Result, query []uint16, filter Candid
 
 // SearchIntoFloat32 appends up to k matches to dst, reusing caller storage.
 func (v *VectorIdx) SearchIntoFloat32(dst []Result, query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementFloat32 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	return v.searchIntoEncoded(dst, filter, k, func(scratch []byte) []byte {
@@ -753,10 +1223,10 @@ func (v *VectorIdx) SearchIntoFloat32(dst []Result, query []float32, filter Cand
 	})
 }
 
-// ExactSearchFloat32 runs the scalar exact-L2 reference scan. It is the
-// recall oracle for tests and benchmarks, not the production path.
+// ExactSearchFloat32 runs the scalar exact reference scan for the index
+// metric. It is the recall oracle for tests and benchmarks.
 func (v *VectorIdx) ExactSearchFloat32(query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	if v.cfg.ElementType != ElementFloat32 || len(query) != v.dims {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
 		return nil, ErrInvalidVector
 	}
 	if k <= 0 {
@@ -764,23 +1234,32 @@ func (v *VectorIdx) ExactSearchFloat32(query []float32, filter CandidateFilter, 
 	}
 	raw := encodeRawFloat32(nil, query)
 	token := v.readers.Acquire()
-	v.mu.RLock()
+	snap := v.view.Load()
 	if v.closed.Load() {
-		v.mu.RUnlock()
 		v.readers.Release(token)
 		return nil, ErrClosed
 	}
-	out := v.exactSearchLocked(raw, filter, k)
-	v.mu.RUnlock()
+	out := snap.exactSearch(raw, filter, k)
 	v.readers.Release(token)
 	return out, nil
 }
 
+// SearchWithFilterHint runs SearchFloat32 with a filter cardinality hint for
+// the cost-based flat fallback.
+func (v *VectorIdx) SearchWithFilterHint(query []float32, filter CandidateFilter, k int, filterHint int) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
+		return nil, ErrInvalidVector
+	}
+	return v.searchEncodedWithHint(filter, k, filterHint, func(dst []byte) []byte {
+		return encodeRawFloat32(dst, query)
+	})
+}
+
 // Checkpoint persists a self-consistent generation and truncates the WAL
-// tail it covers. It is explicit in V1; no background compaction exists.
+// tail it covers.
 func (v *VectorIdx) Checkpoint() error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
 		return ErrClosed
 	}
@@ -793,110 +1272,129 @@ func (v *VectorIdx) Checkpoint() error {
 // Compact rebuilds the graph from live vectors only, preserving NodeIDs,
 // then checkpoints. Tombstones are purged and the WAL restarts after the new
 // checkpoint LSN. Reinsertion uses NodeID order with a fixed seed so a
-// compacted index is deterministic given its live set.
-func (v *VectorIdx) Compact() error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+// compacted index is deterministic given its live set. A concurrent Compact
+// returns ErrCompactionInProgress.
+func (v *VectorIdx) Compact() (CompactionResult, error) {
+	if !v.compactMu.TryLock() {
+		return CompactionResult{}, ErrCompactionInProgress
+	}
+	defer v.compactMu.Unlock()
+	start := time.Now()
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
 	if v.closed.Load() {
-		return ErrClosed
+		return CompactionResult{}, ErrClosed
+	}
+	cur := v.view.Load()
+	result := CompactionResult{
+		NodesBefore:      len(cur.ids),
+		TombstonesPurged: len(cur.tombSorted),
 	}
 	type live struct {
 		id  NodeID
 		raw []byte
 	}
-	liveIDs := make([]NodeID, 0, len(v.ids)-len(v.tombstones))
-	for _, id := range v.sortedIDs {
-		if _, tombstoned := v.tombstones[id]; tombstoned {
-			continue
+	var liveIDs []NodeID
+	if len(cur.sortedIDs) != 0 {
+		liveIDs = make([]NodeID, 0, len(cur.ids)-len(cur.tombSorted))
+		for _, id := range cur.sortedIDs {
+			if cur.tomb.Contains(uint64(id)) {
+				continue
+			}
+			liveIDs = append(liveIDs, id)
 		}
-		liveIDs = append(liveIDs, id)
+	} else {
+		liveIDs = make([]NodeID, 0, len(cur.ids)-len(cur.tombSorted))
+		for _, id := range cur.ids {
+			if cur.tomb.Contains(uint64(id)) {
+				continue
+			}
+			liveIDs = append(liveIDs, id)
+		}
+		sort.Slice(liveIDs, func(i, j int) bool { return liveIDs[i] < liveIDs[j] })
 	}
 	lives := make([]live, 0, len(liveIDs))
 	for _, id := range liveIDs {
-		ord, ok := v.locateLocked(id)
+		ord, ok := cur.locate(id)
 		if !ok {
-			return ErrCorruptStorage
+			return CompactionResult{}, ErrCorruptStorage
 		}
 		raw := make([]byte, v.vecBytes)
-		copy(raw, v.vectorAtLocked(ord))
+		copy(raw, cur.vectorAt(ord))
 		lives = append(lives, live{id: id, raw: raw})
 	}
-	v.ids = v.ids[:0]
-	v.vectors = v.vectors[:0]
-	v.levels = v.levels[:0]
-	v.links = v.links[:0]
-	v.sortedIDs = v.sortedIDs[:0]
-	v.sortedOrd = v.sortedOrd[:0]
-	v.tombstones = make(map[NodeID]struct{})
-	v.hasEntry = false
-	v.maxLevel = 0
+	ns := &vectorSnapshot{
+		cfg:      cur.cfg,
+		dist:     v.dist,
+		vecBytes: v.vecBytes,
+		elemSize: v.elemSize,
+		dims:     v.dims,
+	}
 	v.rng = rand.New(rand.NewSource(0xC0FAC7))
 	ctx := acquireSearchContext()
 	defer releaseSearchContext(ctx)
 	for _, lv := range lives {
 		level := v.sampleLevelLocked()
-		ord := len(v.ids)
-		v.ids = append(v.ids, lv.id)
-		v.vectors = append(v.vectors, lv.raw...)
-		v.levels = append(v.levels, level)
-		v.links = append(v.links, make([][]NodeID, level+1))
-		pos := sort.Search(len(v.sortedIDs), func(i int) bool { return v.sortedIDs[i] >= lv.id })
-		v.sortedIDs = append(v.sortedIDs, 0)
-		v.sortedOrd = append(v.sortedOrd, 0)
-		copy(v.sortedIDs[pos+1:], v.sortedIDs[pos:])
-		copy(v.sortedOrd[pos+1:], v.sortedOrd[pos:])
-		v.sortedIDs[pos] = lv.id
-		v.sortedOrd[pos] = ord
-		if len(v.ids) > 1 {
-			// Reuse the standard insertion wiring against the rebuilt prefix.
-			// Reset scratch per node: the prefix grows each iteration, so the
-			// visited tags must be resized and the generation bumped, exactly
-			// like the write path in addRawLocked.
-			ctx.resetForNodes(len(v.ids), v.vecBytes)
-			v.wireRebuiltLocked(ctx, lv.raw, ord, level, lv.id)
+		ord := len(ns.ids)
+		ns.ids = append(ns.ids, lv.id)
+		ns.vectors = append(ns.vectors, lv.raw...)
+		ns.levels = append(ns.levels, level)
+		holder := &atomic.Pointer[nodeLayers]{}
+		holder.Store(&nodeLayers{layers: make([][]NodeID, level+1)})
+		ns.links = append(ns.links, holder)
+		if denseEnsure(ns, lv.id, len(ns.ids)) {
+			denseSet(ns, lv.id, ord)
 		} else {
-			v.entry = lv.id
-			v.hasEntry = true
-			v.maxLevel = level
+			sortedInsert(ns, lv.id, ord)
 		}
-		if level > v.maxLevel {
-			v.entry = lv.id
-			v.maxLevel = level
+		if len(ns.ids) > 1 {
+			ctx.resetForNodes(len(ns.ids), v.vecBytes)
+			v.wireRebuilt(ctx, ns, lv.raw, ord, level, lv.id)
+		} else {
+			ns.entry = lv.id
+			ns.hasEntry = true
+			ns.maxLevel = level
+		}
+		if level > ns.maxLevel {
+			ns.entry = lv.id
+			ns.maxLevel = level
 		}
 	}
-	v.gen.Add(1)
-	if v.path == "" {
-		return nil
+	ns.gen = v.gen.Add(1)
+	v.view.Store(ns)
+	result.NodesAfter = len(ns.ids)
+	result.BytesReclaimed = int64(result.NodesBefore-result.NodesAfter) * int64(v.vecBytes)
+	if v.path != "" {
+		if err := v.checkpointLocked(); err != nil {
+			return result, err
+		}
 	}
-	return v.checkpointLocked()
+	result.Duration = time.Since(start)
+	v.lastCompact.Store(&result)
+	return result, nil
 }
 
-// wireRebuiltLocked connects rebuilt ordinal ord (already appended) into the
+// wireRebuilt connects rebuilt ordinal ord (already appended) into the
 // prefix graph. It mirrors addRawLocked without WAL/LSN/locator-append.
-func (v *VectorIdx) wireRebuiltLocked(ctx *SearchContext, raw []byte, ord, level int, id NodeID) {
-	entryOrd, ok := v.locateLocked(v.entry)
+// ns is private until published, so direct mutation is safe.
+func (v *VectorIdx) wireRebuilt(ctx *SearchContext, s *vectorSnapshot, raw []byte, ord, level int, id NodeID) {
+	entryOrd, ok := s.locate(s.entry)
 	if !ok {
-		v.entry = id
-		v.hasEntry = true
-		v.maxLevel = level
+		s.entry = id
+		s.hasEntry = true
+		s.maxLevel = level
 		return
 	}
-	// The new node is at the tail; searches may visit it via reciprocal
-	// links added below, but forward search from entry cannot reach it yet
-	// because no edges point to it. Temporarily hide it from distance
-	// contention by excluding self matches in neighbor loops.
 	cur := entryOrd
 	if cur == ord {
 		cur = 0
 	}
-	for l := v.maxLevel; l > level; l-- {
-		cur = v.greedyStepLocked(cur, l, raw)
+	for l := s.maxLevel; l > level; l-- {
+		cur = s.greedyStep(cur, l, raw)
 	}
-	for l := min(v.maxLevel, level); l >= 0; l-- {
-		ef := int(v.cfg.EfConstruction)
-		cands := v.searchLayerLocked(ctx, raw, cur, ef, l)
-		// Drop self if the layer search reached the new node through a
-		// just-added upper-layer reciprocal edge.
+	for l := min(s.maxLevel, level); l >= 0; l-- {
+		ef := int(s.cfg.EfConstruction)
+		cands := s.searchLayer(ctx, raw, cur, ef, l)
 		filtered := cands[:0]
 		for _, c := range cands {
 			if c.ord != ord {
@@ -904,23 +1402,21 @@ func (v *VectorIdx) wireRebuiltLocked(ctx *SearchContext, raw []byte, ord, level
 			}
 		}
 		cands = filtered
-		m := int(v.cfg.M)
+		m := int(s.cfg.M)
 		if l == 0 {
-			m = int(v.cfg.M0)
+			m = int(s.cfg.M0)
 		}
-		picked := selectClosest(cands, m)
+		picked := pickNeighbors(s, cands, m, raw)
+		g := s.links[ord].Load()
 		for _, p := range picked {
-			v.links[ord][l] = append(v.links[ord][l], v.ids[p.ord])
+			g.layers[l] = append(g.layers[l], s.ids[p.ord])
 		}
 		for _, p := range picked {
 			nb := p.ord
-			if nb == ord || l > v.levels[nb] {
+			if nb == ord || l > s.levels[nb] {
 				continue
 			}
-			v.links[nb][l] = append(v.links[nb][l], id)
-			if len(v.links[nb][l]) > m {
-				v.pruneNeighborsLocked(nb, l, m)
-			}
+			v.linkAppend(s, nb, l, id, m)
 		}
 		if len(picked) != 0 {
 			cur = picked[0].ord
@@ -930,71 +1426,94 @@ func (v *VectorIdx) wireRebuiltLocked(ctx *SearchContext, raw []byte, ord, level
 
 // Verify performs a deep structural check: locator consistency, vector
 // lengths, entry validity, edge targets, level bounds, and tombstone subset.
-// It does not verify WAL contents.
+// Lock-free. It does not verify WAL contents.
 func (v *VectorIdx) Verify() error {
 	token := v.readers.Acquire()
-	v.mu.RLock()
-	defer func() {
-		v.mu.RUnlock()
-		v.readers.Release(token)
-	}()
-	if len(v.vectors) != len(v.ids)*v.vecBytes {
+	s := v.view.Load()
+	defer v.readers.Release(token)
+	if len(s.vectors) != len(s.ids)*v.vecBytes {
 		return ErrCorruptStorage
 	}
-	if len(v.levels) != len(v.ids) || len(v.links) != len(v.ids) {
+	if len(s.levels) != len(s.ids) || len(s.links) != len(s.ids) {
 		return ErrCorruptStorage
 	}
-	if len(v.sortedIDs) != len(v.ids) || len(v.sortedOrd) != len(v.ids) {
-		return ErrCorruptStorage
-	}
-	seen := make(map[NodeID]int, len(v.ids))
-	for ord, id := range v.ids {
+	seen := make(map[NodeID]int, len(s.ids))
+	for ord, id := range s.ids {
 		if _, dup := seen[id]; dup {
 			return ErrCorruptStorage
 		}
 		seen[id] = ord
-		if v.levels[ord] < 0 || len(v.links[ord]) != v.levels[ord]+1 {
+		g := s.links[ord].Load()
+		if g == nil {
+			return ErrCorruptStorage
+		}
+		if s.levels[ord] < 0 || len(g.layers) != s.levels[ord]+1 {
 			return ErrCorruptStorage
 		}
 	}
-	for i := 1; i < len(v.sortedIDs); i++ {
-		if v.sortedIDs[i-1] >= v.sortedIDs[i] {
+	if len(s.sortedIDs) != 0 {
+		if len(s.sortedIDs) != len(s.ids) || len(s.sortedOrd) != len(s.ids) {
 			return ErrCorruptStorage
 		}
-	}
-	for i, id := range v.sortedIDs {
-		ord := v.sortedOrd[i]
-		if ord < 0 || ord >= len(v.ids) || v.ids[ord] != id {
-			return ErrCorruptStorage
+		for i := 1; i < len(s.sortedIDs); i++ {
+			if s.sortedIDs[i-1] >= s.sortedIDs[i] {
+				return ErrCorruptStorage
+			}
+		}
+		for i, id := range s.sortedIDs {
+			ord := s.sortedOrd[i]
+			if ord < 0 || ord >= len(s.ids) || s.ids[ord] != id {
+				return ErrCorruptStorage
+			}
 		}
 	}
-	for id := range v.tombstones {
+	if s.useDense {
+		if s.dense == nil {
+			return ErrCorruptStorage
+		}
+		for ord, id := range s.ids {
+			o, ok := denseGet(s.dense, id)
+			if !ok || o != ord {
+				return ErrCorruptStorage
+			}
+		}
+	} else if len(s.sortedIDs) == 0 && len(s.ids) != 0 {
+		return ErrCorruptStorage
+	}
+	for _, id := range s.tombSorted {
 		if _, ok := seen[id]; !ok {
 			return ErrCorruptStorage
 		}
+		if !s.tomb.Contains(uint64(id)) {
+			return ErrCorruptStorage
+		}
 	}
-	if v.hasEntry {
-		entryOrd, ok := v.locateLocked(v.entry)
+	if uint64(len(s.tombSorted)) != s.tomb.Cardinality() {
+		return ErrCorruptStorage
+	}
+	if s.hasEntry {
+		entryOrd, ok := s.locate(s.entry)
 		if !ok {
 			return ErrCorruptStorage
 		}
-		if v.levels[entryOrd] != v.maxLevel {
+		if s.levels[entryOrd] != s.maxLevel {
 			return ErrCorruptStorage
 		}
-	} else if len(v.ids) != 0 {
+	} else if len(s.ids) != 0 {
 		return ErrCorruptStorage
 	}
-	for ord, layerLinks := range v.links {
-		for level, nbs := range layerLinks {
-			if level > v.levels[ord] {
+	for ord := range s.ids {
+		g := s.links[ord].Load()
+		for level, nbs := range g.layers {
+			if level > s.levels[ord] {
 				return ErrCorruptStorage
 			}
 			for _, nb := range nbs {
-				nOrd, ok := v.locateLocked(nb)
+				nOrd, ok := s.locate(nb)
 				if !ok {
 					return ErrCorruptStorage
 				}
-				if v.levels[nOrd] < level {
+				if s.levels[nOrd] < level {
 					return ErrCorruptStorage
 				}
 			}
@@ -1003,5 +1522,218 @@ func (v *VectorIdx) Verify() error {
 	return nil
 }
 
-var errClosedSentinel = errors.New("vectoridx: closed")
-var _ = errClosedSentinel
+// ---- async writer queue + runtime policies ----
+
+// startAsyncWorker launches the single background writer for async ops. When
+// a sync interval is configured, the worker also fsyncs the WAL once after
+// each drained batch and on the interval timer (group commit).
+func (v *VectorIdx) startAsyncWorker() {
+	ch := make(chan asyncOp, 1024)
+	v.asyncCh = ch
+	var ticker *time.Ticker
+	var tickC <-chan time.Time
+	if v.syncInterval > 0 && v.durability == DurabilityOS {
+		ticker = time.NewTicker(v.syncInterval)
+		tickC = ticker.C
+	}
+	v.asyncWg.Add(1)
+	go func() {
+		defer v.asyncWg.Done()
+		if ticker != nil {
+			defer ticker.Stop()
+		}
+		for {
+			select {
+			case op, ok := <-ch:
+				if !ok {
+					return
+				}
+				op.fn()
+				if op.done != nil {
+					close(op.done)
+				}
+				if len(ch) == 0 {
+					v.flushWAL()
+				}
+			case <-tickC:
+				v.flushWAL()
+			}
+		}
+	}()
+}
+
+// flushWAL fsyncs the WAL when dirty records are pending. It is called from
+// the async worker and from the sync-interval ticker. The writer lock is only
+// taken to read the handle, so appends keep flowing while fsync runs; a
+// concurrent append re-dirties the flag and the next flush covers its tail.
+func (v *VectorIdx) flushWAL() {
+	if !v.walDirty.Swap(false) {
+		return
+	}
+	v.syncMu.Lock()
+	defer v.syncMu.Unlock()
+	v.writeMu.Lock()
+	wal := v.wal
+	v.writeMu.Unlock()
+	if wal == nil {
+		return
+	}
+	if err := wal.Sync(); err != nil {
+		// Keep the dirty flag so a later flush retries.
+		v.walDirty.Store(true)
+		return
+	}
+	v.walSyncs.Add(1)
+}
+
+// Sync fsyncs the WAL, establishing a durable boundary for every mutation
+// acknowledged so far. It returns ErrNotPersistent for in-memory indexes.
+func (v *VectorIdx) Sync() error {
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	if v.closed.Load() {
+		return ErrClosed
+	}
+	if v.wal == nil {
+		return ErrNotPersistent
+	}
+	if err := v.wal.Sync(); err != nil {
+		return err
+	}
+	v.walDirty.Store(false)
+	v.walSyncs.Add(1)
+	return nil
+}
+
+// enqueueAsync submits fn to the background writer; callers use WaitIdle to
+// observe completion. It drops the op when closed or full to stay non-blocking.
+func (v *VectorIdx) enqueueAsync(fn func()) {
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	ch := v.asyncCh
+	if v.closed.Load() || ch == nil {
+		return
+	}
+	v.asyncPending.Add(1)
+	select {
+	case ch <- asyncOp{fn: func() { fn(); v.asyncPending.Add(-1) }}:
+	default:
+		v.asyncPending.Add(-1)
+	}
+}
+
+// AddAsync enqueues an Add without blocking the caller.
+func (v *VectorIdx) AddAsync(id NodeID, vec []float32) {
+	q := append([]float32(nil), vec...)
+	v.enqueueAsync(func() { _ = v.AddFloat32(id, q) })
+}
+
+// DeleteAsync enqueues a Delete without blocking the caller.
+func (v *VectorIdx) DeleteAsync(id NodeID) {
+	v.enqueueAsync(func() { _ = v.Delete(id) })
+}
+
+// CompactAsync enqueues a Compact without blocking the caller.
+func (v *VectorIdx) CompactAsync() {
+	v.enqueueAsync(func() { _, _ = v.Compact() })
+}
+
+// PendingOps reports queued background operations.
+func (v *VectorIdx) PendingOps() int64 { return v.asyncPending.Load() }
+
+// WaitIdle blocks until queued background operations drain or ctx is done.
+func (v *VectorIdx) WaitIdle(ctx context.Context) error {
+	for v.asyncPending.Load() != 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			runtime.Gosched()
+		}
+	}
+	return nil
+}
+
+// SetSearchParams updates runtime search policies (EfSearch, dynamic ef,
+// flat cutoff/threshold, oversample) without rebuilding the graph.
+func (v *VectorIdx) SetSearchParams(efSearch uint32, dynFactor, dynMin, dynMax uint32, flatCutoff, flatThreshold int, oversample uint32) error {
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	if v.closed.Load() {
+		return ErrClosed
+	}
+	cur := v.view.Load()
+	cfg := cur.cfg
+	if efSearch != 0 {
+		if efSearch < 1 || efSearch > 4096 {
+			return ErrInvalidConfig
+		}
+		cfg.EfSearch = efSearch
+	}
+	cfg.DynamicEfFactor = dynFactor
+	if dynFactor > 0 {
+		if dynMin == 0 {
+			dynMin = DefaultDynamicEfMin
+		}
+		if dynMax == 0 {
+			dynMax = DefaultDynamicEfMax
+		}
+		if dynMin < 1 || dynMax < dynMin || dynMax > 4096 {
+			return ErrInvalidConfig
+		}
+		cfg.DynamicEfMin, cfg.DynamicEfMax = dynMin, dynMax
+	}
+	if flatCutoff != 0 {
+		cfg.FlatSearchCutoff = flatCutoff
+	}
+	if flatThreshold != 0 {
+		cfg.FlatThreshold = flatThreshold
+	}
+	if oversample != 0 {
+		if oversample < 1 || oversample > 64 {
+			return ErrInvalidConfig
+		}
+		cfg.OversampleFactor = oversample
+	}
+	ns := cloneSnapshot(cur)
+	ns.cfg = cfg
+	ns.gen = v.gen.Add(1)
+	v.view.Store(ns)
+	return nil
+}
+
+// SetHeuristic toggles diversity-based neighbor selection for future writes
+// and compactions.
+func (v *VectorIdx) SetHeuristic(use bool) error {
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	if v.closed.Load() {
+		return ErrClosed
+	}
+	cur := v.view.Load()
+	ns := cloneSnapshot(cur)
+	ns.cfg.UseHeuristic = use
+	ns.gen = v.gen.Add(1)
+	v.view.Store(ns)
+	return nil
+}
+
+// SetAutoCompact enables (ratio > 0) or disables (ratio == 0) background
+// compaction on writes.
+func (v *VectorIdx) SetAutoCompact(ratio float64, minNodes int) error {
+	if ratio < 0 || ratio > 1 || minNodes < 0 {
+		return ErrInvalidConfig
+	}
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	if v.closed.Load() {
+		return ErrClosed
+	}
+	cur := v.view.Load()
+	ns := cloneSnapshot(cur)
+	ns.cfg.AutoCompactRatio = ratio
+	ns.cfg.CompactMinNodes = minNodes
+	ns.gen = v.gen.Add(1)
+	v.view.Store(ns)
+	return nil
+}

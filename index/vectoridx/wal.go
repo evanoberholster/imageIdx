@@ -39,7 +39,7 @@ func (v *VectorIdx) appendWALRecord(rtype uint8, id NodeID, raw []byte) error {
 	binary.LittleEndian.PutUint32(hdr[0:4], walMagic)
 	binary.LittleEndian.PutUint16(hdr[4:6], walVersion)
 	hdr[6] = rtype
-	hdr[7] = v.cfg.ElementType.byte()
+	hdr[7] = v.cfgBase.ElementType.byte()
 	binary.LittleEndian.PutUint64(hdr[8:16], v.lsn+1)
 	binary.LittleEndian.PutUint32(hdr[16:20], uint32(id))
 	binary.LittleEndian.PutUint32(hdr[20:24], uint32(vecLen))
@@ -69,8 +69,23 @@ func (v *VectorIdx) appendWALRecord(rtype uint8, id NodeID, raw []byte) error {
 		}
 		record = record[n:]
 	}
-	// V1 always syncs acknowledged mutations (DurabilitySync semantics).
-	return v.wal.Sync()
+	v.walRecords.Add(1)
+	v.walBytes.Add(uint64(walHeaderSize + vecLen + walCRCSize))
+	// DurabilitySync fsyncs each acknowledged mutation; DurabilityOS leaves
+	// the record in the OS page cache and only marks it dirty for periodic
+	// group commit.
+	if v.durability == DurabilitySync {
+		if err := v.wal.Sync(); err != nil {
+			return err
+		}
+		v.walSyncs.Add(1)
+		v.walDirty.Store(false)
+		return nil
+	}
+	if v.syncInterval > 0 {
+		v.walDirty.Store(true)
+	}
+	return nil
 }
 
 func (t ElementType) byte() byte { return byte(t) }
@@ -121,7 +136,7 @@ func (v *VectorIdx) replayWAL() error {
 		if rtype != walTypeAdd && rtype != walTypeDelete {
 			return ErrCorruptWAL
 		}
-		if elem != v.cfg.ElementType {
+		if elem != v.cfgBase.ElementType {
 			return ErrCorruptWAL
 		}
 		if rtype == walTypeDelete && vecLen != 0 {
@@ -163,41 +178,60 @@ func (v *VectorIdx) replayWAL() error {
 
 // applyReplayRecord folds one WAL record into writer state. Graph insertion
 // reuses the normal writer path but skips WAL appends (the record exists).
+// It runs during Open before the async worker starts; no readers exist yet,
+// so snapshots publish without tracker waits.
 func (v *VectorIdx) applyReplayRecord(rtype uint8, id NodeID, payload []byte, lsn uint64) error {
+	cur := v.view.Load()
 	switch rtype {
 	case walTypeAdd:
-		if _, exists := v.locateLocked(id); exists {
-			// Idempotent replay: duplicate adds after a checkpoint boundary
-			// can occur when Checkpoint and WAL truncation interleave with a
-			// crash. The first record wins.
-			if lsn > v.lsn {
-				v.lsn = lsn
+		ord, exists := cur.locate(id)
+		if exists {
+			if !cur.tomb.Contains(uint64(id)) {
+				// Idempotent replay: duplicate adds after a checkpoint
+				// boundary can occur when Checkpoint and WAL truncation
+				// interleave with a crash. The first record wins.
+				if lsn > v.lsn {
+					v.lsn = lsn
+				}
+				return nil
 			}
+			// Delete-then-re-add: the later add replaces the vector.
+			// Temporarily detach the WAL so resurrect does not re-append.
+			wal := v.wal
+			v.wal = nil
+			ns, err := v.resurrectLocked(cur, ord, id, payload)
+			v.wal = wal
+			if err != nil {
+				return err
+			}
+			v.view.Store(ns)
+			v.lsn = lsn
 			return nil
 		}
-		// Temporarily detach the WAL so addRawLocked does not re-append.
+		// Temporarily detach the WAL so addRaw does not re-append.
 		wal := v.wal
 		v.wal = nil
-		err := v.addRawLocked(id, payload)
+		ns, err := v.addRawLocked(cur, id, payload)
 		v.wal = wal
 		if err != nil {
 			return err
 		}
+		v.view.Store(ns)
 		v.lsn = lsn
 		return nil
 	case walTypeDelete:
-		if _, ok := v.locateLocked(id); !ok {
+		if _, ok := cur.locate(id); !ok {
 			if lsn > v.lsn {
 				v.lsn = lsn
 			}
 			return nil
 		}
-		wal := v.wal
-		v.wal = nil
-		v.tombstones[id] = struct{}{}
-		v.wal = wal
+		ns := cloneSnapshot(cur)
+		ns.tombSorted = insertTombSorted(ns.tombSorted, id)
+		ns.tomb, ns.tombSorted = rebuildTombeset(ns.tombSorted)
+		ns.gen = v.gen.Add(1)
+		v.view.Store(ns)
 		v.lsn = lsn
-		v.gen.Add(1)
 		return nil
 	default:
 		return ErrCorruptWAL
