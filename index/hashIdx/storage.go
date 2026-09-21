@@ -298,7 +298,7 @@ func (i *Index) Vacuum(live CandidateSet) error {
 // OnDiskBytes reports the bytes held by generation files, WAL files, and the
 // manifest.
 func (i *Index) OnDiskBytes() uint64 {
-	return onDiskBytes(i.persistence.dir, genGlob, walGlob, "manifest")
+	return indexutil.DirSize(i.persistence.dir, genGlob, walGlob, "manifest")
 }
 
 // buildDenseView copies records admitted by live into fresh page planes.
@@ -682,8 +682,7 @@ func readManifest(path string) (diskManifest, error) {
 	// A recognized magic with an unknown version is a newer format, not
 	// corruption: fail open with ErrUnsupported so callers never misread
 	// it as a same-version bit rot.
-	if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == manifestMagic &&
-		binary.LittleEndian.Uint16(data[4:6]) != manifestVersion {
+	if magic, version, ok := persist.PeekHeader(data); ok && magic == manifestMagic && version != manifestVersion {
 		return diskManifest{}, ErrUnsupported
 	}
 	if err = persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 60, 60); err != nil {
@@ -756,8 +755,7 @@ func encodeManifest(m exactManifest) []byte {
 func decodeManifest(data []byte) (exactManifest, error) {
 	// Recognized magic with an unknown version is a newer format, not
 	// corruption: fail open with ErrUnsupported (see readManifest).
-	if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == exactManifestMagic &&
-		binary.LittleEndian.Uint16(data[4:6]) != exactManifestVersion {
+	if magic, version, ok := persist.PeekHeader(data); ok && magic == exactManifestMagic && version != exactManifestVersion {
 		return exactManifest{}, ErrUnsupported
 	}
 	if err := persist.VerifyManifest(data, exactManifestSize, exactManifestMagic, exactManifestVersion, 60, 60); err != nil {
@@ -1293,7 +1291,7 @@ func (i *ExactIndex) Vacuum() error {
 // OnDiskBytes reports the total bytes of generation files, the WAL, and the
 // manifest.
 func (i *ExactIndex) OnDiskBytes() uint64 {
-	return onDiskBytes(i.persistence.dir, exactGenGlob, exactWALGlob, "manifest")
+	return indexutil.DirSize(i.persistence.dir, exactGenGlob, exactWALGlob, "manifest")
 }
 
 // StorageAmplification returns the on-disk bytes per live logical byte.

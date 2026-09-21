@@ -168,6 +168,31 @@ func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
 	}
 }
 
+// TestManifestVersionRejected proves unknown manifest versions fail open
+// with ErrUnsupported instead of masquerading as corruption.
+func TestManifestVersionRejected(t *testing.T) {
+	directory := t.TempDir()
+	index, err := NewPersistent(directory, Spec{Offset: 1_000}, Config{}, DurabilityOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "manifest")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[4] ^= 0xff // version field; magic stays recognized
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenPersistent(directory, Config{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("versioned manifest error = %v, want ErrUnsupported", err)
+	}
+}
+
 func TestManifestChecksumRejectsCorruption(t *testing.T) {
 	directory := t.TempDir()
 	index, err := NewPersistent(directory, Spec{}, Config{}, DurabilityOS)

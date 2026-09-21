@@ -4,21 +4,32 @@ import "github.com/evanoberholster/imageIdx/internal/indexutil"
 
 type ExactTimestampFunc func(ImageID) (uint64, bool)
 
+// searchScope resolves the marker range and pins the directory for
+// lock-free readers, returning the release token alongside. The caller
+// must pass the token to Release exactly once; results accumulate into
+// the caller's dst, which it sizes. Empty ranges and closed indexes
+// report ok=false with no reader registered and no allocation.
+func (i *Index) searchScope(start, end uint64) (directory *blockDirectory, lo, hi uint64, token uint32, ok bool) {
+	lo, hi, ok = markerRange(start, end, i.offset)
+	if !ok {
+		return nil, 0, 0, 0, false
+	}
+	token = i.readers.Acquire()
+	if i.closed.Load() {
+		i.readers.Release(token)
+		return nil, 0, 0, 0, false
+	}
+	return i.directory.Load(), lo, hi, token, true
+}
+
 // Search appends compressed-index candidates for [start, end) to dst. The
 // caller controls allocation by supplying enough spare capacity in dst.
 func (i *Index) Search(dst []ImageID, start, end uint64) []ImageID {
-	lo, hi, ok := markerRange(start, end, i.offset)
+	directory, lo, hi, token, ok := i.searchScope(start, end)
 	if !ok {
 		return dst
 	}
-	token := i.readers.Acquire()
-	if i.closed.Load() {
-		i.readers.Release(token)
-		return dst
-	}
-	directory := i.directory.Load()
-	first := directory.firstOverlapping(lo)
-	for index := first; index < len(directory.entries); index++ {
+	for index := directory.firstOverlapping(lo); index < len(directory.entries); index++ {
 		entry := &directory.entries[index]
 		if entry.startMarker >= hi {
 			break
@@ -36,18 +47,11 @@ func (i *Index) SearchExact(dst []ImageID, start, end uint64, lookup ExactTimest
 	if lookup == nil {
 		return i.Search(dst, start, end)
 	}
-	lo, hi, ok := markerRange(start, end, i.offset)
+	directory, lo, hi, token, ok := i.searchScope(start, end)
 	if !ok {
 		return dst
 	}
-	token := i.readers.Acquire()
-	if i.closed.Load() {
-		i.readers.Release(token)
-		return dst
-	}
-	directory := i.directory.Load()
-	first := directory.firstOverlapping(lo)
-	for index := first; index < len(directory.entries); index++ {
+	for index := directory.firstOverlapping(lo); index < len(directory.entries); index++ {
 		entry := &directory.entries[index]
 		if entry.startMarker >= hi {
 			break
@@ -64,25 +68,19 @@ func (i *Index) SearchExact(dst []ImageID, start, end uint64, lookup ExactTimest
 // making it suitable for cross-index query planning. Delta deletes and repeated
 // updates may make the estimate larger than the eventual result.
 func (i *Index) EstimateRange(start, end uint64) uint64 {
-	lo, hi, ok := markerRange(start, end, i.offset)
+	directory, lo, hi, token, ok := i.searchScope(start, end)
 	if !ok {
 		return 0
 	}
-	token := i.readers.Acquire()
-	defer i.readers.Release(token)
-	if i.closed.Load() {
-		return 0
-	}
-	directory := i.directory.Load()
 	var estimate uint64
-	first := directory.firstOverlapping(lo)
-	for index := first; index < len(directory.entries); index++ {
+	for index := directory.firstOverlapping(lo); index < len(directory.entries); index++ {
 		entry := &directory.entries[index]
 		if entry.startMarker >= hi {
 			break
 		}
 		estimate = indexutil.SaturatingAdd(estimate, estimateBlock(entry.block.view.Load(), lo, hi))
 	}
+	i.readers.Release(token)
 	return estimate
 }
 

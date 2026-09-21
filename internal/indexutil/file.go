@@ -70,6 +70,22 @@ func writeFileAtomic(
 	return err
 }
 
+// DirSize sums the sizes of every file matching one of patterns under
+// dir. Patterns may be globs or literal file names; missing files are
+// skipped, so retired generations simply stop contributing.
+func DirSize(dir string, patterns ...string) uint64 {
+	var total uint64
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		for _, path := range matches {
+			if info, err := os.Stat(path); err == nil {
+				total += uint64(info.Size())
+			}
+		}
+	}
+	return total
+}
+
 func Align(value, alignment uint64) uint64 {
 	return (value + alignment - 1) &^ (alignment - 1)
 }

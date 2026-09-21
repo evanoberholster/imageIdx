@@ -30,8 +30,12 @@ const (
 // blocks OpenStore.
 
 var (
-	ErrStoreExists = errors.New("hashidx: store directory is not empty")
-	ErrStoreBusy   = errors.New("hashidx: store directory already has a writer")
+	// ErrStoreExists reports creating a store in a non-empty directory.
+	// It aliases indexutil.ErrExists; see internal/indexutil.
+	ErrStoreExists = indexutil.ErrExists
+	// ErrStoreBusy reports another process holding the store lock. It
+	// aliases indexutil.ErrBusy; see internal/indexutil.
+	ErrStoreBusy   = indexutil.ErrBusy
 	ErrNotStore    = errors.New("hashidx: directory is not a hashidx store")
 	ErrChannelFull = errors.New("hashidx: buffered writer channel full")
 )
@@ -89,8 +93,7 @@ func ReadStoreManifest(dir string) (perceptualGen, exactGen uint64, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == storeManifestMagic &&
-		binary.LittleEndian.Uint16(data[4:6]) != storeManifestVersion {
+	if magic, version, ok := persist.PeekHeader(data); ok && magic == storeManifestMagic && version != storeManifestVersion {
 		return 0, 0, ErrUnsupported
 	}
 	if err := persist.VerifyManifest(data, storeManifestSize, storeManifestMagic, storeManifestVersion, 28, 28); err != nil {
@@ -114,7 +117,7 @@ func NewStore(dir string, spec StoreSpec, durability Durability) (*Store, error)
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := lockStoreDir(dir, true)
+	lock, err := indexutil.AcquireLock(dir, storeLockName, true)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +127,7 @@ func NewStore(dir string, spec StoreSpec, durability Durability) (*Store, error)
 	perceptual, err := newIndex(perceptualDir, spec.Perceptual, durability, readers)
 	if err != nil {
 		_ = os.RemoveAll(perceptualDir)
-		_ = unlockStoreDir(lock)
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	exact, err := newExact(exactDir, spec.Exact, spec.ExactConfig, durability, readers)
@@ -132,7 +135,7 @@ func NewStore(dir string, spec StoreSpec, durability Durability) (*Store, error)
 		_ = perceptual.Close()
 		_ = os.RemoveAll(perceptualDir)
 		_ = os.RemoveAll(exactDir)
-		_ = unlockStoreDir(lock)
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	s := &Store{dir: dir, perceptual: perceptual, exact: exact, lock: lock}
@@ -152,27 +155,27 @@ func OpenStore(dir string, durability Durability) (*Store, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := lockStoreDir(dir, false)
+	lock, err := indexutil.AcquireLock(dir, storeLockName, false)
 	if err != nil {
 		return nil, err
 	}
 	for _, name := range []string{perceptualDirName, exactDirName} {
 		info, statErr := os.Stat(filepath.Join(dir, name))
 		if statErr != nil || !info.IsDir() {
-			_ = unlockStoreDir(lock)
+			_ = indexutil.ReleaseLock(lock)
 			return nil, ErrNotStore
 		}
 	}
 	readers := &indexutil.ReaderTracker{}
 	perceptual, err := openIndex(filepath.Join(dir, perceptualDirName), Config{}, durability, readers)
 	if err != nil {
-		_ = unlockStoreDir(lock)
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	exact, err := openExact(filepath.Join(dir, exactDirName), ExactConfig{}, durability, readers)
 	if err != nil {
 		_ = perceptual.Close()
-		_ = unlockStoreDir(lock)
+		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
 	// The joint anchor is advisory only: a missing file means a pre-V1
@@ -331,11 +334,11 @@ func (s *Store) Close() error {
 		result = errors.Join(result, s.exact.Close())
 	}
 	if s.lock != nil {
-		result = errors.Join(result, unlockStoreDir(s.lock))
+		result = errors.Join(result, indexutil.ReleaseLock(s.lock))
 	}
 	return result
 }
 
-// Directory locking lives in lock_unix.go (flock), lock_windows.go
-// (LockFileEx), and lock_other.go (explicit unsupported error), selected
-// by build tags. See those files for the per-platform contracts.
+// Directory locking lives in internal/indexutil (flock on Unix, LockFileEx
+// on Windows, explicit unsupported error elsewhere), selected by build
+// tags. See the filelock files there for the per-platform contracts.

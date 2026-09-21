@@ -24,6 +24,10 @@ type delta struct {
 	opCount  uint32 // single-writer owned
 }
 
+// newDelta allocates fixed-capacity planes plus an open-addressed state
+// table sized for load at most one half, so probes stay short. Capacity
+// is bounded by Config validation; the table loop below would otherwise
+// spin its shift into overflow on absurd inputs.
 func newDelta(capacity int) *delta {
 	tableSize := 4
 	for tableSize < capacity*2 {
@@ -140,6 +144,10 @@ func (d *delta) hasState(id ImageID) bool {
 	return ok
 }
 
+// stableVersion spins until the seqlock version is even. Every writer
+// bumps it in pairs around each append and reset, so an odd observation
+// always resolves; a writer that died mid-append would hang readers,
+// which is acceptable because only the single writer loop mutates.
 func (d *delta) stableVersion() uint64 {
 	for {
 		version := d.version.Load()
@@ -151,6 +159,8 @@ func (d *delta) stableVersion() uint64 {
 
 func (d *delta) reset() {
 	d.version.Add(1)
+	// Stale keys stay in place: used==0 marks the slot free, and only
+	// used gates lookups, so clearing keys would be pure bandwidth cost.
 	for i := range d.stateUsed {
 		d.stateMeta[i].Store(0)
 		d.stateUsed[i].Store(0)

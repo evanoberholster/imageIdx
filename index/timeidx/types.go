@@ -7,6 +7,8 @@ import (
 	"math"
 
 	imageidx "github.com/evanoberholster/imageIdx"
+	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/internal/persist"
 )
 
 type ImageID = imageidx.ImageID
@@ -18,6 +20,18 @@ const TimestampShift uint8 = 24
 const (
 	DefaultBlockSize     = 65_536
 	DefaultDeltaCapacity = 2_048
+
+	// maxBlockSize caps one base block so per-block slices stay well
+	// below allocation-panic territory and uint32 count fields never
+	// truncate.
+	maxBlockSize = 1 << 24
+	// maxDeltaCapacity caps one delta so its planes plus hash table
+	// stay bounded (~200 bytes per entry worst case across the
+	// active/frozen/spare trio).
+	maxDeltaCapacity = 1 << 20
+	// maxQueueCapacity caps writer channels, which hold pointers and
+	// batch shells only.
+	maxQueueCapacity = 1 << 16
 )
 
 var (
@@ -33,6 +47,19 @@ var (
 	ErrNotPersistent      = errors.New("timeidx: index is not persistent")
 	ErrUninitializedBatch = errors.New("timeidx: write batch was not created with NewBatch")
 	ErrUnsupportedEndian  = errors.New("timeidx: mmap format requires a little-endian host")
+	ErrUnsupported        = errors.New("timeidx: unsupported format")
+	// ErrStoreBusy reports another process holding the store lock. It
+	// aliases indexutil.ErrBusy; see internal/indexutil.
+	ErrStoreBusy = indexutil.ErrBusy
+	// ErrStoreExists reports creating a store in a non-empty directory.
+	// It aliases indexutil.ErrExists; see internal/indexutil.
+	ErrStoreExists = indexutil.ErrExists
+	// ErrRecoveryRequired reports a WAL failure that latched the index:
+	// every later write and maintenance call fails with it until the
+	// index is closed and reopened. It aliases persist.ErrWALFailed.
+	// Recovery is close plus reopen: replay restores the last durable
+	// prefix and reports a torn tail as a clean stop or ErrCorruptWAL.
+	ErrRecoveryRequired = persist.ErrWALFailed
 )
 
 func encodeTimemarker(timestamp, offset uint64) timemarker {
@@ -119,6 +146,13 @@ func (c Config) withDefaults() (Config, error) {
 		c.CompactionQueue = 16
 	}
 	if c.BlockSize < 1 || c.DeltaCapacity < 2 {
+		return Config{}, ErrInvalidConfig
+	}
+	// Upper bounds keep worst-case allocations (delta planes and hash
+	// tables, channel buffers, WAL scratch) far from overflow and panic
+	// on every platform, including 32-bit int arithmetic.
+	if c.BlockSize > maxBlockSize || c.DeltaCapacity > maxDeltaCapacity ||
+		c.WriteQueueCapacity > maxQueueCapacity || c.CompactionQueue > maxQueueCapacity {
 		return Config{}, ErrInvalidConfig
 	}
 	return c, nil

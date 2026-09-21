@@ -57,6 +57,23 @@ func (w *timestampWAL) appendBatch(writes []write, durability Durability) error 
 	return w.WriteRecord(record, durability == DurabilitySync)
 }
 
+// validateWALFrame resolves one frame header to its payload size. Count
+// and size arrive as uint16/uint32 fields compared in int arithmetic:
+// both fit comfortably (at most 65535 writes), so no truncation can hide
+// a malformed size the way a 32-bit multiply could. Shared by both replay
+// entry points and the fuzz target so all three validate identically.
+func validateWALFrame(header []byte) (uint64, error) {
+	if len(header) < 12 {
+		return 0, ErrCorruptWAL
+	}
+	count := int(binary.LittleEndian.Uint16(header[6:8]))
+	payloadSize := int(binary.LittleEndian.Uint32(header[8:12]))
+	if payloadSize != count*walWriteSize {
+		return 0, ErrCorruptWAL
+	}
+	return uint64(payloadSize), nil
+}
+
 // replayWALEnd is replayWAL plus the exclusive end of the last complete
 // frame, used by Vacuum to carry only complete frames into a fresh epoch.
 func replayWALEnd(path string, offset int64) (int64, error) {
@@ -65,14 +82,7 @@ func replayWALEnd(path string, offset int64) (int64, error) {
 		Magic:      walMagic,
 		Version:    walVersion,
 		Corrupt:    ErrCorruptWAL,
-	}, func(header []byte) (uint64, error) {
-		count := int(binary.LittleEndian.Uint16(header[6:8]))
-		payloadSize := int(binary.LittleEndian.Uint32(header[8:12]))
-		if payloadSize != count*walWriteSize {
-			return 0, ErrCorruptWAL
-		}
-		return uint64(payloadSize), nil
-	}, func(header, payload []byte) error {
+	}, validateWALFrame, func(header, payload []byte) error {
 		if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(header[12:16]) {
 			return ErrCorruptWAL
 		}

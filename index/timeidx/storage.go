@@ -22,6 +22,7 @@ const (
 	formatAlignment           = 8
 	walPattern                = "timestamp-%020d.wal"
 	walGlob                   = "timestamp-*.wal"
+	storeLockName             = ".timeidx.lock"
 )
 
 var ErrCorruptManifest = errors.New("timeidx: corrupt manifest")
@@ -56,15 +57,23 @@ type persistentState struct {
 	mappings   [][]byte
 }
 
-// NewPersistent creates a persistent index and publishes its initial
-// checkpoint.
+// NewPersistent creates and locks a store directory, then creates a
+// persistent index and publishes its initial checkpoint. The directory
+// must be empty; a held lock reports ErrStoreBusy.
 func NewPersistent(storeDir string, spec Spec, config Config, durability Durability) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+	lock, err := indexutil.AcquireLock(storeDir, storeLockName, true)
+	if err != nil {
 		return nil, err
 	}
+	locked := true
+	defer func() {
+		if locked {
+			_ = indexutil.ReleaseLock(lock)
+		}
+	}()
 	index, err := New(spec, config)
 	if err != nil {
 		return nil, err
@@ -79,10 +88,16 @@ func NewPersistent(storeDir string, spec Spec, config Config, durability Durabil
 		_ = index.Close()
 		return nil, err
 	}
+	index.lock = lock
+	locked = false
 	return index, nil
 }
 
 // OpenPersistent maps the published base generation and replays the WAL tail.
+// Block sizing is open-time policy, not persisted state: the files record
+// offsets and counts only, so a different BlockSize or DeltaCapacity than
+// the writer used changes memory use and compaction cadence, never the
+// logical contents.
 func OpenPersistent(storeDir string, config Config, durability Durability) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
@@ -91,6 +106,16 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 	if err != nil {
 		return nil, err
 	}
+	lock, err := indexutil.AcquireLock(storeDir, storeLockName, false)
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = indexutil.ReleaseLock(lock)
+		}
+	}()
 	manifest, err := readManifest(filepath.Join(storeDir, "manifest"))
 	if err != nil {
 		return nil, err
@@ -206,10 +231,85 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 		return nil, err
 	}
 	index.persistence.wal = wal
+	// Ownership transfers: Close now releases the lock, so disarm the
+	// error-path unlock above.
+	index.lock = lock
+	ok = true
 	return index, nil
 }
 
-// Checkpoint writes and atomically publishes a new base generation.
+// Verify validates a store directory offline without opening it: the
+// manifest, generation headers, block directory ordering, page CRCs and
+// alignment, and the referenced WAL file's presence. Mappings are
+// read-only and released before return; the WAL is never replayed and no
+// handles outlive the call. Best run on a closed store: concurrent
+// maintenance may move files underfoot and surface transient errors.
+func Verify(dir string) error {
+	manifest, err := readManifest(filepath.Join(dir, "manifest"))
+	if err != nil {
+		return err
+	}
+	markersPath, idsPath, blocksPath := generationPaths(dir, manifest.generation)
+	markersMapping, err := persist.MapFile(markersPath, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = persist.Unmap(markersMapping) }()
+	idsMapping, err := persist.MapFile(idsPath, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = persist.Unmap(idsMapping) }()
+	if len(markersMapping)%formatAlignment != 0 || len(idsMapping)%formatAlignment != 0 {
+		return ErrCorruptManifest
+	}
+	directoryBytes, err := os.ReadFile(blocksPath)
+	if err != nil {
+		return err
+	}
+	if len(directoryBytes)%formatAlignment != 0 {
+		return ErrCorruptManifest
+	}
+	// Sizing is runtime policy only: persisted state is sizing-agnostic,
+	// so verification uses defaults exactly as a fresh open would.
+	cfg, err := Config{}.withDefaults()
+	if err != nil {
+		return err
+	}
+	directory, err := decodeDirectory(directoryBytes, markersMapping, idsMapping, cfg)
+	if err != nil {
+		return err
+	}
+	if uint64(len(directory.entries)) != manifest.blockCount {
+		return ErrCorruptManifest
+	}
+	var persistedCount uint64
+	for _, entry := range directory.entries {
+		if entry.meta.Generation != manifest.generation {
+			return ErrCorruptManifest
+		}
+		persistedCount += uint64(entry.meta.Count)
+	}
+	if persistedCount != manifest.count || directory.entries[0].startMarker != 0 ||
+		directory.entries[len(directory.entries)-1].endMarker != markerSpaceEnd {
+		return ErrCorruptManifest
+	}
+	if _, err := os.Stat(walPath(dir, manifest.walEpoch)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Checkpoint writes and atomically publishes a new base generation. A
+// latched WAL failure fails fast with ErrRecoveryRequired.
+//
+// Checkpoint takes only a read lock, so batches published concurrently
+// land both in the snapshot and in the recorded WAL tail, and open
+// replays them a second time. Replay stays correct by collapse: the
+// per-ID delta state tables always resolve to the latest operation, so a
+// doubled insert or delete reads identically (at the cost of transient
+// delta space until compaction). Checkpoint-then-reopen is therefore
+// idempotent at read time by construction, not by deduplication.
 func (i *Index) Checkpoint() error {
 	i.lifecycle.RLock()
 	defer i.lifecycle.RUnlock()
@@ -218,6 +318,9 @@ func (i *Index) Checkpoint() error {
 	}
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	if err := i.failedErr(); err != nil {
+		return err
 	}
 	i.persistence.mu.Lock()
 	defer i.persistence.mu.Unlock()
@@ -235,11 +338,11 @@ func (i *Index) Checkpoint() error {
 	generation := i.generation.Load() + 1
 	markersPath, idsPath, blocksPath := generationPaths(i.persistence.dir, generation)
 	markerTemp, idTemp, blockTemp := markersPath+".tmp", idsPath+".tmp", blocksPath+".tmp"
-	markerFile, err := os.OpenFile(markerTemp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	markerFile, err := os.OpenFile(markerTemp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	idFile, err := os.OpenFile(idTemp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	idFile, err := os.OpenFile(idTemp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		_ = markerFile.Close()
 		return err
@@ -331,9 +434,12 @@ func (i *Index) Checkpoint() error {
 
 // Vacuum publishes a checkpoint, rolls the WAL to a fresh epoch carrying
 // over the post-checkpoint tail, and removes obsolete generations and WAL
-// epochs. Writers stall briefly on the lifecycle lock; readers never block.
-// Mappings are left alone: live views alias them, so only Close releases
-// them. Generation retention beyond the published generation remains a
+// epochs. It does not rewrite or filter base data: unlike the other index
+// packages, timeidx Vacuum compacts nothing and drops no records —
+// per-block deltas keep folding in the background regardless. Writers
+// stall briefly on the lifecycle lock; readers never block. Mappings are
+// left alone: live views alias them, so only Close releases them.
+// Generation retention beyond the published generation remains a
 // storage-owner policy exercised by calling Vacuum.
 func (i *Index) Vacuum() error {
 	if i.persistence == nil || i.persistence.wal == nil {
@@ -355,6 +461,9 @@ func (i *Index) Vacuum() error {
 	if i.closed.Load() {
 		return ErrClosed
 	}
+	if err := i.failedErr(); err != nil {
+		return err
+	}
 	i.persistence.mu.Lock()
 	manifest, err := readManifest(filepath.Join(i.persistence.dir, "manifest"))
 	if err != nil {
@@ -372,7 +481,7 @@ func (i *Index) Vacuum() error {
 	}
 	if res := <-result; res.err != nil {
 		_ = os.Remove(walPath(i.persistence.dir, epoch))
-		return res.err
+		return i.fail(res.err)
 	}
 
 	i.persistence.mu.Lock()
@@ -454,16 +563,7 @@ func (i *Index) OnDiskBytes() uint64 {
 	if i.persistence == nil {
 		return 0
 	}
-	var total uint64
-	for _, pattern := range []string{"markers.*.base", "ids.*.base", "blocks.*.idx", walGlob, "manifest"} {
-		matches, _ := filepath.Glob(filepath.Join(i.persistence.dir, pattern))
-		for _, path := range matches {
-			if info, err := os.Stat(path); err == nil {
-				total += uint64(info.Size())
-			}
-		}
-	}
-	return total
+	return indexutil.DirSize(i.persistence.dir, "markers.*.base", "ids.*.base", "blocks.*.idx", walGlob, "manifest")
 }
 
 func snapshotBase(view *blockView) *base {
@@ -535,7 +635,7 @@ func writeImageIDs(file *os.File, ids []ImageID) error {
 }
 
 func writeDirectory(path string, entries []blockEntry) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -634,10 +734,20 @@ func readManifest(path string) (diskManifest, error) {
 	if err != nil {
 		return diskManifest{}, err
 	}
-	if err := persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 84, 84); err != nil {
-		return diskManifest{}, ErrCorruptManifest
+	return decodeManifest(data)
+}
+
+// decodeManifest validates manifest bytes without touching the
+// filesystem, so fuzz targets and offline verification share the open
+// path exactly.
+func decodeManifest(data []byte) (diskManifest, error) {
+	// A recognized magic with an unknown version is a newer format, not
+	// corruption: fail open with ErrUnsupported so callers never misread
+	// it as same-version bit rot.
+	if magic, version, ok := persist.PeekHeader(data); ok && magic == manifestMagic && version != manifestVersion {
+		return diskManifest{}, ErrUnsupported
 	}
-	if data[6] != TimestampShift {
+	if err := persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 84, 84); err != nil {
 		return diskManifest{}, ErrCorruptManifest
 	}
 	manifest := diskManifest{

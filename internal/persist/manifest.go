@@ -24,6 +24,17 @@ func BuildManifest(size int, magic uint32, version uint16, crcCovered, crcAt int
 	return data
 }
 
+// PeekHeader splits magic and version from framed bytes without
+// validating anything else. ok is false when fewer than 6 bytes are
+// present. Callers compare against their expected magic and version to
+// tell newer formats (unsupported) apart from corruption.
+func PeekHeader(data []byte) (magic uint32, version uint16, ok bool) {
+	if len(data) < 6 {
+		return 0, 0, false
+	}
+	return binary.LittleEndian.Uint32(data[0:4]), binary.LittleEndian.Uint16(data[4:6]), true
+}
+
 // VerifyManifest checks size, magic, version, and the trailing checksum.
 func VerifyManifest(data []byte, size int, magic uint32, version uint16, crcCovered, crcAt int) error {
 	if len(data) != size || binary.LittleEndian.Uint32(data[0:4]) != magic ||

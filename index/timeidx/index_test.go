@@ -271,3 +271,34 @@ func equalIDSet(got, want []ImageID) bool {
 	slices.Sort(want)
 	return slices.Equal(got, want)
 }
+
+// TestDoubleApplyCollapses proves the replay-idempotence property
+// Checkpoint documents: applying the same batch twice (as open replay
+// does for writes covered by both snapshot and WAL tail) reads
+// identically, because per-ID delta state always resolves to the latest
+// operation.
+func TestDoubleApplyCollapses(t *testing.T) {
+	const offset = uint64(1_000)
+	index := mustNewIndex(t, []Entry{
+		{Timestamp: offset + testQuantum, ImageID: 1},
+	}, offset, Config{BlockSize: 2, DeltaCapacity: 16})
+	apply := func() {
+		t.Helper()
+		batch := NewBatch(3)
+		batch.Append(Insert(2, offset+2*testQuantum))
+		batch.Append(Move(1, offset+testQuantum, offset+3*testQuantum))
+		if err := index.Apply(batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply()
+	apply()
+	all := index.Search(make([]ImageID, 0, 4), offset, offset+4*testQuantum)
+	if !equalIDSet(all, []ImageID{1, 2}) {
+		t.Fatalf("doubled batch reads %v, want IDs 1 and 2 once each", all)
+	}
+	moved := index.Search(make([]ImageID, 0, 2), offset+3*testQuantum, offset+4*testQuantum)
+	if !equalIDSet(moved, []ImageID{1}) {
+		t.Fatalf("moved range reads %v, want [1]", moved)
+	}
+}

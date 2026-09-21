@@ -1,6 +1,6 @@
 package timeidx
 
-import "sort"
+import "slices"
 
 type base struct {
 	markers  []timemarker
@@ -30,11 +30,17 @@ func (b *base) rangeIndexes(lo, hi uint64) (int, int) {
 	if b == nil || lo >= hi {
 		return 0, 0
 	}
-	start := sort.Search(len(b.markers), func(i int) bool {
-		return uint64(b.markers[i]) >= lo
+	start, _ := slices.BinarySearchFunc(b.markers, lo, func(marker timemarker, bound uint64) int {
+		if uint64(marker) < bound {
+			return -1
+		}
+		return 1
 	})
-	end := sort.Search(len(b.markers), func(i int) bool {
-		return uint64(b.markers[i]) >= hi
+	end, _ := slices.BinarySearchFunc(b.markers, hi, func(marker timemarker, bound uint64) int {
+		if uint64(marker) < bound {
+			return -1
+		}
+		return 1
 	})
 	return start, end
 }

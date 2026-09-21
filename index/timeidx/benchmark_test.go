@@ -9,6 +9,10 @@ import (
 	"testing"
 )
 
+// BenchmarkSearch pins hot range-scan cost across narrow/medium/broad
+// widths: 0 allocs past the caller buffer, and time scaling with matches
+// scanned, not index size. Absolute ns/op moves with the machine; watch
+// allocs/op (must stay zero) and the width trend across commits.
 func BenchmarkSearch(b *testing.B) {
 	benchmarkSearchSize(b, 1_000_000)
 }
@@ -61,6 +65,10 @@ func benchmarkSearchSize(b *testing.B, size int) {
 	}
 }
 
+// BenchmarkUpdate measures single-write publish latency through the
+// writer loop, including WAL append and delta staging. Backpressure
+// retries are part of the measured path via submitWithBackpressure;
+// regressions show up first in allocs/op, then ns/op.
 func BenchmarkUpdate(b *testing.B) {
 	index, _ := benchmarkIndex(b, 65_536, Config{DeltaCapacity: 4_096})
 	batch := NewBatch(1)

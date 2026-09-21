@@ -1,8 +1,11 @@
 package timeidx
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"errors"
+	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -43,8 +46,41 @@ type Index struct {
 	workers       sync.WaitGroup
 	writerNeeds   []uint32
 	writerTouched []int
+	// writerMarks and writerBlocks cache per-write marker encodings and
+	// block indexes from applyBatch validation, so the append pass
+	// neither re-encodes timestamps nor re-searches the directory.
+	// Writer-loop owned and reused across batches.
+	writerMarks  []uint64
+	writerBlocks []int
+
+	// failMu guards failed, the latched first WAL error. While set,
+	// writes fail fast and maintenance refuses, until close and reopen.
+	failMu sync.Mutex
+	failed error
+
+	// lock is the store directory lock, nil for in-memory indexes.
+	lock *os.File
 
 	persistence *persistentState
+}
+
+// fail latches the first WAL error wrapped with ErrRecoveryRequired and
+// reports the latched error. Later failures keep the first one so the
+// recovery story stays singular.
+func (i *Index) fail(err error) error {
+	i.failMu.Lock()
+	defer i.failMu.Unlock()
+	if i.failed == nil {
+		i.failed = errors.Join(ErrRecoveryRequired, err)
+	}
+	return i.failed
+}
+
+// failedErr reports the latched WAL failure, if any.
+func (i *Index) failedErr() error {
+	i.failMu.Lock()
+	defer i.failMu.Unlock()
+	return i.failed
 }
 
 // New constructs an in-memory index from stable metadata and canonical
@@ -68,11 +104,13 @@ func New(spec Spec, config Config) (*Index, error) {
 		}
 		prepared[i] = indexedRecord{marker: marker, timestamp: record.Timestamp, imageID: record.ImageID}
 	}
-	sort.Slice(prepared, func(i, j int) bool {
-		if prepared[i].marker != prepared[j].marker {
-			return prepared[i].marker < prepared[j].marker
+	// SortFunc avoids sort.Slice's reflective dispatch on the bulk-load
+	// path; ordering matches newBase's validation exactly.
+	slices.SortFunc(prepared, func(a, b indexedRecord) int {
+		if result := cmp.Compare(a.marker, b.marker); result != 0 {
+			return result
 		}
-		return prepared[i].imageID < prepared[j].imageID
+		return cmp.Compare(a.imageID, b.imageID)
 	})
 
 	directory := buildDirectory(prepared, spec.Offset, config)
@@ -211,7 +249,12 @@ func (i *Index) Close() error {
 		i.workers.Wait()
 		i.readers.WaitForPriorReaders()
 		if i.persistence != nil && i.persistence.wal != nil {
-			closeErr = i.persistence.wal.Close()
+			// An already-closed handle reports os.ErrClosed, which is
+			// tolerated so a broken WAL can never brick cleanup (and
+			// with it, lock release); any other error propagates.
+			if err := i.persistence.wal.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				closeErr = err
+			}
 		}
 		if i.persistence != nil {
 			for _, mapping := range i.persistence.mappings {
@@ -219,6 +262,11 @@ func (i *Index) Close() error {
 					closeErr = err
 				}
 			}
+		}
+		// Last: releasing the directory lock admits the next opener.
+		// A nil lock (in-memory index) is a no-op.
+		if err := indexutil.ReleaseLock(i.lock); err != nil && closeErr == nil {
+			closeErr = err
 		}
 	})
 	return closeErr

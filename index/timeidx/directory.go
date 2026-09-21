@@ -1,6 +1,6 @@
 package timeidx
 
-import "sort"
+import "slices"
 
 const markerSpaceEnd uint64 = 1 << 32
 
@@ -15,23 +15,27 @@ type blockDirectory struct {
 	entries []blockEntry
 }
 
+// firstOverlapping returns the first block whose range extends past
+// marker. Blocks tile [0, markerSpaceEnd) contiguously, so every marker
+// below the space end overlaps exactly one block.
 func (d *blockDirectory) firstOverlapping(marker uint64) int {
-	return sort.Search(len(d.entries), func(i int) bool {
-		return d.entries[i].endMarker > marker
+	index, _ := slices.BinarySearchFunc(d.entries, marker, func(entry blockEntry, bound uint64) int {
+		if entry.endMarker <= bound {
+			return -1
+		}
+		return 1
 	})
+	return index
 }
 
 func (d *blockDirectory) blockFor(marker uint64) int {
 	if len(d.entries) == 1 {
 		return 0
 	}
-	index := sort.Search(len(d.entries), func(i int) bool {
-		return d.entries[i].endMarker > marker
-	})
-	if index == len(d.entries) {
-		return len(d.entries) - 1
+	if index := d.firstOverlapping(marker); index != len(d.entries) {
+		return index
 	}
-	return index
+	return len(d.entries) - 1
 }
 
 func timestampForBoundary(marker, offset uint64) uint64 {

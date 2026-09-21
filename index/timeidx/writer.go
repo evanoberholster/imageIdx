@@ -81,11 +81,22 @@ type Batch struct {
 	inFlight atomic.Bool
 }
 
+// maxBatchCapacity caps Batch capacity so the doubled write backing
+// (moves expand to two private writes) stays bounded and capacity*2 can
+// never overflow. Larger logical batches must be split by the caller;
+// Append reports full past the cap exactly as for a filled batch.
+const maxBatchCapacity = 1 << 20
+
 // NewBatch allocates capacity for logical mutations. Moves expand to two
-// private writes without growing the batch.
+// private writes without growing the batch. Note the WAL frame count is
+// uint16, so even a capped batch fails late with ErrBatchTooLarge past
+// 65535 writes; size batches accordingly (moves count double).
 func NewBatch(capacity int) *Batch {
 	if capacity < 0 {
 		capacity = 0
+	}
+	if capacity > maxBatchCapacity {
+		capacity = maxBatchCapacity
 	}
 	return &Batch{
 		writes:   make([]write, 0, capacity*2),
@@ -137,7 +148,12 @@ func (b *Batch) Len() int {
 }
 
 // Apply sends one reusable batch through the single-owner writer and waits for
-// its atomic acceptance or rejection.
+// its atomic acceptance or rejection. Acceptance is atomic: validation and
+// the single WAL append either happen for the whole batch or fail it whole.
+// Visibility is per write, not per batch: deltas append in place, so a
+// concurrent reader may observe a batch prefix before the writer finishes;
+// the seqlock retry only guarantees no torn reads. A latched WAL failure
+// fails fast with ErrRecoveryRequired until close and reopen.
 func (i *Index) Apply(batch *Batch) error {
 	i.lifecycle.RLock()
 	defer i.lifecycle.RUnlock()
@@ -146,6 +162,9 @@ func (i *Index) Apply(batch *Batch) error {
 	}
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	if err := i.failedErr(); err != nil {
+		return err
 	}
 	if !batch.inFlight.CompareAndSwap(false, true) {
 		return ErrBatchInFlight
@@ -161,24 +180,30 @@ func (i *Index) Apply(batch *Batch) error {
 	return err
 }
 
+// drainStopped rejects everything still queued after stop with ErrClosed.
+// It runs only on the writer loop; the channel selects never block because
+// every case either receives or falls through to default.
+func (i *Index) drainStopped() {
+	for {
+		select {
+		case batch := <-i.writes:
+			batch.done <- ErrClosed
+		case req := <-i.rotate:
+			req.result <- rotateResult{err: ErrClosed}
+		default:
+			return
+		}
+	}
+}
+
 func (i *Index) writerLoop() {
 	defer i.workers.Done()
 	stopping := false
 	outstanding := 0
 	for {
 		if stopping {
-			for {
-				select {
-				case batch := <-i.writes:
-					batch.done <- ErrClosed
-				case req := <-i.rotate:
-					req.result <- rotateResult{err: ErrClosed}
-				default:
-					goto drained
-				}
-			}
+			i.drainStopped()
 		}
-	drained:
 		if stopping && outstanding == 0 {
 			close(i.compactions)
 			return
@@ -219,6 +244,8 @@ func (i *Index) applyBatch(writes []write) (int, error) {
 	}
 	directory := i.directory.Load()
 	i.writerTouched = i.writerTouched[:0]
+	i.writerMarks = i.writerMarks[:0]
+	i.writerBlocks = i.writerBlocks[:0]
 	for _, write := range writes {
 		if write.op != writeAdd && write.op != writeDelete {
 			i.clearWriterNeeds()
@@ -234,6 +261,8 @@ func (i *Index) applyBatch(writes []write) (int, error) {
 			i.writerTouched = append(i.writerTouched, blockIndex)
 		}
 		i.writerNeeds[blockIndex]++
+		i.writerMarks = append(i.writerMarks, uint64(marker))
+		i.writerBlocks = append(i.writerBlocks, blockIndex)
 	}
 
 	for _, blockIndex := range i.writerTouched {
@@ -252,7 +281,7 @@ func (i *Index) applyBatch(writes []write) (int, error) {
 	if i.persistence != nil && i.persistence.wal != nil {
 		if err := i.persistence.wal.appendBatch(writes, i.persistence.durability); err != nil {
 			i.clearWriterNeeds()
-			return 0, err
+			return 0, i.fail(err)
 		}
 	}
 
@@ -266,12 +295,11 @@ func (i *Index) applyBatch(writes []write) (int, error) {
 		}
 	}
 
-	for _, write := range writes {
-		marker, _ := encodeTimemarkerChecked(write.timestamp, i.offset)
-		block := directory.entries[directory.blockFor(uint64(marker))].block
+	for index, write := range writes {
+		block := directory.entries[i.writerBlocks[index]].block
 		active := block.view.Load().active
 		if write.op == writeAdd {
-			active.appendAdd(marker, write.imageID)
+			active.appendAdd(timemarker(i.writerMarks[index]), write.imageID)
 		} else {
 			active.appendDelete(write.imageID)
 		}
@@ -285,8 +313,16 @@ func (i *Index) clearWriterNeeds() {
 		i.writerNeeds[blockIndex] = 0
 	}
 	i.writerTouched = i.writerTouched[:0]
+	i.writerMarks = i.writerMarks[:0]
+	i.writerBlocks = i.writerBlocks[:0]
 }
 
+// rotateBlock freezes the active delta and publishes a fresh one from the
+// block's spare. It runs only on the writer loop. A nil spare with no
+// frozen layer is unreachable: the spare starts populated, every rotation
+// consumes it while publishing a frozen layer, and the backpressure guard
+// in applyBatch refuses further rotations until compaction reclaims one.
+// So a rotation always lands with somewhere to write.
 func (i *Index) rotateBlock(block *block, expected *blockView) {
 	newActive := block.spare
 	block.spare = nil

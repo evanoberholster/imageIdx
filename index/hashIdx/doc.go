@@ -135,9 +135,9 @@
 //	perceptual/    perceptual Index artifacts
 //	exact/         ExactIndex artifacts
 //
-// The single-writer lock is flock on Unix and LockFileEx on Windows
-// (see lock_unix.go, lock_windows.go); other platforms fail fast instead
-// of running unlocked. Mmap-backed reads are Unix-only until
+// The single-writer lock is flock on Unix and LockFileEx on Windows (see
+// the filelock files in internal/indexutil); other platforms fail fast
+// instead of running unlocked. Mmap-backed reads are Unix-only until
 // internal/indexutil gains a MapViewOfFile backend, so Windows support
 // also waits on that.
 //

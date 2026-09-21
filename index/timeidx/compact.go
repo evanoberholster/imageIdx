@@ -33,6 +33,12 @@ func compareCompactRecord(a, b compactRecord) int {
 	return cmp.Compare(a.id, b.id)
 }
 
+// compactorLoop folds frozen deltas into replacement bases. At most one
+// task per block is ever outstanding: applyBatch refuses rotations while
+// a frozen layer is pending, so the CompareAndSwap below cannot lose a
+// race in practice. The failure branch stays as defense in depth —
+// without it a lost swap would wedge its block in permanent backpressure,
+// since the frozen layer would never clear and no spare would return.
 func (i *Index) compactorLoop() {
 	defer i.workers.Done()
 	for task := range i.compactions {
