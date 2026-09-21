@@ -65,7 +65,10 @@ func decodeBlockHeader(data []byte) (uint32, error) {
 	}
 	count := binary.LittleEndian.Uint32(data[8:12])
 	payloadLen := binary.LittleEndian.Uint32(data[12:16])
-	if payloadLen != count*RecordSize {
+	// 64-bit compare: uint32 multiplication would truncate counts above
+	// 2^32/40 (e.g. 0x20000000 claims a zero-length payload), passing a
+	// corrupt header that later slices out of range downstream.
+	if uint64(payloadLen) != uint64(count)*RecordSize {
 		return 0, ErrCorrupt
 	}
 	if uint64(len(data))-blockHeaderSize < uint64(payloadLen) {

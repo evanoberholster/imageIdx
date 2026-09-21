@@ -7,6 +7,7 @@ import (
 	"math/bits"
 
 	imageidx "github.com/evanoberholster/imageIdx"
+	"github.com/evanoberholster/imageIdx/internal/persist"
 	"github.com/zeebo/blake3"
 )
 
@@ -29,6 +30,12 @@ var (
 	ErrCorrupt       = errors.New("hashidx: corrupt index")
 	ErrCorruptWAL    = errors.New("hashidx: corrupt write-ahead log")
 	ErrUnsupported   = errors.New("hashidx: unsupported format")
+	// ErrRecoveryRequired reports a WAL failure that latched the index:
+	// every later write and maintenance call fails with it until the
+	// index is closed and reopened. It aliases persist.ErrWALFailed.
+	// Recovery is close plus reopen: replay restores the last durable
+	// prefix and reports a torn tail as a clean stop or ErrCorruptWAL.
+	ErrRecoveryRequired = persist.ErrWALFailed
 )
 
 // Ordinal is an internal physical position in the shared SoA space. Ordinals
@@ -66,8 +73,16 @@ type CandidateSet interface {
 const DefaultRecordsPerPage uint32 = 8192
 
 // DefaultMaxApplyEntries bounds one perceptual Apply batch by default:
-// 65536 records frame to ~3 MiB of WAL payload and publish once.
+// 65536 records frame to ~3 MiB of WAL payload and publish once. It is
+// larger than the exact default because page appends scale better per
+// entry than block rewrites. Provisional: tuned on Apple Silicon; see
+// BenchmarkApply10000 before changing it.
 const DefaultMaxApplyEntries uint32 = 65536
+
+// maxBatchEntriesLimit caps configured batch sizes so one framed WAL
+// record stays below maxWALFrameBytes on every platform, including
+// 32-bit int arithmetic in the append paths.
+const maxBatchEntriesLimit = 1 << 20
 
 const (
 	minRecordsPerPage = 8
@@ -106,6 +121,12 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	if c.MaxBatchEntries == 0 {
 		c.MaxBatchEntries = DefaultMaxApplyEntries
+	}
+	// Bound batches so one framed WAL record (entries × 48 bytes) stays
+	// far below allocation-panic territory; the append path enforces the
+	// byte-exact limit.
+	if c.MaxBatchEntries > maxBatchEntriesLimit {
+		return Config{}, ErrInvalidConfig
 	}
 	return c, nil
 }
@@ -207,12 +228,15 @@ const (
 	DefaultBlockSize = 16 * 1024
 	// DefaultTargetFillPct is the post-split occupancy target.
 	DefaultTargetFillPct = 80
-	// DefaultMaxBatchEntries bounds one Apply batch by default.
+	// DefaultMaxBatchEntries bounds one Apply batch by default. It is
+	// smaller than the perceptual default because exact publishes rewrite
+	// blocks per affected key range rather than appending pages.
 	DefaultMaxBatchEntries = 8_192
 	// DefaultOverlayMaxEntries stages up to 512 entries (~20 KiB) before
 	// folding. Overlay probes stay within a 9-step binary search, keeping
 	// steady-state reads near base cost while small publishes avoid the
-	// directory copy entirely.
+	// directory copy entirely. Provisional: tuned on Apple Silicon; see
+	// BenchmarkPublishScalingVsBlocks before changing it.
 	DefaultOverlayMaxEntries = 512
 )
 
@@ -235,13 +259,13 @@ func (c ExactConfig) withDefaults() (ExactConfig, error) {
 	if c.OverlayMaxEntries == 0 {
 		c.OverlayMaxEntries = DefaultOverlayMaxEntries
 	}
+	if c.MaxBatchEntries > maxBatchEntriesLimit {
+		return ExactConfig{}, ErrInvalidConfig
+	}
 	if c.BlockSize < minBlockSize || c.BlockSize > maxBlockSize {
 		return ExactConfig{}, ErrInvalidConfig
 	}
 	if c.TargetFillPct < 50 || c.TargetFillPct > 100 {
-		return ExactConfig{}, ErrInvalidConfig
-	}
-	if c.MaxBatchEntries == 0 {
 		return ExactConfig{}, ErrInvalidConfig
 	}
 	if maxRecordsPerBlock(c.BlockSize) < 2 {

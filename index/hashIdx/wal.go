@@ -12,6 +12,12 @@ const (
 	walVersion    uint16 = 1
 	walHeaderSize        = 32
 	walEntrySize         = 48 // ImageID8 + PHash64 8 + PDQ 32
+
+	// maxWALFrameBytes bounds one framed WAL record. Past it the append
+	// fails cleanly with ErrBatchTooLarge instead of growing scratch
+	// toward an out-of-memory panic. It comfortably exceeds the
+	// configured batch-entry caps below.
+	maxWALFrameBytes = 64 << 20
 )
 
 // openHashWAL opens the framed append-batch WAL. Header layout
@@ -31,8 +37,8 @@ func appendHashWAL(w *persist.WAL, entries []Entry, durability Durability) error
 	if len(entries) == 0 {
 		return nil
 	}
-	if uint64(len(entries))*walEntrySize > ^uint64(uint32(0)) {
-		return ErrInvalidEntry
+	if uint64(len(entries))*walEntrySize > maxWALFrameBytes {
+		return ErrBatchTooLarge
 	}
 	record := w.Scratch(walHeaderSize + len(entries)*walEntrySize)
 	clear(record[:walHeaderSize])
@@ -125,6 +131,9 @@ func appendExactWAL(w *persist.WAL, adds, removes []ExactEntry, durability Durab
 	count := len(adds) + len(removes)
 	if count == 0 {
 		return nil
+	}
+	if uint64(count)*exactWALOpSize > maxWALFrameBytes {
+		return ErrBatchTooLarge
 	}
 	required := exactWALHeaderSize + count*exactWALOpSize
 	record := w.Scratch(required)

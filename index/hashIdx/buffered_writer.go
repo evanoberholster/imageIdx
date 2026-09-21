@@ -77,12 +77,27 @@ func (bw *BufferedWriter) Apply(entries []Entry) error {
 	}
 }
 
-// Flush publishes everything buffered so far in one Apply. It swaps the
+// Flush publishes everything submitted so far in one Apply: it first
+// drains submitted-but-unbuffered sends from the channel, then swaps the
 // buffer under the lock and publishes outside it, so concurrent Flush
-// calls and the worker never publish the same entries twice. On publish
+// calls and the worker never publish the same entries twice. Entries
+// submitted concurrently with the drain land in this flush or stay
+// buffered for the next one; nothing is lost either way. On publish
 // failure the entries are prepended back under the lock ahead of anything
 // queued meanwhile, so nothing is lost and order is preserved.
 func (bw *BufferedWriter) Flush() error {
+	for {
+		select {
+		case entries := <-bw.ch:
+			bw.mu.Lock()
+			bw.buf = append(bw.buf, entries)
+			bw.pending += len(entries)
+			bw.mu.Unlock()
+		default:
+			goto swapped
+		}
+	}
+swapped:
 	bw.mu.Lock()
 	entries := bw.buf
 	bw.buf = nil
@@ -166,25 +181,9 @@ func (bw *BufferedWriter) worker() {
 		case <-bw.tick.C:
 			_ = bw.Flush()
 		case <-bw.stop:
-			bw.drain()
-			return
-		}
-	}
-}
-
-// drain moves every channel leftover into the buffer, then flushes once.
-// It runs only on the stopping worker, after which no new channel takes
-// happen here; a concurrent public Flush may still publish first, in
-// which case this flush observes an empty buffer and is a no-op.
-func (bw *BufferedWriter) drain() {
-	for {
-		select {
-		case entries := <-bw.ch:
-			bw.mu.Lock()
-			bw.buf = append(bw.buf, entries)
-			bw.pending += len(entries)
-			bw.mu.Unlock()
-		default:
+			// Final flush: Flush drains the channel itself, so leftovers
+			// are covered. A concurrent public Flush may publish first,
+			// in which case this observes an empty buffer and is a no-op.
 			_ = bw.Flush()
 			return
 		}
