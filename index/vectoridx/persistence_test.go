@@ -116,8 +116,13 @@ func TestCrashTornTailRecovery(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate a crash mid-append: tear the last byte of the WAL tail.
-	walPath := path + ".wal"
+	// Simulate a crash mid-append: tear the last byte of the active WAL
+	// segment's tail.
+	segs, err := listWALSegments(path)
+	if err != nil || len(segs) == 0 {
+		t.Fatalf("list WAL segments: %v (%d)", err, len(segs))
+	}
+	walPath := segs[len(segs)-1].path
 	info, err := os.Stat(walPath)
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +166,7 @@ func TestCorruptFileDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustAddFloat(t, idx, 1, randFloatVec(rand.New(rand.NewSource(54)), Dim512))
-	if err := idx.Checkpoint(); err != nil {
+	if err := idx.Vacuum(); err != nil {
 		t.Fatal(err)
 	}
 	if err := idx.Close(); err != nil {
@@ -484,5 +489,504 @@ func TestSyncInMemoryReturnsNotPersistent(t *testing.T) {
 func TestCreateRejectsNegativeSyncInterval(t *testing.T) {
 	if _, err := Create(tempPath(t), testConfigFloat512(), DurabilityOS, WithSyncInterval(-time.Second)); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("negative sync interval = %v, want ErrInvalidConfig", err)
+	}
+}
+
+func TestWALSegmentRotationAndReplay(t *testing.T) {
+	path := tempPath(t)
+	// One 512-d float32 record frames to ~2KB, so 16 KiB segments rotate
+	// every handful of writes.
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync, WithWALSegmentBytes(16<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(63))
+	vecs := make(map[NodeID][]float32, 60)
+	for i := NodeID(1); i <= 60; i++ {
+		vec := randFloatVec(rng, Dim512)
+		vecs[i] = vec
+		mustAddFloat(t, idx, i, vec)
+	}
+	st := idx.Stats()
+	if st.WALSegments < 3 {
+		t.Fatalf("WALSegments = %d, want >= 3", st.WALSegments)
+	}
+	if st.WALBytes == 0 || st.WALBytesWritten == 0 {
+		t.Fatalf("WAL byte counters = %d/%d", st.WALBytes, st.WALBytesWritten)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync, WithWALSegmentBytes(16<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.LiveCount(); got != 60 {
+		t.Fatalf("LiveCount after segmented replay = %d, want 60", got)
+	}
+	for id, vec := range vecs {
+		results, err := reopened.SearchFloat32(vec, nil, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 || results[0].ImageID != ImageID(id) {
+			t.Fatalf("node %d self-search after segmented replay = %+v", id, results)
+		}
+	}
+}
+
+func TestWALCheckpointRemovesOldSegments(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync, WithWALSegmentBytes(16<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(64))
+	for i := NodeID(1); i <= 60; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if st := idx.Stats(); st.WALSegments < 3 {
+		t.Fatalf("WALSegments before checkpoint = %d, want >= 3", st.WALSegments)
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	st := idx.Stats()
+	if st.WALSegments != 1 {
+		t.Fatalf("WALSegments after checkpoint = %d, want 1", st.WALSegments)
+	}
+	if st.WALBytes != 0 {
+		t.Fatalf("WALBytes after checkpoint = %d, want 0", st.WALBytes)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.LiveCount(); got != 60 {
+		t.Fatalf("LiveCount after checkpoint cleanup = %d, want 60", got)
+	}
+}
+
+func TestLegacyWALMigration(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(65))
+	for i := NodeID(1); i <= 3; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segs, err := listWALSegments(path)
+	if err != nil || len(segs) != 1 {
+		t.Fatalf("segments = %v (%v), want 1", segs, err)
+	}
+	legacy := path + legacyWALSuffix
+	if err := os.Rename(segs[0].path, legacy); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatalf("Open with legacy WAL: %v", err)
+	}
+	if got := reopened.LiveCount(); got != 3 {
+		t.Fatalf("LiveCount after legacy migration = %d, want 3", got)
+	}
+	if reopened.Stats().WALSegments < 1 {
+		t.Fatalf("no segmented WAL after migration")
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy WAL still present: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWALTornOlderSegmentIsCorruption(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilityOS, WithWALSegmentBytes(16<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(66))
+	for i := NodeID(1); i <= 60; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segs, err := listWALSegments(path)
+	if err != nil || len(segs) < 3 {
+		t.Fatalf("segments = %d (%v), want >= 3", len(segs), err)
+	}
+	first := segs[0]
+	if err := os.Truncate(first.path, first.size-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, DurabilityOS); !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("Open with torn older segment = %v, want ErrCorruptWAL", err)
+	}
+}
+
+func TestCheckpointWritesDeltaWithoutBaseRewrite(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(67))
+	mustAddFloat(t, idx, 1, randFloatVec(rng, Dim512))
+	baseBefore, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	baseAfter, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseAfter.Size() != baseBefore.Size() {
+		t.Fatalf("base rewritten by delta checkpoint: %d -> %d", baseBefore.Size(), baseAfter.Size())
+	}
+	if st := idx.Stats(); st.Deltas != 1 || st.DeltaRecords != 1 || st.DeltaBytes == 0 {
+		t.Fatalf("delta stats after first checkpoint = %+v", st)
+	}
+	mustAddFloat(t, idx, 2, randFloatVec(rng, Dim512))
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.Deltas != 2 {
+		t.Fatalf("Deltas = %d, want 2", st.Deltas)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.LiveCount(); got != 2 {
+		t.Fatalf("LiveCount after delta reopen = %d, want 2", got)
+	}
+	if err := reopened.Verify(); err != nil {
+		t.Fatalf("Verify after delta reopen: %v", err)
+	}
+}
+
+func TestDeltaCheckpointCarriesDeletesAndUpdates(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(68))
+	for i := NodeID(1); i <= 20; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	for i := NodeID(1); i <= 5; i++ {
+		if err := idx.Delete(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated := randFloatVec(rng, Dim512)
+	if err := idx.Delete(6); err != nil {
+		t.Fatal(err)
+	}
+	mustAddFloat(t, idx, 6, updated)
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.DeltaTombstones != 5 || st.DeltaRecords != 15 {
+		t.Fatalf("delta stats = %+v, want 15 puts / 5 tombstones", st)
+	}
+	mustAddFloat(t, idx, 21, randFloatVec(rng, Dim512))
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.LiveCount(); got != 16 {
+		t.Fatalf("LiveCount = %d, want 16", got)
+	}
+	if err := reopened.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	results, err := reopened.SearchFloat32(updated, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ImageID != 6 || results[0].Score != 0 {
+		t.Fatalf("re-added node 6 after delta reopen = %+v", results)
+	}
+}
+
+func TestVacuumMergesDeltas(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(69))
+	for i := NodeID(1); i <= 10; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Delete(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.Deltas != 2 {
+		t.Fatalf("Deltas = %d, want 2", st.Deltas)
+	}
+	baseBefore, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Vacuum(); err != nil {
+		t.Fatal(err)
+	}
+	st := idx.Stats()
+	if st.Deltas != 0 || st.DeltaBytes != 0 {
+		t.Fatalf("stats after vacuum = %+v", st)
+	}
+	baseAfter, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseAfter.Size() <= baseBefore.Size() {
+		t.Fatalf("base did not grow on vacuum: %d -> %d", baseBefore.Size(), baseAfter.Size())
+	}
+	files, err := filepath.Glob(path + ".delta.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("delta files remain after vacuum: %v", files)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.LiveCount(); got != 9 {
+		t.Fatalf("LiveCount after vacuum = %d, want 9", got)
+	}
+}
+
+func TestOrphanDeltaIgnored(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(70))
+	for i := NodeID(1); i <= 3; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	// Write a delta that the manifest does not name: a crash between delta
+	// publication and manifest update leaves this behind.
+	orphan := deltaName(path, 99)
+	raw := make([]byte, Dim512*4)
+	if err := os.WriteFile(orphan, encodeDeltaFile(99, []deltaRecord{{rtype: deltaTypePut, id: 999, raw: raw}}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.LiveCount(); got != 3 {
+		t.Fatalf("LiveCount with orphan delta = %d, want 3", got)
+	}
+	if err := reopened.Vacuum(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan delta survived vacuum: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckpointNoopWhenClean(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	mustAddFloat(t, idx, 1, randFloatVec(rand.New(rand.NewSource(71)), Dim512))
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.Deltas != 1 {
+		t.Fatalf("Deltas after clean checkpoint = %d, want 1", st.Deltas)
+	}
+}
+
+func TestManifestCorruptionDetected(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAddFloat(t, idx, 1, randFloatVec(rand.New(rand.NewSource(72)), Dim512))
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := path + ".manifest"
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)/2] ^= 0xff
+	if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
+		t.Fatalf("Open with corrupt manifest = %v, want ErrCorruptStorage", err)
+	}
+}
+
+func TestAutoVacuumByDeltaCount(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	if err := idx.SetAutoVacuum(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(73))
+	for i := NodeID(1); i <= 5; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	mustAddFloat(t, idx, 6, randFloatVec(rng, Dim512))
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.Deltas != 2 {
+		t.Fatalf("Deltas before trigger = %d, want 2", st.Deltas)
+	}
+	// The next write observes two deltas and enqueues a vacuum.
+	mustAddFloat(t, idx, 7, randFloatVec(rng, Dim512))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := idx.WaitIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.Deltas != 0 || st.DeltaBytes != 0 {
+		t.Fatalf("stats after auto vacuum = %+v", st)
+	}
+	if got := idx.LiveCount(); got != 7 {
+		t.Fatalf("LiveCount after auto vacuum = %d, want 7", got)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.LiveCount(); got != 7 {
+		t.Fatalf("LiveCount after auto vacuum reopen = %d, want 7", got)
+	}
+	if err := reopened.Verify(); err != nil {
+		t.Fatalf("Verify after auto vacuum: %v", err)
+	}
+}
+
+func TestAutoVacuumByFragmentation(t *testing.T) {
+	path := tempPath(t)
+	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(74))
+	for i := NodeID(1); i <= 10; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	for i := NodeID(1); i <= 5; i++ {
+		if err := idx.Delete(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.DeltaFragmentation < 0.3 {
+		t.Fatalf("DeltaFragmentation = %v, want >= 0.3", st.DeltaFragmentation)
+	}
+	if err := idx.SetAutoVacuum(0, 0.3); err != nil {
+		t.Fatal(err)
+	}
+	mustAddFloat(t, idx, 11, randFloatVec(rng, Dim512))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := idx.WaitIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st := idx.Stats(); st.Deltas != 0 {
+		t.Fatalf("Deltas after fragmentation vacuum = %d, want 0", st.Deltas)
+	}
+	if got := idx.LiveCount(); got != 6 {
+		t.Fatalf("LiveCount = %d, want 6", got)
+	}
+}
+
+func TestSetAutoVacuumValidation(t *testing.T) {
+	idx, err := New(testConfigFloat512())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	if err := idx.SetAutoVacuum(-1, 0); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("negative deltas = %v", err)
+	}
+	if err := idx.SetAutoVacuum(0, 1.5); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("bad fragmentation = %v", err)
 	}
 }

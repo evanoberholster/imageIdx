@@ -7,7 +7,8 @@ import "time"
 type Option func(*options)
 
 type options struct {
-	syncInterval time.Duration
+	syncInterval    time.Duration
+	walSegmentBytes int64
 }
 
 // WithSyncInterval enables periodic WAL synchronization when durability is
@@ -23,14 +24,22 @@ func WithSyncInterval(d time.Duration) Option {
 	return func(o *options) { o.syncInterval = d }
 }
 
+// WithWALSegmentBytes sets the WAL rotation threshold. A checkpoint removes
+// every segment except the active one, so the threshold bounds single-file
+// growth between checkpoints. Zero (the default) uses
+// DefaultWALSegmentBytes; negative is rejected by Create/Open.
+func WithWALSegmentBytes(n int64) Option {
+	return func(o *options) { o.walSegmentBytes = n }
+}
+
 func applyOptions(opts []Option) (options, error) {
-	var o options
+	o := options{walSegmentBytes: DefaultWALSegmentBytes}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&o)
 		}
 	}
-	if o.syncInterval < 0 {
+	if o.syncInterval < 0 || o.walSegmentBytes < 1 {
 		return options{}, ErrInvalidConfig
 	}
 	return o, nil

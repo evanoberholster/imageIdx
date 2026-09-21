@@ -85,7 +85,10 @@ type VectorIdx struct {
 	dims     int
 
 	walPath      string
-	wal          *os.File // writer-only under writeMu
+	wal          *os.File // writer-only under writeMu (active segment)
+	walSeq       uint64   // active segment sequence
+	walSize      int64    // active segment bytes on disk
+	walSegBytes  int64    // rotation threshold
 	lock         *os.File // exclusive store lock held until Close
 	syncInterval time.Duration
 	syncMu       sync.Mutex // serializes flushWAL fsync calls
@@ -96,6 +99,13 @@ type VectorIdx struct {
 
 	compactMu   sync.Mutex
 	lastCompact atomic.Pointer[CompactionResult]
+
+	manifest         atomic.Pointer[manifestData]
+	nextDeltaGen     uint64              // writer-only
+	pending          map[NodeID]struct{} // writer-only, changes since last checkpoint
+	pendingMutations int                 // writer-only, raw mutation count
+	coalescedRecords atomic.Uint64
+	loadingDelta     bool // writer-only during Open
 
 	asyncCh      chan asyncOp
 	asyncWg      sync.WaitGroup
@@ -180,9 +190,9 @@ func Create(path string, cfg Config, durability Durability, opts ...Option) (*Ve
 		vecBytes:     validated.VectorBytes(),
 		elemSize:     validated.ElementSize(),
 		dims:         int(validated.Dimensions),
-		walPath:      path + ".wal",
 		lock:         lock,
 		syncInterval: runtimeOpts.syncInterval,
+		walSegBytes:  runtimeOpts.walSegmentBytes,
 	}
 	v.dist = resolveDistance(validated)
 	v.view.Store(&vectorSnapshot{
@@ -194,14 +204,23 @@ func Create(path string, cfg Config, durability Durability, opts ...Option) (*Ve
 		gen:      1,
 	})
 	v.gen.Store(1)
-	wal, err := os.OpenFile(v.walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
-	if err != nil {
+	if err := removeWALFiles(path); err != nil {
 		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
-	v.wal = wal
-	if err := v.checkpointLocked(); err != nil {
-		_ = wal.Close()
+	if err := v.openWALSegment(1); err != nil {
+		_ = indexutil.ReleaseLock(lock)
+		return nil, err
+	}
+	v.manifest.Store(&manifestData{baseGeneration: 1})
+	v.nextDeltaGen = 2
+	if err := v.writeBaseLocked(); err != nil {
+		_ = v.wal.Close()
+		_ = indexutil.ReleaseLock(lock)
+		return nil, err
+	}
+	if err := v.writeManifestLocked(&manifestData{baseGeneration: v.gen.Load(), checkpointLSN: v.lsn}); err != nil {
+		_ = v.wal.Close()
 		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
@@ -240,6 +259,19 @@ func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error
 		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
+	manifest, err := readManifest(path)
+	if err != nil {
+		_ = indexutil.ReleaseLock(lock)
+		return nil, err
+	}
+	checkpointLSN := header.checkpointLSN
+	baseGeneration := header.generation
+	if manifest != nil {
+		checkpointLSN = manifest.checkpointLSN
+		baseGeneration = manifest.baseGeneration
+	} else {
+		manifest = &manifestData{baseGeneration: header.generation, checkpointLSN: header.checkpointLSN}
+	}
 	cfg := Config{
 		SpaceID:        header.spaceID,
 		Dimensions:     Dimensions(header.dims),
@@ -264,13 +296,20 @@ func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error
 		vecBytes:      validated.VectorBytes(),
 		elemSize:      validated.ElementSize(),
 		dims:          int(validated.Dimensions),
-		walPath:       path + ".wal",
-		checkpointLSN: header.checkpointLSN,
-		lsn:           header.checkpointLSN,
+		checkpointLSN: checkpointLSN,
+		lsn:           checkpointLSN,
 		lock:          lock,
 		syncInterval:  runtimeOpts.syncInterval,
+		walSegBytes:   runtimeOpts.walSegmentBytes,
 	}
-	v.checkpointLSNPub.Store(header.checkpointLSN)
+	v.checkpointLSNPub.Store(checkpointLSN)
+	v.manifest.Store(manifest)
+	v.nextDeltaGen = baseGeneration + 1
+	for _, d := range manifest.deltas {
+		if d.gen >= v.nextDeltaGen {
+			v.nextDeltaGen = d.gen + 1
+		}
+	}
 	v.dist = resolveDistance(validated)
 	v.view.Store(&vectorSnapshot{
 		cfg:      validated,
@@ -285,14 +324,14 @@ func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error
 		return nil, err
 	}
 	v.gen.Store(header.generation + 1)
-	wal, err := os.OpenFile(v.walPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
+	if err := v.applyDeltasLocked(manifest); err != nil {
 		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
-	v.wal = wal
 	if err := v.replayWAL(); err != nil {
-		_ = wal.Close()
+		if v.wal != nil {
+			_ = v.wal.Close()
+		}
 		_ = indexutil.ReleaseLock(lock)
 		return nil, err
 	}
@@ -632,6 +671,13 @@ func removeTombSorted(sorted []NodeID, id NodeID) []NodeID {
 }
 
 func (v *VectorIdx) addRawLocked(cur *vectorSnapshot, id NodeID, raw []byte) (*vectorSnapshot, error) {
+	return v.addRawLockedAtLevel(cur, id, raw, -1)
+}
+
+// addRawLockedAtLevel adds id with the given HNSW level; a negative level
+// samples from the writer RNG. Delta replay supplies the stored level so a
+// reloaded graph does not depend on RNG state.
+func (v *VectorIdx) addRawLockedAtLevel(cur *vectorSnapshot, id NodeID, raw []byte, fixedLevel int) (*vectorSnapshot, error) {
 	if len(raw) != v.vecBytes {
 		return nil, ErrInvalidVector
 	}
@@ -648,7 +694,10 @@ func (v *VectorIdx) addRawLocked(cur *vectorSnapshot, id NodeID, raw []byte) (*v
 		}
 		v.lsn++
 	}
-	level := v.sampleLevelLocked()
+	level := fixedLevel
+	if level < 0 {
+		level = v.sampleLevelLocked()
+	}
 	// Neighbor search runs before the node becomes visible: search the graph
 	// without the new node, then append and wire.
 	type fwdLinks struct {
@@ -728,6 +777,7 @@ func (v *VectorIdx) addRawLocked(cur *vectorSnapshot, id NodeID, raw []byte) (*v
 		ns.maxLevel = level
 	}
 	ns.gen = v.gen.Add(1)
+	v.markPendingLocked(id)
 	return ns, nil
 }
 
@@ -825,6 +875,7 @@ func (v *VectorIdx) resurrectLocked(cur *vectorSnapshot, ord int, id NodeID, raw
 		}
 	}
 	ns.gen = v.gen.Add(1)
+	v.markPendingLocked(id)
 	return ns, nil
 }
 
@@ -874,27 +925,48 @@ func (v *VectorIdx) Delete(id NodeID) error {
 	ns.tomb, ns.tombSorted = rebuildTombeset(ns.tombSorted)
 	ns.gen = v.gen.Add(1)
 	v.view.Store(ns)
+	v.markPendingLocked(id)
 	v.maybeAutoCompactLocked(ns)
 	return nil
 }
 
-// maybeAutoCompactLocked enqueues background compaction when the tombstone
-// ratio exceeds policy. Caller holds writeMu.
+// maybeAutoCompactLocked enqueues background maintenance when policy is
+// exceeded: tombstone ratio selects Compact (graph rebuild), while delta
+// count or delta fragmentation selects Vacuum (base merge). Caller holds
+// writeMu.
 func (v *VectorIdx) maybeAutoCompactLocked(snap *vectorSnapshot) {
-	ratio := snap.cfg.AutoCompactRatio
-	if ratio <= 0 || v.closed.Load() {
+	if v.closed.Load() {
 		return
 	}
 	live := len(snap.ids) - len(snap.tombSorted)
-	if live < snap.cfg.CompactMinNodes && snap.cfg.CompactMinNodes > 0 {
+	compact := false
+	if ratio := snap.cfg.AutoCompactRatio; ratio > 0 && live > 0 {
+		if snap.cfg.CompactMinNodes <= 0 || live >= snap.cfg.CompactMinNodes {
+			compact = float64(len(snap.tombSorted))/float64(live) >= ratio
+		}
+	}
+	vacuum := false
+	if m := v.manifest.Load(); m != nil && len(m.deltas) > 0 {
+		if max := snap.cfg.AutoVacuumDeltas; max > 0 && len(m.deltas) >= max {
+			vacuum = true
+		}
+		if frag := snap.cfg.AutoVacuumFragmentation; frag > 0 && m.fragmentation() >= frag {
+			vacuum = true
+		}
+	}
+	if !compact && !vacuum {
 		return
 	}
-	if live == 0 {
+	if compact {
+		v.tryEnqueueLocked(func() { _, _ = v.Compact() })
 		return
 	}
-	if float64(len(snap.tombSorted))/float64(live) < ratio {
-		return
-	}
+	v.tryEnqueueLocked(func() { _ = v.Vacuum() })
+}
+
+// tryEnqueueLocked submits fn to the async queue without blocking. Caller
+// holds writeMu.
+func (v *VectorIdx) tryEnqueueLocked(fn func()) {
 	v.asyncPending.Add(1)
 	ch := v.asyncCh
 	if ch == nil {
@@ -902,10 +974,7 @@ func (v *VectorIdx) maybeAutoCompactLocked(snap *vectorSnapshot) {
 		return
 	}
 	select {
-	case ch <- asyncOp{fn: func() {
-		_, _ = v.Compact()
-		v.asyncPending.Add(-1)
-	}}:
+	case ch <- asyncOp{fn: func() { fn(); v.asyncPending.Add(-1) }}:
 	default:
 		v.asyncPending.Add(-1)
 	}
@@ -1365,7 +1434,14 @@ func (v *VectorIdx) Compact() (CompactionResult, error) {
 	result.NodesAfter = len(ns.ids)
 	result.BytesReclaimed = int64(result.NodesBefore-result.NodesAfter) * int64(v.vecBytes)
 	if v.path != "" {
-		if err := v.checkpointLocked(); err != nil {
+		if m := v.manifest.Load(); m != nil {
+			result.DeltasMerged = len(m.deltas)
+			for _, d := range m.deltas {
+				result.ReclaimedRecords += int64(d.tombstones)
+			}
+		}
+		result.ReclaimedRecords += int64(v.coalescedRecords.Load())
+		if err := v.vacuumLocked(); err != nil {
 			return result, err
 		}
 	}
@@ -1610,16 +1686,10 @@ func (v *VectorIdx) Sync() error {
 func (v *VectorIdx) enqueueAsync(fn func()) {
 	v.writeMu.Lock()
 	defer v.writeMu.Unlock()
-	ch := v.asyncCh
-	if v.closed.Load() || ch == nil {
+	if v.closed.Load() || v.asyncCh == nil {
 		return
 	}
-	v.asyncPending.Add(1)
-	select {
-	case ch <- asyncOp{fn: func() { fn(); v.asyncPending.Add(-1) }}:
-	default:
-		v.asyncPending.Add(-1)
-	}
+	v.tryEnqueueLocked(fn)
 }
 
 // AddAsync enqueues an Add without blocking the caller.
@@ -1733,6 +1803,28 @@ func (v *VectorIdx) SetAutoCompact(ratio float64, minNodes int) error {
 	ns := cloneSnapshot(cur)
 	ns.cfg.AutoCompactRatio = ratio
 	ns.cfg.CompactMinNodes = minNodes
+	ns.gen = v.gen.Add(1)
+	v.view.Store(ns)
+	return nil
+}
+
+// SetAutoVacuum enables (values > 0) or disables (values == 0) background
+// vacuum on writes: when the manifest holds maxDeltas generations or delta
+// tombstone fragmentation reaches minFragmentation, the async worker merges
+// base and deltas. Either trigger can be disabled by passing zero.
+func (v *VectorIdx) SetAutoVacuum(maxDeltas int, minFragmentation float64) error {
+	if maxDeltas < 0 || minFragmentation < 0 || minFragmentation > 1 {
+		return ErrInvalidConfig
+	}
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	if v.closed.Load() {
+		return ErrClosed
+	}
+	cur := v.view.Load()
+	ns := cloneSnapshot(cur)
+	ns.cfg.AutoVacuumDeltas = maxDeltas
+	ns.cfg.AutoVacuumFragmentation = minFragmentation
 	ns.gen = v.gen.Add(1)
 	v.view.Store(ns)
 	return nil

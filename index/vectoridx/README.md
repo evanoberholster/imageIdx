@@ -95,36 +95,51 @@ idx, err := vectoridx.New(vectoridx.Config{...})
 
 ## Persistence
 
-One logical file per vector space plus a `<path>.wal` sidecar:
+A base generation file plus a `<path>.manifest`, `<path>.delta.<gen>`
+generations, and segmented `<path>.wal.<seq>` logs:
 
 - 256-byte little-endian superblock (magic `VCTRIDX1`, version, config,
   entry node, counts, checkpoint LSN, CRC32).
 - 4-entry region directory (node metadata, vectors, graph, tombstones)
   with offsets, lengths, and CRC32 checksums.
-- Framed WAL (`AddVector`/`DeleteNode` with LSN and CRC32). Recovery
-  replays records after `CheckpointLSN`, stops at the first torn tail,
-  truncates it, and is idempotent across restarts.
-- `Checkpoint` writes the file atomically (temp + rename + dir sync) and
-  truncates the covered WAL tail. `Compact` returns a `CompactionResult`
-  (nodes before/after, tombstones purged, bytes reclaimed, duration);
-  it rebuilds the graph from live vectors in NodeID order, purges
-  tombstones, and checkpoints. A concurrent `Compact` returns
+- `Checkpoint` publishes the mutations since the last checkpoint as one
+  immutable delta generation (puts carry level and vector, deletes carry
+  the NodeID; superseded mutations are promoted away) and updates the
+  manifest atomically. The base file is not rewritten, so checkpoint cost
+  scales with changes, not index size.
+- `Vacuum` merges the base and every delta into a fresh base, drops
+  superseded and tombstone records, removes the delta files, and truncates
+  the covered WAL. `Compact` rebuilds the graph from live vectors in NodeID
+  order first and then vacuums; it returns a `CompactionResult` (nodes
+  before/after, tombstones purged, deltas merged, records reclaimed, bytes
+  reclaimed, duration) and a concurrent call returns
   `ErrCompactionInProgress`.
+- `SetAutoVacuum(maxDeltas, minFragmentation)` enqueues background vacuum
+  when the manifest holds too many generations or tombstone fragmentation
+  crosses the threshold; `SetAutoCompact(ratio, minNodes)` keeps the
+  tombstone-ratio rebuild policy.
+- WAL files rotate at `WithWALSegmentBytes` (64 MiB default); recovery
+  replays segments oldest to newest, stops at the newest torn tail and
+  truncates it, and a checkpoint removes every non-active segment.
 - The index path is exclusively locked (`<path>.lock`) from `Create`/`Open`
   until `Close`; a second handle returns `ErrStoreBusy`.
-- `Stats` reports generation, counts, checkpoint LSN, WAL counters, file
-  sizes, pending async ops, and the last compaction; `FileSize` returns
-  checkpoint plus WAL bytes.
-- `Verify` deep-checks in-memory structure; `VerifyFile` validates a file
-  offline (header, bounds, checksums).
+- `Stats` reports generation, counts, checkpoint LSN, WAL counters, delta
+  generations/fragmentation/promotion counters, file sizes, pending async
+  ops, and the last compaction; `FileSize` returns base plus WAL bytes.
+- `Verify` deep-checks in-memory structure; `VerifyFile` validates the base
+  file offline (header, bounds, checksums), and a corrupt manifest or delta
+  fails Open with `ErrCorruptStorage`.
 
 Crash model: `Create`/`Open` select a durability policy; with
 `DurabilitySync` acknowledged mutations are WAL-synced before return, with
 `DurabilityOS` they are in the OS page cache. `WithSyncInterval(d)` adds
 periodic group commit for `DurabilityOS`: fsync happens when the async queue
 drains and at least every `d`, so a write batch shares one fsync. `Sync`
-forces a durable boundary at any time; `Close` always syncs. Checkpoint
-publication is atomic; readers never see a partial generation.
+forces a durable boundary at any time; `Close` always syncs. A delta file is
+durable before the manifest names it and the WAL is truncated only after
+both, so an orphan delta from a crash is ignored and reclaimed by the next
+vacuum. Checkpoint publication is atomic; readers never see a partial
+generation.
 
 ## API rules worth knowing
 
@@ -183,8 +198,9 @@ that degrade the graph fail loudly.
 | `index.go` | VectorIdx: typed Add/Search, Delete, Checkpoint/Compact/Verify, async queue, policies |
 | `options.go` | Runtime `Option`s (WithSyncInterval) |
 | `stats.go` | `Stats`/`FileSize`/`CompactionResult` |
-| `format.go` | Single-file superblock + region encode/decode, `VerifyFile` |
-| `wal.go` | Framed WAL append and prefix recovery |
+| `format.go` | Base superblock + region encode/decode, `VerifyFile` |
+| `manifest.go` | Manifest and delta generations, Checkpoint/Vacuum, promotion |
+| `wal.go` | Segmented framed WAL: rotation, append, prefix recovery |
 
 ## Deliberate V1 simplifications (future work)
 

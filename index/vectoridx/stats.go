@@ -6,12 +6,16 @@ import (
 )
 
 // CompactionResult summarizes one Compact: node counts before and after the
-// rebuild, tombstones purged, and the approximate vector payload bytes
-// reclaimed. Duration covers the graph rebuild and the checkpoint.
+// rebuild, tombstones purged, delta generations merged into the base,
+// records reclaimed by promotion (superseded puts and tombstones), and the
+// approximate vector payload bytes reclaimed. Duration covers the graph
+// rebuild and the base write.
 type CompactionResult struct {
 	NodesBefore      int
 	NodesAfter       int
 	TombstonesPurged int
+	DeltasMerged     int
+	ReclaimedRecords int64
 	BytesReclaimed   int64
 	Duration         time.Duration
 }
@@ -23,7 +27,7 @@ type Stats struct {
 	Generation      uint64
 	LiveCount       int
 	TombstoneCount  int
-	FileBytes       uint64 // checkpoint file on disk
+	FileBytes       uint64 // base generation file on disk
 	WALBytes        uint64 // WAL segments on disk
 	TotalBytes      uint64
 	WALSegments     int
@@ -34,6 +38,15 @@ type Stats struct {
 	PendingOps      int64
 	SyncInterval    time.Duration
 	LastCompaction  CompactionResult
+
+	// Delta generations persisted since the base write and their promotion
+	// counters.
+	Deltas             int
+	DeltaBytes         uint64
+	DeltaRecords       uint64
+	DeltaTombstones    uint64
+	DeltaFragmentation float64
+	CoalescedRecords   uint64
 }
 
 // Stats returns a snapshot of size and maintenance counters. In-memory
@@ -54,14 +67,25 @@ func (v *VectorIdx) Stats() Stats {
 	if cmp := v.lastCompact.Load(); cmp != nil {
 		s.LastCompaction = *cmp
 	}
+	if m := v.manifest.Load(); m != nil {
+		s.Deltas = len(m.deltas)
+		for _, d := range m.deltas {
+			s.DeltaBytes += d.bytes
+			s.DeltaRecords += d.records
+			s.DeltaTombstones += d.tombstones
+		}
+		s.DeltaFragmentation = m.fragmentation()
+	}
+	s.CoalescedRecords = v.coalescedRecords.Load()
 	if v.path != "" {
 		if info, err := os.Stat(v.path); err == nil && info.Size() > 0 {
 			s.FileBytes = uint64(info.Size())
 		}
-		if v.walPath != "" {
-			if info, err := os.Stat(v.walPath); err == nil && info.Size() > 0 {
-				s.WALBytes = uint64(info.Size())
-				s.WALSegments = 1
+		segs, err := listWALSegments(v.path)
+		if err == nil {
+			s.WALSegments = len(segs)
+			for _, seg := range segs {
+				s.WALBytes += uint64(seg.size)
 			}
 		}
 	}
@@ -69,7 +93,8 @@ func (v *VectorIdx) Stats() Stats {
 	return s
 }
 
-// FileSize returns the total bytes used by the index (checkpoint plus WAL).
+// FileSize returns the total bytes used by the index (checkpoint plus WAL
+// segments).
 func (v *VectorIdx) FileSize() (int64, error) {
 	if v.path == "" {
 		return 0, nil
@@ -79,12 +104,12 @@ func (v *VectorIdx) FileSize() (int64, error) {
 		return 0, err
 	}
 	total := info.Size()
-	if v.walPath != "" {
-		if walInfo, err := os.Stat(v.walPath); err == nil {
-			total += walInfo.Size()
-		} else if !os.IsNotExist(err) {
-			return 0, err
-		}
+	segs, err := listWALSegments(v.path)
+	if err != nil {
+		return 0, err
+	}
+	for _, seg := range segs {
+		total += seg.size
 	}
 	return total, nil
 }

@@ -159,6 +159,12 @@ type Config struct {
 	// the ratio (0 disables). CompactMinNodes gates small indexes.
 	AutoCompactRatio float64
 	CompactMinNodes  int
+	// AutoVacuumDeltas triggers async Vacuum when the manifest holds at
+	// least this many delta generations (0 disables).
+	AutoVacuumDeltas int
+	// AutoVacuumFragmentation triggers async Vacuum when the fraction of
+	// tombstone records across deltas reaches this value (0 disables).
+	AutoVacuumFragmentation float64
 }
 
 func (c Config) withDefaults() (Config, error) {
@@ -236,6 +242,12 @@ func (c Config) withDefaults() (Config, error) {
 		return Config{}, ErrInvalidConfig
 	}
 	if c.CompactMinNodes < 0 {
+		return Config{}, ErrInvalidConfig
+	}
+	if c.AutoVacuumDeltas < 0 {
+		return Config{}, ErrInvalidConfig
+	}
+	if c.AutoVacuumFragmentation < 0 || c.AutoVacuumFragmentation > 1 {
 		return Config{}, ErrInvalidConfig
 	}
 	return c, nil

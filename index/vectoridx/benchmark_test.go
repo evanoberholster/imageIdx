@@ -229,14 +229,39 @@ func BenchmarkWALAppendGroupCommit(b *testing.B) {
 	}
 }
 
-// BenchmarkCheckpoint measures the full-file checkpoint cost.
+// BenchmarkCheckpoint measures an incremental delta checkpoint: one pending
+// node is published as a one-record delta generation plus manifest update.
 func BenchmarkCheckpoint(b *testing.B) {
+	idx := benchPersistentIndex(b, 5000, DurabilityOS)
+	defer idx.Close()
+	mark := func(id NodeID) {
+		idx.writeMu.Lock()
+		if idx.pending == nil {
+			idx.pending = make(map[NodeID]struct{})
+		}
+		idx.pending[id] = struct{}{}
+		idx.pendingMutations++
+		idx.writeMu.Unlock()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mark(NodeID(1 + i%5000))
+		if err := idx.Checkpoint(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkVacuum measures a full base rewrite (the previous Checkpoint
+// cost) plus manifest reset.
+func BenchmarkVacuum(b *testing.B) {
 	idx := benchPersistentIndex(b, 2000, DurabilityOS)
 	defer idx.Close()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := idx.Checkpoint(); err != nil {
+		if err := idx.Vacuum(); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -255,9 +280,35 @@ func BenchmarkCompact(b *testing.B) {
 	}
 }
 
-// BenchmarkOpen measures cold open of a checkpointed index (no WAL replay).
+// BenchmarkOpen measures cold open of a vacuumed base generation (no delta
+// or WAL replay).
 func BenchmarkOpen(b *testing.B) {
 	idx := benchPersistentIndex(b, 2000, DurabilityOS)
+	path := idx.path
+	if err := idx.Vacuum(); err != nil {
+		b.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		re, err := Open(path, DurabilityOS)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := re.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkOpenDelta measures cold open of a base plus one delta generation
+// holding the whole index: delta application re-inserts nodes like WAL
+// replay, which is why Vacuum or auto-vacuum materializes bases over time.
+func BenchmarkOpenDelta(b *testing.B) {
+	idx := benchPersistentIndex(b, 100, DurabilityOS)
 	path := idx.path
 	if err := idx.Checkpoint(); err != nil {
 		b.Fatal(err)

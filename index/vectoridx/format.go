@@ -364,9 +364,11 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 	return nil
 }
 
-// checkpointLocked serializes the published snapshot and atomically publishes
-// it to disk. Caller holds the writer lock.
-func (v *VectorIdx) checkpointLocked() error {
+// writeBaseLocked serializes the published snapshot and atomically publishes
+// it as the base generation. Caller holds the writer lock. It does not touch
+// the WAL or the manifest: Vacuum wraps it with both, while Create publishes
+// the empty base before any delta exists.
+func (v *VectorIdx) writeBaseLocked() error {
 	snap := v.view.Load()
 	// NodeMeta region: 8 bytes per node (id u32, level u16, reserved u16).
 	nodeMeta := make([]byte, len(snap.ids)*8)
@@ -451,16 +453,6 @@ func (v *VectorIdx) checkpointLocked() error {
 	base := filepath.Base(v.path)
 	if err := indexutil.WriteFileAtomic(dir, base+".tmp", base, file, 0o644); err != nil {
 		return err
-	}
-	// Truncate the WAL to the checkpoint: everything replayable is durable
-	// in the new generation.
-	if v.wal != nil {
-		if err := v.wal.Truncate(0); err != nil {
-			return err
-		}
-		if _, err := v.wal.Seek(0, 0); err != nil {
-			return err
-		}
 	}
 	return nil
 }

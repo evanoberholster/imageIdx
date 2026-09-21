@@ -509,6 +509,8 @@ Deletion records only need the NodeID plus WAL framing metadata.
 
 An acknowledged durable mutation should have its WAL record safely persisted according to the database's durability contract. `Create` and `Open` take a `Durability` (`DurabilityOS` or `DurabilitySync`); it is a runtime policy and is not persisted in the file format. `DurabilitySync` fsyncs each acknowledged mutation; `DurabilityOS` leaves the record to the OS page cache, optionally with `WithSyncInterval(d)` periodic group commit. `Sync` forces a durable boundary; the index path is exclusively locked until `Close`.
 
+Checkpoints are incremental: `Checkpoint` publishes a delta generation and updates the manifest atomically; `Vacuum` merges base and deltas into a fresh base. The WAL is segmented and rotates at `WithWALSegmentBytes`; a checkpoint removes every non-active segment. A delta is durable before the manifest names it, and the WAL is truncated only after both, so orphan deltas are ignored and reclaimed by the next vacuum.
+
 Graph/vector checkpointing may lag WAL persistence.
 
 ### 13.2 Recovery
@@ -1106,6 +1108,7 @@ func (v *VectorIdx) Search(query any, candidates *Bitmap, k int) ([]Result, erro
 func (v *VectorIdx) SearchInto(dst []Result, query any, candidates *Bitmap, k int) ([]Result, error)
 
 func (v *VectorIdx) Checkpoint() error
+func (v *VectorIdx) Vacuum() error
 func (v *VectorIdx) Compact() error
 ```
 

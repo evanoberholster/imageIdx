@@ -22,10 +22,13 @@
 //   - Post-ANN candidate filtering with dynamic ef, oversampling, iterative
 //     expansion, cost-based flat fallback, and an exact-scan fallback
 //     guaranteeing k-or-available semantics under filters.
-//   - Single-file multi-region persistence (superblock, region directory,
-//     node metadata, vectors, graph, tombstones) with CRC32 integrity,
-//     framed WAL with prefix recovery, explicit Checkpoint/Compact, and a
-//     per-path lock that rejects a second writer with ErrStoreBusy.
+//   - Base generation plus delta checkpoints and a manifest: Checkpoint
+//     publishes only the mutations since the last checkpoint, Vacuum merges
+//     base and deltas, and Compact rebuilds the graph then vacuums.
+//   - Segmented WAL with prefix recovery and rotation; base files, deltas,
+//     and the manifest carry CRC32 integrity and publish atomically.
+//   - Per-path lock that rejects a second writer with ErrStoreBusy, plus
+//     durability policy per open and Stats/FileSize counters.
 //   - Durability policy per open (OS page cache, per-record fsync, or
 //     interval group commit), explicit Sync, and Stats/FileSize counters.
 //   - Lock-free reads over atomically published snapshots plus a
