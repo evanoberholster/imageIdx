@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/evanoberholster/imageIdx/hashIdx"
+	"github.com/evanoberholster/imageIdx/index/hashIdx"
 )
 
 // ExampleStore exercises the public Store lifecycle end to end with no
