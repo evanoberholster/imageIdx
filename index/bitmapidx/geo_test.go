@@ -531,9 +531,9 @@ func TestGeoCoverAndNearest(t *testing.T) {
 // unmapped underneath it.
 func TestGeoReadersSurviveVacuum(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewPersistentFields(dir, []Field{geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []Field{geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewPersistentFields: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	index, _ := s.Lookup(IndexTypeLocation)
 	key := sfKey(t)

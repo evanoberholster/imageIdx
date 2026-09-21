@@ -20,7 +20,7 @@ func TestFieldCrashWriter(t *testing.T) {
 	if dir == "" {
 		return
 	}
-	s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+	s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestFieldRecoveryAfterProcessExit(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child: %s: %v", out, err)
 	}
-	s, err := OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+	s, err := OpenIndex(dir, FieldConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestFieldRecoveryAfterProcessExit(t *testing.T) {
 
 func TestFieldManifestFailureRequiresRecovery(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+	s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestFieldManifestFailureRequiresRecovery(t *testing.T) {
 	if err := os.Remove(temporary); err != nil {
 		t.Fatal(err)
 	}
-	s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+	s, err = OpenIndex(dir, FieldConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestFieldPersistentCollisions(t *testing.T) {
 	hashCanonical = func(t IndexType, _ Kind, _ []byte) FieldKey { return FieldKey{Type: t, Hash: 99} }
 	defer func() { hashCanonical = previous }()
 	dir := t.TempDir()
-	s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestFieldPersistentCollisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close()
-	s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+	s, err = OpenIndex(dir, FieldConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestPersistentFieldsAllKinds(t *testing.T) {
 	for _, checkpoint := range []bool{false, true} {
 		t.Run(fmt.Sprint(checkpoint), func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := NewPersistentFields(dir, fields, FieldConfig{}, DurabilitySync)
+			s, err := NewIndex(dir, fields, FieldConfig{}, DurabilitySync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -183,7 +183,7 @@ func TestPersistentFieldsAllKinds(t *testing.T) {
 			if err := s.Close(); err != nil {
 				t.Fatal(err)
 			}
-			s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+			s, err = OpenIndex(dir, FieldConfig{}, DurabilityOS)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -242,7 +242,7 @@ func TestFieldWALTailAndValidation(t *testing.T) {
 	for _, corrupt := range []bool{false, true} {
 		t.Run(fmt.Sprint(corrupt), func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+			s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -267,7 +267,7 @@ func TestFieldWALTailAndValidation(t *testing.T) {
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				t.Fatal(err)
 			}
-			s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilitySync)
+			s, err = OpenIndex(dir, FieldConfig{}, DurabilitySync)
 			if corrupt {
 				if !errors.Is(err, ErrCorruptWAL) {
 					if s != nil {
@@ -285,7 +285,7 @@ func TestFieldWALTailAndValidation(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.Close()
-			s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+			s, err = OpenIndex(dir, FieldConfig{}, DurabilityOS)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -298,9 +298,9 @@ func TestFieldWALTailAndValidation(t *testing.T) {
 	}
 }
 
-func TestFieldStoreBoundsAndFailedWrites(t *testing.T) {
+func TestIndexBoundsAndFailedWrites(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestFieldStoreBoundsAndFailedWrites(t *testing.T) {
 func TestFieldConcurrentCheckpointAndReaders(t *testing.T) {
 	dir := t.TempDir()
 	config := FieldConfig{ActiveTarget: 2, HardDeltaLimit: 8, CompactDelay: time.Millisecond}
-	s, err := NewPersistentFields(dir, []Field{enumField(100)}, config, DurabilityOS)
+	s, err := NewIndex(dir, []Field{enumField(100)}, config, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func TestFieldConcurrentCheckpointAndReaders(t *testing.T) {
 	close(done)
 	wg.Wait()
 	s.Close()
-	s, err = OpenPersistentFields(dir, config, DurabilityOS)
+	s, err = OpenIndex(dir, config, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,13 +408,13 @@ func TestFieldConcurrentCheckpointAndReaders(t *testing.T) {
 	}
 }
 
-func TestFieldStoreOwnershipAndSnapshotCorruption(t *testing.T) {
+func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other, err := OpenPersistentFields(dir, FieldConfig{}, DurabilityOS); !errors.Is(err, ErrStoreBusy) {
+	if other, err := OpenIndex(dir, FieldConfig{}, DurabilityOS); !errors.Is(err, ErrStoreBusy) {
 		if other != nil {
 			other.Close()
 		}
@@ -426,7 +426,7 @@ func TestFieldStoreOwnershipAndSnapshotCorruption(t *testing.T) {
 	}
 	path := s.snapshotPath(s.generation)
 	s.Close()
-	if other, err := NewPersistentFields(dir, nil, FieldConfig{}, DurabilityOS); !errors.Is(err, ErrStoreExists) {
+	if other, err := NewIndex(dir, nil, FieldConfig{}, DurabilityOS); !errors.Is(err, ErrStoreExists) {
 		if other != nil {
 			other.Close()
 		}
@@ -440,7 +440,7 @@ func TestFieldStoreOwnershipAndSnapshotCorruption(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if other, err := OpenPersistentFields(dir, FieldConfig{}, DurabilityOS); !errors.Is(err, ErrCorruptSegment) {
+	if other, err := OpenIndex(dir, FieldConfig{}, DurabilityOS); !errors.Is(err, ErrCorruptSegment) {
 		if other != nil {
 			other.Close()
 		}
@@ -451,10 +451,10 @@ func TestFieldStoreOwnershipAndSnapshotCorruption(t *testing.T) {
 	}
 }
 
-func TestFieldStoreRejectsForeignFiles(t *testing.T) {
+func TestIndexRejectsForeignFiles(t *testing.T) {
 	build := func(t *testing.T, dir string, id ImageID) (snapshot, wal string) {
 		t.Helper()
-		s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+		s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -484,7 +484,7 @@ func TestFieldStoreRejectsForeignFiles(t *testing.T) {
 		_, walA := build(t, dirA, 1)
 		_, walB := build(t, dirB, 2)
 		copyFile(t, walB, walA)
-		s, err := OpenPersistentFields(dirA, FieldConfig{}, DurabilityOS)
+		s, err := OpenIndex(dirA, FieldConfig{}, DurabilityOS)
 		if s != nil {
 			s.Close()
 		}
@@ -497,7 +497,7 @@ func TestFieldStoreRejectsForeignFiles(t *testing.T) {
 		snapC, _ := build(t, dirC, 1)
 		snapD, _ := build(t, dirD, 2)
 		copyFile(t, snapD, snapC)
-		s, err := OpenPersistentFields(dirC, FieldConfig{}, DurabilityOS)
+		s, err := OpenIndex(dirC, FieldConfig{}, DurabilityOS)
 		if s != nil {
 			s.Close()
 		}
@@ -513,7 +513,7 @@ func TestFieldStoreRejectsForeignFiles(t *testing.T) {
 func TestFieldCheckpointCrashBoundaries(t *testing.T) {
 	t.Run("unpublished successor files ignored", func(t *testing.T) {
 		dir := t.TempDir()
-		s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+		s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -536,7 +536,7 @@ func TestFieldCheckpointCrashBoundaries(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+		s, err = OpenIndex(dir, FieldConfig{}, DurabilityOS)
 		if err != nil {
 			t.Fatalf("open with unpublished successor: %v", err)
 		}
@@ -555,7 +555,7 @@ func TestFieldCheckpointCrashBoundaries(t *testing.T) {
 
 	t.Run("segment write failure recoverable", func(t *testing.T) {
 		dir := t.TempDir()
-		s, err := NewPersistentFields(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
+		s, err := NewIndex(dir, []Field{enumField(100)}, FieldConfig{}, DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -585,7 +585,7 @@ func TestFieldCheckpointCrashBoundaries(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		s, err = OpenPersistentFields(dir, FieldConfig{}, DurabilityOS)
+		s, err = OpenIndex(dir, FieldConfig{}, DurabilityOS)
 		if err != nil {
 			t.Fatal(err)
 		}

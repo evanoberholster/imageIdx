@@ -75,7 +75,7 @@ func encodeFieldChanges(changes []stagedChange) ([]byte, uint32, error) {
 // skip the WAL. DurabilitySync fsyncs per frame; other modes leave it to
 // the OS and checkpoint Sync. Failures mark the store failed so later
 // writes require recovery.
-func (s *FieldStore) append(index *FieldIndex, payload []byte, groups, updates uint32) error {
+func (s *Index) append(index *FieldIndex, payload []byte, groups, updates uint32) error {
 	if updates == 0 {
 		return nil
 	}
@@ -108,7 +108,7 @@ func (s *FieldStore) append(index *FieldIndex, payload []byte, groups, updates u
 // counts, and payload CRCs. Changes apply with idempotent set semantics
 // and no live geo preconditions, because the WAL already validated once;
 // text needs no re-analysis since groups carry canonical bytes.
-func (s *FieldStore) replay(path string) (int64, error) {
+func (s *Index) replay(path string) (int64, error) {
 	position := uint64(0)
 	return persist.ReplayEnd(path, 0, persist.FrameSpec{HeaderSize: fieldWALHeaderSize, Magic: fieldWALMagic, Version: 2, Corrupt: ErrCorruptWAL, MaxPayload: MaxFieldBatchBytes}, func(header []byte) (uint64, error) {
 		if crc32.ChecksumIEEE(header[:60]) != binary.LittleEndian.Uint32(header[60:64]) ||

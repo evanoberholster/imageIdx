@@ -36,7 +36,12 @@ func TestHeavyStress(t *testing.T) {
 	seconds := heavyInt("HEAVY_SECONDS", 30)
 	valuesN := heavyInt("HEAVY_VALUES_PER_FIELD", 64)
 	checkpointEvery := heavyInt("HEAVY_CHECKPOINT_EVERY", 2_000_000)
-	if fieldsN < 1 || items < 1 || perItem < 1 || valuesN < 1 || writers < 0 || readers < 0 {
+	batchSize := heavyInt("HEAVY_BATCH", 64)
+	durability := DurabilityOS
+	if os.Getenv("HEAVY_DURABILITY") == "sync" {
+		durability = DurabilitySync
+	}
+	if fieldsN < 1 || items < 1 || perItem < 1 || valuesN < 1 || writers < 0 || readers < 0 || batchSize < 1 {
 		t.Fatal("invalid heavy parameters")
 	}
 	if perItem > fieldsN {
@@ -50,11 +55,17 @@ func TestHeavyStress(t *testing.T) {
 	}
 	config := FieldConfig{}
 	dir := t.TempDir()
-	store, err := NewPersistentFields(dir, fields, config, DurabilityOS)
-	if err != nil {
-		t.Fatalf("NewPersistentFields: %v", err)
+	// Bulk load is always written with OS durability; a sync-mode run reopens
+	// the checkpointed store so the measured phase pays per-write fsync.
+	loadDurability := durability
+	if durability == DurabilitySync {
+		loadDurability = DurabilityOS
 	}
-	defer store.Close()
+	store, err := NewIndex(dir, fields, config, loadDurability)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	defer func() { _ = store.Close() }()
 	indexes := make([]*FieldIndex, fieldsN)
 	for f := 0; f < fieldsN; f++ {
 		index, ok := store.Lookup(firstType + IndexType(f))
@@ -161,6 +172,23 @@ func TestHeavyStress(t *testing.T) {
 		t.Fatalf("final load checkpoint: %v", err)
 	}
 	loadDuration := time.Since(loadStart)
+	if durability != loadDurability {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close after load: %v", err)
+		}
+		store, err = OpenIndex(dir, config, durability)
+		if err != nil {
+			t.Fatalf("reopen for sync durability: %v", err)
+		}
+		indexes = indexes[:0]
+		for f := 0; f < fieldsN; f++ {
+			index, ok := store.Lookup(firstType + IndexType(f))
+			if !ok {
+				t.Fatalf("field %d missing after reopen", f)
+			}
+			indexes = append(indexes, index)
+		}
+	}
 
 	stop := make(chan struct{})
 	var (
@@ -192,7 +220,7 @@ func TestHeavyStress(t *testing.T) {
 			defer writersWG.Done()
 			src := rand.New(rand.NewSource(int64(w) + 1))
 			lo := (w * perWriter) % fieldsN
-			batch := make([]Entry, 0, 64)
+			batch := make([]Entry, 0, batchSize)
 			for {
 				select {
 				case <-stop:
@@ -201,7 +229,7 @@ func TestHeavyStress(t *testing.T) {
 				}
 				f := (lo + src.Intn(perWriter)) % fieldsN
 				batch = batch[:0]
-				for n := 0; n < 64; n++ {
+				for n := 0; n < batchSize; n++ {
 					id := ImageID(src.Intn(items) + 1)
 					v := src.Intn(valuesN)
 					batch = append(batch, Entry{ImageID: id, Value: BytesValue(values[f][v])})
@@ -217,7 +245,7 @@ func TestHeavyStress(t *testing.T) {
 						return
 					}
 				}
-				writeOps.Add(64)
+				writeOps.Add(int64(batchSize))
 			}
 		}(w)
 	}
@@ -321,7 +349,7 @@ func TestHeavyStress(t *testing.T) {
 	t.Logf("heap: start=%dMiB peak=%dMiB end=%dMiB goroutines=%d GOMAXPROCS=%d",
 		memBefore.HeapAlloc>>20, peakHeap>>20, memAfter.HeapAlloc>>20, runtime.NumGoroutine(), runtime.GOMAXPROCS(0))
 
-	reopened, err := OpenPersistentFields(dir, config, DurabilityOS)
+	reopened, err := OpenIndex(dir, config, DurabilityOS)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

@@ -11,7 +11,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/evanoberholster/imageIdx/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
@@ -21,7 +21,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	store, err := bitmapidx.NewPersistentFields(dir, []bitmapidx.Field{
+	store, err := bitmapidx.NewIndex(dir, []bitmapidx.Field{
 		{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
 		{Type: bitmapidx.IndexTypeAlbum, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
 	}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)

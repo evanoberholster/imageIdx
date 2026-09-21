@@ -6,8 +6,8 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/bitmapidx"
-	"github.com/evanoberholster/imageIdx/timeidx"
+	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/golang/geo/s2"
 )
 

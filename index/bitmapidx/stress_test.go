@@ -65,11 +65,11 @@ func TestStressMixedWorkload(t *testing.T) {
 
 	dir := t.TempDir()
 	config := FieldConfig{ActiveTarget: 64, HardDeltaLimit: 256, MaxDeltaValues: 32}
-	store, err := NewPersistentFields(dir, []Field{
+	store, err := NewIndex(dir, []Field{
 		enumField(enumType), textField(textType), continuousField(continuousType), geoFieldFor(geoType),
 	}, config, DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewPersistentFields: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	tag, _ := store.Lookup(enumType)
 	title, _ := store.Lookup(textType)
@@ -272,7 +272,7 @@ func TestStressMixedWorkload(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := OpenPersistentFields(dir, config, DurabilityOS)
+	reopened, err := OpenIndex(dir, config, DurabilityOS)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -332,9 +332,9 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 		t.Skip("stress test")
 	}
 	dir := t.TempDir()
-	store, err := NewPersistentFields(dir, []Field{geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
+	store, err := NewIndex(dir, []Field{geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewPersistentFields: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	loc, _ := store.Lookup(IndexTypeLocation)
 	key := sfKey(t)

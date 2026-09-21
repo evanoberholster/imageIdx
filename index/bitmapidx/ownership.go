@@ -15,7 +15,7 @@ var (
 	// ErrStoreBusy reports another process holding the store lock.
 	ErrStoreBusy = errors.New("bitmapidx: store directory already has a writer")
 	// ErrOwnedIndex reports Close on a store-owned FieldIndex. Close the
-	// owning FieldStore instead; it owns all child and mmap lifetimes.
+	// owning Index instead; it owns all child and mmap lifetimes.
 	ErrOwnedIndex = errors.New("bitmapidx: close the owning store instead")
 	// ErrRecoveryRequired reports a WAL failure that leaves the store
 	// failed until recovery. It aliases persist.ErrWALFailed.

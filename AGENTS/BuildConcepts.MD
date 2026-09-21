@@ -49,11 +49,10 @@ Every change must pass `go build ./...`, `go test ./...`, and
 
 ```text
 ./           imageidx: shared ImageID and durability domain types
-roar/        immutable zero-copy bitmap sets used directly by bitmapidx and geoidx
-bitmapidx/   persistent typed fields and bounded per-field deltas
-timeidx/   standalone block-local timestamp index
-geoidx/    S2 level-16 spatial index (dense cells are roar bitmaps)
-internal/indexutil/ shared non-domain mechanisms used by all three indexes
+roar/          immutable zero-copy bitmap sets used by the indexes
+index/bitmapidx/  persistent typed fields and bounded per-field deltas (package bitmapidx)
+index/timeidx/    standalone block-local timestamp index (package timeidx)
+internal/indexutil/ shared non-domain mechanisms used by the indexes
 search/      cross-index planner and conjunctive query executor
 cmd/imageidx/ runnable one-shot and HTTP-server combined-search example
 ```
@@ -192,8 +191,8 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 - `Field` is the only persisted bitmap abstraction. A fixed `Registry` defines
   the typed enum, bool, text, continuous, and geo fields in a store.
-- `NewPersistentFields`/`OpenPersistentFields` create or reopen a
-  `FieldStore`. The store owns field handles, one WAL, checkpoint generations,
+- `NewIndex`/`OpenIndex` create or reopen a
+  `Index`. The store owns field handles, one WAL, checkpoint generations,
   and all mmap lifetimes. Callers mutate through `Add`, `Remove`, `Move`,
   `ReplaceText`, and `Apply` on the returned fields.
 - Field queries use typed operations such as `MatchValues`, `MatchText`,

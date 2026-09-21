@@ -14,7 +14,7 @@ import (
 
 const fieldManifestMagic uint32 = 0x424d464d
 
-// FieldStore persists a fixed registry of fields with one serialized WAL
+// Index persists a fixed registry of fields with one serialized WAL
 // writer. Child Add/Apply/Move/ReplaceText calls automatically append to
 // that WAL. Each batch is atomic within one field; cross-field
 // transactions are not provided. Reads remain lock-free across writes and
@@ -26,7 +26,7 @@ const fieldManifestMagic uint32 = 0x424d464d
 // maintenance, bound WAL growth, and monitor free space themselves; the
 // package benchmark suite probes the checkpoint write stall and restart
 // budgets.
-type FieldStore struct {
+type Index struct {
 	dir        string
 	fields     map[IndexType]*FieldIndex // immutable after construction
 	order      []*FieldIndex
@@ -53,12 +53,12 @@ func newStoreID() ([16]byte, error) {
 	return id, nil
 }
 
-// NewPersistentFields creates a new mmap-backed field store. The
+// NewIndex creates a new mmap-backed field store. The
 // directory must be empty (besides the lock file). Field definitions are
 // validated, persisted in the first checkpoint, and immutable after;
 // config is runtime-only policy. Handles become store-owned on success
 // and must be closed via the store.
-func NewPersistentFields(dir string, fields []Field, config FieldConfig, durability Durability) (*FieldStore, error) {
+func NewIndex(dir string, fields []Field, config FieldConfig, durability Durability) (*Index, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -78,7 +78,7 @@ func NewPersistentFields(dir string, fields []Field, config FieldConfig, durabil
 	if err != nil {
 		return nil, err
 	}
-	s := &FieldStore{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, fields: make(map[IndexType]*FieldIndex)}
+	s := &Index{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, fields: make(map[IndexType]*FieldIndex)}
 	for _, field := range registry.Fields() {
 		index, err := NewFieldIndex(field, config)
 		if err != nil {
@@ -98,11 +98,11 @@ func NewPersistentFields(dir string, fields []Field, config FieldConfig, durabil
 	return s, nil
 }
 
-// OpenPersistentFields opens a checkpoint, replays its WAL, and repairs
+// OpenIndex opens a checkpoint, replays its WAL, and repairs
 // only an incomplete terminal frame before making field handles
 // available. Generation, field count, segment checksums, and WAL offsets
 // all validate; any other corruption fails the open for external recovery.
-func OpenPersistentFields(dir string, config FieldConfig, durability Durability) (*FieldStore, error) {
+func OpenIndex(dir string, config FieldConfig, durability Durability) (*Index, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -114,7 +114,7 @@ func OpenPersistentFields(dir string, config FieldConfig, durability Durability)
 	if err != nil {
 		return nil, err
 	}
-	s := &FieldStore{dir: dir, config: config, durability: durability, lock: lock}
+	s := &Index{dir: dir, config: config, durability: durability, lock: lock}
 	ok := false
 	defer func() {
 		if !ok {
@@ -171,29 +171,29 @@ func OpenPersistentFields(dir string, config FieldConfig, durability Durability)
 
 // Lookup returns the store-owned field for t. All mutations append to the
 // store WAL. The handle must not be closed directly.
-func (s *FieldStore) Lookup(t IndexType) (*FieldIndex, bool) {
+func (s *Index) Lookup(t IndexType) (*FieldIndex, bool) {
 	index, ok := s.fields[t]
 	return index, ok
 }
 
 // Len returns the number of fields in physical storage order.
-func (s *FieldStore) Len() int { return len(s.order) }
+func (s *Index) Len() int { return len(s.order) }
 
 // Fields returns store-owned handles in physical storage order. The slice
 // is a copy; the handles are shared and must not be closed directly.
-func (s *FieldStore) Fields() []*FieldIndex { return append([]*FieldIndex(nil), s.order...) }
+func (s *Index) Fields() []*FieldIndex { return append([]*FieldIndex(nil), s.order...) }
 
-func (s *FieldStore) writable() error {
+func (s *Index) writable() error {
 	if s.closed {
 		return ErrClosed
 	}
 	return s.failed
 }
 
-func (s *FieldStore) snapshotPath(gen uint64) string {
+func (s *Index) snapshotPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("fields-%020d.idx", gen))
 }
-func (s *FieldStore) walPath(gen uint64) string {
+func (s *Index) walPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("fields-%020d.wal", gen))
 }
 
@@ -202,7 +202,7 @@ func (s *FieldStore) walPath(gen uint64) string {
 // directory, then publishes the manifest. Afterwards it swaps field
 // roots, drains prior readers, and unmaps the old snapshot. A completed
 // checkpoint bounds subsequent replay to its WAL.
-func (s *FieldStore) Checkpoint() error {
+func (s *Index) Checkpoint() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.checkpointLocked(false)
@@ -211,7 +211,7 @@ func (s *FieldStore) Checkpoint() error {
 // Vacuum checkpoints with dead dictionary entries dropped, then removes
 // obsolete snapshot and WAL generations. Retirement serializes with
 // manifest publication; only the live generation's files remain.
-func (s *FieldStore) Vacuum() error {
+func (s *Index) Vacuum() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := s.checkpointLocked(true); err != nil {
@@ -230,7 +230,7 @@ func (s *FieldStore) Vacuum() error {
 // is safe to truncate while the lock is held. Dictionary generations are
 // preserved on plain checkpoints so compiled queries keep their fast
 // path; vacuum advances them because dead values may leave the set.
-func (s *FieldStore) checkpointLocked(vacuum bool) error {
+func (s *Index) checkpointLocked(vacuum bool) error {
 	if err := s.writable(); err != nil {
 		return err
 	}
@@ -346,7 +346,7 @@ func syncStoreDir(dir string) error {
 // Close marks the store closed, closes children without per-index
 // locks, then closes the WAL, unmaps the snapshot, and releases the
 // directory lock. It is idempotent.
-func (s *FieldStore) Close() error {
+func (s *Index) Close() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closed {

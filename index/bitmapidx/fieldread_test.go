@@ -63,9 +63,9 @@ func TestCountValuesMatchesMaterialized(t *testing.T) {
 // unmap here.
 func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewPersistentFields(dir, []Field{enumField(IndexTypeTag), geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
+	store, err := NewIndex(dir, []Field{enumField(IndexTypeTag), geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewPersistentFields: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	defer store.Close()
 	tag, _ := store.Lookup(IndexTypeTag)
