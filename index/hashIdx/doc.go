@@ -72,6 +72,15 @@
 // may pick the order from measured candidate density; V1 keeps the two
 // scalar, benchmarkable paths with the tradeoff documented here.
 //
+// # Standalone scope
+//
+// hashIdx is usable standalone through Store (see ExampleStore): combined
+// search integration stays a post-V1 co-design item. The seam is ready:
+// CandidateSet admits any live/candidate bitmap (a roar.Bitmap satisfies it
+// directly) and imageidx.ImageID is one type everywhere, so a future clause
+// can filter hashIdx results by, and feed candidates into, other indexes
+// without representation changes.
+//
 // # Exact content-hash index
 //
 // ExactIndex maps 256-bit content digests (SHA-256 or BLAKE3-256) to image IDs
@@ -110,13 +119,27 @@
 // view generation is stable, re-resolving exactly once per generation
 // change.
 //
+// Overlay reads cost up to two small binary probes before the base walk
+// (measured +50-70ns on a 40-60ns base with a full overlay, 0 allocs).
+// Workloads that burst-write then read hot should Checkpoint once after
+// the burst — the checkpoint folds for the persisted file — or serve hot
+// hashes through CompileLookup, which replays at ~6ns regardless of
+// overlay depth.
+//
 // # Persistence
 //
 // A persistent Store owns one directory:
 //
 //	.hashidx.lock  exclusive single-writer lock
+//	manifest       joint generation anchor (advisory; see below)
 //	perceptual/    perceptual Index artifacts
 //	exact/         ExactIndex artifacts
+//
+// The single-writer lock is flock on Unix and LockFileEx on Windows
+// (see lock_unix.go, lock_windows.go); other platforms fail fast instead
+// of running unlocked. Mmap-backed reads are Unix-only until
+// internal/indexutil gains a MapViewOfFile backend, so Windows support
+// also waits on that.
 //
 // The perceptual index uses three artifact kinds under perceptual/:
 //
@@ -146,6 +169,27 @@
 // algorithm, generation, and block count for the exact index. Page size and
 // exact block sizing are persistent properties: OpenStore adopts the recorded
 // values rather than silently reinterpreting them.
+//
+// Store.Checkpoint persists perceptual then exact, then the joint anchor
+// naming both generations; a failure between them leaves the indexes
+// diverged by design, and the next Checkpoint converges while the stale
+// anchor still names the last joint pair. The anchor is advisory only:
+// sub-manifests stay authoritative, a missing file (pre-V1 stores) is
+// normal, and OpenStore never consults it.
+//
+// # Format stability
+//
+// Every artifact carries magic plus version, and every payload carries a
+// CRC32/IEEE: recognized magic with an unknown version fails open with
+// ErrUnsupported (never misread as same-version rot), corrupt bytes fail
+// with ErrCorrupt. WAL framing violations report ErrCorruptWAL either way:
+// WALs are transient epochs, rolled on every Vacuum, so they carry no
+// upgrade path — Vacuum before upgrading. Batch limits, overlay bounds,
+// and durability are runtime policy, never persisted, so tuning them
+// changes no bytes on disk. (Exact block sizing, page sizing, and the
+// digest algorithm are persisted and adopted on open.) There is no
+// migration framework yet: V1 opens what V1 wrote, and any future version
+// bump must add a tested upgrade path before it ships.
 //
 // # Non-goals
 //

@@ -218,6 +218,71 @@ func TestCorruptManifestRejected(t *testing.T) {
 	}
 }
 
+// TestManifestVersionRejected proves unknown manifest versions fail open
+// with ErrUnsupported instead of masquerading as corruption.
+func TestManifestVersionRejected(t *testing.T) {
+	bumpVersion := func(t *testing.T, path string) {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[4] ^= 0xff // version field; magic stays recognized
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := t.TempDir()
+	idx := mustNewPersistent(t, dir, Config{})
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bumpVersion(t, filepath.Join(dir, "manifest"))
+	if _, err := openIndex(dir, Config{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("versioned manifest error = %v, want ErrUnsupported", err)
+	}
+
+	exactDir := persistentDir(t)
+	exactIdx, err := newExact(exactDir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = exactIdx.Close()
+	bumpVersion(t, filepath.Join(exactDir, "manifest"))
+	if _, err := openExact(exactDir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("versioned exact manifest error = %v, want ErrUnsupported", err)
+	}
+
+	storeDir := t.TempDir()
+	mustNewStore(t, storeDir, StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}})
+	if pGen, eGen, err := ReadStoreManifest(storeDir); err != nil || pGen != 1 || eGen != 1 {
+		t.Fatalf("fresh joint anchor = (%d, %d, %v), want (1, 1, nil)", pGen, eGen, err)
+	}
+	bumpVersion(t, filepath.Join(storeDir, "manifest"))
+	if _, _, err := ReadStoreManifest(storeDir); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("versioned joint manifest error = %v, want ErrUnsupported", err)
+	}
+	// Restore a well-formed anchor before the corruption stage: the
+	// version bump above persists in the file.
+	if err := writeStoreManifest(storeDir, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(storeDir, "manifest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[10] ^= 0xff
+	if err := os.WriteFile(filepath.Join(storeDir, "manifest"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReadStoreManifest(storeDir); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("corrupt joint manifest error = %v, want ErrCorrupt", err)
+	}
+	if _, _, err := ReadStoreManifest(filepath.Join(storeDir, "missing")); !os.IsNotExist(err) {
+		t.Fatalf("missing joint manifest error = %v, want not-exist", err)
+	}
+}
+
 func TestCorruptGenerationHeaderRejected(t *testing.T) {
 	dir := t.TempDir()
 	idx := mustNewPersistent(t, dir, Config{RecordsPerPage: 32})

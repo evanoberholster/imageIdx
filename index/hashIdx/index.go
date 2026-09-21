@@ -2,6 +2,7 @@ package hashidx
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,9 @@ type Index struct {
 	writerMu sync.Mutex
 	config   Config
 	closed   atomic.Bool
+	// failed latches the first WAL error, guarded by writerMu. While set,
+	// writes and maintenance fail fast with it until close and reopen.
+	failed error
 
 	persistence persistedState
 }
@@ -46,7 +50,8 @@ func (i *Index) Add(entry Entry) error { return i.Apply([]Entry{entry}) }
 // the batch. Batches past Config.MaxBatchEntries fail with ErrBatchTooLarge
 // before any WAL or view work. Apply validates entries, appends the WAL
 // batch first when the index is persistent, then publishes the new
-// immutable view.
+// immutable view. A WAL failure latches ErrRecoveryRequired: the view is
+// untouched, and later writes fail fast with it until close and reopen.
 func (i *Index) Apply(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
@@ -64,11 +69,15 @@ func (i *Index) Apply(entries []Entry) error {
 	if i.closed.Load() {
 		return ErrClosed
 	}
+	if i.failed != nil {
+		return i.failed
+	}
 	i.persistence.mu.Lock()
 	err := appendHashWAL(i.persistence.wal, entries, i.persistence.durability)
 	i.persistence.mu.Unlock()
 	if err != nil {
-		return err
+		i.failed = errors.Join(ErrRecoveryRequired, err)
+		return i.failed
 	}
 	i.appendEntriesLocked(entries)
 	return nil
@@ -161,11 +170,14 @@ func (i *Index) EntryAt(ordinal Ordinal) (Entry, bool) {
 	return entry, found
 }
 
-// PendingCompactions reports in-flight background work. hashidx compacts
-// synchronously, so this is always zero.
+// PendingCompactions reports in-flight background work. The perceptual
+// index compacts synchronously, so this is always zero. It exists for
+// symmetry with the other index packages, so a future generic
+// maintenance driver can poll every index type uniformly.
 func (i *Index) PendingCompactions() int64 { return 0 }
 
-// WaitIdle returns immediately; there is no background work to drain.
+// WaitIdle returns immediately; there is no background work to drain. It
+// exists for the same cross-package symmetry as PendingCompactions.
 func (i *Index) WaitIdle(_ context.Context) error { return nil }
 
 // Close marks the index closed, drains readers, and releases the WAL and mmap

@@ -24,13 +24,17 @@ type persistedState struct {
 }
 
 // close releases the WAL and every live mapping. It must run after readers
-// have drained.
+// have drained. An already-closed WAL handle reports os.ErrClosed, which is
+// tolerated so cleanup (unmapping, lock release by the caller) always
+// proceeds; any other WAL error is propagated.
 func (s *persistedState) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var err error
 	if s.wal != nil {
-		err = errors.Join(err, s.wal.Close())
+		if cerr := s.wal.Close(); cerr != nil && !errors.Is(cerr, os.ErrClosed) {
+			err = errors.Join(err, cerr)
+		}
 		s.wal = nil
 	}
 	for _, mapping := range s.mappings {
@@ -67,10 +71,11 @@ func onDiskBytes(dir string, patterns ...string) uint64 {
 }
 
 // writeAtomicFile writes path+".tmp" through write, fsyncs it, and renames it
-// over path.
+// over path. Index data is owner-only (0o600), matching WAL and segment
+// files everywhere else in the package.
 func writeAtomicFile(path string, write func(file *os.File) error) error {
 	tmpPath := path + ".tmp"
-	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

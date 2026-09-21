@@ -193,6 +193,9 @@ func (i *Index) checkpointLocked() error {
 	if i.closed.Load() {
 		return ErrClosed
 	}
+	if i.failed != nil {
+		return i.failed
+	}
 	i.persistence.mu.Lock()
 	defer i.persistence.mu.Unlock()
 	view := i.view.Load()
@@ -230,6 +233,9 @@ func (i *Index) Vacuum(live CandidateSet) error {
 	defer i.writerMu.Unlock()
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	if i.failed != nil {
+		return i.failed
 	}
 	next := buildDenseView(i.view.Load(), int(i.config.RecordsPerPage), live)
 	i.persistence.mu.Lock()
@@ -673,6 +679,13 @@ func readManifest(path string) (diskManifest, error) {
 	if err != nil {
 		return diskManifest{}, err
 	}
+	// A recognized magic with an unknown version is a newer format, not
+	// corruption: fail open with ErrUnsupported so callers never misread
+	// it as a same-version bit rot.
+	if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == manifestMagic &&
+		binary.LittleEndian.Uint16(data[4:6]) != manifestVersion {
+		return diskManifest{}, ErrUnsupported
+	}
 	if err = persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 60, 60); err != nil {
 		return diskManifest{}, ErrCorrupt
 	}
@@ -741,6 +754,12 @@ func encodeManifest(m exactManifest) []byte {
 }
 
 func decodeManifest(data []byte) (exactManifest, error) {
+	// Recognized magic with an unknown version is a newer format, not
+	// corruption: fail open with ErrUnsupported (see readManifest).
+	if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == exactManifestMagic &&
+		binary.LittleEndian.Uint16(data[4:6]) != exactManifestVersion {
+		return exactManifest{}, ErrUnsupported
+	}
 	if err := persist.VerifyManifest(data, exactManifestSize, exactManifestMagic, exactManifestVersion, 60, 60); err != nil {
 		return exactManifest{}, ErrCorrupt
 	}
@@ -1038,6 +1057,9 @@ func (i *ExactIndex) checkpointLocked() error {
 	if i.closed.Load() {
 		return ErrClosed
 	}
+	if err := i.failedErr(); err != nil {
+		return err
+	}
 	i.persistence.mu.Lock()
 	defer i.persistence.mu.Unlock()
 	view := i.view.Load()
@@ -1130,6 +1152,9 @@ func (i *ExactIndex) Vacuum() error {
 	defer i.lifecycle.Unlock()
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	if err := i.failedErr(); err != nil {
+		return err
 	}
 	response := make(chan barrierResult, 1)
 	select {

@@ -281,6 +281,12 @@ func BenchmarkRecordsPerPage(b *testing.B) {
 	}
 }
 
+// BenchmarkCheckpoint measures the writer stall of a full rewrite plus
+// manifest publish per 1,000-entry delta. Treat it as the write-stall
+// budget probe: on reference hardware a delta checkpoint should stay
+// well under an interactive maintenance window. Absolute ns/op moves
+// with the machine; watch allocs/op (should stay flat) and the
+// entries/sec trend across commits.
 func BenchmarkCheckpoint(b *testing.B) {
 	dir := b.TempDir()
 	idx, err := newIndex(dir, Config{RecordsPerPage: 8192}, DurabilityOS)
@@ -310,6 +316,9 @@ func BenchmarkCheckpoint(b *testing.B) {
 	b.ReportMetric(float64(1_000*b.N)/b.Elapsed().Seconds(), "entries/sec")
 }
 
+// BenchmarkVacuum measures a full dense repack of 100k records. Same
+// reading contract as BenchmarkCheckpoint: machine-dependent absolute
+// time, but allocs/op and records/sec must not regress across commits.
 func BenchmarkVacuum(b *testing.B) {
 	dir := b.TempDir()
 	cfg := Config{RecordsPerPage: 8192}
@@ -389,6 +398,9 @@ func buildExactBenchIndex(b *testing.B, count int, cfg ExactConfig, duplicates i
 	return idx, hashes
 }
 
+// BenchmarkLookupHit1 pins the hot point-lookup cost: 0 allocs, and time
+// must scale with the matching run length (see Hit4/Hit16/Spanning), not
+// with index size.
 func BenchmarkLookupHit1(b *testing.B) {
 	idx, hashes := buildExactBenchIndex(b, 100_000, ExactConfig{}, 1)
 	h := hashes[len(hashes)/2]
@@ -504,6 +516,9 @@ func BenchmarkLookupRandomHits(b *testing.B) {
 	}
 }
 
+// BenchmarkContainsHot pins the hot membership cost alongside
+// BenchmarkCompiledContains: one-shot stays 0-alloc, and the compiled
+// form must hold its ~7x lead across commits.
 func BenchmarkContainsHot(b *testing.B) {
 	idx, hashes := buildExactBenchIndex(b, 100_000, ExactConfig{}, 1)
 	h := hashes[7]

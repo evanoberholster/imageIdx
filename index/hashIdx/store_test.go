@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -35,6 +36,7 @@ func TestStorePersistentCheckpointReopenAndWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{
+		filepath.Join(dir, "manifest"),
 		filepath.Join(dir, perceptualDirName, "manifest"),
 		filepath.Join(dir, exactDirName, "manifest"),
 		filepath.Join(dir, storeLockName),
@@ -114,6 +116,87 @@ func TestStoreDirectoryOwnership(t *testing.T) {
 	}
 	if _, err := OpenStore(t.TempDir(), DurabilityOS); !errors.Is(err, ErrNotStore) {
 		t.Fatalf("OpenStore over plain dir err = %v, want ErrNotStore", err)
+	}
+}
+
+// TestStoreCheckpointConvergenceAfterExactFailure hides the exact
+// directory so its generation write fails mid-Checkpoint, then proves
+// the store converges: perceptual advances alone, the joint anchor still
+// names the last joint pair, and the next Checkpoint repairs both the
+// exact generation and the anchor with data intact.
+func TestStoreCheckpointConvergenceAfterExactFailure(t *testing.T) {
+	// Renaming a directory out from under open mmap/WAL handles fails on
+	// Windows; the fault this test injects is Unix-only.
+	if runtime.GOOS == "windows" {
+		t.Skip("rename-away fault injection needs Unix rename semantics")
+	}
+	dir := t.TempDir()
+	spec := StoreSpec{
+		Perceptual: Config{RecordsPerPage: 64},
+		Exact:      ExactSpec{Algorithm: AlgorithmSHA256},
+	}
+	store := mustNewStore(t, dir, spec)
+	if err := store.Perceptual().Apply(seedEntries(4)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Exact().Add(makeHash(4242), 4242); err != nil {
+		t.Fatal(err)
+	}
+	subGen := func() (uint64, uint64) {
+		t.Helper()
+		p, err := readManifest(filepath.Join(dir, perceptualDirName, "manifest"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e, err := readDiskManifest(filepath.Join(dir, exactDirName, "manifest"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.generation, e.generation
+	}
+	// Fault: the exact generation file cannot be created.
+	exactDir := filepath.Join(dir, exactDirName)
+	hidden := exactDir + ".hidden"
+	if err := os.Rename(exactDir, hidden); err != nil {
+		t.Fatal(err)
+	}
+	failed := store.Checkpoint() == nil
+	if err := os.Rename(hidden, exactDir); err != nil {
+		t.Fatal(err)
+	}
+	if failed {
+		t.Fatal("Checkpoint over a hidden exact dir succeeded")
+	}
+	pPersisted, ePersisted := subGen()
+	if pPersisted == 1 {
+		t.Fatal("perceptual checkpoint did not advance before the exact failure")
+	}
+	if ePersisted != 1 {
+		t.Fatalf("exact generation advanced despite failure: %d", ePersisted)
+	}
+	if pGen, eGen, err := ReadStoreManifest(dir); err != nil || pGen != 1 || eGen != 1 {
+		t.Fatalf("joint anchor = (%d, %d, %v), want (1, 1, nil)", pGen, eGen, err)
+	}
+	// Repair is another Checkpoint: it converges and re-anchors.
+	if err := store.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	pGen, eGen, err := ReadStoreManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pNow, eNow := subGen()
+	if pGen != pNow || eGen != eNow {
+		t.Fatalf("joint anchor = (%d, %d), sub-manifests = (%d, %d)", pGen, eGen, pNow, eNow)
+	}
+	if lp, le := store.Generations(); lp != pGen || le != eGen {
+		t.Fatalf("live Generations = (%d, %d), anchor = (%d, %d)", lp, le, pGen, eGen)
+	}
+	if got := store.Perceptual().Metadata().RecordCount; got != 4 {
+		t.Fatalf("perceptual records = %d, want 4", got)
+	}
+	if got := store.Exact().Lookup(nil, makeHash(4242)); len(got) != 1 || got[0] != 4242 {
+		t.Fatalf("exact lookup = %v, want [4242]", got)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -70,7 +71,31 @@ type ExactIndex struct {
 	publishes  atomic.Uint64
 	coalesced  atomic.Uint64
 
+	// failMu guards failed, the latched first WAL error. While set,
+	// writes fail fast and maintenance refuses, until close and reopen.
+	failMu sync.Mutex
+	failed error
+
 	persistence persistedState
+}
+
+// fail latches the first WAL error wrapped with ErrRecoveryRequired and
+// reports the latched error. Later failures keep the first one so the
+// recovery story stays singular.
+func (i *ExactIndex) fail(err error) error {
+	i.failMu.Lock()
+	defer i.failMu.Unlock()
+	if i.failed == nil {
+		i.failed = errors.Join(ErrRecoveryRequired, err)
+	}
+	return i.failed
+}
+
+// failedErr reports the latched WAL failure, if any.
+func (i *ExactIndex) failedErr() error {
+	i.failMu.Lock()
+	defer i.failMu.Unlock()
+	return i.failed
 }
 
 // exactWriteQueue bounds queued write batches. Coalescing drains the queue,
@@ -494,7 +519,8 @@ func (i *ExactIndex) Remove(hash Hash, imageID ImageID) error {
 // into one WAL append and one publication; each waiter still observes its
 // own mutation on return, so calls stay linearizable. Slices are copied into
 // pooled buffers and never retained. A concurrent Close may fail the call
-// with ErrClosed instead of applying it.
+// with ErrClosed instead of applying it. A latched WAL failure fails fast
+// with ErrRecoveryRequired until close and reopen.
 func (i *ExactIndex) Apply(m Mutation) error {
 	if len(m.Add) == 0 && len(m.Remove) == 0 {
 		return nil
@@ -516,6 +542,9 @@ func (i *ExactIndex) Apply(m Mutation) error {
 	defer i.lifecycle.RUnlock()
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	if err := i.failedErr(); err != nil {
+		return err
 	}
 	batch := acquireExactBatch(m.Add, m.Remove)
 	select {
@@ -601,6 +630,15 @@ func (i *ExactIndex) applyCoalesced(first *exactBatch) {
 // past OverlayMaxEntries staged IDs the batch folds into the blocks and
 // clears the overlay, amortizing the O(#blocks) directory copy.
 func (i *ExactIndex) publishMerged(pending []*exactBatch) {
+	// Fast-fail without touching the WAL or the publish counters: a
+	// latched failure means no waiter took effect, so there is nothing
+	// to count and nothing to roll back.
+	if err := i.failedErr(); err != nil {
+		for _, batch := range pending {
+			batch.done <- err
+		}
+		return
+	}
 	adds, removes := flattenBatches(pending)
 	current := i.view.Load()
 	if len(adds)+len(removes) != 0 {
@@ -654,11 +692,14 @@ func (i *ExactIndex) publishBatch(current *exactIndexView, adds, removes []Exact
 	err := appendExactWAL(i.persistence.wal, adds, removes, i.persistence.durability, i.seq.Add(1))
 	i.persistence.mu.Unlock()
 	if err != nil {
-		return err
+		return i.fail(err)
 	}
 	staged := stageOverlay(current.overlay, adds, removes)
 	var next *exactIndexView
-	if staged == nil || staged.ids() <= int(i.config.OverlayMaxEntries) {
+	// Compared in uint64: int would overflow the bound on 32-bit
+	// platforms for absurd configurations, degrading to always-fold
+	// instead of misbehaving.
+	if staged == nil || uint64(staged.ids()) <= uint64(i.config.OverlayMaxEntries) {
 		next = &exactIndexView{
 			generation: current.generation + 1,
 			liveCount:  current.liveCount,
@@ -982,10 +1023,12 @@ func (i *ExactIndex) PendingCompactions() int64 { return int64(len(i.writes)) }
 // there is no detached background work to drain.
 func (i *ExactIndex) WaitIdle(_ context.Context) error { return nil }
 
-// WriteStats returns the total publications and the number of batches
-// coalesced into shared publications since construction. Consecutive
-// concurrent Applies sharing one WAL append and one view publish show up as
-// coalesced batches.
+// WriteStats returns the writer-loop cycles run and the batches coalesced
+// into shared cycles since construction. A cycle counts once it runs,
+// including no-op cycles over fully canonicalized-away batches and failed
+// cycles that published nothing; only latched fast-fails run no cycle.
+// Consecutive concurrent Applies sharing one WAL append and one view
+// publish show up as coalesced batches.
 func (i *ExactIndex) WriteStats() (publishes, coalesced uint64) {
 	return i.publishes.Load(), i.coalesced.Load()
 }
