@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"math/rand"
 	"testing"
 
@@ -56,14 +57,10 @@ func BenchmarkCombinedSearch(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = geo.Close() })
-	geoClause, err := WithinCells(geo, bitmapidx.DecodeS2Key(key))
-	if err != nil {
-		b.Fatal(err)
-	}
 	plan, err := Compile(
-		FieldValues(field, bitmapidx.StringValue("favorite")),
+		AllValues(field, bitmapidx.StringValue("favorite")),
 		During(timeIndex, 4_000*quantum, 6_000*quantum),
-		geoClause,
+		InCells(geo, bitmapidx.DecodeS2Key(key)),
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -73,7 +70,10 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		results = plan.Search(results[:0], workspace)
+		results, err = plan.AppendIDs(context.Background(), results[:0], workspace)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -97,11 +97,7 @@ func BenchmarkGeoCollectSearch(b *testing.B) {
 	}
 	b.Cleanup(func() { _ = geo.Close() })
 	cover := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(30, -120)).Parent(0))
-	geoClause, err := WithinCells(geo, cover)
-	if err != nil {
-		b.Fatal(err)
-	}
-	plan, err := Compile(FieldValues(field, bitmapidx.StringValue("favorite")), geoClause)
+	plan, err := Compile(AllValues(field, bitmapidx.StringValue("favorite")), InCells(geo, cover))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -110,7 +106,10 @@ func BenchmarkGeoCollectSearch(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		results = plan.Search(results[:0], workspace)
+		results, err = plan.AppendIDs(context.Background(), results[:0], workspace)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -144,23 +143,22 @@ func BenchmarkGeoCityPlan(b *testing.B) {
 	b.Cleanup(func() { _ = geo.Close() })
 	for _, city := range cities {
 		cityCell := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(city.lat, city.lng)).Parent(8))
-		geoClause, err := WithinCells(geo, cityCell)
-		if err != nil {
-			b.Fatal(err)
-		}
-		plan, err := Compile(FieldValues(field, bitmapidx.StringValue("favorite")), geoClause)
+		plan, err := Compile(AllValues(field, bitmapidx.StringValue("favorite")), InCells(geo, cityCell))
 		if err != nil {
 			b.Fatal(err)
 		}
 		workspace := NewWorkspace(perCity)
 		results := make([]ImageID, 0, perCity)
-		if got := plan.Count(workspace); got == 0 {
+		if got, err := plan.Count(context.Background(), workspace); err != nil || got == 0 {
 			b.Fatalf("%s plan matched nothing", city.name)
 		}
 		b.Run(city.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
-				results = plan.Search(results[:0], workspace)
+				results, err = plan.AppendIDs(context.Background(), results[:0], workspace)
+				if err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

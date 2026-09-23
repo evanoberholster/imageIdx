@@ -113,27 +113,107 @@ func (i *FieldIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr
 	return out, nil
 }
 
-// FilterGeoRanges appends the candidates inside any key range to dst. It
-// probes each candidate against covered buckets instead of materializing
-// the union, so it allocates nothing beyond dst growth at O(candidates ×
-// buckets) probe cost. Prefer CollectGeoRanges plus bitmap probes when
-// buckets are many or the match will be reused; see CountGeoCells for the
-// planning probe.
+// FilterGeoRanges appends the candidates inside any key range to dst. Covered
+// base spans and in-range delta keys are resolved once per call, so each
+// candidate costs a posting probe instead of a binary search. It preserves the
+// candidates' order and allocates nothing beyond dst growth for typical range
+// counts. Prefer CollectGeoRanges plus bitmap probes when buckets are many or
+// the match will be reused; see CountGeoCells for the planning probe.
 func (i *FieldIndex) FilterGeoRanges(dst, candidates []ImageID, ranges []GeoRange) ([]ImageID, error) {
 	if i.field().Kind != KindGeo {
 		return dst, ErrFieldMismatch
 	}
 	token := i.readers.Acquire()
 	view := i.view.Load()
-	if !i.closed.Load() {
+	if !i.closed.Load() && len(ranges) != 0 {
+		var spanBuf [8]geoBaseSpan
+		var keyBuf [16]FieldKey
+		probe := view.prepareGeoProbe(ranges, spanBuf[:0], keyBuf[:0])
 		for _, id := range candidates {
-			if view.geoContains(ranges, id) {
+			if view.geoProbeContains(&probe, id) {
 				dst = append(dst, id)
 			}
 		}
 	}
 	i.readers.Release(token)
 	return dst, nil
+}
+
+// geoBaseSpan is one precomputed base key span for a geo range.
+type geoBaseSpan struct {
+	start int
+	end   int
+}
+
+// geoProbe is a prepared geo filter: base spans and in-range delta keys are
+// resolved once so candidate probes avoid per-candidate binary searches.
+type geoProbe struct {
+	spans     []geoBaseSpan
+	deltaKeys []FieldKey
+}
+
+// prepareGeoProbe resolves ranges against the view once. spanBuf and keyBuf are
+// caller-owned scratch; unusually large range sets fall back to allocation.
+func (v *fieldView) prepareGeoProbe(ranges []GeoRange, spanBuf []geoBaseSpan, keyBuf []FieldKey) geoProbe {
+	spans := spanBuf
+	for _, keyRange := range ranges {
+		if keyRange.End < keyRange.Start {
+			continue
+		}
+		start, end := geoBaseRangeIn(v.base.keys, keyRange)
+		spans = append(spans, geoBaseSpan{start: start, end: end})
+	}
+	if !v.hasDeltas() {
+		return geoProbe{spans: spans}
+	}
+	keys := keyBuf
+	for _, delta := range []*fieldDelta{v.frozen, v.active} {
+		if delta == nil {
+			continue
+		}
+		for _, key := range delta.keys {
+			if key.Slot != 0 {
+				continue
+			}
+			for _, keyRange := range ranges {
+				if key.Hash >= keyRange.Start && key.Hash <= keyRange.End {
+					keys = append(keys, key)
+					break
+				}
+			}
+		}
+	}
+	return geoProbe{spans: spans, deltaKeys: keys}
+}
+
+// geoProbeContains reports whether id holds any bucket inside the prepared
+// spans, walking base postings directly when no deltas are visible and the
+// full active/frozen/base precedence otherwise.
+func (v *fieldView) geoProbeContains(p *geoProbe, id ImageID) bool {
+	if p.deltaKeys == nil {
+		for _, span := range p.spans {
+			postings := v.base.postings[span.start:span.end]
+			for index := range postings {
+				if postings[index].contains(id) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, span := range p.spans {
+		for _, key := range v.base.keys[span.start:span.end] {
+			if v.contains(key, id) {
+				return true
+			}
+		}
+	}
+	for _, key := range p.deltaKeys {
+		if v.contains(key, id) {
+			return true
+		}
+	}
+	return false
 }
 
 // EstimateGeoRanges returns the effective candidate count for occupied
@@ -309,49 +389,14 @@ func (v *fieldView) countGeoKeys(ranges []GeoRange) int {
 
 // geoContains reports whether id holds any bucket inside ranges, walking
 // base spans and delta keys without materializing postings. Each key
-// resolves through the full active/frozen/base precedence.
+// resolves through the full active/frozen/base precedence. It is retained for
+// callers that probe a single id; bulk filtering uses geoProbeContains, which
+// resolves the spans once.
 func (v *fieldView) geoContains(ranges []GeoRange, id ImageID) bool {
-	for _, keyRange := range ranges {
-		if keyRange.End < keyRange.Start {
-			continue
-		}
-		if !v.hasDeltas() {
-			start, end := geoBaseRangeIn(v.base.keys, keyRange)
-			for _, p := range v.base.postings[start:end] {
-				if p.contains(id) {
-					return true
-				}
-			}
-			continue
-		}
-		start, end := geoBaseRangeIn(v.base.keys, keyRange)
-		for _, key := range v.base.keys[start:end] {
-			if v.contains(key, id) {
-				return true
-			}
-		}
-	}
-	for _, delta := range []*fieldDelta{v.frozen, v.active} {
-		if delta == nil {
-			continue
-		}
-		for _, key := range delta.keys {
-			if key.Slot != 0 {
-				continue
-			}
-			inRange := false
-			for _, keyRange := range ranges {
-				if key.Hash >= keyRange.Start && key.Hash <= keyRange.End {
-					inRange = true
-					break
-				}
-			}
-			if inRange && v.contains(key, id) {
-				return true
-			}
-		}
-	}
-	return false
+	var spanBuf [8]geoBaseSpan
+	var keyBuf [16]FieldKey
+	probe := v.prepareGeoProbe(ranges, spanBuf[:0], keyBuf[:0])
+	return v.geoProbeContains(&probe, id)
 }
 
 // AppendTo appends every indexed image ID in ascending order, preserving
@@ -470,6 +515,13 @@ func (i *FieldIndex) Nearest(dst []NearestResult, latitude, longitude float64, k
 		dst = dst[:start+k]
 	}
 	return dst
+}
+
+// DistanceMeters returns the haversine distance in metres between two
+// coordinates. It is the metric Nearest ranks by, exposed for callers that
+// rank their own candidate sets.
+func DistanceMeters(lat1, lng1, lat2, lng2 float64) float64 {
+	return haversineMeters(lat1, lng1, lat2, lng2)
 }
 
 func haversineMeters(lat1, lng1, lat2, lng2 float64) float64 {

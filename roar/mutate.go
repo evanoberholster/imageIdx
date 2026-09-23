@@ -1,6 +1,9 @@
 package roar
 
-import "slices"
+import (
+	"slices"
+	"unsafe"
+)
 
 // inlineDeltaCapacity is the number of pending additions and removals each
 // DeltaBuilder stores without allocating. Most mutations are small; the
@@ -229,6 +232,20 @@ func NewMutableBitmap() *MutableBitmap {
 func (m *MutableBitmap) Reset() {
 	m.delta.Reset()
 	m.folded = false
+}
+
+// RetainedBytes returns a conservative bound for this accumulator's retained
+// memory, including scratch buffers. Shared/inline backing can be counted
+// more than once. It is intended for pool admission, not heap accounting.
+func (m *MutableBitmap) RetainedBytes() int {
+	if m == nil {
+		return 0
+	}
+	d := &m.delta
+	b := &d.fold
+	return int(unsafe.Sizeof(*m)) + cap(m.result) + cap(d.bitmap.data) +
+		8*(cap(d.adds)+cap(d.removes)+cap(b.keys)+cap(b.offsets)+cap(b.scratchWords)) +
+		cap(b.data) + 2*cap(b.scratchValues)
 }
 
 // AddMany stages raw additions. IDs may arrive in any order and may repeat;

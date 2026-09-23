@@ -460,13 +460,46 @@ func (i *FieldIndex) FilterValues(dst, candidates []ImageID, values ...Value) ([
 	return filterBitmap(dst, candidates, match), nil
 }
 
-// FilterRange appends the candidates inside bounds to dst.
+// FilterRange preserves order and duplicates; dst=candidates[:0] is safe.
+// It probes candidates or unions postings, according to the estimated work.
 func (i *FieldIndex) FilterRange(dst, candidates []ImageID, bounds NumericRange) ([]ImageID, error) {
-	match, err := i.Range(bounds)
-	if err != nil {
-		return dst, err
+	if i.field().Kind != KindContinuous {
+		return dst, ErrInvalidRange
 	}
-	return filterBitmap(dst, candidates, match), nil
+	if bounds.empty() || len(candidates) == 0 {
+		return dst, nil
+	}
+	token := i.readers.Acquire()
+	defer i.readers.Release(token)
+	view := i.view.Load()
+	if i.closed.Load() {
+		return dst, nil
+	}
+	start, end := view.baseRangeIndexes(bounds)
+	keys := view.base.keys[start:end]
+	if view.hasDeltas() {
+		keys = view.continuousKeys(i.field().Type, bounds)
+	}
+	if len(keys) > 1 && uint64(len(keys))*uint64(len(candidates)) > 4*view.estimateKeys(keys) {
+		postings := acquirePostings(len(keys))
+		defer releasePostings(postings)
+		for _, key := range keys {
+			if p, ok := view.effective(key); ok {
+				*postings = append(*postings, p)
+			}
+		}
+		bit, _ := unionPostings(*postings)
+		return filterBitmap(dst, candidates, bit), nil
+	}
+	for _, id := range candidates {
+		for _, key := range keys {
+			if view.contains(key, id) {
+				dst = append(dst, id)
+				break
+			}
+		}
+	}
+	return dst, nil
 }
 
 // filterBitmap appends the candidates present in bit, tolerating unsorted

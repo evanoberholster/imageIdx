@@ -1,6 +1,5 @@
 // Command service shows the long-lived path: one compiled Plan shared across
-// agents through search.Service, which pools workspaces and timestamp write
-// batches. A nil workspace must never be shared; the service owns pooling.
+// callers through search.Executor, which pools exclusive query workspaces.
 //
 // Usage:
 //
@@ -58,27 +57,32 @@ func main() {
 	defer times.Close()
 
 	plan, err := search.Compile(
-		search.FieldValues(favorites, bitmapidx.StringValue("favorite")),
+		search.AllValues(favorites, bitmapidx.StringValue("favorite")),
 		search.During(times, quantum, 3*quantum),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	service := search.NewService(plan, 64, 16)
-	service.Prewarm(2)
-
-	ctx := context.Background()
-	matches, err := service.QueryContext(ctx, nil)
+	executor, err := search.NewExecutor(search.ExecutorConfig{WorkspaceCapacity: 64})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("matches=%v count=%d empty=%v\n", matches, service.Count(), service.IsEmpty())
+	executor.Prewarm(2)
 
-	// Timestamp writes go through the owning index, not the service, but the
-	// service pools reusable batches: one batch per writer at a time.
-	batch := service.AcquireBatch()
-	defer service.ReleaseBatch(batch)
+	ctx := context.Background()
+	matches, err := executor.AppendIDs(ctx, nil, plan)
+	if err != nil {
+		log.Fatal(err)
+	}
+	count, err := executor.Count(ctx, plan)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("matches=%v count=%d empty=%v\n", matches, count, plan.IsEmpty())
+
+	// Timestamp writers own their batches independently of query execution.
+	batch := timeidx.NewBatch(16)
 	if ok := batch.Append(timeidx.Move(300, 3*quantum, 2*quantum)); !ok {
 		log.Fatal("batch full")
 	}

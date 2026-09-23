@@ -183,13 +183,85 @@ func (q Query) Count() (uint64, error) {
 	}
 }
 
-// Filter appends the candidates holding every compiled value to dst. It
-// materializes the match once, then probes candidates with a cursor, so it
-// tolerates unsorted input.
+// Filter appends candidates holding every compiled value, preserving order
+// and duplicates. It pins one view and probes postings directly, without
+// materializing or copying the matching population. dst=candidates[:0] is safe.
 func (q Query) Filter(dst, candidates []ImageID) ([]ImageID, error) {
-	match, err := q.Match()
-	if err != nil {
-		return dst, err
+	if q.index == nil || len(candidates) == 0 {
+		return dst, nil
 	}
-	return filterBitmap(dst, candidates, match), nil
+	i := q.index
+	token := i.readers.Acquire()
+	defer i.readers.Release(token)
+	view := i.view.Load()
+	if i.closed.Load() {
+		return dst, nil
+	}
+	keys, scratch, ok := q.keysFor(view)
+	if scratch != nil {
+		defer releaseFieldKeys(scratch)
+	}
+	if !ok || len(keys) == 0 {
+		return dst, nil
+	}
+	start := len(dst)
+	for n, key := range keys {
+		if n != 0 {
+			candidates = dst[start:]
+		}
+		out := dst[:start]
+		if !view.hasDeltas() {
+			p, ok := view.base.get(key)
+			if !ok {
+				return dst[:start], nil
+			}
+			if !p.isTiny() {
+				out = filterBitmap(out, candidates, p.bit)
+			} else {
+				for _, id := range candidates {
+					if p.contains(id) {
+						out = append(out, id)
+					}
+				}
+			}
+		} else {
+			for _, id := range candidates {
+				if view.contains(key, id) {
+					out = append(out, id)
+				}
+			}
+		}
+		dst = out
+		if len(dst) == start {
+			break
+		}
+	}
+	return dst, nil
+}
+
+// Estimate returns a live upper bound using the smallest effective posting
+// cardinality, without computing the conjunction. It is a planning hint only.
+func (q Query) Estimate() uint64 {
+	if q.index == nil {
+		return 0
+	}
+	i := q.index
+	token := i.readers.Acquire()
+	defer i.readers.Release(token)
+	view := i.view.Load()
+	if i.closed.Load() {
+		return 0
+	}
+	keys, scratch, ok := q.keysFor(view)
+	if scratch != nil {
+		defer releaseFieldKeys(scratch)
+	}
+	if !ok || len(keys) == 0 {
+		return 0
+	}
+	minimum := ^uint64(0)
+	for n := range keys {
+		minimum = min(minimum, view.estimateKeys(keys[n:n+1]))
+	}
+	return minimum
 }

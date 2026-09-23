@@ -88,7 +88,7 @@ func level16CellFromLatLng(latitude, longitude float64) (s2.CellID, error) {
 }
 
 // CellIDFromLatLng converts a coordinate to its level-16 S2 cell ID,
-// ready for RangesFromCellIDs or search.WithinCells. Non-finite or
+// ready for RangesFromCellIDs or search.InCells. Non-finite or
 // out-of-range coordinates return zero, which those APIs reject as
 // ErrInvalidS2Cell.
 func CellIDFromLatLng(latitude, longitude float64) uint64 {

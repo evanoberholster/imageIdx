@@ -28,6 +28,14 @@ import (
 // ImageID is the database-wide identifier type shared by all index packages.
 type ImageID = imageidx.ImageID
 
+// UserID is the database-wide user principal type shared by all index
+// packages.
+type UserID = imageidx.UserID
+
+// GroupID is the database-wide group principal type shared by all index
+// packages.
+type GroupID = imageidx.GroupID
+
 // IndexType identifies a database field (location, person, album, and so
 // on). The concrete registry is database-defined. Zero is reserved and
 // never a valid field.
@@ -45,6 +53,12 @@ const (
 	IndexTypeRating
 	IndexTypeColorLabel
 	IndexTypeFlag
+
+	// ACL fields: one KindEnum field per principal kind, so the stored
+	// key IS the uint64 user or group ID in fixed 8-byte form.
+	// See UserACL/GroupACL.
+	IndexTypeUserACL
+	IndexTypeGroupACL
 )
 
 var (

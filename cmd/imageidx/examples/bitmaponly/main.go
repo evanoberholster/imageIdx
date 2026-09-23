@@ -1,5 +1,5 @@
-// Command bitmaponly exercises field-only execution shapes: Search, Count,
-// SearchLimit, and Iterate.
+// Command bitmaponly exercises field-only execution shapes: AppendIDs, Count,
+// AppendPage, and Visit.
 //
 // Usage:
 //
@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -48,20 +49,34 @@ func main() {
 	}
 
 	plan, err := search.Compile(
-		search.FieldValues(tags, bitmapidx.StringValue("favorite")),
-		search.FieldValues(album, bitmapidx.StringValue("holiday")),
+		search.AllValues(tags, bitmapidx.StringValue("favorite")),
+		search.AllValues(album, bitmapidx.StringValue("holiday")),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	workspace := search.NewWorkspace(8)
-	fmt.Printf("matches=%v\n", plan.Search(nil, workspace))
-	fmt.Printf("count=%d\n", plan.Count(workspace))
-	fmt.Printf("limit1=%v\n", plan.SearchLimit(nil, workspace, 1))
+	ctx := context.Background()
+	matches, err := plan.AppendIDs(ctx, nil, workspace)
+	if err != nil {
+		log.Fatal(err)
+	}
+	count, err := plan.Count(ctx, workspace)
+	if err != nil {
+		log.Fatal(err)
+	}
+	first, err := plan.AppendPage(ctx, nil, workspace, search.Page{Limit: 1})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("matches=%v\ncount=%d\nfirst=%v\n", matches, count, first)
 	fmt.Print("iterated=")
-	for id := range plan.Iterate(workspace) {
+	if err := plan.Visit(ctx, workspace, func(id search.ImageID) bool {
 		fmt.Printf("%d ", id)
+		return true
+	}); err != nil {
+		log.Fatal(err)
 	}
 	fmt.Println()
 }

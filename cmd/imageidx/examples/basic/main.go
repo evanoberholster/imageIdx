@@ -9,6 +9,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -86,21 +87,14 @@ func main() {
 	}
 	defer times.Close()
 
-	// WithinCells is the only clause constructor that returns an error:
-	// unknown cells, an empty set, or a non-geo field are rejected here.
-	geoClause, err := search.WithinCells(geo, bitmapidx.CellIDFromLatLng(37.7749, -122.4194))
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	plan, err := search.Compile(
-		search.FieldValues(favorites, bitmapidx.StringValue("favorite")),
+		search.AllValues(favorites, bitmapidx.StringValue("favorite")),
 		search.During(times, quantum, 3*quantum,
 			search.ExactTimestamp(func(id imageidx.ImageID) (uint64, bool) {
 				value, ok := canonical[id]
 				return value, ok
 			})),
-		geoClause,
+		search.InCells(geo, bitmapidx.CellIDFromLatLng(37.7749, -122.4194)),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -108,6 +102,9 @@ func main() {
 
 	workspace := search.NewWorkspace(64)
 	matches := make([]search.ImageID, 0, 16)
-	matches = plan.Search(matches, workspace)
+	matches, err = plan.AppendIDs(context.Background(), matches, workspace)
+	if err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("matches=%v stages=%v estimate=%d\n", matches, plan.Stages(), plan.Estimate())
 }

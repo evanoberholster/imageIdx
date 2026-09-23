@@ -2,51 +2,28 @@ package search
 
 import (
 	"context"
-	"iter"
 	"slices"
+	"time"
 )
 
-// Search compiles clauses and immediately appends their sorted, unique matches
-// to dst. Compile a Plan directly when executing a query more than once.
-func Search(dst []ImageID, clauses ...Clause) ([]ImageID, error) {
+// SearchOnce compiles clauses and immediately appends their sorted,
+// unique matches to dst. It is named for its single-use cost model:
+// compiling per execution repeats canonicalization, hashing, and
+// cardinality estimation, so Compile a Plan directly when executing a
+// query more than once.
+func SearchOnce(ctx context.Context, dst []ImageID, clauses ...Clause) ([]ImageID, error) {
 	plan, err := Compile(clauses...)
 	if err != nil {
 		return dst, err
 	}
-	return plan.Search(dst, nil), nil
+	return plan.AppendIDs(ctx, dst, nil)
 }
 
-// Search appends the plan's sorted, unique intersection to dst. Estimates are
-// ordering hints only; every execution reads current published index views.
-func (plan Plan) Search(dst []ImageID, workspace *Workspace) []ImageID {
-	result, _ := plan.SearchContext(context.Background(), dst, workspace)
-	return result
-}
-
-// SearchContext is Search with cancellation checked between stages.
-func (plan Plan) SearchContext(ctx context.Context, dst []ImageID, workspace *Workspace) ([]ImageID, error) {
-	return plan.searchInto(ctx, dst, workspace, -1)
-}
-
-// SearchLimit appends at most limit sorted, unique matches to dst.
-// A negative limit means no limit; zero returns dst unchanged.
-func (plan Plan) SearchLimit(dst []ImageID, workspace *Workspace, limit int) []ImageID {
-	if limit == 0 || plan.IsEmpty() {
-		return dst
+// Count returns the number of sorted, unique matches without retaining them.
+func (plan Plan) Count(ctx context.Context, workspace *Workspace) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	result, _ := plan.searchInto(context.Background(), dst, workspace, limit)
-	return result
-}
-
-// Count returns the number of sorted, unique matches without retaining them
-// in the caller slice. It reuses workspace scratch.
-func (plan Plan) Count(workspace *Workspace) int {
-	count, _ := plan.CountContext(context.Background(), workspace)
-	return count
-}
-
-// CountContext is Count with cancellation checked between stages.
-func (plan Plan) CountContext(ctx context.Context, workspace *Workspace) (int, error) {
 	if plan.IsEmpty() {
 		return 0, nil
 	}
@@ -57,51 +34,33 @@ func (plan Plan) CountContext(ctx context.Context, workspace *Workspace) (int, e
 		}
 		stage := &plan.stages[0]
 		if stage.fieldKind == fieldRange {
-			count, err := stage.fieldIndex.CountRange(stage.fieldRange)
-			return int(count), err
+			return stage.fieldIndex.CountRange(stage.fieldRange)
 		}
-		count, err := stage.fieldQuery.Count()
-		return int(count), err
+		return stage.fieldQuery.Count()
 	}
-	// Materialize into a private dst so it never aliases workspace scratch,
-	// which searchInto uses for per-stage collects.
-	out, err := plan.searchInto(ctx, nil, workspace, -1)
+	bitmapOnly := true
+	for _, st := range plan.stages {
+		if st.kind == StageTimestamp {
+			bitmapOnly = false
+			break
+		}
+	}
+	if bitmapOnly {
+		return plan.countBitmaps(ctx, workspace)
+	}
+	var count uint64
+	err := plan.walk(ctx, workspace, 0, executionBatch, func(ids []ImageID) bool { count += uint64(len(ids)); return true })
 	if err != nil {
 		return 0, err
 	}
-	return len(out), nil
+	return count, nil
 }
 
-// Iterate yields sorted, unique matches. The result is materialized once on
-// first iteration (indexes do not provide ID-ordered cursors: timestamp scans
-// in time order, geo scans in shard order), then yielded without further
-// allocation.
-func (plan Plan) Iterate(workspace *Workspace) iter.Seq[ImageID] {
-	return func(yield func(ImageID) bool) {
-		if plan.IsEmpty() {
-			return
-		}
-		var scratch Workspace
-		ws := workspace
-		if ws == nil {
-			ws = &scratch
-		}
-		// Materialize into a privately owned slice so workspace reuse by the
-		// caller cannot corrupt iteration.
-		ids := plan.Search(nil, ws)
-		for _, id := range ids {
-			if !yield(id) {
-				return
-			}
-		}
-	}
-}
-
-func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Workspace, limit int) ([]ImageID, error) {
+// searchInto keeps the full-result fast path: materialize the smallest source
+// once, then filter its sorted IDs in place. walk uses bounded batches for
+// pages, visitors and ranking; both paths retain the same stage semantics.
+func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Workspace, metrics *SearchMetrics) ([]ImageID, error) {
 	if plan.IsEmpty() {
-		return dst, nil
-	}
-	if limit == 0 {
 		return dst, nil
 	}
 	var scratch Workspace
@@ -110,8 +69,15 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 		ws = &scratch
 	}
 	ws.scratch = ws.scratch[:0]
+	needsScratch := false
+	for _, st := range plan.stages[1:] {
+		if st.kind == StageGeo || !st.canFilter() {
+			needsScratch = true
+			break
+		}
+	}
 	// Pre-grow scratch from the plan estimate when the caller under-sized it.
-	if estimate := plan.Estimate(); estimate > 0 && uint64(cap(ws.scratch)) < estimate {
+	if estimate := plan.Estimate(); needsScratch && estimate > 0 && uint64(cap(ws.scratch)) < estimate {
 		need := estimate
 		if need > 1<<20 {
 			need = 1 << 20
@@ -126,9 +92,24 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 		return dst, err
 	}
 	start := len(dst)
-	dst = collectStage(dst, ws, &plan.stages[0])
+	var err error
+	var stageStart time.Time
+	if metrics != nil {
+		metrics.reach(0, StageModeSource)
+		stageStart = time.Now()
+	}
+	dst, err = collectStage(dst, ws, &plan.stages[0])
+	if metrics != nil {
+		stage := &metrics.Stages[0]
+		stage.Duration += time.Since(stageStart)
+		stage.Collected = uint64(len(dst) - start)
+		stage.Passed = stage.Collected
+	}
+	if err != nil {
+		return dst, err
+	}
 	if len(dst) == start {
-		return truncateLimit(dst, start, limit), nil
+		return dst, nil
 	}
 
 	// Filter-first: apply all in-place filters (field, exact-timestamp)
@@ -142,10 +123,23 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 			continue
 		}
 		candidates := dst[start:]
-		filtered := st.filter(candidates[:0], candidates, ws.scratch, ws)
+		if metrics != nil {
+			stage := metrics.reach(index, StageModeFilter)
+			stage.Input = uint64(len(candidates))
+			stageStart = time.Now()
+		}
+		filtered, err := st.filter(candidates[:0], candidates, ws.scratch, ws)
+		if metrics != nil {
+			stage := &metrics.Stages[index]
+			stage.Duration += time.Since(stageStart)
+			stage.Passed = uint64(len(filtered))
+		}
+		if err != nil {
+			return dst, err
+		}
 		dst = dst[:start+len(filtered)]
 		if len(dst) == start {
-			return truncateLimit(dst, start, limit), nil
+			return dst, nil
 		}
 	}
 	for index := 1; index < len(plan.stages); index++ {
@@ -156,36 +150,60 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 		if st.canFilter() {
 			continue
 		}
-		ws.scratch = collectStage(ws.scratch[:0], ws, st)
+		if metrics != nil {
+			stage := metrics.reach(index, StageModeCollectIntersect)
+			stage.Input = uint64(len(dst) - start)
+			stageStart = time.Now()
+		}
+		ws.scratch, err = collectStage(ws.scratch[:0], ws, st)
+		if metrics != nil {
+			stage := &metrics.Stages[index]
+			stage.Collected = uint64(len(ws.scratch))
+		}
+		if err != nil {
+			if metrics != nil {
+				metrics.Stages[index].Duration += time.Since(stageStart)
+			}
+			return dst, err
+		}
 		dst = intersectSortedSuffix(dst, start, ws.scratch)
+		if metrics != nil {
+			stage := &metrics.Stages[index]
+			stage.Duration += time.Since(stageStart)
+			stage.Passed = uint64(len(dst) - start)
+		}
 		if len(dst) == start {
-			return truncateLimit(dst, start, limit), nil
+			return dst, nil
 		}
 	}
-	return truncateLimit(dst, start, limit), nil
+	return dst, nil
 }
 
-func truncateLimit(dst []ImageID, start int, limit int) []ImageID {
-	if limit < 0 || len(dst)-start <= limit {
-		return dst
+// collectStage appends one stage's candidates to dst. Bitmap-backed field and
+// geo collects are already ascending and unique, so only timestamp scans need
+// sorting. Geo stages accumulate covered cells into the workspace-owned
+// MutableBitmap and materialize once.
+func collectStage(dst []ImageID, ws *Workspace, st *stage) ([]ImageID, error) {
+	switch st.kind {
+	case StageGeo:
+		if ws != nil {
+			m := ws.mutableBitmap()
+			m.Reset()
+			st.geoIndex.CollectGeoRanges(m, st.geoRanges)
+			return m.AppendTo(dst), nil
+		}
+		return st.collect(dst)
+	case StageTimestamp:
+		start := len(dst)
+		var err error
+		dst, err = st.collect(dst)
+		if err != nil {
+			return dst, err
+		}
+		return dst[:start+len(sortUnique(dst[start:]))], nil
+	default:
+		return st.collect(dst)
 	}
-	return dst[:start+limit]
-}
-
-// collectStage appends one stage's sorted, unique candidates to dst. Geo
-// stages accumulate covered cells into the workspace-owned MutableBitmap and
-// materialize once; other stages collect ID lists and sort them.
-func collectStage(dst []ImageID, ws *Workspace, st *stage) []ImageID {
-	if st.kind == StageGeo && ws != nil {
-		m := ws.mutableBitmap()
-		m.Reset()
-		st.geoIndex.CollectGeoRanges(m, st.geoRanges)
-		return m.AppendTo(dst)
-	}
-	start := len(dst)
-	dst = st.collect(dst)
-	values := sortUnique(dst[start:])
-	return dst[:start+len(values)]
 }
 
 func sortUnique(values []ImageID) []ImageID {
