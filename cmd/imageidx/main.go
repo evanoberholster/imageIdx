@@ -79,7 +79,7 @@ func runOnce(output io.Writer) error {
 		Start: demoQuantum, End: 3 * demoQuantum,
 		CellIDs: []uint64{service.demoCell},
 	}
-	ids, err := service.searchOnce(request)
+	ids, err := service.searchOnce(context.Background(), request)
 	if err != nil {
 		return err
 	}
@@ -217,19 +217,15 @@ func (service *demoService) Close() error {
 	return first
 }
 
-func (service *demoService) searchOnce(request searchRequest) ([]imageidx.ImageID, error) {
-	geoClause, err := search.WithinCells(service.geo, request.CellIDs...)
-	if err != nil {
-		return nil, err
-	}
-	return search.Search(nil,
-		search.FieldValues(service.favorites, bitmapidx.StringValue("favorite")),
+func (service *demoService) searchOnce(ctx context.Context, request searchRequest) ([]imageidx.ImageID, error) {
+	return search.SearchOnce(ctx, nil,
+		search.AllValues(service.favorites, bitmapidx.StringValue("favorite")),
 		search.During(service.times, request.Start, request.End,
 			search.ExactTimestamp(func(id imageidx.ImageID) (uint64, bool) {
 				value, ok := service.canonical[id]
 				return value, ok
 			})),
-		geoClause,
+		search.InCells(service.geo, request.CellIDs...),
 	)
 }
 
@@ -241,7 +237,7 @@ func (service *demoService) handler() http.Handler {
 			http.Error(response, err.Error(), http.StatusBadRequest)
 			return
 		}
-		ids, err := service.searchOnce(query)
+		ids, err := service.searchOnce(request.Context(), query)
 		if err != nil {
 			http.Error(response, err.Error(), http.StatusBadRequest)
 			return

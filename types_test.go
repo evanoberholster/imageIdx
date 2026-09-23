@@ -26,6 +26,12 @@ func TestIndexPackagesShareDomainTypes(t *testing.T) {
 		t.Fatalf("shared Durability = %d", durability)
 	}
 
+	var user bitmapidx.UserID = imageidx.UserID(rootID)
+	var group bitmapidx.GroupID = imageidx.GroupID(rootID)
+	if uint64(user) != rootID || uint64(group) != rootID {
+		t.Fatalf("shared principals = %d/%d, want %d", user, group, rootID)
+	}
+
 	geo, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
 		Type:    bitmapidx.IndexTypeLocation,
 		Kind:    bitmapidx.KindGeo,

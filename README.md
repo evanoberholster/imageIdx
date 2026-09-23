@@ -364,7 +364,7 @@ workspace accumulation.
 Geo is a `bitmapidx` field kind. Each image holds one level-16 S2 bucket key;
 higher-level areas are searched by expanding cells into lexicographic key
 ranges, so any S2 level up to 16 maps onto the same bucket table.
-`search.WithinCells` takes the field directly, and the same queries are
+`search.InCells` takes the field directly, and the same queries are
 available without the search package.
 
 ```go
@@ -476,46 +476,44 @@ geographic indexes. Every clause is combined with AND semantics:
 The compiler orders these stages using live cardinality estimates. This only
 changes execution order; it does not change query results. Results are returned
 as sorted, unique `search.ImageID` values. All index packages alias the
-canonical root `imageidx.ImageID` type. There is no OR, no result ordering or
-reranking, and no `vectoridx` involvement: `SearchLimit` truncates the sorted
-prefix.
+canonical root `imageidx.ImageID` type. Clauses are intersected; `WithACL` is
+the built-in exception that unions authenticated user and group grants within
+one clause. Ordering and reranking are opt-in (`RankTime`, `RankGeo`, and the
+`FilterRanked` bridge for `vectoridx` ANN results); `AppendPage` returns a
+bounded sorted prefix. The full API reference lives in
+`search/README.md`.
 
 ```go
-geoClause, err := search.WithinCells(geo, cellIDs...)
-if err != nil {
-	log.Fatal(err)
-}
-
 plan, err := search.Compile(
-	search.FieldValues(tags, bitmapidx.StringValue("Trekking")),
-	search.FieldValues(favorites, bitmapidx.StringValue("favorite")),
+	search.AllValues(tags, bitmapidx.StringValue("Trekking")),
+	search.AllValues(favorites, bitmapidx.StringValue("favorite")),
 	search.During(
 		timeIndex,
 		start,
 		end,
 		search.ExactTimestamp(lookupCanonicalTimestamp),
 	),
-	geoClause,
+	search.InCells(geo, cellIDs...),
 )
 if err != nil {
 	log.Fatal(err)
 }
 
-// Plans and workspaces can be reused. Search reads the indexes' current
+// Plans and workspaces can be reused. AppendIDs reads the indexes' current
 // published views; the estimates captured by Plan affect ordering only.
 workspace := search.NewWorkspace(4_096)
 matches := make([]search.ImageID, 0, 256)
-matches = plan.Search(matches, workspace)
+matches, err = plan.AppendIDs(ctx, matches, workspace)
 ```
 
-For a one-off query, pass clauses directly to `search.Search`. It compiles and
+For a one-off query, pass clauses directly to `search.SearchOnce`. It compiles and
 executes them immediately:
 
 ```go
-matches, err := search.Search(nil,
-	search.FieldValues(tags, bitmapidx.StringValue("Trekking")),
+matches, err := search.SearchOnce(ctx, nil,
+	search.AllValues(tags, bitmapidx.StringValue("Trekking")),
 	search.During(timeIndex, start, end),
-	geoClause,
+	search.InCells(geo, cellIDs...),
 )
 ```
 
@@ -527,48 +525,48 @@ A `Plan` exposes several execution shapes over the same compiled stages:
 
 ```go
 // Count matches without retaining IDs.
-count := plan.Count(workspace)
+count, err := plan.Count(ctx, workspace)
 
 // Stop after N sorted matches (truncation, not ranking).
-top := plan.SearchLimit(nil, workspace, 100)
+top, err := plan.AppendPage(ctx, nil, workspace, search.Page{Limit: 100})
 
 // Stream sorted, unique matches without building a result slice.
-for id := range plan.Iterate(workspace) {
+err = plan.Visit(ctx, workspace, func(id search.ImageID) bool {
 	fmt.Println(id)
-}
+	return true
+})
 
-// Cancellation is checked between stages.
-matches, err = plan.SearchContext(ctx, matches[:0], workspace)
+// Cancellation is checked between stages and batches.
+matches, err = plan.AppendIDs(ctx, matches[:0], workspace)
 ```
 
-For long-lived services, `search.NewService` shares one plan and pools
-workspaces plus timestamp write batches across concurrent agents:
+For long-lived services, `search.Executor` pools exclusive workspaces across
+concurrent queries and plans:
 
 ```go
-service := search.NewService(plan, 4_096, 256)
-service.Prewarm(4)
+executor, err := search.NewExecutor(search.ExecutorConfig{WorkspaceCapacity: 4_096})
+if err != nil { log.Fatal(err) }
+executor.Prewarm(4)
 
-matches := service.Query(nil)
-matches, err = service.QueryContext(ctx, matches[:0])
-count = service.Count()
-
-batch := service.AcquireBatch() // sized for the plan's timestamp writer
-// fill batch with timeidx mutations, then apply through
-// the timestamp index; return it so another agent can reuse its buffers.
-service.ReleaseBatch(batch)
+matches, err = executor.AppendIDs(ctx, matches[:0], plan)
+count, err = executor.Count(ctx, plan)
 ```
 
-Clauses are conjunctive: `search.FieldValues`, `search.FieldText` and
+Clauses are conjunctive: `search.AllValues`, `search.FieldText` and
 `search.FieldRange` query typed fields; `search.During` handles a half-open
 timestamp range (optionally with `search.ExactTimestamp`); and
-`search.WithinCells` queries a `KindGeo` field. `WithinCells` is the only clause
-constructor that returns an error. `vectoridx` is not a clause source.
+`search.InCells` queries a `KindGeo` field. Constructors are validated by
+`Compile`. `vectoridx` is not a clause source.
+
+For access control, compile `search.WithACL(userID, authenticatedGroupIDs...)`
+with `search.CompileWithStore(store, clauses...)`. The clause unions direct
+UserACL and GroupACL postings; callers authenticate group membership.
 
 Timestamp ranges use the timestamp index's compressed candidate semantics.
 Add `search.ExactTimestamp` when exact boundary filtering is required; only
 exact timestamp stages can filter candidates in place. An empty range
 (`start >= end`) compiles to a valid empty plan. Geographic search options
-are S2 cell IDs, not latitude/longitude values: `search.WithinCells` accepts
+are S2 cell IDs, not latitude/longitude values: `search.InCells` accepts
 one or more valid cells and normalizes them to level-16 descendant ranges
 (coarser cells expand, finer cells snap to their ancestor). Exact polygon or
 coordinate verification belongs in the caller's canonical-data layer before or
@@ -576,7 +574,7 @@ after the candidate search.
 
 A combined search does not create a database-wide transactional snapshot. Each
 stage reads one independently published immutable view, consistent with the
-standalone index APIs. `search.Compile` and `search.Search` return
+standalone index APIs. `search.Compile` and `search.SearchOnce` return
 `search.ErrEmptyQuery` when no clauses are supplied and `search.ErrInvalidClause`
 for a missing index.
 
@@ -588,7 +586,7 @@ reference retired or mmap-backed state. Callers open one persistent
 ## Runnable command
 
 `cmd/imageidx` constructs a small compatible field, timestamp, and geographic
-index set. Its default one-shot mode executes `search.Search` once and prints a
+index set. Its default one-shot mode executes `search.SearchOnce` once and prints a
 JSON result:
 
 ```sh
@@ -600,8 +598,8 @@ Focused, copy-pasteable programs live under `cmd/imageidx/examples`:
 
 ```sh
 go run ./cmd/imageidx/examples/basic      # bitmap + timestamp + geo plan
-go run ./cmd/imageidx/examples/bitmaponly # Search, Count, SearchLimit, Iterate
-go run ./cmd/imageidx/examples/service    # shared Service plus batch reuse
+go run ./cmd/imageidx/examples/bitmaponly # AppendIDs, Count, AppendPage, Visit
+go run ./cmd/imageidx/examples/service    # shared Plan with pooled Executor
 ```
 
 Server mode demonstrates a long-lived HTTP function:

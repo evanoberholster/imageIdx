@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"fmt"
 	"runtime/debug"
 	"slices"
@@ -27,12 +28,14 @@ const (
 )
 
 type stressFixture struct {
-	service *Service
-	bitmap  *bitmapidx.FieldIndex
-	times   *timeidx.Index
-	geo     *bitmapidx.FieldIndex
-	cell    bitmapidx.S2Key
-	quantum uint64
+	plan     Plan
+	executor *Executor
+	batches  sync.Pool
+	bitmap   *bitmapidx.FieldIndex
+	times    *timeidx.Index
+	geo      *bitmapidx.FieldIndex
+	cell     bitmapidx.S2Key
+	quantum  uint64
 }
 
 func buildStressFixture(tb testing.TB) *stressFixture {
@@ -82,22 +85,50 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	geoClause, err := WithinCells(geo, bitmapidx.DecodeS2Key(cell))
-	if err != nil {
-		tb.Fatal(err)
-	}
 	plan, err := Compile(
-		FieldValues(bitmap, bitmapidx.StringValue("favorite")),
+		AllValues(bitmap, bitmapidx.StringValue("favorite")),
 		During(timeIndex, quantum, 20000*quantum),
-		geoClause,
+		InCells(geo, bitmapidx.DecodeS2Key(cell)),
 	)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	return &stressFixture{
-		service: NewService(plan, 8192, 32),
-		bitmap:  bitmap, times: timeIndex, geo: geo,
+	executor, err := NewExecutor(ExecutorConfig{WorkspaceCapacity: 8192})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	fixture := &stressFixture{
+		plan: plan, executor: executor,
+		bitmap: bitmap, times: timeIndex, geo: geo,
 		cell: cell, quantum: quantum,
+	}
+	fixture.batches.New = func() any { return timeidx.NewBatch(32) }
+	return fixture
+}
+
+func (fixture *stressFixture) query(dst []ImageID) []ImageID {
+	out, err := fixture.executor.AppendIDs(context.Background(), dst, fixture.plan)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+func (fixture *stressFixture) count() uint64 {
+	n, err := fixture.executor.Count(context.Background(), fixture.plan)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+func (fixture *stressFixture) acquireBatch() *timeidx.Batch {
+	return fixture.batches.Get().(*timeidx.Batch)
+}
+
+func (fixture *stressFixture) releaseBatch(batch *timeidx.Batch) {
+	if batch.Reset() {
+		fixture.batches.Put(batch)
 	}
 }
 
@@ -118,10 +149,10 @@ type loadResult struct {
 }
 
 // runLoad fires readers query agents and writers mutation agents at one
-// shared Service. Every response must be sorted, unique, and non-empty;
+// shared Executor. Every response must be sorted, unique, and non-empty;
 // the first violation aborts via err.
 func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize int) (loadResult, error) {
-	service := fixture.service
+	runner := fixture
 	var totalQueries atomic.Int64
 	latencies := make([][]int64, readers)
 	errs := make(chan error, readers+writers)
@@ -137,7 +168,7 @@ func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize 
 			timings := make([]int64, 0, iters)
 			for i := 0; i < iters; i++ {
 				begin := time.Now()
-				out := service.Query(dst[:0])
+				out := runner.query(dst[:0])
 				timings = append(timings, int64(time.Since(begin)))
 				dst = out[:0]
 				if len(out) == 0 || !checkSortedUnique(out) {
@@ -169,20 +200,20 @@ func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize 
 					errs <- err
 					return
 				}
-				batch := service.AcquireBatch()
+				batch := runner.acquireBatch()
 				for k, id := range ids {
 					if !batch.Append(timeidx.Insert(ImageID(id), fixture.quantum*uint64(7000+round*batchSize+k))) {
-						service.ReleaseBatch(batch)
+						runner.releaseBatch(batch)
 						errs <- fmt.Errorf("writer %d: batch full", w)
 						return
 					}
 				}
 				if err := fixture.times.Apply(batch); err != nil {
-					service.ReleaseBatch(batch)
+					runner.releaseBatch(batch)
 					errs <- err
 					return
 				}
-				service.ReleaseBatch(batch)
+				runner.releaseBatch(batch)
 				moves := make([]bitmapidx.Move, 0, len(ids))
 				for _, id := range ids {
 					moves = append(moves, bitmapidx.Move{ImageID: id, To: int64(fixture.cell)})
@@ -227,28 +258,28 @@ func logLoadResult(tb testing.TB, name string, result loadResult, writers int) {
 		name, percentile(0.50), percentile(0.99), time.Duration(result.latency[len(result.latency)-1]))
 }
 
-// TestServiceConcurrentReadersWriters runs 100 query agents against one
-// shared Service while 10 writer agents mutate all three indexes.
-func TestServiceConcurrentReadersWriters(t *testing.T) {
+// TestExecutorConcurrentReadersWriters runs 100 query agents against one
+// shared Executor while 10 writer agents mutate all three indexes.
+func TestExecutorConcurrentReadersWriters(t *testing.T) {
 	fixture := buildStressFixture(t)
 	// Warm the workspace pool before the thundering herd so first queries
 	// reuse scratch instead of growing it.
-	fixture.service.Prewarm(stressReaders)
+	fixture.executor.Prewarm(stressReaders)
 
 	result, err := runLoad(fixture, stressReaders, stressWriters, stressReaderIter, stressWriteRound, stressBatchSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 	logLoadResult(t, "100r/10w", result, stressWriters)
-	t.Logf("final count=%d estimate=%d", fixture.service.Count(), fixture.service.Estimate())
+	t.Logf("final count=%d estimate=%d", fixture.count(), fixture.plan.Estimate())
 }
 
-// TestServiceReaderSweep varies reader pressure at fixed writer load to
+// TestExecutorReaderSweep varies reader pressure at fixed writer load to
 // locate the oversubscription knee.
-func TestServiceReaderSweep(t *testing.T) {
+func TestExecutorReaderSweep(t *testing.T) {
 	for _, readers := range []int{12, 48} {
 		fixture := buildStressFixture(t)
-		fixture.service.Prewarm(readers)
+		fixture.executor.Prewarm(readers)
 		result, err := runLoad(fixture, readers, stressWriters, 100, stressWriteRound, stressBatchSize)
 		if err != nil {
 			t.Fatal(err)
@@ -257,11 +288,11 @@ func TestServiceReaderSweep(t *testing.T) {
 	}
 }
 
-// TestServiceGOGCComparison reruns the load at GOGC=200 to isolate the
+// TestExecutorGOGCComparison reruns the load at GOGC=200 to isolate the
 // allocator/GC contribution to tail latency.
-func TestServiceGOGCComparison(t *testing.T) {
+func TestExecutorGOGCComparison(t *testing.T) {
 	fixture := buildStressFixture(t)
-	fixture.service.Prewarm(stressReaders)
+	fixture.executor.Prewarm(stressReaders)
 	base, err := runLoad(fixture, stressReaders, 0, 100, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -277,92 +308,92 @@ func TestServiceGOGCComparison(t *testing.T) {
 	logLoadResult(t, "GOGC=200,no-writers", hot, 0)
 }
 
-func BenchmarkServiceQuery(b *testing.B) {
+func BenchmarkExecutorQuery(b *testing.B) {
 	fixture := buildStressFixture(b)
 	dst := make([]ImageID, 0, 8192)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		dst = fixture.service.Query(dst[:0])
+		dst = fixture.query(dst[:0])
 	}
 }
 
-func BenchmarkServiceQueryParallel(b *testing.B) {
+func BenchmarkExecutorQueryParallel(b *testing.B) {
 	fixture := buildStressFixture(b)
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		dst := make([]ImageID, 0, 8192)
 		for pb.Next() {
-			dst = fixture.service.Query(dst[:0])
+			dst = fixture.query(dst[:0])
 		}
 	})
 }
 
-// BenchmarkServiceWorkspace isolates the pool: pooled workspaces against a
+// BenchmarkExecutorWorkspace isolates the pool: pooled workspaces against a
 // freshly allocated Workspace per query.
-func BenchmarkServiceWorkspace(b *testing.B) {
+func BenchmarkExecutorWorkspace(b *testing.B) {
 	fixture := buildStressFixture(b)
 	dst := make([]ImageID, 0, 8192)
 	b.Run("pooled", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			dst = fixture.service.Query(dst[:0])
+			dst = fixture.query(dst[:0])
 		}
 	})
 	b.Run("fresh", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			dst = fixture.service.plan.Search(dst[:0], NewWorkspace(8192))
+			var err error
+			dst, err = fixture.plan.AppendIDs(context.Background(), dst[:0], NewWorkspace(8192))
+			if err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }
 
-// BenchmarkServiceDstSizing isolates caller-buffer reuse: a pre-sized dst
+// BenchmarkExecutorDstSizing isolates caller-buffer reuse: a pre-sized dst
 // against a nil dst per query.
-func BenchmarkServiceDstSizing(b *testing.B) {
+func BenchmarkExecutorDstSizing(b *testing.B) {
 	fixture := buildStressFixture(b)
 	b.Run("sized", func(b *testing.B) {
 		dst := make([]ImageID, 0, 8192)
 		b.ReportAllocs()
 		for range b.N {
-			dst = fixture.service.Query(dst[:0])
+			dst = fixture.query(dst[:0])
 		}
 	})
 	b.Run("nil", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			_ = fixture.service.Query(nil)
+			_ = fixture.query(nil)
 		}
 	})
 }
 
-// BenchmarkServiceStaleVsFreshPlan grows the indexes the way writers do,
+// BenchmarkExecutorStaleVsFreshPlan grows the indexes the way writers do,
 // then compares the original (stale-estimate) plan against a recompiled one.
-func BenchmarkServiceStaleVsFreshPlan(b *testing.B) {
+func BenchmarkExecutorStaleVsFreshPlan(b *testing.B) {
 	fixture := buildStressFixture(b)
 	if _, err := runLoad(fixture, 0, stressWriters, 0, stressWriteRound, stressBatchSize); err != nil {
 		b.Fatal(err)
 	}
-	geoClause, err := WithinCells(fixture.geo, bitmapidx.DecodeS2Key(fixture.cell))
-	if err != nil {
-		b.Fatal(err)
-	}
 	fresh, err := Compile(
-		FieldValues(fixture.bitmap, bitmapidx.StringValue("favorite")),
+		AllValues(fixture.bitmap, bitmapidx.StringValue("favorite")),
 		During(fixture.times, fixture.quantum, 20000*fixture.quantum),
-		geoClause,
+		InCells(fixture.geo, bitmapidx.DecodeS2Key(fixture.cell)),
 	)
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Logf("stale stages=%+v", fixture.service.plan.Stages())
+	b.Logf("stale stages=%+v", fixture.plan.Stages())
 	b.Logf("fresh stages=%+v", fresh.Stages())
 	for _, tc := range []struct {
 		name string
 		plan Plan
 	}{
-		{"stale", fixture.service.plan},
+		{"stale", fixture.plan},
 		{"fresh", fresh},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
@@ -370,7 +401,11 @@ func BenchmarkServiceStaleVsFreshPlan(b *testing.B) {
 			dst := make([]ImageID, 0, 8192)
 			b.ReportAllocs()
 			for range b.N {
-				dst = tc.plan.Search(dst[:0], workspace)
+				var err error
+				dst, err = tc.plan.AppendIDs(context.Background(), dst[:0], workspace)
+				if err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

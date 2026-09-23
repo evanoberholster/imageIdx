@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"errors"
 	"math"
 	"slices"
@@ -58,16 +59,11 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	geoClause, err := WithinCells(geo, bitmapidx.DecodeS2Key(key))
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	plan, err := Compile(
-		FieldValues(tags, bitmapidx.StringValue("favorite")),
-		FieldValues(albums, bitmapidx.StringValue("holiday")),
+		AllValues(tags, bitmapidx.StringValue("favorite")),
+		AllValues(albums, bitmapidx.StringValue("holiday")),
 		During(timeIndex, 2*quantum, 5*quantum),
-		geoClause,
+		InCells(geo, bitmapidx.DecodeS2Key(key)),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -77,16 +73,16 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 		t.Fatalf("stages = %+v", stages)
 	}
 	workspace := NewWorkspace(8)
-	if got := plan.Search([]ImageID{99}, workspace); !slices.Equal(got, []ImageID{99, 2, 3}) {
-		t.Fatalf("Plan.Search = %v", got)
+	if got, err := plan.AppendIDs(context.Background(), []ImageID{99}, workspace); err != nil || !slices.Equal(got, []ImageID{99, 2, 3}) {
+		t.Fatalf("Plan.AppendIDs = %v, %v", got, err)
 	}
 	workspace.Reset()
-	if got := plan.Search(nil, workspace); !slices.Equal(got, []ImageID{2, 3}) {
-		t.Fatalf("reused Plan.Search = %v", got)
+	if got, err := plan.AppendIDs(context.Background(), nil, workspace); err != nil || !slices.Equal(got, []ImageID{2, 3}) {
+		t.Fatalf("reused Plan.AppendIDs = %v, %v", got, err)
 	}
 }
 
-func TestWithinCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
+func TestInCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
 	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(21), []bitmapidx.GeoEntry{
 		{ImageID: 1, Latitude: 37.7749, Longitude: -122.4194},
 		{ImageID: 2, Latitude: 34.0522, Longitude: -118.2437},
@@ -97,19 +93,15 @@ func TestWithinCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
 	defer geo.Close()
 	cell := s2.CellID(bitmapidx.CellIDFromLatLng(37.7749, -122.4194))
 	for _, level := range []int{16, 12, 10} {
-		clause, err := WithinCells(geo, uint64(cell.Parent(level)))
-		if err != nil {
-			t.Fatalf("level %d clause: %v", level, err)
-		}
-		got, err := Search(nil, clause)
+		got, err := SearchOnce(context.Background(), nil, InCells(geo, uint64(cell.Parent(level))))
 		if err != nil || !slices.Equal(got, []ImageID{1}) {
 			t.Fatalf("level %d Search = %v, err=%v", level, got, err)
 		}
 	}
-	if _, err = WithinCells(geo, 0); err == nil {
+	if _, err = Compile(InCells(geo, 0)); err == nil {
 		t.Fatal("invalid cell accepted")
 	}
-	if _, err = WithinCells(geo); !errors.Is(err, ErrInvalidClause) {
+	if _, err = Compile(InCells(geo)); !errors.Is(err, ErrInvalidClause) {
 		t.Fatalf("empty cells error = %v", err)
 	}
 }
@@ -124,7 +116,7 @@ func TestSearchUsesExactTimestampLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer index.Close()
-	got, err := Search(nil, During(index, quantum+15, quantum+25, ExactTimestamp(func(id timeidx.ImageID) (uint64, bool) {
+	got, err := SearchOnce(context.Background(), nil, During(index, quantum+15, quantum+25, ExactTimestamp(func(id timeidx.ImageID) (uint64, bool) {
 		value, ok := times[id]
 		return value, ok
 	})))
@@ -134,13 +126,13 @@ func TestSearchUsesExactTimestampLookup(t *testing.T) {
 }
 
 func TestSearchRejectsEmptyAndNilFieldQueries(t *testing.T) {
-	if _, err := Search(nil); !errors.Is(err, ErrEmptyQuery) {
+	if _, err := SearchOnce(context.Background(), nil); !errors.Is(err, ErrEmptyQuery) {
 		t.Fatalf("empty query error = %v", err)
 	}
-	if _, err := Search(nil, FieldValues(nil, bitmapidx.StringValue("x"))); !errors.Is(err, ErrInvalidClause) {
+	if _, err := SearchOnce(context.Background(), nil, AllValues(nil, bitmapidx.StringValue("x"))); !errors.Is(err, ErrInvalidClause) {
 		t.Fatalf("nil field error = %v", err)
 	}
-	if _, err := WithinCells(nil, uint64(s2.CellIDFromFace(0))); !errors.Is(err, ErrInvalidClause) {
+	if _, err := Compile(InCells(nil, uint64(s2.CellIDFromFace(0)))); !errors.Is(err, ErrInvalidClause) {
 		t.Fatalf("nil geo index error = %v", err)
 	}
 }
@@ -149,15 +141,18 @@ func TestFieldOnlyCountMatchesSearch(t *testing.T) {
 	first := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3, 5})
 	second := enumFieldForSearch(t, bitmapidx.IndexTypeAlbum, "holiday", []uint64{2, 3, 4})
 	plan, err := Compile(
-		FieldValues(first, bitmapidx.StringValue("favorite")),
-		FieldValues(second, bitmapidx.StringValue("holiday")),
+		AllValues(first, bitmapidx.StringValue("favorite")),
+		AllValues(second, bitmapidx.StringValue("holiday")),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	workspace := NewWorkspace(8)
-	got := plan.Search(nil, workspace)
-	if count := plan.Count(workspace); count != len(got) {
+	got, err := plan.AppendIDs(context.Background(), nil, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := plan.Count(context.Background(), workspace); err != nil || count != uint64(len(got)) {
 		t.Fatalf("Count = %d, Search len = %d", count, len(got))
 	}
 	if !slices.Equal(got, []ImageID{2, 3}) {
@@ -202,7 +197,7 @@ func TestFieldTextAndRangeClauses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := plan.Search(nil, NewWorkspace(4)); !slices.Equal(got, []ImageID{1}) {
+	if got, err := plan.AppendIDs(context.Background(), nil, NewWorkspace(4)); err != nil || !slices.Equal(got, []ImageID{1}) {
 		t.Fatalf("field text/range search = %v", got)
 	}
 }
@@ -228,15 +223,11 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 
 	geo, key := newGeo(t, bitmapidx.IndexType(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
 	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
-	geoClause, err := WithinCells(geo, bitmapidx.DecodeS2Key(key))
+	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")), InCells(geo, bitmapidx.DecodeS2Key(key)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := Compile(FieldValues(tags, bitmapidx.StringValue("favorite")), geoClause)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := plan.Search(nil, NewWorkspace(16)); !slices.Equal(got, []ImageID{1, 2, 3}) {
+	if got, err := plan.AppendIDs(context.Background(), nil, NewWorkspace(16)); err != nil || !slices.Equal(got, []ImageID{1, 2, 3}) {
 		t.Fatalf("filter-path Search = %v", got)
 	}
 
@@ -263,10 +254,6 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer bigGeo.Close()
-	bigClause, err := WithinCells(bigGeo, cellIDs...)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(cellIDs) < 5 {
 		t.Fatalf("need distinct cells, got %d", len(cellIDs))
 	}
@@ -277,11 +264,48 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 		}
 	}
 	largeTags := enumFieldForSearch(t, bitmapidx.IndexTypeObject, "favorite", bitmapIDs)
-	fallback, err := Compile(FieldValues(largeTags, bitmapidx.StringValue("favorite")), bigClause)
+	fallback, err := Compile(AllValues(largeTags, bitmapidx.StringValue("favorite")), InCells(bigGeo, cellIDs...))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := fallback.Search(nil, NewWorkspace(100)); !slices.Equal(got, bitmapIDs) {
+	if got, err := fallback.AppendIDs(context.Background(), nil, NewWorkspace(100)); err != nil || !slices.Equal(got, bitmapIDs) {
 		t.Fatalf("fallback-path Search = %v, want %v", got, bitmapIDs)
+	}
+}
+
+func TestAppendPage(t *testing.T) {
+	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
+	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := NewWorkspace(16)
+	if got, err := plan.AppendPage(context.Background(), nil, workspace, Page{Limit: 2}); err != nil || !slices.Equal(got, []ImageID{1, 2}) {
+		t.Fatalf("AppendPage = %v, %v; want [1 2], nil", got, err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := plan.AppendPage(cancelled, nil, workspace, Page{Limit: 2}); err == nil {
+		t.Fatal("cancelled AppendPage succeeded")
+	}
+}
+
+func TestVisit(t *testing.T) {
+	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
+	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []ImageID
+	if err := plan.Visit(context.Background(), NewWorkspace(16), func(id ImageID) bool { got = append(got, id); return true }); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []ImageID{1, 2, 3}) {
+		t.Fatalf("Visit = %v, want [1 2 3]", got)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := plan.Visit(cancelled, NewWorkspace(16), func(ImageID) bool { t.Fatal("cancelled Visit yielded"); return false }); err != context.Canceled {
+		t.Fatal(err)
 	}
 }

@@ -10,11 +10,15 @@ import (
 
 var (
 	ErrEmptyQuery    = errors.New("search: query has no clauses")
-	ErrInvalidClause = errors.New("search: clause contains no usable index")
+	ErrInvalidClause = errors.New("search: invalid clause")
 )
 
 // Clause is one conjunctive search restriction. Clause implementations are
 // created by this package so Compile can validate and optimize them together.
+//
+// Constructors capture their arguments; Compile validates nil indexes, empty
+// value lists, kind mismatches and cells. Empty ranges are
+// valid and match nothing; empty value lists are rejected.
 type Clause interface {
 	searchClause()
 }
@@ -37,8 +41,10 @@ type fieldClause struct {
 
 func (fieldClause) searchClause() {}
 
-// FieldValues requires every supplied value to be present in the field.
-func FieldValues(index *bitmapidx.FieldIndex, values ...bitmapidx.Value) Clause {
+// AllValues requires every supplied value to be present in the field.
+// Compile rejects an empty value list. Canonical bytes are copied at Compile;
+// callers must not mutate Value.Bytes until compilation completes.
+func AllValues(index *bitmapidx.FieldIndex, values ...bitmapidx.Value) Clause {
 	return fieldClause{index: index, kind: fieldValues, values: append([]bitmapidx.Value(nil), values...)}
 }
 
@@ -50,6 +56,20 @@ func FieldText(index *bitmapidx.FieldIndex, text string) Clause {
 // FieldRange restricts a continuous field to bounds.
 func FieldRange(index *bitmapidx.FieldIndex, bounds bitmapidx.NumericRange) Clause {
 	return fieldClause{index: index, kind: fieldRange, bounds: bounds}
+}
+
+type aclClause struct {
+	userID   uint64
+	groupIDs []uint64
+}
+
+func (aclClause) searchClause() {}
+
+// WithACL restricts results to images granted to userID or any supplied
+// group ID. Group membership must be authenticated by the caller. Compile
+// this clause with CompileWithStore so it can resolve the dedicated ACL fields.
+func WithACL(userID uint64, groupIDs ...uint64) Clause {
+	return aclClause{userID: userID, groupIDs: append([]uint64(nil), groupIDs...)}
 }
 
 type timestampClause struct {
@@ -95,22 +115,13 @@ func During(index *timeidx.Index, start, end uint64, options ...TimestampOption)
 type geoClause struct {
 	index  *bitmapidx.FieldIndex
 	ranges []bitmapidx.GeoRange
+	cells  []uint64
 }
 
 func (geoClause) searchClause() {}
 
-// WithinCells restricts images to the union of the supplied S2 cells. The
-// index must be a KindGeo field. Coarser cells are converted to level-16
-// descendant ranges when the clause is created; finer cells snap to their
-// level-16 ancestor. Invalid cell IDs join ErrInvalidClause with the
-// underlying cause.
-func WithinCells(index *bitmapidx.FieldIndex, cellIDs ...uint64) (Clause, error) {
-	if index == nil || len(cellIDs) == 0 || index.Field().Kind != bitmapidx.KindGeo {
-		return nil, ErrInvalidClause
-	}
-	ranges, err := bitmapidx.RangesFromCellIDs(make([]bitmapidx.GeoRange, 0, len(cellIDs)), cellIDs)
-	if err != nil {
-		return nil, errors.Join(ErrInvalidClause, err)
-	}
-	return geoClause{index: index, ranges: ranges}, nil
+// InCells restricts to the union of S2 cells. Like other constructors, it
+// defers validation/normalization to Compile and copies the input slice.
+func InCells(index *bitmapidx.FieldIndex, cellIDs ...uint64) Clause {
+	return geoClause{index: index, cells: append([]uint64(nil), cellIDs...)}
 }

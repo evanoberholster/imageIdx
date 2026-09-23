@@ -9,6 +9,20 @@ package imageidx
 // backend uses it as its sentinel.
 type ImageID = uint64
 
+// UserID identifies a user principal across every index package. Unlike
+// ImageID it is a defined type rather than an alias, so user, group, and
+// image IDs never mix implicitly; convert explicitly at trust boundaries.
+//
+// UserID 0 is reserved and never represents a user, mirroring ImageID 0.
+type UserID uint64
+
+// GroupID identifies a group principal across every index package. Like
+// UserID it is a defined type so the three ID kinds stay distinct; see
+// UserID for the rationale.
+//
+// GroupID 0 is reserved and never represents a group.
+type GroupID uint64
+
 // Durability controls when a write is acknowledged relative to filesystem
 // synchronization.
 type Durability uint8
