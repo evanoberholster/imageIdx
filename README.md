@@ -225,7 +225,23 @@ if err = tags.Apply(bitmapidx.FieldMutation{
 }); err != nil {
 	log.Fatal(err)
 }
+
+distinctValues := tags.Cardinality() // 2: "Trekking" and "Travel"
 ```
+
+`CountValues` counts matching ImageIDs; `Cardinality` counts distinct values
+with at least one live ImageID. Removing a value's final membership drops it
+from cardinality without requiring a checkpoint or vacuum. On a multi-field
+index, query one registered type or get counts for every registered type
+(including empty fields):
+
+```go
+tagValues, ok := store.Cardinality(bitmapidx.IndexTypeTag)
+byType := store.Cardinalities() // map[bitmapidx.IndexType]uint64
+```
+
+The per-type counts are sampled independently, not as one cross-field snapshot
+when writes are concurrent.
 
 Continuous values use explicit transitions, which resolve the zero-value
 ambiguity (`To: 0` alone would otherwise be indistinguishable from "absent"):
