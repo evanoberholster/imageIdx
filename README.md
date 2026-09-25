@@ -1,7 +1,7 @@
 # imageIdx
 
 Image indexing tools written in Go 1.27. The root `imageidx` package defines
-the shared `ImageID` and durability types. The `roar` package owns the
+the shared `ImageID`, principal (`UserID`/`GroupID`), and durability types. The `roar` package owns the
 immutable zero-copy bitmap representation, used directly by the logical
 indexes in `bitmapidx`, `timeidx`, and `vectoridx`. The `search` package
 compiles and executes queries across them.
@@ -438,16 +438,17 @@ other field kinds.
 The `vectoridx` package provides persistent HNSW approximate-nearest-neighbor
 search over fixed-dimension embeddings (`512`, `768`, or `1024`) in one of
 five element types (`int8`, `uint8`, `int16`, `uint16`, `float32`), ranked by
-squared L2 distance. `NodeID` is the application identifier defined by the
-index `TypeID`, so an image-embedding index addresses `ImageID`s directly
-with no second mapping. See `vectoridx/README.md` and `AGENTS/VectorIdx.MD`.
+squared L2 distance. `NodeID` is the application identifier whose type is
+declared by the index `SpaceID`, so an image-embedding index addresses
+`ImageID`s directly with no second mapping. See `vectoridx/README.md` and
+`AGENTS/VectorIdx.MD`.
 
 ```go
 idx, err := vectoridx.Create(path, vectoridx.Config{
-    TypeID:      1,
+    SpaceID:     vectoridx.NewSpaceID(vectoridx.IndexTypeImage, 1),
     Dimensions:  vectoridx.Dim512,
     ElementType: vectoridx.ElementFloat32,
-})
+}, vectoridx.DurabilitySync)
 if err != nil {
     log.Fatal(err)
 }
@@ -463,9 +464,10 @@ if err != nil {
 ```
 
 Deletion is tombstone-only (`Delete` keeps nodes traversable but never
-returned) and `Compact` rebuilds the graph from live vectors without
-renumbering NodeIDs. `CandidateFilter` applies bitmap-style membership after
-ANN discovery with oversampling and an exact-scan fallback:
+returned); re-adding a deleted NodeID replaces its vector and reconnects it,
+and `Compact` rebuilds the graph from live vectors without renumbering
+NodeIDs. `CandidateFilter` applies bitmap-style membership after ANN
+discovery with oversampling and an exact-scan fallback:
 
 ```go
 filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
@@ -577,6 +579,7 @@ timestamp range (optionally with `search.ExactTimestamp`); and
 For access control, compile `search.WithACL(userID, authenticatedGroupIDs...)`
 with `search.CompileWithStore(store, clauses...)`. The clause unions direct
 UserACL and GroupACL postings; callers authenticate group membership.
+See Access control (ACL) below.
 
 Timestamp ranges use the timestamp index's compressed candidate semantics.
 Add `search.ExactTimestamp` when exact boundary filtering is required; only
@@ -598,6 +601,119 @@ Reader lifetime tracking is automatic. Every field read registers with its
 internal tracker, and `Index.Close` waits for reads that could still
 reference retired or mmap-backed state. Callers open one persistent
 `Index`, obtain fields with `Lookup`, and close the store after use.
+
+## Access control (ACL)
+
+Access control is a `search`-level policy over two dedicated `bitmapidx`
+`KindEnum` fields. `bitmapidx` only stores opaque values; all principal
+semantics live in `search`:
+
+- `bitmapidx.IndexTypeUserACL` holds one posting per user: the `ImageID`s
+  granted directly to that user.
+- `bitmapidx.IndexTypeGroupACL` holds one posting per group: the `ImageID`s
+  granted to that group.
+- A principal is its `uint64` ID (`imageidx.UserID` / `imageidx.GroupID`) in
+  fixed 8-byte little-endian form. The field IS the namespace, so equal IDs
+  in the user, group, or any ordinary enum field never collide. ID zero is
+  reserved and rejected everywhere.
+
+imageIdx stores image grants, not user-to-group membership. Your application
+authenticates which groups a user belongs to and passes those IDs to the
+query; there is no public-image bypass — images without a grant never match
+a `WithACL` clause.
+
+Declare the fields alongside the rest of the store. A user-only deployment
+needs only the user field; group queries additionally require the group
+field:
+
+```go
+fields := []bitmapidx.Field{
+	{Type: bitmapidx.IndexTypeUserACL, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+	{Type: bitmapidx.IndexTypeGroupACL, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+	{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+}
+store, err := bitmapidx.NewIndex("./data/fields", fields, bitmapidx.FieldConfig{}, imageidx.DurabilityOS)
+if err != nil {
+	log.Fatal(err)
+}
+defer store.Close()
+```
+
+Grant and revoke images with `search.UserGrants` and `search.GroupGrants`,
+bound once to the looked-up fields. `Add`, `Contains`, and `Remove` take
+typed IDs (`imageidx.UserID` / `imageidx.GroupID` / `search.ImageID`);
+zero IDs report `search.ErrInvalidPrincipal`. Batches of up to 8 images
+stay on the stack and share one encoded key, so the helpers add no
+allocations of their own:
+
+```go
+userField, _ := store.Lookup(bitmapidx.IndexTypeUserACL)
+groupField, _ := store.Lookup(bitmapidx.IndexTypeGroupACL)
+users, err := search.NewUserGrants(userField)
+if err != nil {
+	log.Fatal(err)
+}
+groups, err := search.NewGroupGrants(groupField)
+if err != nil {
+	log.Fatal(err)
+}
+
+// Direct grant: image 100 is visible to user 42.
+if err := users.Add(42, 100); err != nil {
+	log.Fatal(err)
+}
+// Group grant: image 100 is visible to every member of group 7.
+if err := groups.Add(7, 100); err != nil {
+	log.Fatal(err)
+}
+if ok, err := users.Contains(42, 100); err != nil || !ok {
+	log.Fatal(ok, err)
+}
+
+// Revoking the direct grant leaves the group grant intact.
+if err := users.Remove(42, 100); err != nil {
+	log.Fatal(err)
+}
+```
+
+The single-principal `search.NewUserACL` / `search.NewGroupACL` constructors
+and their `Value()` / `Parse*` helpers remain for audit paths: resolving a
+principal back from dictionary bytes returned by `LookupValue` or `Iterate`.
+
+Query with `search.WithACL`, compiled through `search.CompileWithStore` so
+the clause can bind the dedicated fields. The clause unions the user's
+posting with one posting per authenticated group, then intersects that union
+with the rest of the query. Repeated group IDs are deduplicated:
+
+```go
+plan, err := search.CompileWithStore(store,
+	search.WithACL(42, authenticatedGroupIDs...),
+	search.AllValues(tags, bitmapidx.StringValue("visible")),
+)
+if err != nil {
+	log.Fatal(err)
+}
+matches, err := plan.AppendIDs(ctx, nil, search.NewWorkspace(4_096))
+```
+
+Misuse is a compile error (`search.ErrInvalidClause`): `WithACL` without a
+store, user or group ID zero, or a missing required ACL field. Plans keep
+compiled field queries, so the store must stay open while they execute;
+grants added after compilation are picked up by subsequent executions, and
+`plan.Refresh` re-samples planning estimates.
+
+Audit group exposure without touching your membership store: each group
+posting lists exactly the images granted through it. Resolve a principal
+back from dictionary bytes with `search.ParseUserACL` /
+`search.ParseGroupACL`:
+
+```go
+editors, err := search.NewGroupACL(7)
+if err != nil {
+	log.Fatal(err)
+}
+imageIDs, err := groupField.ValueIDs(nil, editors.Value()) // images granted to group 7
+```
 
 ## Runnable command
 

@@ -154,9 +154,10 @@ func (v *dictionaryView) entriesWithHash(base FieldKey) []dictEntry {
 
 // resolve returns the key, including its collision slot, of the entry
 // whose canonical bytes equal canonical. It scans the hash group in
-// precedence order and compares bytes.
+// precedence order and compares bytes. Layers range over a stack array so
+// reads allocate nothing.
 func (v *dictionaryView) resolve(base FieldKey, canonical []byte) (FieldKey, bool) {
-	for _, layer := range [][]dictEntry{v.active, v.base} {
+	for _, layer := range [2][]dictEntry{v.active, v.base} {
 		for _, entry := range groupEntries(layer, base) {
 			if bytes.Equal(v.bytes(entry), canonical) {
 				return entry.key, true

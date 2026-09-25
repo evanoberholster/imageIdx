@@ -4,6 +4,7 @@ import (
 	"errors"
 	"slices"
 
+	imageidx "github.com/evanoberholster/imageIdx"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/roar"
 )
@@ -14,7 +15,7 @@ func compileACL(store *bitmapidx.Index, clause aclClause) (stage, error) {
 	if store == nil {
 		return stage{}, errACLStore
 	}
-	user, err := bitmapidx.NewUserACL(bitmapidx.UserID(clause.userID))
+	user, err := NewUserACL(imageidx.UserID(clause.userID))
 	if err != nil {
 		return stage{}, err
 	}
@@ -35,7 +36,7 @@ func compileACL(store *bitmapidx.Index, clause aclClause) (stage, error) {
 		}
 		seen := make([]uint64, 0, len(clause.groupIDs))
 		for _, id := range clause.groupIDs {
-			group, err := bitmapidx.NewGroupACL(bitmapidx.GroupID(id))
+			group, err := NewGroupACL(imageidx.GroupID(id))
 			if err != nil {
 				return stage{}, err
 			}

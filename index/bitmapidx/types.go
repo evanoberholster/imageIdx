@@ -54,9 +54,10 @@ const (
 	IndexTypeColorLabel
 	IndexTypeFlag
 
-	// ACL fields: one KindEnum field per principal kind, so the stored
-	// key IS the uint64 user or group ID in fixed 8-byte form.
-	// See UserACL/GroupACL.
+	// Reserved field IDs for access-control postings: one KindEnum field
+	// per principal kind, so the stored key IS the uint64 user or group ID
+	// in fixed 8-byte form. Principal encoding and policy live in search
+	// (search.UserACL/search.GroupACL); this package stores opaque values.
 	IndexTypeUserACL
 	IndexTypeGroupACL
 )
