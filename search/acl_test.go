@@ -29,11 +29,11 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 	users, _ := store.Lookup(bitmapidx.IndexTypeUserACL)
 	groups, _ := store.Lookup(bitmapidx.IndexTypeGroupACL)
 	tags, _ := store.Lookup(bitmapidx.IndexTypeTag)
-	user, _ := bitmapidx.NewUserACL(42)
-	otherUser, _ := bitmapidx.NewUserACL(43)
-	group7, _ := bitmapidx.NewGroupACL(7)
-	group9, _ := bitmapidx.NewGroupACL(9)
-	otherGroup, _ := bitmapidx.NewGroupACL(10)
+	user, _ := NewUserACL(42)
+	otherUser, _ := NewUserACL(43)
+	group7, _ := NewGroupACL(7)
+	group9, _ := NewGroupACL(9)
+	otherGroup, _ := NewGroupACL(10)
 	for _, entry := range []struct {
 		index *bitmapidx.FieldIndex
 		id    uint64
@@ -117,7 +117,7 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 		t.Fatal(metrics.Stages)
 	}
 	// Compiled queries resolve principals added after compilation.
-	group11, _ := bitmapidx.NewGroupACL(11)
+	group11, _ := NewGroupACL(11)
 	withFuture, err := CompileWithStore(store, WithACL(42, 11))
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 func TestWithACLValidationAndUserOnly(t *testing.T) {
 	store := aclStore(t, false)
 	users, _ := store.Lookup(bitmapidx.IndexTypeUserACL)
-	user, _ := bitmapidx.NewUserACL(42)
+	user, _ := NewUserACL(42)
 	if err := users.Add(bitmapidx.Entry{ImageID: 9, Value: user.Value()}); err != nil {
 		t.Fatal(err)
 	}
