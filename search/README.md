@@ -1,8 +1,14 @@
 # search
 
-Compile conjunctive predicates once, then select an explicit execution operation.
-Plans are immutable and safe to share. Workspaces and destination buffers are
-exclusively owned by one execution.
+Compile conjunctive predicates once into an immutable, shareable `Plan`,
+then select an explicit execution operation. Destination buffers and
+`Workspace` scratch are exclusively owned by one execution.
+
+## Search usage
+
+Compile once and reuse the plan. `Compile` canonicalizes predicates and
+caches cardinality estimates for strategy selection; `SearchOnce` skips
+that caching and suits single-use queries only.
 
 ```go
 plan, err := search.Compile(
@@ -12,13 +18,56 @@ plan, err := search.Compile(
 )
 if err != nil { return err }
 
-var ws search.Workspace
-ids, err := plan.AppendIDs(ctx, dst[:0], &ws)
-count, err := plan.Count(ctx, &ws)
+var ws search.Workspace // reusable scratch; do not share across goroutines
+```
+
+A full bulk search appends sorted, unique IDs while preserving the
+destination prefix. `Search` is the uninstrumented fast path and is
+identical to `AppendIDs`.
+
+```go
+dst, err := plan.Search(ctx, dst[:0], &ws)
+```
+
+`Count` avoids building the ID slice by using cardinality kernels where
+possible. `Exists` stops at the first verified match. Both answer
+existence questions without paying for full materialization.
+
+```go
+n, err := plan.Count(ctx, &ws)
 found, err := plan.Exists(ctx, &ws)
+```
+
+`FilterIDs` probes an existing candidate list instead of collecting from
+the indexes. It preserves input order and duplicates, so
+`dst=candidates[:0]` reuse is supported for filtering in place.
+
+```go
 kept, err := plan.FilterIDs(ctx, dst[:0], candidates, &ws)
+```
+
+`AppendPage` pages by ID cursor: it returns up to `Limit` verified matches
+strictly greater than `AfterID`. `Visit` streams matches in the same order
+and stops early when the callback returns false.
+
+```go
 page, err := plan.AppendPage(ctx, dst[:0], &ws,
     search.Page{AfterID: lastID, Limit: 100})
+err = plan.Visit(ctx, &ws, func(id search.ImageID) bool {
+    return true // return false to stop early
+})
+```
+
+For long-lived services, pool workspaces with `Executor` instead of
+hand-rolling per-request scratch. The retention budget bounds each idle
+workspace, not process memory.
+
+```go
+executor, err := search.NewExecutor(search.ExecutorConfig{
+    WorkspaceCapacity: 4096,
+    MaxRetainedBytes:  8 << 20,
+})
+ids, err := executor.AppendIDs(ctx, dst[:0], plan)
 ```
 
 ## Contracts and costs
@@ -38,68 +87,30 @@ page, err := plan.AppendPage(ctx, dst[:0], &ws,
 
 ## Per-run metrics
 
-`Search` keeps the uninstrumented bulk path. Use `SearchWithMetrics` when a
-request needs counts and stage timings; reuse the report sequentially to avoid
-allocating stage records on every run:
+`SearchWithMetrics` runs the same bulk search while filling a
+caller-owned report. Reuse the report across calls to avoid reallocating
+stage records. `Matched` counts pre-ranking matches, `Returned` counts
+appended IDs, and `Stages` follows plan order while `ExecutionOrder`
+records actual execution (`-1` means unreached).
 
 ```go
 metrics := search.NewSearchMetrics(plan)
 ids, err := plan.SearchWithMetrics(ctx, dst[:0], &ws, metrics)
-if err != nil { return err }
 for _, stage := range metrics.Stages {
     log.Printf("stage=%d kind=%s input=%d passed=%d duration=%s",
         stage.PlanIndex, stage.Stage.Kind, stage.Input,
         stage.Passed, stage.Duration)
 }
-log.Printf("matched=%d total=%s", metrics.Matched, metrics.TotalDuration)
 ```
-
-`Executor.SearchWithMetrics` uses pooled scratch; the report remains caller-owned.
-`FilterIDsWithMetrics`, `RankTimeWithMetrics`, and `RankGeoWithMetrics` expose
-the same stage records. Ranking also reports candidate, scored, and skipped
-counts plus scoring/heap and final-sort durations in `metrics.Rank`. `Stages`
-is in plan order, while `ExecutionOrder` shows actual execution order; `-1`
-means a stage was not reached. Source `Collected` is its full population and
-`Passed` is the number visited. Filter `Input`/`Passed` count candidate entries,
-including duplicates. A buffered timestamp filter's `Collected` is the size
-of its prepared lookup set; its `Calls` includes preparation and batch probes.
-`Matched` is before top-k ranking, while `Returned` is the appended result
-count. On cancellation or error, `Complete` is false and observed counts may
-be partial even though the returned destination has its original length.
-Metrics reflect live per-stage views, not a store-wide snapshot.
-
-Bitmap sources seek by ID and do not expand the entire result into an ID slice
-for pagination, existence or ranking. Their bitmaps may still be materialized or
-copied: persistent results must detach from mmap. Timestamp sources are buffered
-and sorted because timeidx has no ID-ordered cursor. Lossy timestamp filters
-without an exact lookup also buffer a range. Numeric ranges may choose a union
-when that is cheaper than probing many keys.
-
-Cancellation is checked between candidate batches and stages, and during
-scoring/visiting. A single index materialization or bitmap kernel is not
-interruptible. Destination-returning operations return the original
-slice length on error, but appended backing storage may have changed. A visitor
-may already have delivered matches.
-
-Stages and batches read independently published views. A query is **not a
-database-wide snapshot**; writes between pages can alter subsequent pages.
-`AfterID` is an ID-order cursor, not a ranked-score cursor. Keep indexes open
-during execution. Callbacks must not reuse the active workspace.
 
 ## Predicates and planning
 
-`AllValues` requires every supplied value; `FieldText` requires every analyzed
-token. `FieldRange` uses stored-grid integer bounds. `During` uses `[start,end)`;
-add `ExactTimestamp` to verify lossy candidates against canonical timestamps.
-`InCells` takes S2 cell IDs, expanding coarse cells and snapping finer cells.
-These constructors defer validation to `Compile`. Empty value lists are errors;
-empty ranges match nothing. Compile validates all clauses even when another
-clause is empty. There are no OR/NOT combinators.
-
-`WithACL(userID, groupIDs...)` is the one built-in OR clause: it unions the
-direct `UserACL` bitmap with the supplied `GroupACL` bitmaps, then intersects
-that union with the rest of the query. Bind the two dedicated fields through
-the bitmap store when compiling:
+`AllValues` requires every value; `FieldText` requires every analyzed
+token; `FieldRange` uses stored-grid bounds; `During` uses `[start,end)`
+with optional `ExactTimestamp` verification; `InCells` expands S2 cells.
+Validation happens at `Compile`. There are no OR/NOT combinators, except
+`WithACL`, which unions user/group bitmaps and intersects the result.
+Bind it through the store and authenticate group membership yourself.
 
 ```go
 plan, err := search.CompileWithStore(store,
@@ -108,48 +119,87 @@ plan, err := search.CompileWithStore(store,
 )
 ```
 
-The caller must authenticate group membership; `WithACL` does not check it.
-`Compile` without a store rejects this clause. User ID zero, group ID zero,
-and missing required ACL fields are errors. A user-only ACL needs only the
-`UserACL` field. This clause does not automatically include public images.
-
-`IsEmpty` means structural emptiness; use `Exists` for live data. Estimates are
-cached planning hints sampled at Compile or Refresh, never correctness
-conditions. After a workload changes, explicitly refresh without mutating an
-executing plan:
+`IsEmpty` is structural only; use `Exists` for live data. Estimates are
+planning hints. After the workload shifts, refresh ordering without
+repeating canonicalization — but do not refresh per request.
 
 ```go
 updated, err := plan.Refresh(ctx) // reuses canonicalized predicates
-stages := updated.Stages()       // field, predicate, estimate and capabilities
+stages := updated.Stages()        // predicate, estimate, capabilities
 ```
 
-Do not refresh on every request. Publish a replacement plan safely if other
-goroutines share the containing variable.
+Stages read independently published views: a query is not a
+database-wide snapshot. `AfterID` is an ID cursor, not a score cursor.
+Keep indexes open during execution and never reuse the active workspace
+inside callbacks.
 
-## Shared execution and retained memory
+## Ranking usage
+
+Native ranking keeps full precision and lower-is-better ordering.
+`RankTime` orders by `|timestamp-target|` via an exact-timestamp lookup;
+`RankGeo` orders by haversine metres. Missing or invalid entries are
+skipped, equal scores break ties by ID, `k < 0` keeps all matches, and
+`k == 0` returns `dst` unchanged.
 
 ```go
-executor, err := search.NewExecutor(search.ExecutorConfig{
-    WorkspaceCapacity: 4096,
-    MaxRetainedBytes: 8 << 20,
-})
-ids, err := executor.AppendIDs(ctx, dst[:0], plan)
-count, err := executor.Count(ctx, plan)
+byTime, err := plan.RankTime(ctx, nil, &ws, lookupTime, target, 100)
+byGeo, err := plan.RankGeo(ctx, nil, &ws, lat, lng, lookupGeo, 100)
 ```
 
-Executor is independent of plans and index lifetimes. It has no writer-batch
-pool. The retention budget applies to **each idle workspace**, not active-query
-or process memory. Oversized scratch is dropped after use; `sync.Pool` can also
-discard buffers at GC. Explicit owners can use `Workspace.Trim` and
-`RetainedBytes`. `Reset` alone retains capacity. Allocation behavior depends on
-the operation, source representation, pending deltas and buffer sizing.
+`FilterRanked` bridges external vector search: it probes ANN entries
+against the plan while preserving source order, duplicates, and integer
+scores. Over-fetch from the ANN side because a selective plan can
+under-fill.
 
-## Ranking
+```go
+kept, err := plan.FilterRanked(ctx, nil, &ws, annResults,
+    func(r vectoridx.Result) (imageidx.ImageID, bool) { return r.ImageID, true },
+    func(r vectoridx.Result) uint64 { return uint64(r.Score) })
+```
 
-Scores no longer saturate at 65,535. `Result` is `RankedResult[uint64]` for time
-and integer-ranked input; `GeoResult` is `RankedResult[float64]`. Geo ranking
-methods accept/return `[]GeoResult`. Equal native scores break ties by ID.
-Ranked `k < 0` means all matches, `k == 0` means no output. Invalid origins and
-nil ranking callbacks return errors.
+`search/ranking` is the optional `uint16` fusion layer used after
+native Top-k, at the presentation boundary. `Rank` is higher-is-better:
+`NoRank=0` (missing, sorts last), `MinRank=1` (worst), `MaxRank=65535`
+(best). Each lane is monotonic within itself only; lanes are never
+directly comparable before fusion.
+
+```go
+import "github.com/evanoberholster/imageIdx/search/ranking"
+
+// Encode one lane per signal; missing entries get ranking.NoRank.
+timeRanks := make([]ranking.Rank, len(ids))
+vecRanks := make([]ranking.Rank, len(ids))
+ranking.RankTimeSignal(timeRanks, ids, target, lookup)
+for i, sim := range cosineSims {
+    vecRanks[i] = ranking.QuantizeCosine(sim)
+}
+
+// Fuse heterogeneous lanes with RRF and sort the output.
+var sig ranking.Signals
+sig.ImageIDs = ids
+sig.Values[0], sig.Values[1] = timeRanks, vecRanks
+sig.Kinds[0], sig.Kinds[1] = ranking.KindTime, ranking.KindVector
+sig.Count = 2
+
+fused := make([]ranking.Rank, len(ids))
+var rrf ranking.RRF // reuse per goroutine; holds scratch
+if err := rrf.Fuse(fused, &sig); err != nil { return err }
+
+// Full sort, or Top-K when only a few heads are needed.
+ranking.Sort(ids, fused)
+topIDs, _ := ranking.TopK(nil, nil, ids, fused, 100)
+_ = topIDs
+```
+
+`Signals` lanes are positional (`ImageIDs[i]` matches `Values[s][i]`)
+until after `Fuse`; only final results reorder. All hot paths reuse
+caller buffers with zero allocations after warmup. `Results` holds the
+same parallel layout for the fused output.
+
+Rank-phase metrics use the shared `search/metrics` report, the same
+type as `SearchMetrics.Rank`: pass one `*metrics.RankMetrics` across
+the `...WithMetrics` entry points (encode, `Fuse`, `Sort`, `TopK`) and
+durations accumulate into `ScoreDuration`/`SortDuration`. Nil reports
+are rejected; use the plain entry points for the fast path.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for benchmark methodology and results.
