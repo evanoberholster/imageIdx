@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 
 	"github.com/evanoberholster/imageIdx/index/timeidx"
@@ -14,7 +15,7 @@ import (
 type StageKind uint8
 
 const (
-	StageField StageKind = iota + 1
+	StageNamespace StageKind = iota + 1
 	StageTimestamp
 	StageGeo
 	StageACL
@@ -22,8 +23,8 @@ const (
 
 func (kind StageKind) String() string {
 	switch kind {
-	case StageField:
-		return "field"
+	case StageNamespace:
+		return "namespace"
 	case StageTimestamp:
 		return "timestamp"
 	case StageGeo:
@@ -39,8 +40,8 @@ func (kind StageKind) String() string {
 type Stage struct {
 	Kind     StageKind
 	Estimate uint64
-	// Field is zero for timestamp and ACL stages. Predicate describes semantics.
-	Field            bitmapidx.IndexType
+	// Namespace is zero for timestamp and ACL stages. Predicate describes semantics.
+	Namespace        common.Namespace
 	Predicate        string
 	CanProbe         bool
 	OrderedSource    bool
@@ -54,17 +55,17 @@ type stage struct {
 	kind     StageKind
 	estimate uint64
 
-	fieldIndex *bitmapidx.FieldIndex
-	fieldKind  fieldClauseKind
-	fieldQuery bitmapidx.Query
-	fieldRange bitmapidx.NumericRange
+	namespaceIndex *bitmapidx.NamespaceIndex
+	namespaceKind  namespaceClauseKind
+	namespaceQuery bitmapidx.Query
+	namespaceRange bitmapidx.NumericRange
 
 	tsIndex *timeidx.Index
 	tsStart uint64
 	tsEnd   uint64
 	tsExact timeidx.ExactTimestampFunc
 
-	geoIndex  *bitmapidx.FieldIndex
+	geoIndex  *bitmapidx.NamespaceIndex
 	geoRanges []bitmapidx.GeoRange
 
 	aclQueries []bitmapidx.Query
@@ -74,18 +75,18 @@ func (s *stage) metadata() Stage {
 	meta := Stage{Kind: s.kind, Estimate: s.estimate, CanProbe: s.canFilter(), OrderedSource: s.kind != StageTimestamp,
 		BufferedFallback: s.kind == StageTimestamp && s.tsExact == nil}
 	switch s.kind {
-	case StageField:
-		meta.Field = s.fieldIndex.Field().Type
-		switch s.fieldKind {
-		case fieldValues:
+	case StageNamespace:
+		meta.Namespace = s.namespaceIndex.Spec().Namespace
+		switch s.namespaceKind {
+		case namespaceValues:
 			meta.Predicate = "all-values"
-		case fieldText:
+		case namespaceText:
 			meta.Predicate = "all-tokens"
-		case fieldRange:
+		case namespaceRange:
 			meta.Predicate = "numeric-range"
 		}
 	case StageGeo:
-		meta.Field = s.geoIndex.Field().Type
+		meta.Namespace = s.geoIndex.Spec().Namespace
 		meta.Predicate = "cell-union"
 	case StageTimestamp:
 		meta.Predicate = "timestamp-range"
@@ -96,14 +97,14 @@ func (s *stage) metadata() Stage {
 }
 
 // canFilter reports whether filter can verify candidates without collecting.
-// Field stages always filter via their typed field query. Timestamp stages filter
+// Namespace stages always filter via their typed namespace query. Timestamp stages filter
 // only with an exact canonical lookup. Geo stages filter by verifying
 // candidates against covered cells; filter itself falls back to
 // collect+intersect when the covered population is small relative to the
 // candidate set.
 func (s *stage) canFilter() bool {
 	switch s.kind {
-	case StageField:
+	case StageNamespace:
 		return true
 	case StageTimestamp:
 		return s.tsExact != nil
@@ -118,15 +119,15 @@ func (s *stage) canFilter() bool {
 
 func (s *stage) collect(dst []ImageID) ([]ImageID, error) {
 	switch s.kind {
-	case StageField:
-		if s.fieldKind == fieldRange {
-			match, err := s.fieldIndex.Range(s.fieldRange)
+	case StageNamespace:
+		if s.namespaceKind == namespaceRange {
+			match, err := s.namespaceIndex.Range(s.namespaceRange)
 			if err != nil {
 				return dst, err
 			}
 			return match.AppendTo(dst), nil
 		}
-		match, err := s.fieldQuery.Match()
+		match, err := s.namespaceQuery.Match()
 		if err != nil {
 			return dst, err
 		}
@@ -155,12 +156,12 @@ func (s *stage) collect(dst []ImageID) ([]ImageID, error) {
 
 func (s *stage) filter(dst, candidates, scratch []ImageID, ws *Workspace) ([]ImageID, error) {
 	switch s.kind {
-	case StageField:
-		if s.fieldKind == fieldRange {
-			filtered, err := s.fieldIndex.FilterRange(dst, candidates, s.fieldRange)
+	case StageNamespace:
+		if s.namespaceKind == namespaceRange {
+			filtered, err := s.namespaceIndex.FilterRange(dst, candidates, s.namespaceRange)
 			return filtered, err
 		}
-		filtered, err := s.fieldQuery.Filter(dst, candidates)
+		filtered, err := s.namespaceQuery.Filter(dst, candidates)
 		return filtered, err
 	case StageTimestamp:
 		if s.tsExact == nil {
@@ -258,7 +259,7 @@ type timestampRange struct {
 	order int
 }
 
-// Compile validates field clauses, coalesces
+// Compile validates namespace clauses, coalesces
 // lossy-only timestamp ranges on the same index by intersection, and orders
 // the resulting stages by their current cardinality estimates. Ties retain
 // clause order.
@@ -267,7 +268,7 @@ func Compile(clauses ...Clause) (Plan, error) {
 }
 
 // CompileWithStore binds WithACL clauses to the store's UserACL and GroupACL
-// fields. Plans keep compiled field queries, so the store must stay open while
+// namespaces. Plans keep compiled namespace queries, so the store must stay open while
 // they execute. Other clauses compile identically to Compile.
 func CompileWithStore(store *bitmapidx.Index, clauses ...Clause) (Plan, error) {
 	return compile(store, clauses...)
@@ -312,28 +313,28 @@ func compile(store *bitmapidx.Index, clauses ...Clause) (Plan, error) {
 				return Plan{}, errors.Join(ErrInvalidClause, err)
 			}
 			ordered = append(ordered, orderedStage{s: st, order: clauseIndex})
-		case fieldClause:
+		case namespaceClause:
 			if value.index == nil {
 				return Plan{}, ErrInvalidClause
 			}
-			st := stage{kind: StageField, fieldIndex: value.index, fieldKind: value.kind}
+			st := stage{kind: StageNamespace, namespaceIndex: value.index, namespaceKind: value.kind}
 			var err error
 			switch value.kind {
-			case fieldValues:
+			case namespaceValues:
 				if len(value.values) == 0 {
 					return Plan{}, ErrInvalidClause
 				}
-				st.fieldQuery, err = value.index.Compile(value.values...)
+				st.namespaceQuery, err = value.index.Compile(value.values...)
 				if err == nil {
-					st.estimate = st.fieldQuery.Estimate()
+					st.estimate = st.namespaceQuery.Estimate()
 				}
-			case fieldText:
-				st.fieldQuery, err = value.index.CompileText(value.text)
+			case namespaceText:
+				st.namespaceQuery, err = value.index.CompileText(value.text)
 				if err == nil {
-					st.estimate = st.fieldQuery.Estimate()
+					st.estimate = st.namespaceQuery.Estimate()
 				}
-			case fieldRange:
-				st.fieldRange = value.bounds
+			case namespaceRange:
+				st.namespaceRange = value.bounds
 				st.estimate, err = value.index.EstimateRange(value.bounds)
 			default:
 				return Plan{}, ErrInvalidClause
@@ -455,11 +456,11 @@ func (plan Plan) Refresh(ctx context.Context) (Plan, error) {
 		st := &stages[n]
 		var err error
 		switch st.kind {
-		case StageField:
-			if st.fieldKind == fieldRange {
-				st.estimate, err = st.fieldIndex.EstimateRange(st.fieldRange)
+		case StageNamespace:
+			if st.namespaceKind == namespaceRange {
+				st.estimate, err = st.namespaceIndex.EstimateRange(st.namespaceRange)
 			} else {
-				st.estimate = st.fieldQuery.Estimate()
+				st.estimate = st.namespaceQuery.Estimate()
 			}
 		case StageGeo:
 			st.estimate, err = st.geoIndex.EstimateGeoRanges(st.geoRanges)

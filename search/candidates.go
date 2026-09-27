@@ -121,11 +121,11 @@ func (plan Plan) probe(ctx context.Context, candidates []ImageID, ws *Workspace,
 		}
 		var err error
 		switch st.kind {
-		case StageField:
-			if st.fieldKind == fieldRange {
-				candidates, err = st.fieldIndex.FilterRange(candidates[:0], candidates, st.fieldRange)
+		case StageNamespace:
+			if st.namespaceKind == namespaceRange {
+				candidates, err = st.namespaceIndex.FilterRange(candidates[:0], candidates, st.namespaceRange)
 			} else {
-				candidates, err = st.fieldQuery.Filter(candidates[:0], candidates)
+				candidates, err = st.namespaceQuery.Filter(candidates[:0], candidates)
 			}
 		case StageGeo:
 			candidates, err = st.geoIndex.FilterGeoRanges(candidates[:0], candidates, st.geoRanges)

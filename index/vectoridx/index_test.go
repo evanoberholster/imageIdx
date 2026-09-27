@@ -19,7 +19,7 @@ func TestConfigValidation(t *testing.T) {
 			t.Fatalf("cfg %+v: expected ErrInvalidConfig, got %v", cfg, err)
 		}
 	}
-	idx, err := New(Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: Dim512, ElementType: ElementFloat32})
+	idx, err := New(Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,10 +193,10 @@ func TestTypedAPIMismatchRejected(t *testing.T) {
 func TestAllElementTypesRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(12))
 	cfgs := []Config{
-		{SpaceID: NewSpaceID(IndexTypeImage, 2), Dimensions: Dim512, ElementType: ElementInt8},
-		{SpaceID: NewSpaceID(IndexTypeImage, 3), Dimensions: Dim512, ElementType: ElementUint8},
-		{SpaceID: NewSpaceID(IndexTypeImage, 4), Dimensions: Dim512, ElementType: ElementInt16},
-		{SpaceID: NewSpaceID(IndexTypeImage, 5), Dimensions: Dim512, ElementType: ElementUint16},
+		{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementInt8},
+		{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementUint8},
+		{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementInt16},
+		{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementUint16},
 	}
 	v8 := randInt8Vec(rng, Dim512)
 	vu := make([]uint8, Dim512)

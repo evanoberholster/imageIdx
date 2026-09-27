@@ -5,16 +5,21 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/commit"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 const (
-	manifestMagic   uint32 = 0x48494d46 // HIMF
-	manifestVersion uint16 = 1
+	manifestMagic uint32 = 0x48494d46 // HIMF
+	// manifestVersion 2 stores the index namespace in bytes 6:8 (reserved in
+	// version 1). Version 1 manifests fail open with ErrUnsupported rather
+	// than be read as namespace zero.
+	manifestVersion uint16 = 2
 	manifestSize           = 64
 
 	genMagic      uint32 = 0x48494458 // HIDX
@@ -37,11 +42,12 @@ const (
 )
 
 // diskManifest is the atomically published root.
-// Layout (little-endian): magic 0:4, version 4:6, generation 8:16,
-// walOffset 16:24, recordCount 24:32, pageCount 32:40,
+// Layout (little-endian): magic 0:4, version 4:6, namespace 6:8,
+// generation 8:16, walOffset 16:24, recordCount 24:32, pageCount 32:40,
 // recordsPerPage 40:44, flags 44:48, walEpoch 48:56, CRC32 60:64 over
 // [0:60).
 type diskManifest struct {
+	namespace      common.Namespace
 	generation     uint64
 	walOffset      int64
 	recordCount    uint64
@@ -89,13 +95,14 @@ func validRecordsPerPage(value uint32) bool {
 }
 
 // newIndex creates a persistent index in dir and publishes its initial
-// checkpoint and manifest. An optional reader tracker lets Store share one
-// tracker across its indexes.
-func newIndex(dir string, cfg Config, durability Durability, readers ...*indexutil.ReaderTracker) (*Index, error) {
+// checkpoint and manifest. spec.Namespace is persisted zero-extended and may
+// be zero for tests; NewStore validates non-zero and uniqueness. An optional
+// reader tracker lets Store share one tracker across its indexes.
+func newIndex(dir string, spec PerceptualSpec, durability Durability, readers ...*storage.ReaderTracker) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	cfg, err := cfg.withDefaults()
+	cfg, err := spec.Config.withDefaults()
 	if err != nil {
 		return nil, err
 	}
@@ -106,9 +113,10 @@ func newIndex(dir string, cfg Config, durability Durability, readers ...*indexut
 	if err != nil {
 		return nil, err
 	}
-	idx := &Index{config: cfg, readers: chooseReaders(readers)}
+	idx := &Index{config: cfg, namespace: spec.Namespace, readers: chooseReaders(readers)}
 	idx.view.Store(&indexView{generation: 1})
 	idx.persistence = persistedState{dir: dir, durability: durability, wal: wal, walEpoch: 1}
+	idx.commits = commit.New(hashCommitQueueCapacity, idx.commitGroup)
 	if err = idx.Checkpoint(); err != nil {
 		_ = idx.Close()
 		return nil, err
@@ -120,7 +128,7 @@ func newIndex(dir string, cfg Config, durability Durability, readers ...*indexut
 // cfg.RecordsPerPage must match the persisted page size; a zero value adopts
 // the persisted size. An optional reader tracker lets Store share one tracker
 // across its indexes.
-func openIndex(dir string, cfg Config, durability Durability, readers ...*indexutil.ReaderTracker) (*Index, error) {
+func openIndex(dir string, cfg Config, durability Durability, readers ...*storage.ReaderTracker) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -143,22 +151,23 @@ func openIndex(dir string, cfg Config, durability Durability, readers ...*indexu
 	if cfg.MaxBatchEntries == 0 {
 		cfg.MaxBatchEntries = DefaultMaxApplyEntries
 	}
-	mapping, err := persist.MapFile(generationPath(dir, manifest.generation), ErrCorrupt)
+	mapping, err := storage.MapFile(generationPath(dir, manifest.generation), ErrCorrupt)
 	if err != nil {
 		return nil, err
 	}
 	view, header, err := decodeGeneration(mapping, cfg)
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, err
 	}
 	if header.generation != manifest.generation || view.count != manifest.recordCount || header.pageCount != manifest.pageCount {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, ErrCorrupt
 	}
 	idx := &Index{
-		config:  cfg,
-		readers: chooseReaders(readers),
+		config:    cfg,
+		namespace: manifest.namespace,
+		readers:   chooseReaders(readers),
 		persistence: persistedState{
 			dir: dir, durability: durability, mappings: [][]byte{mapping},
 			persistedGen: manifest.generation, walEpoch: manifest.walEpoch,
@@ -167,16 +176,17 @@ func openIndex(dir string, cfg Config, durability Durability, readers ...*indexu
 	idx.view.Store(view)
 	entries, err := replayHashWAL(walPath(dir, manifest.walEpoch), manifest.walOffset)
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, err
 	}
 	idx.appendEntriesLocked(entries)
 	wal, err := openHashWAL(walPath(dir, manifest.walEpoch))
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, err
 	}
 	idx.persistence.wal = wal
+	idx.commits = commit.New(hashCommitQueueCapacity, idx.commitGroup)
 	return idx, nil
 }
 
@@ -207,6 +217,7 @@ func (i *Index) checkpointLocked() error {
 		return err
 	}
 	manifest := diskManifest{
+		namespace:      i.namespace,
 		generation:     view.generation,
 		walOffset:      walOffset,
 		walEpoch:       i.persistence.walEpoch,
@@ -254,6 +265,7 @@ func (i *Index) Vacuum(live CandidateSet) error {
 		return err
 	}
 	manifest := diskManifest{
+		namespace:      i.namespace,
 		generation:     next.generation,
 		walOffset:      0,
 		walEpoch:       epoch,
@@ -270,27 +282,27 @@ func (i *Index) Vacuum(live CandidateSet) error {
 	i.persistence.walEpoch = epoch
 	i.persistence.persistedGen = next.generation
 	_ = oldWAL.Close()
-	mapping, err := persist.MapFile(generationPath(i.persistence.dir, next.generation), ErrCorrupt)
+	mapping, err := storage.MapFile(generationPath(i.persistence.dir, next.generation), ErrCorrupt)
 	if err != nil {
 		return err
 	}
 	mapped, _, err := decodeGeneration(mapping, i.config)
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return err
 	}
 	if mapped.count != next.count {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return ErrCorrupt
 	}
 	i.view.Store(mapped)
 	i.readers.WaitForPriorReaders()
 	obsolete := i.persistence.mappings
 	i.persistence.mappings = [][]byte{mapping}
-	_ = persist.RemoveObsolete(i.persistence.dir, genGlob, generationPath(i.persistence.dir, next.generation))
-	_ = persist.RemoveObsolete(i.persistence.dir, walGlob, walPath(i.persistence.dir, epoch))
+	_ = storage.RemoveObsolete(i.persistence.dir, genGlob, generationPath(i.persistence.dir, next.generation))
+	_ = storage.RemoveObsolete(i.persistence.dir, walGlob, walPath(i.persistence.dir, epoch))
 	for _, old := range obsolete {
-		_ = persist.Unmap(old)
+		_ = storage.Unmap(old)
 	}
 	return nil
 }
@@ -298,7 +310,7 @@ func (i *Index) Vacuum(live CandidateSet) error {
 // OnDiskBytes reports the bytes held by generation files, WAL files, and the
 // manifest.
 func (i *Index) OnDiskBytes() uint64 {
-	return indexutil.DirSize(i.persistence.dir, genGlob, walGlob, "manifest")
+	return storage.DirSize(i.persistence.dir, genGlob, walGlob, "manifest")
 }
 
 // buildDenseView copies records admitted by live into fresh page planes.
@@ -385,23 +397,23 @@ func writeGenerationFile(dir string, view *indexView, recordsPerPage uint32) err
 	headerBytes := make([]byte, genHeaderSize)
 	encodeGenHeader(headerBytes, header)
 	buffer := make([]byte, 64*1024)
-	return writeAtomicFile(generationPath(dir, view.generation), func(file *os.File) error {
-		if _, err := file.Write(headerBytes); err != nil {
+	return writeAtomicFile(generationPath(dir, view.generation), func(out io.Writer) error {
+		if _, err := out.Write(headerBytes); err != nil {
 			return err
 		}
-		if _, err := file.Write(directory); err != nil {
+		if _, err := out.Write(directory); err != nil {
 			return err
 		}
 		for pageIndex := range view.pages {
 			page := &view.pages[pageIndex]
-			if err := writePage(file, buffer, page.imageIDs, page.phash64, page.pdq); err != nil {
+			if err := writePage(out, buffer, page.imageIDs, page.phash64, page.pdq); err != nil {
 				return err
 			}
 		}
 		if view.activeCount > 0 {
 			active := view.active
 			count := view.activeCount
-			return writePage(file, buffer,
+			return writePage(out, buffer,
 				active.imageIDs[:count], active.phash64[:count],
 				[4][]uint64{
 					active.pdq[0][:count], active.pdq[1][:count],
@@ -421,7 +433,7 @@ func writePageRef(dst []byte, offset uint64, count uint32) {
 // writePage encodes one page: a 64-byte header followed by the six planes.
 // Planes are written with explicit little-endian encoding; the CRC covers the
 // concatenated payload.
-func writePage(file *os.File, buffer []byte, imageIDs []ImageID, phash64 []uint64, pdq [4][]uint64) error {
+func writePage(out io.Writer, buffer []byte, imageIDs []ImageID, phash64 []uint64, pdq [4][]uint64) error {
 	crc := crc32.ChecksumIEEE(nil)
 	crc = crcPlane(crc, buffer, imageIDs)
 	crc = crcPlane(crc, buffer, phash64)
@@ -431,17 +443,17 @@ func writePage(file *os.File, buffer []byte, imageIDs []ImageID, phash64 []uint6
 	var headerBuf [pageHeaderSize]byte
 	header := headerBuf[:]
 	encodePageHeader(header, uint32(len(imageIDs)), crc)
-	if _, err := file.Write(header); err != nil {
+	if _, err := out.Write(header); err != nil {
 		return err
 	}
-	if err := writePlane(file, buffer, imageIDs); err != nil {
+	if err := writePlane(out, buffer, imageIDs); err != nil {
 		return err
 	}
-	if err := writePlane(file, buffer, phash64); err != nil {
+	if err := writePlane(out, buffer, phash64); err != nil {
 		return err
 	}
 	for word := 0; word < 4; word++ {
-		if err := writePlane(file, buffer, pdq[word]); err != nil {
+		if err := writePlane(out, buffer, pdq[word]); err != nil {
 			return err
 		}
 	}
@@ -477,8 +489,8 @@ func crcPlane(crc uint32, buffer []byte, values []uint64) uint32 {
 	return crc
 }
 
-func writePlane(file *os.File, buffer []byte, values []uint64) error {
-	return emitPlaneChunks(values, buffer, nil, file)
+func writePlane(out io.Writer, buffer []byte, values []uint64) error {
+	return emitPlaneChunks(values, buffer, nil, out)
 }
 
 func encodePageHeader(dst []byte, count uint32, crc uint32) {
@@ -617,17 +629,17 @@ func decodeGeneration(mapping []byte, cfg Config) (*indexView, genHeader, error)
 		}
 		planeWidth := uint64(count) * 8
 		planeOffset := offset + pageHeaderSize
-		imageIDs, err := persist.View[ImageID](mapping, planeOffset, uint64(count), ErrCorrupt, ErrUnsupported)
+		imageIDs, err := storage.View[ImageID](mapping, planeOffset, uint64(count), ErrCorrupt, ErrUnsupported)
 		if err != nil {
 			return nil, genHeader{}, err
 		}
-		phash64, err := persist.View[uint64](mapping, planeOffset+planeWidth, uint64(count), ErrCorrupt, ErrUnsupported)
+		phash64, err := storage.View[uint64](mapping, planeOffset+planeWidth, uint64(count), ErrCorrupt, ErrUnsupported)
 		if err != nil {
 			return nil, genHeader{}, err
 		}
 		var pdq [4][]uint64
 		for word := 0; word < 4; word++ {
-			pdq[word], err = persist.View[uint64](mapping, planeOffset+planeWidth*uint64(2+word), uint64(count), ErrCorrupt, ErrUnsupported)
+			pdq[word], err = storage.View[uint64](mapping, planeOffset+planeWidth*uint64(2+word), uint64(count), ErrCorrupt, ErrUnsupported)
 			if err != nil {
 				return nil, genHeader{}, err
 			}
@@ -662,7 +674,8 @@ func decodeGeneration(mapping []byte, cfg Config) (*indexView, genHeader, error)
 }
 
 func writeManifest(dir string, manifest diskManifest) error {
-	data := persist.BuildManifest(manifestSize, manifestMagic, manifestVersion, 60, 60, func(data []byte) {
+	data := storage.BuildManifest(manifestSize, manifestMagic, manifestVersion, 60, 60, func(data []byte) {
+		binary.LittleEndian.PutUint16(data[6:8], uint16(manifest.namespace))
 		binary.LittleEndian.PutUint64(data[8:16], manifest.generation)
 		binary.LittleEndian.PutUint64(data[16:24], uint64(manifest.walOffset))
 		binary.LittleEndian.PutUint64(data[24:32], manifest.recordCount)
@@ -671,7 +684,7 @@ func writeManifest(dir string, manifest diskManifest) error {
 		binary.LittleEndian.PutUint32(data[44:48], manifest.flags)
 		binary.LittleEndian.PutUint64(data[48:56], manifest.walEpoch)
 	})
-	return persist.WriteManifest(dir, data)
+	return storage.WriteManifest(dir, data)
 }
 
 func readManifest(path string) (diskManifest, error) {
@@ -682,13 +695,14 @@ func readManifest(path string) (diskManifest, error) {
 	// A recognized magic with an unknown version is a newer format, not
 	// corruption: fail open with ErrUnsupported so callers never misread
 	// it as a same-version bit rot.
-	if magic, version, ok := persist.PeekHeader(data); ok && magic == manifestMagic && version != manifestVersion {
+	if magic, version, ok := storage.PeekHeader(data); ok && magic == manifestMagic && version != manifestVersion {
 		return diskManifest{}, ErrUnsupported
 	}
-	if err = persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 60, 60); err != nil {
+	if err = storage.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 60, 60); err != nil {
 		return diskManifest{}, ErrCorrupt
 	}
 	manifest := diskManifest{
+		namespace:      common.Namespace(binary.LittleEndian.Uint16(data[6:8])),
 		generation:     binary.LittleEndian.Uint64(data[8:16]),
 		walOffset:      int64(binary.LittleEndian.Uint64(data[16:24])),
 		recordCount:    binary.LittleEndian.Uint64(data[24:32]),
@@ -721,12 +735,12 @@ const (
 
 // exactManifest is the atomically published root.
 // Layout (little-endian): magic 0:4, version 4:6, algorithm 6, targetFillPct
-// 7, generation 8:16, indexID 16:24, liveCount 24:32, blockCount 32:40,
-// walOffset 40:48, flags 48:52, blockSize 52:56, walEpoch 56:60, CRC32 60:64
-// over [0:60).
+// 7, generation 8:16, namespace 16:24 (zero-extended uint16), liveCount 24:32,
+// blockCount 32:40, walOffset 40:48, flags 48:52, blockSize 52:56, walEpoch
+// 56:60, CRC32 60:64 over [0:60).
 type exactManifest struct {
 	generation    uint64
-	indexID       uint64
+	namespace     common.Namespace
 	liveCount     uint64
 	blockCount    uint64
 	walOffset     int64
@@ -737,12 +751,23 @@ type exactManifest struct {
 	walEpoch      uint32
 }
 
+// decodeNamespaceField converts the zero-extended uint64 identity field into
+// a namespace, rejecting values above math.MaxUint16 as corruption. The field
+// width is unchanged from the old uint64 IndexID, so values written before the
+// namespace migration still fit uint16 are reinterpreted as namespaces.
+func decodeNamespaceField(raw uint64) (common.Namespace, error) {
+	if raw > math.MaxUint16 {
+		return 0, ErrCorrupt
+	}
+	return common.Namespace(raw), nil
+}
+
 func encodeManifest(m exactManifest) []byte {
-	return persist.BuildManifest(exactManifestSize, exactManifestMagic, exactManifestVersion, 60, 60, func(data []byte) {
+	return storage.BuildManifest(exactManifestSize, exactManifestMagic, exactManifestVersion, 60, 60, func(data []byte) {
 		data[6] = byte(m.algorithm)
 		data[7] = m.targetFillPct
 		binary.LittleEndian.PutUint64(data[8:16], m.generation)
-		binary.LittleEndian.PutUint64(data[16:24], m.indexID)
+		binary.LittleEndian.PutUint64(data[16:24], uint64(m.namespace))
 		binary.LittleEndian.PutUint64(data[24:32], m.liveCount)
 		binary.LittleEndian.PutUint64(data[32:40], m.blockCount)
 		binary.LittleEndian.PutUint64(data[40:48], uint64(m.walOffset))
@@ -755,21 +780,25 @@ func encodeManifest(m exactManifest) []byte {
 func decodeManifest(data []byte) (exactManifest, error) {
 	// Recognized magic with an unknown version is a newer format, not
 	// corruption: fail open with ErrUnsupported (see readManifest).
-	if magic, version, ok := persist.PeekHeader(data); ok && magic == exactManifestMagic && version != exactManifestVersion {
+	if magic, version, ok := storage.PeekHeader(data); ok && magic == exactManifestMagic && version != exactManifestVersion {
 		return exactManifest{}, ErrUnsupported
 	}
-	if err := persist.VerifyManifest(data, exactManifestSize, exactManifestMagic, exactManifestVersion, 60, 60); err != nil {
+	if err := storage.VerifyManifest(data, exactManifestSize, exactManifestMagic, exactManifestVersion, 60, 60); err != nil {
 		return exactManifest{}, ErrCorrupt
 	}
 	algo := Algorithm(data[6])
 	if !algo.Valid() {
 		return exactManifest{}, ErrCorrupt
 	}
+	namespace, err := decodeNamespaceField(binary.LittleEndian.Uint64(data[16:24]))
+	if err != nil {
+		return exactManifest{}, err
+	}
 	m := exactManifest{
 		algorithm:     algo,
 		targetFillPct: data[7],
 		generation:    binary.LittleEndian.Uint64(data[8:16]),
-		indexID:       binary.LittleEndian.Uint64(data[16:24]),
+		namespace:     namespace,
 		liveCount:     binary.LittleEndian.Uint64(data[24:32]),
 		blockCount:    binary.LittleEndian.Uint64(data[32:40]),
 		walOffset:     int64(binary.LittleEndian.Uint64(data[40:48])),
@@ -793,8 +822,8 @@ func readDiskManifest(path string) (exactManifest, error) {
 
 // encodeExactGenHeader writes a 128-byte generation header. Layout (LE):
 // 0:4 magic, 4:6 version, 6 algorithm u8, 7 targetFillPct u8,
-// 8:16 generation, 16:24 indexID, 24:28 flags, 28:32 blockCount,
-// 32:40 liveCount, 40:48 dirOffset, 48:56 dirLen,
+// 8:16 generation, 16:24 namespace (zero-extended uint16), 24:28 flags,
+// 28:32 blockCount, 32:40 liveCount, 40:48 dirOffset, 48:56 dirLen,
 // 56:64 walOffset, 64:68 blockSize, 68:124 reserved, 124:128 crc of [0:124).
 func encodeExactGenHeader(dst []byte, m exactManifest) {
 	binary.LittleEndian.PutUint32(dst[0:4], exactGenMagic)
@@ -802,7 +831,7 @@ func encodeExactGenHeader(dst []byte, m exactManifest) {
 	dst[6] = byte(m.algorithm)
 	dst[7] = m.targetFillPct
 	binary.LittleEndian.PutUint64(dst[8:16], m.generation)
-	binary.LittleEndian.PutUint64(dst[16:24], m.indexID)
+	binary.LittleEndian.PutUint64(dst[16:24], uint64(m.namespace))
 	binary.LittleEndian.PutUint32(dst[24:28], m.flags)
 	binary.LittleEndian.PutUint32(dst[28:32], uint32(m.blockCount))
 	binary.LittleEndian.PutUint64(dst[32:40], m.liveCount)
@@ -831,11 +860,15 @@ func decodeExactGenHeader(data []byte) (exactManifest, error) {
 	if !algo.Valid() {
 		return exactManifest{}, ErrCorrupt
 	}
+	namespace, err := decodeNamespaceField(binary.LittleEndian.Uint64(data[16:24]))
+	if err != nil {
+		return exactManifest{}, err
+	}
 	m := exactManifest{
 		algorithm:     algo,
 		targetFillPct: data[7],
 		generation:    binary.LittleEndian.Uint64(data[8:16]),
-		indexID:       binary.LittleEndian.Uint64(data[16:24]),
+		namespace:     namespace,
 		flags:         binary.LittleEndian.Uint32(data[24:28]),
 		blockCount:    uint64(binary.LittleEndian.Uint32(data[28:32])),
 		liveCount:     binary.LittleEndian.Uint64(data[32:40]),
@@ -867,7 +900,7 @@ func exactWALPath(dir string, epoch uint64) string {
 // newExact creates a persistent index in dir and publishes its initial
 // checkpoint. An optional reader tracker lets Store share one tracker across
 // its indexes.
-func newExact(dir string, spec ExactSpec, cfg ExactConfig, durability Durability, readers ...*indexutil.ReaderTracker) (*ExactIndex, error) {
+func newExact(dir string, spec ExactSpec, cfg ExactConfig, durability Durability, readers ...*storage.ReaderTracker) (*ExactIndex, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -896,7 +929,7 @@ func newExact(dir string, spec ExactSpec, cfg ExactConfig, durability Durability
 // BlockSize and TargetFillPct values adopt the persisted generation's sizing
 // so reopening a store keeps its write policy. An optional reader tracker lets
 // Store share one tracker across its indexes.
-func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*indexutil.ReaderTracker) (*ExactIndex, error) {
+func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*storage.ReaderTracker) (*ExactIndex, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -906,23 +939,23 @@ func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*i
 		return nil, err
 	}
 	genPath := exactGenerationPath(dir, manifest.generation)
-	mapping, err := persist.MapFile(genPath, ErrCorrupt)
+	mapping, err := storage.MapFile(genPath, ErrCorrupt)
 	if err != nil {
 		return nil, err
 	}
 	view, header, err := decodeExactGeneration(mapping)
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, err
 	}
-	if header.generation != manifest.generation || header.indexID != manifest.indexID ||
+	if header.generation != manifest.generation || header.namespace != manifest.namespace ||
 		header.liveCount != manifest.liveCount || header.blockCount != manifest.blockCount ||
 		header.algorithm != manifest.algorithm {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, ErrCorrupt
 	}
 	if view.liveCount != manifest.liveCount || uint64(len(view.blocks)) != manifest.blockCount {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, ErrCorrupt
 	}
 	if raw.BlockSize == 0 {
@@ -933,7 +966,7 @@ func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*i
 	}
 	cfg, err = cfg.withDefaults()
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, err
 	}
 	idx := &ExactIndex{
@@ -942,7 +975,7 @@ func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*i
 		writes:    make(chan *exactBatch, exactWriteQueue),
 		barriers:  make(chan chan barrierResult),
 		stop:      make(chan struct{}),
-		indexID:   manifest.indexID,
+		namespace: manifest.namespace,
 		flags:     manifest.flags,
 		algorithm: manifest.algorithm,
 		persistence: persistedState{
@@ -954,7 +987,7 @@ func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*i
 	idx.generation.Store(view.generation)
 	batches, maxSeq, err := replayExactWAL(exactWALPath(dir, uint64(manifest.walEpoch)), manifest.walOffset)
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, err
 	}
 	for _, batch := range batches {
@@ -972,7 +1005,7 @@ func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*i
 	idx.seq.Store(maxSeq + 1)
 	wal, err := openExactWAL(exactWALPath(dir, uint64(manifest.walEpoch)), int(cfg.MaxBatchEntries))
 	if err != nil {
-		_ = persist.Unmap(mapping)
+		_ = storage.Unmap(mapping)
 		return nil, err
 	}
 	idx.persistence.wal = wal
@@ -1080,7 +1113,7 @@ func (i *ExactIndex) checkpointLocked() error {
 		return err
 	}
 	manifest := exactManifest{
-		generation: view.generation, indexID: i.indexID, liveCount: fileView.liveCount,
+		generation: view.generation, namespace: i.namespace, liveCount: fileView.liveCount,
 		blockCount: uint64(len(fileView.blocks)), walOffset: walOffset,
 		flags: i.flags, blockSize: i.config.BlockSize,
 		algorithm: i.algorithm, targetFillPct: i.config.TargetFillPct,
@@ -1089,7 +1122,7 @@ func (i *ExactIndex) checkpointLocked() error {
 	if err := writeExactGenerationFile(i.persistence.dir, manifest, fileView); err != nil {
 		return err
 	}
-	if err := persist.WriteManifest(i.persistence.dir, encodeManifest(manifest)); err != nil {
+	if err := storage.WriteManifest(i.persistence.dir, encodeManifest(manifest)); err != nil {
 		return err
 	}
 	i.persistence.persistedGen = view.generation
@@ -1112,20 +1145,20 @@ func writeExactGenerationFile(dir string, manifest exactManifest, view *exactInd
 		offset += blockHeaderSize + uint64(count)*RecordSize
 	}
 	blockHeader := make([]byte, blockHeaderSize)
-	return writeAtomicFile(exactGenerationPath(dir, manifest.generation), func(file *os.File) error {
-		if _, err := file.Write(header); err != nil {
+	return writeAtomicFile(exactGenerationPath(dir, manifest.generation), func(out io.Writer) error {
+		if _, err := out.Write(header); err != nil {
 			return err
 		}
-		if _, err := file.Write(dirBuf); err != nil {
+		if _, err := out.Write(dirBuf); err != nil {
 			return err
 		}
 		for _, b := range view.blocks {
 			encodeBlockHeader(blockHeader, uint32(b.count()), crc32.ChecksumIEEE(b.records))
-			if _, err := file.Write(blockHeader); err != nil {
+			if _, err := out.Write(blockHeader); err != nil {
 				return err
 			}
 			if len(b.records) != 0 {
-				if _, err := file.Write(b.records); err != nil {
+				if _, err := out.Write(b.records); err != nil {
 					return err
 				}
 			}
@@ -1227,7 +1260,7 @@ func (i *ExactIndex) Vacuum() error {
 	defer i.persistence.mu.Unlock()
 	view := i.view.Load()
 	manifest := exactManifest{
-		generation: view.generation, indexID: i.indexID, liveCount: view.liveCount,
+		generation: view.generation, namespace: i.namespace, liveCount: view.liveCount,
 		blockCount: uint64(len(view.blocks)),
 		flags:      i.flags, blockSize: i.config.BlockSize,
 		algorithm: i.algorithm, targetFillPct: i.config.TargetFillPct,
@@ -1253,7 +1286,7 @@ func (i *ExactIndex) Vacuum() error {
 	}
 	manifest.walOffset = 0
 	manifest.walEpoch = uint32(epoch)
-	if err = persist.WriteManifest(i.persistence.dir, encodeManifest(manifest)); err != nil {
+	if err = storage.WriteManifest(i.persistence.dir, encodeManifest(manifest)); err != nil {
 		_ = newWAL.Close()
 		return err
 	}
@@ -1264,10 +1297,10 @@ func (i *ExactIndex) Vacuum() error {
 	_ = oldWAL.Close()
 	i.readers.WaitForPriorReaders()
 	keep := exactGenerationPath(i.persistence.dir, i.persistence.persistedGen)
-	if err := persist.RemoveObsolete(i.persistence.dir, exactGenGlob, keep); err != nil {
+	if err := storage.RemoveObsolete(i.persistence.dir, exactGenGlob, keep); err != nil {
 		return err
 	}
-	if err := persist.RemoveObsolete(i.persistence.dir, exactWALGlob, exactWALPath(i.persistence.dir, epoch)); err != nil {
+	if err := storage.RemoveObsolete(i.persistence.dir, exactWALGlob, exactWALPath(i.persistence.dir, epoch)); err != nil {
 		return err
 	}
 	// The repacked view holds fresh heap blocks after the reader drain above,
@@ -1276,7 +1309,7 @@ func (i *ExactIndex) Vacuum() error {
 	// stays alive until Close.
 	if needsPublish {
 		for _, m := range i.persistence.mappings {
-			_ = persist.Unmap(m)
+			_ = storage.Unmap(m)
 		}
 		i.persistence.mappings = nil
 	}
@@ -1291,7 +1324,7 @@ func (i *ExactIndex) Vacuum() error {
 // OnDiskBytes reports the total bytes of generation files, the WAL, and the
 // manifest.
 func (i *ExactIndex) OnDiskBytes() uint64 {
-	return indexutil.DirSize(i.persistence.dir, exactGenGlob, exactWALGlob, "manifest")
+	return storage.DirSize(i.persistence.dir, exactGenGlob, exactWALGlob, "manifest")
 }
 
 // StorageAmplification returns the on-disk bytes per live logical byte.

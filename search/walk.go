@@ -17,10 +17,10 @@ func (s *stage) bitmap() (roar.Bitmap, error) {
 	if s.kind == StageGeo {
 		return s.geoIndex.GeoRanges(s.geoRanges)
 	}
-	if s.fieldKind == fieldRange {
-		return s.fieldIndex.Range(s.fieldRange)
+	if s.namespaceKind == namespaceRange {
+		return s.namespaceIndex.Range(s.namespaceRange)
 	}
-	return s.fieldQuery.Match()
+	return s.namespaceQuery.Match()
 }
 
 // walk emits fully verified, ascending batches. Bitmap sources seek by ID;

@@ -15,6 +15,7 @@ func TestTimerAccumulates(t *testing.T) {
 	}
 	before := d
 	second := Start()
+	time.Sleep(time.Millisecond)
 	second.Add(&d)
 	if d <= before {
 		t.Fatal("timer should accumulate across phases")

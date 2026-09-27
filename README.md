@@ -1,17 +1,22 @@
 # imageIdx
 
-Image indexing tools written in Go 1.27. The root `imageidx` package defines
-the shared `ImageID`, principal (`UserID`/`GroupID`), and durability types. The `roar` package owns the
-immutable zero-copy bitmap representation, used directly by the logical
-indexes in `bitmapidx`, `timeidx`, and `vectoridx`. The `search` package
-compiles and executes queries across them.
+Image indexing tools written in Go 1.27. The `common` package defines the
+shared `ImageID`, principal (`UserID`/`GroupID`), and durability types, plus
+the namespace and schema vocabulary that identifies every indexed collection.
+The `roar` package owns the immutable zero-copy bitmap representation, used
+directly by the logical indexes in `index/bitmapidx`, `index/timeidx`, and
+`index/vectoridx`. The `search` package compiles and executes queries across
+them.
 
-- `bitmapidx` provides persistent typed fields for enum, bool, text, continuous
-  and geo values.
+- `bitmapidx` provides persistent typed namespaces for enum, bool, text,
+  continuous and geo values.
 - `timeidx` indexes timestamps for range search.
 - `vectoridx` indexes fixed-dimension embeddings with persistent HNSW ANN search.
-- `search` combines field, timestamp and geographic clauses with AND
+- `search` combines namespace, timestamp and geographic clauses with AND
   semantics.
+
+Every collection is registered in a `common.Schema` under a unique namespace
+number and name; see `common/namespace.go` and `common/schema.go`.
 
 Pre-v1 note: `timestamp` and `geoindex` were renamed to `timeidx` and
 `geoidx`; geo is now part of `bitmapidx`. Persisted geo formats are unchanged.
@@ -60,8 +65,9 @@ for large image collections. Its current implementation includes:
 
 ```go
 idx, err := timeidx.New(timeidx.Spec{
-	IndexID: 1,
-	Offset:  offset,
+	Namespace: common.Namespace(90), // register in common.Schema
+	Name:      "timeline",
+	Offset:    offset,
 	Entries: []timeidx.Entry{
 		{ImageID: 100, Timestamp: createdAt},
 	},
@@ -97,7 +103,7 @@ persistent, err := timeidx.NewPersistent(
 	"./data/time",
 	spec,
 	timeidx.Config{},
-	imageidx.DurabilityOS,
+	common.DurabilityOS,
 )
 if err != nil {
 	log.Fatal(err)
@@ -112,10 +118,10 @@ if err := persistent.Vacuum(); err != nil {
 }
 ```
 
-## Field index (enum, bool, text, continuous, geo)
+## Namespace index (enum, bool, text, continuous, geo)
 
-`bitmapidx` provides a unified typed field index. One `FieldIndex` holds one
-field and supports five value shapes:
+`bitmapidx` provides a unified typed namespace index. One `NamespaceIndex`
+holds one namespace and supports five value shapes:
 
 | Kind | Values | Query |
 |---|---|---|
@@ -129,57 +135,71 @@ Values are identified by a 64-bit xxh3 hash. Rare hash collisions claim a
 dictionary slot, so distinct values never share membership. The built-in Latin
 analyzer lowercases, accent-folds and tokenizes text.
 
-Declare fields as values and persist the registry with `NewIndex`:
+Declare namespaces as values, register them in a `common.Schema`, and persist
+the definitions with `NewIndex`:
 
 ```go
 const (
-	IndexTypeTitle       bitmapidx.IndexType = 100 // callers use 100..65535
-	IndexTypeFocalLength bitmapidx.IndexType = 101
+	NamespaceTitle       common.Namespace = 100 // callers may allocate 100..65535
+	NamespaceFocalLength common.Namespace = 101
 )
 
-tag := bitmapidx.Field{
-	Type:       bitmapidx.IndexTypeTag,
+tag := bitmapidx.NamespaceSpec{
+	Namespace:  common.NamespaceTag,
+	Name:       "tag",
 	Kind:       bitmapidx.KindEnum,
 	Storage:    bitmapidx.StoragePerType,
 	Normalizer: bitmapidx.CodecSpec{Code: bitmapidx.NormalizerIdentity},
 }
-focal := bitmapidx.Field{
-	Type:    IndexTypeFocalLength,
-	Kind:    bitmapidx.KindContinuous,
-	Storage: bitmapidx.StoragePerType,
-	Quant:   bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
+focal := bitmapidx.NamespaceSpec{
+	Namespace: NamespaceFocalLength,
+	Name:      "focal-length",
+	Kind:      bitmapidx.KindContinuous,
+	Storage:   bitmapidx.StoragePerType,
+	Quant:     bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
 }
-title := bitmapidx.Field{
-	Type:     IndexTypeTitle,
-	Kind:     bitmapidx.KindText,
-	Storage:  bitmapidx.StoragePerType,
-	Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
+title := bitmapidx.NamespaceSpec{
+	Namespace: NamespaceTitle,
+	Name:      "title",
+	Kind:      bitmapidx.KindText,
+	Storage:   bitmapidx.StoragePerType,
+	Analyzer:  bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
 }
 
-registry := bitmapidx.NewRegistry()
-if err := registry.Register(tag, focal, title); err != nil {
+// NewNamespaceSchema builds the shared namespace vocabulary; numbers and
+// names must be unique within it.
+schema, err := bitmapidx.NewNamespaceSchema(tag, focal, title)
+if err != nil {
 	log.Fatal(err)
 }
 ```
 
-Create or reopen the persistent field store with `NewIndex` and
-`OpenIndex`. The store owns the field handles and their WAL; callers
-must close the store rather than individual fields:
+Create or reopen the persistent namespace store with `NewIndex` and
+`OpenIndex`. The store owns the namespace handles and their WAL; callers
+must close the store rather than individual namespaces:
 
 ```go
 store, err := bitmapidx.NewIndex(
-	"./data/fields", []bitmapidx.Field{tag, focal, title},
-	bitmapidx.FieldConfig{}, imageidx.DurabilityOS,
+	"./data/namespaces", []bitmapidx.NamespaceSpec{tag, focal, title},
+	bitmapidx.NamespaceConfig{}, common.DurabilityOS,
 )
 if err != nil {
 	log.Fatal(err)
 }
 defer store.Close()
 
-tags, _ := store.Lookup(bitmapidx.IndexTypeTag)
-if err := tags.Add(bitmapidx.Entry{
+tags, _ := store.Lookup(common.NamespaceTag)
+batch := tags.NewBatch()
+if err := batch.Add(bitmapidx.Entry{
 	ImageID: 100, Value: bitmapidx.StringValue("Trekking"),
 }); err != nil {
+	log.Fatal(err)
+}
+if err := batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+if err := tags.Barrier(); err != nil {
 	log.Fatal(err)
 }
 if err := store.Checkpoint(); err != nil {
@@ -187,22 +207,30 @@ if err := store.Checkpoint(); err != nil {
 }
 ```
 
-Use `StoragePerValue` for low-cardinality fields and `StoragePerType` for
-high-cardinality fields; both mutate and query the same way. Enum and bool
+Use `StoragePerValue` for low-cardinality namespaces and `StoragePerType` for
+high-cardinality namespaces; both mutate and query the same way. Enum and bool
 membership:
 
 ```go
-tags, err := bitmapidx.NewFieldIndex(tag, bitmapidx.FieldConfig{})
+tags, err := bitmapidx.NewNamespaceIndex(tag, bitmapidx.NamespaceConfig{})
 if err != nil {
 	log.Fatal(err)
 }
 defer tags.Close()
 
-if err = tags.Add(
+batch := tags.NewBatch()
+if err = batch.Add(
 	bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("Trekking")},
 	bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("Trekking")},
 	bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("Travel")},
 ); err != nil {
+	log.Fatal(err)
+}
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+if err = tags.Barrier(); err != nil {
 	log.Fatal(err)
 }
 
@@ -219,10 +247,18 @@ filtered, err := tags.FilterValues(nil, candidates, bitmapidx.StringValue("Trekk
 present, err := tags.Contains(100, bitmapidx.StringValue("Trekking"))
 
 // Remove wins when an ID appears in both sets of one batch.
-if err = tags.Apply(bitmapidx.FieldMutation{
-	Add:    []bitmapidx.Entry{{ImageID: 400, Value: bitmapidx.StringValue("Trekking")}},
-	Remove: []bitmapidx.Entry{{ImageID: 400, Value: bitmapidx.StringValue("Trekking")}},
-}); err != nil {
+batch = tags.NewBatch()
+if err = batch.Add(bitmapidx.Entry{ImageID: 400, Value: bitmapidx.StringValue("Trekking")}); err != nil {
+	log.Fatal(err)
+}
+if err = batch.Remove(bitmapidx.Entry{ImageID: 400, Value: bitmapidx.StringValue("Trekking")}); err != nil {
+	log.Fatal(err)
+}
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+if err = tags.Barrier(); err != nil {
 	log.Fatal(err)
 }
 
@@ -231,57 +267,80 @@ distinctValues := tags.Cardinality() // 2: "Trekking" and "Travel"
 
 `CountValues` counts matching ImageIDs; `Cardinality` counts distinct values
 with at least one live ImageID. Removing a value's final membership drops it
-from cardinality without requiring a checkpoint or vacuum. On a multi-field
-index, query one registered type or get counts for every registered type
-(including empty fields):
+from cardinality without requiring a checkpoint or vacuum. On a
+multi-namespace store, query one registered namespace or get counts for every
+registered namespace (including empty ones):
 
 ```go
-tagValues, ok := store.Cardinality(bitmapidx.IndexTypeTag)
-byType := store.Cardinalities() // map[bitmapidx.IndexType]uint64
+tagValues, ok := store.Cardinality(common.NamespaceTag)
+byNamespace := store.Cardinalities() // map[common.Namespace]uint64
 ```
 
-The per-type counts are sampled independently, not as one cross-field snapshot
-when writes are concurrent.
+The per-namespace counts are sampled independently, not as one cross-namespace
+snapshot when writes are concurrent.
 
 Continuous values use explicit transitions, which resolve the zero-value
-ambiguity (`To: 0` alone would otherwise be indistinguishable from "absent"):
+ambiguity (`To: 0` alone would otherwise be indistinguishable from "absent").
+One batch may stage only one transition per image, so apply each step
+separately:
 
 ```go
-focals, err := bitmapidx.NewFieldIndex(focal, bitmapidx.FieldConfig{})
+focals, err := bitmapidx.NewNamespaceIndex(focal, bitmapidx.NamespaceConfig{})
 if err != nil {
 	log.Fatal(err)
 }
 defer focals.Close()
 
-if err = focals.Move(
-	bitmapidx.Move{ImageID: 100, To: 35, HasTo: true},                                   // insert
-	bitmapidx.Move{ImageID: 100, From: 35, To: 50, HasFrom: true, HasTo: true},          // move
-); err != nil {
+batch := focals.NewBatch()
+if err = batch.Move(bitmapidx.Move{ImageID: 100, To: 35, HasTo: true}); err != nil { // insert
 	log.Fatal(err)
 }
-if err = focals.Move(bitmapidx.Move{ImageID: 100, From: 50, HasFrom: true}); err != nil { // remove
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+
+batch = focals.NewBatch()
+if err = batch.Move(bitmapidx.Move{ImageID: 100, From: 35, To: 50, HasFrom: true, HasTo: true}); err != nil { // move
+	log.Fatal(err)
+}
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+
+batch = focals.NewBatch()
+if err = batch.Move(bitmapidx.Move{ImageID: 100, From: 50, HasFrom: true}); err != nil { // remove
+	log.Fatal(err)
+}
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+if err = focals.Barrier(); err != nil {
 	log.Fatal(err)
 }
 
 // Between is [lo, hi); AtLeast and AtMost are open-ended. Bounds are int64 in
-// the field's stored grid domain.
+// the namespace's stored grid domain.
 match, err = focals.Range(bitmapidx.Between(24, 70))
 match, err = focals.Range(bitmapidx.AtLeast(200))
 estimate, err := focals.EstimateRange(bitmapidx.Between(24, 70)) // planning hint
 ```
 
-Geo fields store one level-16 S2 cell per image. Keys come from coordinates or
-cells, and queries take inclusive key ranges produced by `RangesFromCellIDs` or
-`CoverRegion`:
+Geo namespaces store one level-16 S2 cell per image. Keys come from coordinates
+or cells, and queries take inclusive key ranges produced by
+`RangesFromCellIDs` or `CoverRegion`:
 
 ```go
-geoField := bitmapidx.Field{
-	Type:    bitmapidx.IndexTypeLocation,
-	Kind:    bitmapidx.KindGeo,
-	Storage: bitmapidx.StoragePerType,
-	Geo:     bitmapidx.GeoCodec{Version: 1},
+geoSpec := bitmapidx.NamespaceSpec{
+	Namespace: common.NamespaceLocation,
+	Name:      "location",
+	Kind:      bitmapidx.KindGeo,
+	Storage:   bitmapidx.StoragePerType,
+	Geo:       bitmapidx.GeoCodec{Version: 1},
 }
-locations, err := bitmapidx.NewFieldIndex(geoField, bitmapidx.FieldConfig{})
+locations, err := bitmapidx.NewNamespaceIndex(geoSpec, bitmapidx.NamespaceConfig{})
 if err != nil {
 	log.Fatal(err)
 }
@@ -292,7 +351,15 @@ if err != nil {
 	log.Fatal(err)
 }
 // One cell per image: insert, move and remove with explicit transitions.
-if err = locations.Move(bitmapidx.Move{ImageID: 100, To: int64(key)}); err != nil {
+batch := locations.NewBatch()
+if err = batch.Move(bitmapidx.Move{ImageID: 100, To: int64(key)}); err != nil {
+	log.Fatal(err)
+}
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+if err = locations.Barrier(); err != nil {
 	log.Fatal(err)
 }
 
@@ -323,22 +390,40 @@ Stale `From` values and duplicate inserts into the same cell are rejected
 before publication. No reverse index is kept, so a cross-cell
 insert without `From` is caller discipline.
 
-Text fields are replaced whole, so callers supply the old and new field text
+Text namespaces are replaced whole, so callers supply the old and new text
 and the index diffs token sets. A token present in both before and after is
-retained:
+retained. One batch may stage at most one replacement per image:
 
 ```go
-titles, err := bitmapidx.NewFieldIndex(title, bitmapidx.FieldConfig{})
+titles, err := bitmapidx.NewNamespaceIndex(title, bitmapidx.NamespaceConfig{})
 if err != nil {
 	log.Fatal(err)
 }
 defer titles.Close()
 
-if err = titles.ReplaceText(
+batch := titles.NewBatch()
+if err = batch.ReplaceText(
 	bitmapidx.TextReplacement{ImageID: 100, After: []string{"Golden Gate Bridge"}},
 	bitmapidx.TextReplacement{ImageID: 200, After: []string{"Golden Gate Park"}},
+); err != nil {
+	log.Fatal(err)
+}
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+
+batch = titles.NewBatch()
+if err = batch.ReplaceText(
 	bitmapidx.TextReplacement{ImageID: 100, Before: []string{"Golden Gate Bridge"}, After: []string{"Golden Gate Park"}},
 ); err != nil {
+	log.Fatal(err)
+}
+if err = batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+if err = titles.Barrier(); err != nil {
 	log.Fatal(err)
 }
 
@@ -351,11 +436,11 @@ Dictionary inspection and maintenance:
 key, ok, err := tags.KeyForValue(bitmapidx.StringValue("Trekking"))
 value, ok := tags.LookupValue(nil, key) // appends canonical bytes to the buffer
 
-tags.Iterate(func(key bitmapidx.FieldKey, value []byte) bool {
+tags.Iterate(func(key bitmapidx.NamespaceKey, value []byte) bool {
 	fmt.Println(key, string(value))
 	return true // return false to stop
 })
-tags.Prefix([]byte("Tr"), func(key bitmapidx.FieldKey, value []byte) bool {
+tags.Prefix([]byte("Tr"), func(key bitmapidx.NamespaceKey, value []byte) bool {
 	return true
 })
 
@@ -371,22 +456,22 @@ if err := tags.Vacuum(); err != nil {
 
 `OpenIndex` restores the persisted registry, mmap snapshot and WAL
 tail. `Checkpoint` publishes a new snapshot; `Vacuum` also removes obsolete
-generations and dead dictionary values. Field query results are immutable
+generations and dead dictionary values. Namespace query results are immutable
 `roar.Bitmap` values. Mutable bitmaps are reserved for transient `search`
 workspace accumulation.
 
 ## Geographic index
 
-Geo is a `bitmapidx` field kind. Each image holds one level-16 S2 bucket key;
-higher-level areas are searched by expanding cells into lexicographic key
+Geo is a `bitmapidx` namespace kind. Each image holds one level-16 S2 bucket
+key; higher-level areas are searched by expanding cells into lexicographic key
 ranges, so any S2 level up to 16 maps onto the same bucket table.
-`search.InCells` takes the field directly, and the same queries are
+`search.InCells` takes the namespace handle directly, and the same queries are
 available without the search package.
 
 ```go
-locations, err := bitmapidx.NewGeoField(bitmapidx.IndexTypeLocation, []bitmapidx.GeoEntry{
+locations, err := bitmapidx.NewGeoNamespace(common.NamespaceLocation, []bitmapidx.GeoEntry{
 	{ImageID: 100, Latitude: 37.7749, Longitude: -122.4194},
-}, bitmapidx.FieldConfig{})
+}, bitmapidx.NamespaceConfig{})
 if err != nil {
 	log.Fatal(err)
 }
@@ -397,7 +482,15 @@ losAngeles, err := bitmapidx.KeyFromLatLng(34.0522, -118.2437)
 if err != nil {
 	log.Fatal(err)
 }
-if err := locations.Move(bitmapidx.Move{ImageID: 200, To: int64(losAngeles)}); err != nil {
+batch := locations.NewBatch()
+if err := batch.Move(bitmapidx.Move{ImageID: 200, To: int64(losAngeles)}); err != nil {
+	log.Fatal(err)
+}
+if err := batch.Apply(); err != nil {
+	log.Fatal(err)
+}
+batch.Close()
+if err := locations.Barrier(); err != nil {
 	log.Fatal(err)
 }
 
@@ -419,36 +512,37 @@ filtered, err := locations.FilterGeoRanges(nil, candidates, ranges)
 
 Moves and removals use explicit transitions. Geo keys are never zero, so the
 presence flags may be omitted there (`To: key` inserts, `From: key, To: key`
-moves, `From: key` removes); continuous fields keep the flags because zero is a
-valid grid value. `GeoValue` carries a bucket key for direct `Add`/`Remove`.
-Stale `From` values and duplicate inserts into the same bucket are rejected
-before publication, and no reverse image-to-cell map is retained, so a
-cross-cell insert without `From` is caller discipline.
+moves, `From: key` removes); continuous namespaces keep the flags because zero
+is a valid grid value. `GeoValue` carries a bucket key for direct batch
+`Add`/`Remove`. Stale `From` values and duplicate inserts into the same bucket
+are rejected before publication, and no reverse image-to-cell map is retained,
+so a cross-cell insert without `From` is caller discipline.
 
 `CoverRegion` converts an `s2.Region` to ranges. Supply both a reusable
 `GeoCoverWorkspace` and a destination with sufficient capacity for the
 allocation-free path; `Nearest` returns exact top-K using a caller-supplied
 coordinate lookup. Allocation behavior inside the caller-supplied region's
 `IntersectsCell` and `ContainsCell` methods remains the responsibility of that
-region implementation. Geo fields use the same persistent `Index` as the
-other field kinds.
+region implementation. Geo namespaces use the same persistent `Index` as the
+other namespace kinds.
 
 ## Vector index
 
 The `vectoridx` package provides persistent HNSW approximate-nearest-neighbor
 search over fixed-dimension embeddings (`512`, `768`, or `1024`) in one of
 five element types (`int8`, `uint8`, `int16`, `uint16`, `float32`), ranked by
-squared L2 distance. `NodeID` is the application identifier whose type is
-declared by the index `SpaceID`, so an image-embedding index addresses
-`ImageID`s directly with no second mapping. See `vectoridx/README.md` and
-`AGENTS/VectorIdx.MD`.
+squared L2 distance. Each vector space registers a `common.Namespace` with
+kind `common.KindVector`. `NodeID` is the compact identifier stored in the
+graph; results widen it to the database-wide `common.ImageID`
+(`vectoridx.ImageID`), so an image-embedding index addresses images directly
+with no second mapping. See `vectoridx/README.md` and `AGENTS/VectorIdx.MD`.
 
 ```go
 idx, err := vectoridx.Create(path, vectoridx.Config{
-    SpaceID:     vectoridx.NewSpaceID(vectoridx.IndexTypeImage, 1),
+    Namespace:   common.Namespace(100), // registered as common.KindVector
     Dimensions:  vectoridx.Dim512,
     ElementType: vectoridx.ElementFloat32,
-}, vectoridx.DurabilitySync)
+}, common.DurabilitySync)
 if err != nil {
     log.Fatal(err)
 }
@@ -483,18 +577,18 @@ scratch for zero steady-state allocations.
 
 ## Combined search
 
-The `search` package compiles and executes clauses across field, timestamp and
-geographic indexes. Every clause is combined with AND semantics:
+The `search` package compiles and executes clauses across namespace, timestamp
+and geographic indexes. Every clause is combined with AND semantics:
 
-- all field clauses must contain the image;
+- all namespace clauses must contain the image;
 - every timestamp range must contain the image (lossy-only ranges on the same
   index coalesce by intersection; each `ExactTimestamp` range is separate);
 - every geographic range set must contain the image.
 
 The compiler orders these stages using live cardinality estimates. This only
 changes execution order; it does not change query results. Results are returned
-as sorted, unique `search.ImageID` values. All index packages alias the
-canonical root `imageidx.ImageID` type. Clauses are intersected; `WithACL` is
+as sorted, unique `search.ImageID` values. Every package aliases the
+canonical `common.ImageID` type. Clauses are intersected; `WithACL` is
 the built-in exception that unions authenticated user and group grants within
 one clause. Ordering and reranking are opt-in (`RankTime`, `RankGeo`, and the
 `FilterRanked` bridge for `vectoridx` ANN results); `AppendPage` returns a
@@ -571,9 +665,9 @@ count, err = executor.Count(ctx, plan)
 ```
 
 Clauses are conjunctive: `search.AllValues`, `search.FieldText` and
-`search.FieldRange` query typed fields; `search.During` handles a half-open
+`search.FieldRange` query typed namespaces; `search.During` handles a half-open
 timestamp range (optionally with `search.ExactTimestamp`); and
-`search.InCells` queries a `KindGeo` field. Constructors are validated by
+`search.InCells` queries a `KindGeo` namespace. Constructors are validated by
 `Compile`. `vectoridx` is not a clause source.
 
 For access control, compile `search.WithACL(userID, authenticatedGroupIDs...)`
@@ -597,42 +691,42 @@ standalone index APIs. `search.Compile` and `search.SearchOnce` return
 `search.ErrEmptyQuery` when no clauses are supplied and `search.ErrInvalidClause`
 for a missing index.
 
-Reader lifetime tracking is automatic. Every field read registers with its
+Reader lifetime tracking is automatic. Every namespace read registers with its
 internal tracker, and `Index.Close` waits for reads that could still
 reference retired or mmap-backed state. Callers open one persistent
-`Index`, obtain fields with `Lookup`, and close the store after use.
+`Index`, obtain namespaces with `Lookup`, and close the store after use.
 
 ## Access control (ACL)
 
 Access control is a `search`-level policy over two dedicated `bitmapidx`
-`KindEnum` fields. `bitmapidx` only stores opaque values; all principal
+`KindEnum` namespaces. `bitmapidx` only stores opaque values; all principal
 semantics live in `search`:
 
-- `bitmapidx.IndexTypeUserACL` holds one posting per user: the `ImageID`s
+- `common.NamespaceUserACL` holds one posting per user: the `ImageID`s
   granted directly to that user.
-- `bitmapidx.IndexTypeGroupACL` holds one posting per group: the `ImageID`s
+- `common.NamespaceGroupACL` holds one posting per group: the `ImageID`s
   granted to that group.
-- A principal is its `uint64` ID (`imageidx.UserID` / `imageidx.GroupID`) in
-  fixed 8-byte little-endian form. The field IS the namespace, so equal IDs
-  in the user, group, or any ordinary enum field never collide. ID zero is
-  reserved and rejected everywhere.
+- A principal is its `uint64` ID (`common.UserID` / `common.GroupID`) in
+  fixed 8-byte little-endian form. Each principal kind has its own namespace
+  number, so equal IDs in the user, group, or any ordinary enum namespace
+  never collide. ID zero is reserved and rejected everywhere.
 
 imageIdx stores image grants, not user-to-group membership. Your application
 authenticates which groups a user belongs to and passes those IDs to the
 query; there is no public-image bypass — images without a grant never match
 a `WithACL` clause.
 
-Declare the fields alongside the rest of the store. A user-only deployment
-needs only the user field; group queries additionally require the group
-field:
+Declare the namespaces alongside the rest of the store. A user-only deployment
+needs only the user namespace; group queries additionally require the group
+namespace:
 
 ```go
-fields := []bitmapidx.Field{
-	{Type: bitmapidx.IndexTypeUserACL, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-	{Type: bitmapidx.IndexTypeGroupACL, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-	{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+namespaces := []bitmapidx.NamespaceSpec{
+	{Namespace: common.NamespaceUserACL, Name: "user-acl", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+	{Namespace: common.NamespaceGroupACL, Name: "group-acl", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+	{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
 }
-store, err := bitmapidx.NewIndex("./data/fields", fields, bitmapidx.FieldConfig{}, imageidx.DurabilityOS)
+store, err := bitmapidx.NewIndex("./data/namespaces", namespaces, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 if err != nil {
 	log.Fatal(err)
 }
@@ -640,20 +734,20 @@ defer store.Close()
 ```
 
 Grant and revoke images with `search.UserGrants` and `search.GroupGrants`,
-bound once to the looked-up fields. `Add`, `Contains`, and `Remove` take
-typed IDs (`imageidx.UserID` / `imageidx.GroupID` / `search.ImageID`);
+bound once to the looked-up namespaces. `Add`, `Contains`, and `Remove` take
+typed IDs (`common.UserID` / `common.GroupID` / `search.ImageID`);
 zero IDs report `search.ErrInvalidPrincipal`. Batches of up to 8 images
 stay on the stack and share one encoded key, so the helpers add no
 allocations of their own:
 
 ```go
-userField, _ := store.Lookup(bitmapidx.IndexTypeUserACL)
-groupField, _ := store.Lookup(bitmapidx.IndexTypeGroupACL)
-users, err := search.NewUserGrants(userField)
+userNamespace, _ := store.Lookup(common.NamespaceUserACL)
+groupNamespace, _ := store.Lookup(common.NamespaceGroupACL)
+users, err := search.NewUserGrants(userNamespace)
 if err != nil {
 	log.Fatal(err)
 }
-groups, err := search.NewGroupGrants(groupField)
+groups, err := search.NewGroupGrants(groupNamespace)
 if err != nil {
 	log.Fatal(err)
 }
@@ -681,7 +775,7 @@ and their `Value()` / `Parse*` helpers remain for audit paths: resolving a
 principal back from dictionary bytes returned by `LookupValue` or `Iterate`.
 
 Query with `search.WithACL`, compiled through `search.CompileWithStore` so
-the clause can bind the dedicated fields. The clause unions the user's
+the clause can bind the dedicated namespaces. The clause unions the user's
 posting with one posting per authenticated group, then intersects that union
 with the rest of the query. Repeated group IDs are deduplicated:
 
@@ -697,8 +791,8 @@ matches, err := plan.AppendIDs(ctx, nil, search.NewWorkspace(4_096))
 ```
 
 Misuse is a compile error (`search.ErrInvalidClause`): `WithACL` without a
-store, user or group ID zero, or a missing required ACL field. Plans keep
-compiled field queries, so the store must stay open while they execute;
+store, user or group ID zero, or a missing required ACL namespace. Plans keep
+compiled namespace queries, so the store must stay open while they execute;
 grants added after compilation are picked up by subsequent executions, and
 `plan.Refresh` re-samples planning estimates.
 
@@ -712,13 +806,13 @@ editors, err := search.NewGroupACL(7)
 if err != nil {
 	log.Fatal(err)
 }
-imageIDs, err := groupField.ValueIDs(nil, editors.Value()) // images granted to group 7
+imageIDs, err := groupNamespace.ValueIDs(nil, editors.Value()) // images granted to group 7
 ```
 
 ## Runnable command
 
-`cmd/imageidx` constructs a small compatible field, timestamp, and geographic
-index set. Its default one-shot mode executes `search.SearchOnce` once and prints a
+`cmd/imageidx` constructs a small compatible namespace, timestamp, and
+geographic index set. Its default one-shot mode executes `search.SearchOnce` once and prints a
 JSON result:
 
 ```sh
@@ -756,10 +850,10 @@ go run ./cmd/imageidx
 go run ./cmd/imageidx -mode server -addr :8080
 go test ./...
 go test -race ./...
-go test ./timeidx -run '^$' -bench 'Benchmark(SearchParallel|UpdateParallel)$' -benchmem
-go test ./bitmapidx -run '^$' -bench BenchmarkField -benchmem
+go test ./index/timeidx -run '^$' -bench 'Benchmark(SearchParallel|UpdateParallel)$' -benchmem
+go test ./index/bitmapidx -run '^$' -bench BenchmarkNamespaceIndex -benchmem
 go test ./search -run '^$' -bench BenchmarkCombinedSearch -benchmem
 ```
 
-Set `TIMESTAMP_BENCH_LARGE=1` to enable the synthetic 10M and 100M-entry
+Set `IMAGEIDX_BENCH_LARGE=1` to enable the synthetic 10M and 100M-entry
 benchmark builds.

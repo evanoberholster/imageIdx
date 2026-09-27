@@ -1,0 +1,672 @@
+package bitmapidx
+
+import (
+	"fmt"
+	"strconv"
+	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
+)
+
+func benchmarkEnumNamespace(tb testing.TB, values int, perValue int) (*NamespaceIndex, []Value) {
+	tb.Helper()
+	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	if err != nil {
+		tb.Fatalf("NewNamespaceIndex: %v", err)
+	}
+	tb.Cleanup(func() { _ = index.Close() })
+	entries := make([]Entry, 0, values*perValue)
+	names := make([]Value, values)
+	for value := 0; value < values; value++ {
+		name := fmt.Sprintf("value-%d", value)
+		names[value] = StringValue(name)
+		for n := 0; n < perValue; n++ {
+			entries = append(entries, Entry{ImageID: ImageID(value*perValue + n + 1), Value: names[value]})
+		}
+	}
+	commit(tb, index, func(bt *Batch) error { return bt.Add(entries...) })
+	return index, names
+}
+
+// benchmarkEnumIntersectionNamespace mirrors the legacy And4 fixture: each value
+// has its own arithmetic ID set, and one image may carry all four values.
+func benchmarkEnumIntersectionNamespace(tb testing.TB) (*NamespaceIndex, []Value) {
+	tb.Helper()
+	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	if err != nil {
+		tb.Fatalf("NewNamespaceIndex: %v", err)
+	}
+	tb.Cleanup(func() { _ = index.Close() })
+	const values, perValue = 4, 20_000
+	names := make([]Value, values)
+	entries := make([]Entry, 0, values*perValue)
+	for value := 0; value < values; value++ {
+		names[value] = StringValue(fmt.Sprintf("value-%d", value))
+		for n := 0; n < perValue; n++ {
+			id := n*(value+1) + value
+			if id == 0 { // ImageID zero is reserved by the namespace API.
+				continue
+			}
+			entries = append(entries, Entry{ImageID: ImageID(id), Value: names[value]})
+		}
+	}
+	commit(tb, index, func(bt *Batch) error { return bt.Add(entries...) })
+	return index, names
+}
+
+func BenchmarkNamespaceContainsKey(b *testing.B) {
+	index, _ := benchmarkEnumNamespace(b, 1, 100_000)
+	key := hashCanonical(common.NamespaceTag, KindEnum, []byte("value-0"))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_ = index.ContainsKey(uint64(n%300_000), key)
+	}
+}
+
+func BenchmarkNamespaceContainsValue(b *testing.B) {
+	index, _ := benchmarkEnumNamespace(b, 1, 100_000)
+	value := BytesValue([]byte("value-0"))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_, _ = index.Contains(uint64(n%300_000), value)
+	}
+}
+
+func BenchmarkNamespaceMatch4(b *testing.B) {
+	index, names := benchmarkEnumIntersectionNamespace(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if _, err := index.MatchValues(names...); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNamespaceApplyDistinct1000(b *testing.B) {
+	entries := make([]Entry, 1_000)
+	for n := range entries {
+		entries[n] = Entry{ImageID: ImageID(n + 1), Value: StringValue("value-" + strconv.Itoa(n))}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		bt := index.NewBatch()
+		if err := bt.Add(entries...); err != nil {
+			b.Fatal(err)
+		}
+		if err := bt.Apply(); err != nil {
+			b.Fatal(err)
+		}
+		if err := index.Barrier(); err != nil {
+			b.Fatal(err)
+		}
+		_ = bt.Close()
+		_ = index.Close()
+	}
+}
+
+func BenchmarkNamespaceApplyBatch1000(b *testing.B) {
+	entries := make([]Entry, 1_000)
+	for n := range entries {
+		entries[n] = Entry{ImageID: ImageID(n + 1), Value: StringValue("batch")}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		bt := index.NewBatch()
+		if err := bt.Add(entries...); err != nil {
+			b.Fatal(err)
+		}
+		if err := bt.Apply(); err != nil {
+			b.Fatal(err)
+		}
+		if err := index.Barrier(); err != nil {
+			b.Fatal(err)
+		}
+		_ = bt.Close()
+		_ = index.Close()
+	}
+}
+
+func BenchmarkNamespaceValueIDs(b *testing.B) {
+	index, _ := benchmarkEnumNamespace(b, 1, 100_000)
+	value := StringValue("value-0")
+	buffer := make([]ImageID, 0, 100_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		var err error
+		buffer, err = index.ValueIDs(buffer[:0], value)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNamespaceRange(b *testing.B) {
+	index, err := NewNamespaceIndex(continuousNamespace(testFocalLength), NamespaceConfig{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = index.Close() })
+	entries := make([]Entry, 0, 100_000)
+	for value := -5_000; value < 5_000; value++ {
+		for n := 0; n < 10; n++ {
+			id := ImageID((value+5_000)*10 + n + 1)
+			entries = append(entries, Entry{ImageID: id, Value: IntValue(int64(value))})
+		}
+	}
+	commit(b, index, func(bt *Batch) error { return bt.Add(entries...) })
+	bounds := Between(-4_500, -3_500)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if _, err := index.Range(bounds); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNamespaceFilter(b *testing.B) {
+	index, names := benchmarkEnumIntersectionNamespace(b)
+	candidates := make([]ImageID, 10_000)
+	for n := range candidates {
+		candidates[n] = ImageID(n*7 + 1)
+	}
+	buffer := make([]ImageID, 0, 10_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		var err error
+		buffer, err = index.FilterValues(buffer[:0], candidates, names...)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNamespaceTextMatch(b *testing.B) {
+	index, err := NewNamespaceIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = index.Close() })
+	replacements := make([]TextReplacement, 0, 10_000)
+	for n := 0; n < 10_000; n++ {
+		replacements = append(replacements, TextReplacement{
+			ImageID: ImageID(n + 1),
+			After:   []string{fmt.Sprintf("alpha beta gamma delta%d", n)},
+		})
+	}
+	commit(b, index, func(bt *Batch) error { return bt.ReplaceText(replacements...) })
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if _, err := index.MatchText("alpha beta"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNamespaceHashValue(b *testing.B) {
+	const cameraModel common.Namespace = 100
+	value := []byte("Canon EOS R6 Mark II")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_ = hashCanonical(cameraModel, KindEnum, value)
+	}
+}
+
+// Batch write shapes: single updates versus one batched mutation.
+
+func batchEntries(total int) []Entry {
+	entries := make([]Entry, total)
+	for i := range entries {
+		entries[i] = Entry{ImageID: ImageID(i + 1), Value: StringValue("v")}
+	}
+	return entries
+}
+
+func benchmarkNamespaceApplyN(b *testing.B, batch, total int) {
+	entries := batchEntries(total)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		bt := index.NewBatch()
+		for start := 0; start < total; start += batch {
+			if err := bt.Add(entries[start : start+batch]...); err != nil {
+				b.Fatal(err)
+			}
+			if err := bt.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := index.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+			if err := bt.Reset(); err != nil {
+				b.Fatal(err)
+			}
+		}
+		_ = bt.Close()
+		_ = index.Close()
+	}
+}
+
+func BenchmarkNamespaceApplySingle(b *testing.B)  { benchmarkNamespaceApplyN(b, 1, 64) }
+func BenchmarkNamespaceApplyBatch8(b *testing.B)  { benchmarkNamespaceApplyN(b, 8, 64) }
+func BenchmarkNamespaceApplyBatch64(b *testing.B) { benchmarkNamespaceApplyN(b, 64, 64) }
+
+func BenchmarkNamespaceApplyChannel8(b *testing.B) {
+	entries := batchEntries(64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		bt := index.NewBatch()
+		batches := make(chan []Entry, 8)
+		done := make(chan struct{}, 8)
+		go func() {
+			defer bt.Close()
+			for chunk := range batches {
+				if err := bt.Add(chunk...); err != nil {
+					b.Error(err)
+				} else if err := bt.Apply(); err != nil {
+					b.Error(err)
+				} else if err := index.Barrier(); err != nil {
+					b.Error(err)
+				}
+				if err := bt.Reset(); err != nil {
+					b.Error(err)
+				}
+				done <- struct{}{}
+			}
+		}()
+		for start := 0; start < 64; start += 8 {
+			batches <- entries[start : start+8]
+			<-done
+		}
+		close(batches)
+		_ = index.Close()
+	}
+}
+
+// Compiled queries resolve values once and execute repeatedly.
+
+func BenchmarkCompiledMatch4(b *testing.B) {
+	index, names := benchmarkEnumIntersectionNamespace(b)
+	compiled, err := index.Compile(names...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if _, err := compiled.Match(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCompiledCount4(b *testing.B) {
+	index, names := benchmarkEnumNamespace(b, 4, 20_000)
+	compiled, err := index.Compile(names...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if _, err := compiled.Count(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCompiledFilter(b *testing.B) {
+	index, names := benchmarkEnumIntersectionNamespace(b)
+	compiled, err := index.Compile(names...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	candidates := make([]ImageID, 10_000)
+	for n := range candidates {
+		candidates[n] = ImageID(n*7 + 1)
+	}
+	buffer := make([]ImageID, 0, 10_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		var err error
+		buffer, err = compiled.Filter(buffer[:0], candidates)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCompiledTextMatch(b *testing.B) {
+	index, err := NewNamespaceIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = index.Close() })
+	replacements := make([]TextReplacement, 0, 10_000)
+	for n := 0; n < 10_000; n++ {
+		replacements = append(replacements, TextReplacement{
+			ImageID: ImageID(n + 1),
+			After:   []string{fmt.Sprintf("alpha beta gamma delta%d", n)},
+		})
+	}
+	commit(b, index, func(bt *Batch) error { return bt.ReplaceText(replacements...) })
+	compiled, err := index.CompileText("alpha beta")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if _, err := compiled.Match(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Container transitions exercise postingTable folds between the tiny
+// inline form and roaring bitmaps.
+
+var sinkTable postingTable
+
+// seededEnumNamespace builds a compacted enum base with count members under one
+// value and returns the namespace, the value key, and the Value.
+func seededEnumNamespace(b *testing.B, count int) (*NamespaceIndex, NamespaceKey, Value) {
+	b.Helper()
+	value := StringValue("v")
+	namespace, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = namespace.Close() })
+	for id := 1; id <= count; id++ {
+		commit(b, namespace, func(bt *Batch) error {
+			return bt.Add(Entry{ImageID: ImageID(id), Value: value})
+		})
+	}
+	if err := namespace.Compact(); err != nil {
+		b.Fatal(err)
+	}
+	return namespace, hashCanonical(common.NamespaceTag, KindEnum, []byte("v")), value
+}
+
+func testDelta(key NamespaceKey, add, remove []ImageID) *namespaceDelta {
+	bd := newBitmapDelta(add, remove)
+	if bd == nil {
+		return nil
+	}
+	return &namespaceDelta{values: map[NamespaceKey]*bitmapDelta{key: bd}, keys: []NamespaceKey{key}, ids: bd.len()}
+}
+
+// BenchmarkContainerFold isolates the fold that changes container types:
+// tiny->tiny, tiny->bitmap (promotion), bitmap->bitmap, bitmap->tiny
+// (demotion), and key removal.
+func BenchmarkContainerFold(b *testing.B) {
+	cases := []struct {
+		name   string
+		base   int
+		add    []ImageID
+		remove []ImageID
+	}{
+		{"TinyAdd", 3, []ImageID{1000}, nil},
+		{"TinyPromote", 4, []ImageID{1000}, nil},
+		{"TinyDrop", 1, nil, []ImageID{1}},
+		{"BitmapAdd", 64, []ImageID{1000}, nil},
+		{"BitmapDemote", 5, nil, []ImageID{1}},
+		{"BitmapDrop", 5, nil, []ImageID{1, 2, 3, 4, 5}},
+	}
+	for _, testCase := range cases {
+		b.Run(testCase.name, func(b *testing.B) {
+			namespace, key, _ := seededEnumNamespace(b, testCase.base)
+			view := namespace.view.Load()
+			delta := testDelta(key, testCase.add, testCase.remove)
+			if delta == nil {
+				b.Fatal("empty delta")
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				sinkTable = view.effectiveTable(delta)
+			}
+		})
+	}
+}
+
+// BenchmarkContainerDelta measures the public Add+Remove cycle while the write
+// stays in the Active delta (no fold), for a tiny and a bitmap base posting.
+func BenchmarkContainerDelta(b *testing.B) {
+	for _, count := range []int{3, 64} {
+		b.Run(fmt.Sprintf("Base%d", count), func(b *testing.B) {
+			namespace, _, value := seededEnumNamespace(b, count)
+			batch := namespace.NewBatch()
+			defer batch.Close()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				id := ImageID(10_000 + (n & 1023))
+				if err := batch.Reset(); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Add(Entry{ImageID: id, Value: value}); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Apply(); err != nil {
+					b.Fatal(err)
+				}
+				if err := namespace.Barrier(); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Reset(); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Remove(Entry{ImageID: id, Value: value}); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Apply(); err != nil {
+					b.Fatal(err)
+				}
+				if err := namespace.Barrier(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkContainerGeoMove measures one Add+Remove transition cycle between
+// two geo buckets of the given container sizes. The round trip returns the
+// moved image to its source bucket.
+func BenchmarkContainerGeoMove(b *testing.B) {
+	paris, err := KeyFromLatLng(48.8566, 2.3522)
+	if err != nil {
+		b.Fatal(err)
+	}
+	london, err := KeyFromLatLng(51.5074, -0.1278)
+	if err != nil {
+		b.Fatal(err)
+	}
+	cases := []struct{ from, to int }{
+		{3, 3},
+		{4, 4},
+		{4, 64},
+		{64, 4},
+		{64, 64},
+	}
+	for _, testCase := range cases {
+		b.Run(fmt.Sprintf("From%dTo%d", testCase.from, testCase.to), func(b *testing.B) {
+			namespace, err := NewGeoNamespace(common.NamespaceLocation, nil, NamespaceConfig{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = namespace.Close() })
+			for id := 1; id <= testCase.from; id++ {
+				commit(b, namespace, func(bt *Batch) error {
+					return bt.Add(Entry{ImageID: ImageID(id), Value: GeoValue(paris)})
+				})
+			}
+			for id := 1000; id < 1000+testCase.to; id++ {
+				commit(b, namespace, func(bt *Batch) error {
+					return bt.Add(Entry{ImageID: ImageID(id), Value: GeoValue(london)})
+				})
+			}
+			if err := namespace.Compact(); err != nil {
+				b.Fatal(err)
+			}
+			batch := namespace.NewBatch()
+			defer batch.Close()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				if err := batch.Reset(); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Move(Move{ImageID: 1, From: int64(paris), To: int64(london)}); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Apply(); err != nil {
+					b.Fatal(err)
+				}
+				if err := namespace.Barrier(); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Reset(); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Move(Move{ImageID: 1, From: int64(london), To: int64(paris)}); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Apply(); err != nil {
+					b.Fatal(err)
+				}
+				if err := namespace.Barrier(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkContainerFlip measures the full public path for a tiny<->bitmap
+// promotion and demotion cycle, including publication and both folds.
+func BenchmarkContainerFlip(b *testing.B) {
+	paris, err := KeyFromLatLng(48.8566, 2.3522)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run("Enum", func(b *testing.B) {
+		namespace, _, value := seededEnumNamespace(b, 4)
+		batch := namespace.NewBatch()
+		defer batch.Close()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			if err := batch.Reset(); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Add(Entry{ImageID: 1000, Value: value}); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Compact(); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Reset(); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Remove(Entry{ImageID: 1000, Value: value}); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Compact(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("Geo", func(b *testing.B) {
+		namespace, err := NewGeoNamespace(common.NamespaceLocation, nil, NamespaceConfig{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = namespace.Close() })
+		for id := 1; id <= 4; id++ {
+			commit(b, namespace, func(bt *Batch) error {
+				return bt.Add(Entry{ImageID: ImageID(id), Value: GeoValue(paris)})
+			})
+		}
+		if err := namespace.Compact(); err != nil {
+			b.Fatal(err)
+		}
+		batch := namespace.NewBatch()
+		defer batch.Close()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			if err := batch.Reset(); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Add(Entry{ImageID: 1000, Value: GeoValue(paris)}); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Compact(); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Reset(); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Remove(Entry{ImageID: 1000, Value: GeoValue(paris)}); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+			if err := namespace.Compact(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

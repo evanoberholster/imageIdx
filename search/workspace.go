@@ -1,12 +1,12 @@
 package search
 
 import (
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 	"unsafe"
 )
 
-type ImageID = imageidx.ImageID
+type ImageID = common.ImageID
 
 // Workspace retains intermediate candidates between searches. A Workspace is
 // reusable but must not be used by concurrent or reentrant searches. It owns

@@ -3,9 +3,11 @@ package bitmapidx
 import (
 	"slices"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
-func basePosting(t *testing.T, index *FieldIndex, key FieldKey) *posting {
+func basePosting(t *testing.T, index *NamespaceIndex, key NamespaceKey) *posting {
 	t.Helper()
 	p, ok := index.view.Load().base.get(key)
 	if !ok {
@@ -24,15 +26,15 @@ func TestIntersectPostingsEmpty(t *testing.T) {
 }
 
 func TestTinyPostingTier(t *testing.T) {
-	rare := hashCanonical(IndexTypeTag, KindEnum, []byte("rare"))
-	index := mustField(t, enumField(IndexTypeTag), FieldConfig{})
-	if err := index.Add(
-		Entry{ImageID: 1, Value: StringValue("rare")},
-		Entry{ImageID: 2, Value: StringValue("rare")},
-		Entry{ImageID: 3, Value: StringValue("rare")},
-	); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	rare := hashCanonical(common.NamespaceTag, KindEnum, []byte("rare"))
+	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	commit(t, index, func(b *Batch) error {
+		return b.Add(
+			Entry{ImageID: 1, Value: StringValue("rare")},
+			Entry{ImageID: 2, Value: StringValue("rare")},
+			Entry{ImageID: 3, Value: StringValue("rare")},
+		)
+	})
 	if err := index.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -47,12 +49,12 @@ func TestTinyPostingTier(t *testing.T) {
 	}
 
 	// Promotion: a fifth member exceeds the inline capacity.
-	if err := index.Add(
-		Entry{ImageID: 4, Value: StringValue("rare")},
-		Entry{ImageID: 5, Value: StringValue("rare")},
-	); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Add(
+			Entry{ImageID: 4, Value: StringValue("rare")},
+			Entry{ImageID: 5, Value: StringValue("rare")},
+		)
+	})
 	if err := index.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -61,12 +63,12 @@ func TestTinyPostingTier(t *testing.T) {
 	}
 
 	// Demotion: collapsing back to three members returns to the inline form.
-	if err := index.Remove(
-		Entry{ImageID: 1, Value: StringValue("rare")},
-		Entry{ImageID: 2, Value: StringValue("rare")},
-	); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Remove(
+			Entry{ImageID: 1, Value: StringValue("rare")},
+			Entry{ImageID: 2, Value: StringValue("rare")},
+		)
+	})
 	if err := index.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -78,12 +80,12 @@ func TestTinyPostingTier(t *testing.T) {
 	}
 
 	// Tiny-to-tiny intersection and count avoid the roaring kernel.
-	if err := index.Add(
-		Entry{ImageID: 3, Value: StringValue("overlap")},
-		Entry{ImageID: 4, Value: StringValue("overlap")},
-	); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Add(
+			Entry{ImageID: 3, Value: StringValue("overlap")},
+			Entry{ImageID: 4, Value: StringValue("overlap")},
+		)
+	})
 	if err := index.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -102,21 +104,21 @@ func TestTinyPostingTier(t *testing.T) {
 
 func TestTinyPostingTierKinds(t *testing.T) {
 	// Geo: two images in one level-16 bucket stay inline.
-	geo := mustField(t, geoFieldFor(IndexTypeLocation), FieldConfig{})
+	geo := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), NamespaceConfig{})
 	key, err := KeyFromLatLng(48.8566, 2.3522)
 	if err != nil {
 		t.Fatalf("KeyFromLatLng: %v", err)
 	}
-	if err := geo.Add(
-		Entry{ImageID: 1, Value: GeoValue(key)},
-		Entry{ImageID: 2, Value: GeoValue(key)},
-	); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	commit(t, geo, func(b *Batch) error {
+		return b.Add(
+			Entry{ImageID: 1, Value: GeoValue(key)},
+			Entry{ImageID: 2, Value: GeoValue(key)},
+		)
+	})
 	if err := geo.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	geoKey := FieldKey{Hash: key, Type: IndexTypeLocation}
+	geoKey := NamespaceKey{Hash: key, Namespace: common.NamespaceLocation}
 	if p := basePosting(t, geo, geoKey); !p.isTiny() {
 		t.Fatal("geo posting not tiny")
 	}
@@ -132,13 +134,13 @@ func TestTinyPostingTierKinds(t *testing.T) {
 	if err != nil || !slices.Equal(filtered, []ImageID{1, 2}) {
 		t.Fatalf("FilterGeoRanges = %v, %v", filtered, err)
 	}
-	if err := geo.Add(
-		Entry{ImageID: 3, Value: GeoValue(key)},
-		Entry{ImageID: 4, Value: GeoValue(key)},
-		Entry{ImageID: 5, Value: GeoValue(key)},
-	); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	commit(t, geo, func(b *Batch) error {
+		return b.Add(
+			Entry{ImageID: 3, Value: GeoValue(key)},
+			Entry{ImageID: 4, Value: GeoValue(key)},
+			Entry{ImageID: 5, Value: GeoValue(key)},
+		)
+	})
 	if err := geo.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -151,13 +153,13 @@ func TestTinyPostingTierKinds(t *testing.T) {
 	}
 
 	// Continuous: two rare grid values, each with one image, union inline.
-	focals := mustField(t, continuousField(testFocalLength), FieldConfig{})
-	if err := focals.Move(
-		Move{ImageID: 1, To: 24, HasTo: true},
-		Move{ImageID: 2, To: 50, HasTo: true},
-	); err != nil {
-		t.Fatalf("Move: %v", err)
-	}
+	focals := mustNamespace(t, continuousNamespace(testFocalLength), NamespaceConfig{})
+	commit(t, focals, func(b *Batch) error {
+		return b.Move(
+			Move{ImageID: 1, To: 24, HasTo: true},
+			Move{ImageID: 2, To: 50, HasTo: true},
+		)
+	})
 	if err := focals.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -167,14 +169,14 @@ func TestTinyPostingTierKinds(t *testing.T) {
 	}
 
 	// Text: a token with a single member stays inline and matches.
-	titles := mustField(t, textField(IndexTypeTag), FieldConfig{})
-	if err := titles.ReplaceText(TextReplacement{ImageID: 7, After: []string{"golden"}}); err != nil {
-		t.Fatalf("ReplaceText: %v", err)
-	}
+	titles := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	commit(t, titles, func(b *Batch) error {
+		return b.ReplaceText(TextReplacement{ImageID: 7, After: []string{"golden"}})
+	})
 	if err := titles.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	token := hashCanonical(IndexTypeTag, KindText, []byte("golden"))
+	token := hashCanonical(common.NamespaceTag, KindText, []byte("golden"))
 	if p := basePosting(t, titles, token); !p.isTiny() {
 		t.Fatal("text posting not tiny")
 	}

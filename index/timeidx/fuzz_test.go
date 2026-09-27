@@ -12,7 +12,7 @@ import (
 
 func validManifestBytes() []byte {
 	return encodeManifest(diskManifest{
-		generation: 3, indexID: 7, count: 11,
+		generation: 3, namespace: 7, count: 11,
 		startTime: 1000, endTime: 2000, offsetTime: 1000,
 		walOffset: 128, blockCount: 2, flags: 0, walEpoch: 1,
 	})

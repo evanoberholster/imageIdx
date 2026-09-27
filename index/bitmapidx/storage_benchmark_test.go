@@ -3,6 +3,8 @@ package bitmapidx
 import (
 	"fmt"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // seedStore builds a persistent store with values distinct enum values,
@@ -10,19 +12,17 @@ import (
 // memberships stay in the WAL until the caller checkpoints.
 func seedStore(b *testing.B, dir string, values, perValue int) *Index {
 	b.Helper()
-	s, err := NewIndex(dir, []Field{enumField(IndexTypeTag)}, FieldConfig{}, DurabilitySync)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}
-	index, _ := s.Lookup(IndexTypeTag)
+	index, _ := s.Lookup(common.NamespaceTag)
 	entries := make([]Entry, 0, 1024)
 	flush := func() {
 		if len(entries) == 0 {
 			return
 		}
-		if err := index.Add(entries...); err != nil {
-			b.Fatal(err)
-		}
+		commit(b, index, func(bt *Batch) error { return bt.Add(entries...) })
 		entries = entries[:0]
 	}
 	for value := 0; value < values; value++ {
@@ -39,8 +39,8 @@ func seedStore(b *testing.B, dir string, values, perValue int) *Index {
 }
 
 // addTail appends updates memberships spread over distinct values, split
-// into MaxFieldBatchUpdates-sized write batches.
-func addTail(index *FieldIndex, baseImage ImageID, updates, distinct int) error {
+// into MaxNamespaceBatchUpdates-sized write batches.
+func addTail(index *NamespaceIndex, baseImage ImageID, updates, distinct int) error {
 	if updates <= 0 {
 		return nil
 	}
@@ -51,19 +51,30 @@ func addTail(index *FieldIndex, baseImage ImageID, updates, distinct int) error 
 			Value:   StringValue(fmt.Sprintf("tail-%d", n%distinct)),
 		})
 	}
-	for start := 0; start < len(batch); start += MaxFieldBatchUpdates {
-		end := min(start+MaxFieldBatchUpdates, len(batch))
-		if err := index.Add(batch[start:end]...); err != nil {
+	bt := index.NewBatch()
+	defer bt.Close()
+	for start := 0; start < len(batch); start += MaxNamespaceBatchUpdates {
+		end := min(start+MaxNamespaceBatchUpdates, len(batch))
+		if err := bt.Add(batch[start:end]...); err != nil {
+			return err
+		}
+		if err := bt.Apply(); err != nil {
+			return err
+		}
+		if err := index.Barrier(); err != nil {
+			return err
+		}
+		if err := bt.Reset(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// BenchmarkFieldCheckpoint measures the writer stall from rewriting and
+// BenchmarkNamespaceCheckpoint measures the writer stall from rewriting and
 // validating a full snapshot generation on checkpoint. It blocks all
 // writers for the duration, so treat it as the write-stall budget probe.
-func BenchmarkFieldCheckpoint(b *testing.B) {
+func BenchmarkNamespaceCheckpoint(b *testing.B) {
 	s := seedStore(b, b.TempDir(), 256, 256)
 	b.Cleanup(func() { _ = s.Close() })
 	b.ResetTimer()
@@ -74,12 +85,12 @@ func BenchmarkFieldCheckpoint(b *testing.B) {
 	}
 }
 
-// BenchmarkFieldReopen measures restart time: manifest validation, snapshot
+// BenchmarkNamespaceReopen measures restart time: manifest validation, snapshot
 // open, and replay of a nonempty WAL tail. Target: reopening a tail of up to
-// MaxFieldBatchUpdates should stay well under an interactive maintenance
+// MaxNamespaceBatchUpdates should stay well under an interactive maintenance
 // window (< 250 ms on reference hardware); this benchmark catches replay
 // regressions as the format evolves.
-func BenchmarkFieldReopen(b *testing.B) {
+func BenchmarkNamespaceReopen(b *testing.B) {
 	const distinct = 64
 	for _, updates := range []int{2048, 4096, 8192} {
 		b.Run(fmt.Sprintf("updates=%d", updates), func(b *testing.B) {
@@ -88,7 +99,7 @@ func BenchmarkFieldReopen(b *testing.B) {
 			if err := s.Checkpoint(); err != nil {
 				b.Fatal(err)
 			}
-			index, _ := s.Lookup(IndexTypeTag)
+			index, _ := s.Lookup(common.NamespaceTag)
 			if err := addTail(index, 1_000_000, updates, distinct); err != nil {
 				b.Fatal(err)
 			}
@@ -97,7 +108,7 @@ func BenchmarkFieldReopen(b *testing.B) {
 			}
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
-				opened, err := OpenIndex(dir, FieldConfig{}, DurabilityOS)
+				opened, err := OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -109,9 +120,9 @@ func BenchmarkFieldReopen(b *testing.B) {
 	}
 }
 
-func benchmarkMaxCardinalityIndex(b *testing.B) *FieldIndex {
+func benchmarkMaxCardinalityIndex(b *testing.B) *NamespaceIndex {
 	b.Helper()
-	index, err := NewFieldIndex(enumField(IndexTypeTag), FieldConfig{})
+	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -122,24 +133,20 @@ func benchmarkMaxCardinalityIndex(b *testing.B) *FieldIndex {
 	for n := 1; n <= ids; n++ {
 		entries = append(entries, Entry{ImageID: ImageID(n), Value: value})
 		if len(entries) == cap(entries) {
-			if err := index.Add(entries...); err != nil {
-				b.Fatal(err)
-			}
+			commit(b, index, func(bt *Batch) error { return bt.Add(entries...) })
 			entries = entries[:0]
 		}
 	}
 	if len(entries) > 0 {
-		if err := index.Add(entries...); err != nil {
-			b.Fatal(err)
-		}
+		commit(b, index, func(bt *Batch) error { return bt.Add(entries...) })
 	}
 	return index
 }
 
-// BenchmarkFieldMaxCardinalityMatchInMemory probes a single value holding
+// BenchmarkNamespaceMaxCardinalityMatchInMemory probes a single value holding
 // many images on a standalone index, the worst case for intersecting and
 // returning a posting with no persistence copy.
-func BenchmarkFieldMaxCardinalityMatchInMemory(b *testing.B) {
+func BenchmarkNamespaceMaxCardinalityMatchInMemory(b *testing.B) {
 	index := benchmarkMaxCardinalityIndex(b)
 	value := StringValue("shared")
 	b.ResetTimer()
@@ -151,16 +158,16 @@ func BenchmarkFieldMaxCardinalityMatchInMemory(b *testing.B) {
 	}
 }
 
-// BenchmarkFieldMaxCardinalityMatchPersistent adds the store-owned result
+// BenchmarkNamespaceMaxCardinalityMatchPersistent adds the store-owned result
 // copy: every match is cloned away from mmap state, so this is the number
 // that matters for a persistent maximum-cardinality query.
-func BenchmarkFieldMaxCardinalityMatchPersistent(b *testing.B) {
+func BenchmarkNamespaceMaxCardinalityMatchPersistent(b *testing.B) {
 	s := seedStore(b, b.TempDir(), 1, 1<<18)
 	b.Cleanup(func() { _ = s.Close() })
 	if err := s.Checkpoint(); err != nil {
 		b.Fatal(err)
 	}
-	index, _ := s.Lookup(IndexTypeTag)
+	index, _ := s.Lookup(common.NamespaceTag)
 	value := StringValue("value-0")
 	b.ResetTimer()
 	b.ReportAllocs()

@@ -2,6 +2,7 @@ package vectoridx
 
 import (
 	"context"
+	"errors"
 	"math"
 	"math/rand"
 	"os"
@@ -12,21 +13,24 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
 // VectorIdx is a persistent HNSW approximate-nearest-neighbor index over one
-// fixed vector space (SpaceID, Dimensions, ElementType, metric).
+// fixed vector space (Namespace, Dimensions, ElementType, metric).
 //
 // Concurrency: reads are lock-free — they acquire a ReaderTracker token and
 // load one atomically published snapshot, taking no mutex. One writer
 // serializes Add/Delete/Checkpoint/Compact through writeMu (plus an async
-// queue for background work). Published snapshots share backing arrays with
-// copy-on-write rules: appends beyond the published length are safe in place,
-// middle inserts copy, dense fills filter via bounds checks, link rewrites
-// clone short inner slices, and tombstones swap an immutable roar bitmap.
-// See doc.go.
+// queue for background work). Under DurabilitySync the per-mutation fsync
+// runs after the writer releases writeMu, so it overlaps the next writer's
+// graph insertion instead of serializing every insert behind it. Published
+// snapshots share backing arrays with copy-on-write rules: appends beyond
+// the published length are safe in place, middle inserts copy, dense fills
+// filter via bounds checks, link rewrites clone short inner slices, and
+// tombstones swap an immutable roar bitmap. See doc.go.
 type vectorSnapshot struct {
 	cfg      Config
 	dist     distRaw
@@ -62,12 +66,12 @@ type asyncOp struct {
 }
 
 type VectorIdx struct {
-	cfgBase    Config // persisted identity (SpaceID/Dims/Elem/Metric/M/M0/Ef*), immutable
+	cfgBase    Config // persisted identity (Namespace/Dims/Elem/Metric/M/M0/Ef*), immutable
 	durability Durability
 	path       string // empty for in-memory indexes (New)
 
 	view    atomic.Pointer[vectorSnapshot]
-	readers *indexutil.ReaderTracker
+	readers *storage.ReaderTracker
 	writeMu sync.Mutex
 	closed  atomic.Bool
 	gen     atomic.Uint64 // published generation, bumped per mutation
@@ -84,14 +88,18 @@ type VectorIdx struct {
 	elemSize int
 	dims     int
 
-	walPath      string
-	wal          *os.File // writer-only under writeMu (active segment)
+	walPath string
+	wal     *os.File // writer-only under writeMu (active segment)
+	// pendingSync records the segment handle of the last successful
+	// DurabilitySync append so the writer can fsync it after releasing
+	// writeMu. Guarded by writeMu; cleared by its own writer.
+	pendingSync  *os.File
 	walSeq       uint64   // active segment sequence
 	walSize      int64    // active segment bytes on disk
 	walSegBytes  int64    // rotation threshold
 	lock         *os.File // exclusive store lock held until Close
 	syncInterval time.Duration
-	syncMu       sync.Mutex // serializes flushWAL fsync calls
+	syncMu       sync.Mutex // serializes WAL fsync calls
 	walDirty     atomic.Bool
 	walRecords   atomic.Uint64
 	walBytes     atomic.Uint64
@@ -121,7 +129,7 @@ func New(cfg Config) (*VectorIdx, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !indexutil.HostIsLittleEndian() {
+	if !storage.HostIsLittleEndian() {
 		return nil, ErrUnsupportedHost
 	}
 	dist := resolveDistance(validated)
@@ -130,7 +138,7 @@ func New(cfg Config) (*VectorIdx, error) {
 	}
 	v := &VectorIdx{
 		cfgBase:  validated,
-		readers:  &indexutil.ReaderTracker{},
+		readers:  &storage.ReaderTracker{},
 		rng:      rand.New(rand.NewSource(1)),
 		mL:       levelMultiplier(validated.M),
 		dist:     dist,
@@ -164,7 +172,7 @@ func Create(path string, cfg Config, durability Durability, opts ...Option) (*Ve
 	if path == "" || !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	if !indexutil.HostIsLittleEndian() {
+	if !storage.HostIsLittleEndian() {
 		return nil, ErrUnsupportedHost
 	}
 	runtimeOpts, err := applyOptions(opts)
@@ -176,7 +184,7 @@ func Create(path string, cfg Config, durability Durability, opts ...Option) (*Ve
 			return nil, err
 		}
 	}
-	lock, err := indexutil.AcquireLock(filepath.Dir(path), filepath.Base(path)+".lock", false)
+	lock, err := storage.AcquireLock(filepath.Dir(path), filepath.Base(path)+".lock", false)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +192,7 @@ func Create(path string, cfg Config, durability Durability, opts ...Option) (*Ve
 		cfgBase:      validated,
 		durability:   durability,
 		path:         path,
-		readers:      &indexutil.ReaderTracker{},
+		readers:      &storage.ReaderTracker{},
 		rng:          rand.New(rand.NewSource(1)),
 		mL:           levelMultiplier(validated.M),
 		vecBytes:     validated.VectorBytes(),
@@ -205,23 +213,23 @@ func Create(path string, cfg Config, durability Durability, opts ...Option) (*Ve
 	})
 	v.gen.Store(1)
 	if err := removeWALFiles(path); err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	if err := v.openWALSegment(1); err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	v.manifest.Store(&manifestData{baseGeneration: 1})
 	v.nextDeltaGen = 2
 	if err := v.writeBaseLocked(); err != nil {
 		_ = v.wal.Close()
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	if err := v.writeManifestLocked(&manifestData{baseGeneration: v.gen.Load(), checkpointLSN: v.lsn}); err != nil {
 		_ = v.wal.Close()
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	v.startAsyncWorker()
@@ -238,30 +246,30 @@ func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error
 	if path == "" || !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	if !indexutil.HostIsLittleEndian() {
+	if !storage.HostIsLittleEndian() {
 		return nil, ErrUnsupportedHost
 	}
 	runtimeOpts, err := applyOptions(opts)
 	if err != nil {
 		return nil, err
 	}
-	lock, err := indexutil.AcquireLock(filepath.Dir(path), filepath.Base(path)+".lock", false)
+	lock, err := storage.AcquireLock(filepath.Dir(path), filepath.Base(path)+".lock", false)
 	if err != nil {
 		return nil, err
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	header, regions, err := decodeFile(data)
 	if err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	manifest, err := readManifest(path)
 	if err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	checkpointLSN := header.checkpointLSN
@@ -273,7 +281,7 @@ func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error
 		manifest = &manifestData{baseGeneration: header.generation, checkpointLSN: header.checkpointLSN}
 	}
 	cfg := Config{
-		SpaceID:        header.spaceID,
+		Namespace:      header.namespace,
 		Dimensions:     Dimensions(header.dims),
 		ElementType:    header.elem,
 		Metric:         header.metric,
@@ -290,7 +298,7 @@ func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error
 		cfgBase:       validated,
 		durability:    durability,
 		path:          path,
-		readers:       &indexutil.ReaderTracker{},
+		readers:       &storage.ReaderTracker{},
 		rng:           rand.New(rand.NewSource(1)),
 		mL:            levelMultiplier(validated.M),
 		vecBytes:      validated.VectorBytes(),
@@ -320,19 +328,19 @@ func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error
 		gen:      header.generation + 1,
 	})
 	if err := v.loadRegions(header, regions); err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	v.gen.Store(header.generation + 1)
 	if err := v.applyDeltasLocked(manifest); err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	if err := v.replayWAL(); err != nil {
 		if v.wal != nil {
 			_ = v.wal.Close()
 		}
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	v.startAsyncWorker()
@@ -349,8 +357,21 @@ func (v *VectorIdx) Close() error {
 		return nil
 	}
 	v.closed.Store(true)
+	// Sync and close the WAL under the write lock: a writer that appended
+	// before closed was set is covered by this sync, so its post-unlock
+	// syncWALAfterWrite sees a closed handle it treats as durable.
+	var syncErr error
 	wal := v.wal
+	if wal != nil {
+		if err := wal.Sync(); err != nil {
+			syncErr = err
+		} else {
+			v.walSyncs.Add(1)
+		}
+		_ = wal.Close()
+	}
 	v.wal = nil
+	v.pendingSync = nil
 	ch := v.asyncCh
 	v.asyncCh = nil
 	if ch != nil {
@@ -358,16 +379,10 @@ func (v *VectorIdx) Close() error {
 	}
 	v.writeMu.Unlock()
 	v.asyncWg.Wait()
-	if wal != nil {
-		if err := wal.Sync(); err == nil {
-			v.walSyncs.Add(1)
-		}
-		_ = wal.Close()
-	}
 	v.readers.WaitForPriorReaders()
 	lock := v.lock
 	v.lock = nil
-	return indexutil.ReleaseLock(lock)
+	return errors.Join(syncErr, storage.ReleaseLock(lock))
 }
 
 // Config returns the validated index configuration.
@@ -399,7 +414,7 @@ func (v *VectorIdx) TombstoneCount() int {
 
 // Metadata is a copied summary of the current generation.
 type Metadata struct {
-	SpaceID        SpaceID
+	Namespace      common.Namespace
 	Dimensions     Dimensions
 	ElementType    ElementType
 	Generation     uint64
@@ -415,7 +430,7 @@ func (v *VectorIdx) Metadata() Metadata {
 	token := v.readers.Acquire()
 	snap := v.view.Load()
 	m := Metadata{
-		SpaceID:        snap.cfg.SpaceID,
+		Namespace:      snap.cfg.Namespace,
 		Dimensions:     snap.cfg.Dimensions,
 		ElementType:    snap.cfg.ElementType,
 		Generation:     v.gen.Load(),
@@ -903,15 +918,17 @@ func wiringSeed(s *vectorSnapshot, exclude NodeID) (NodeID, bool) {
 // returned; Compact purges them. Delete is idempotent for tombstoned nodes.
 func (v *VectorIdx) Delete(id NodeID) error {
 	v.writeMu.Lock()
-	defer v.writeMu.Unlock()
 	if v.closed.Load() {
+		v.writeMu.Unlock()
 		return ErrClosed
 	}
 	cur := v.view.Load()
 	if _, ok := cur.locate(id); !ok {
+		v.writeMu.Unlock()
 		return ErrNodeNotFound
 	}
 	if cur.tomb.Contains(uint64(id)) {
+		v.writeMu.Unlock()
 		return nil
 	}
 	if v.wal != nil {
@@ -927,7 +944,9 @@ func (v *VectorIdx) Delete(id NodeID) error {
 	v.view.Store(ns)
 	v.markPendingLocked(id)
 	v.maybeAutoCompactLocked(ns)
-	return nil
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
 }
 
 // maybeAutoCompactLocked enqueues background maintenance when policy is
@@ -993,8 +1012,8 @@ func (v *VectorIdx) AddInt8(id NodeID, vec []int8) error {
 		return ErrInvalidVector
 	}
 	v.writeMu.Lock()
-	defer v.writeMu.Unlock()
 	if v.closed.Load() {
+		v.writeMu.Unlock()
 		return ErrClosed
 	}
 	raw := make([]byte, v.vecBytes)
@@ -1002,11 +1021,14 @@ func (v *VectorIdx) AddInt8(id NodeID, vec []int8) error {
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
+		v.writeMu.Unlock()
 		return err
 	}
 	v.view.Store(ns)
 	v.maybeAutoCompactLocked(ns)
-	return nil
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
 }
 
 // AddUint8 inserts one uint8 vector.
@@ -1018,8 +1040,8 @@ func (v *VectorIdx) AddUint8(id NodeID, vec []uint8) error {
 		return ErrInvalidVector
 	}
 	v.writeMu.Lock()
-	defer v.writeMu.Unlock()
 	if v.closed.Load() {
+		v.writeMu.Unlock()
 		return ErrClosed
 	}
 	raw := make([]byte, v.vecBytes)
@@ -1027,11 +1049,14 @@ func (v *VectorIdx) AddUint8(id NodeID, vec []uint8) error {
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
+		v.writeMu.Unlock()
 		return err
 	}
 	v.view.Store(ns)
 	v.maybeAutoCompactLocked(ns)
-	return nil
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
 }
 
 // AddInt16 inserts one int16 vector.
@@ -1043,19 +1068,22 @@ func (v *VectorIdx) AddInt16(id NodeID, vec []int16) error {
 		return ErrInvalidVector
 	}
 	v.writeMu.Lock()
-	defer v.writeMu.Unlock()
 	if v.closed.Load() {
+		v.writeMu.Unlock()
 		return ErrClosed
 	}
 	raw := encodeRawInt16(nil, vec)
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
+		v.writeMu.Unlock()
 		return err
 	}
 	v.view.Store(ns)
 	v.maybeAutoCompactLocked(ns)
-	return nil
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
 }
 
 // AddUint16 inserts one uint16 vector.
@@ -1067,19 +1095,22 @@ func (v *VectorIdx) AddUint16(id NodeID, vec []uint16) error {
 		return ErrInvalidVector
 	}
 	v.writeMu.Lock()
-	defer v.writeMu.Unlock()
 	if v.closed.Load() {
+		v.writeMu.Unlock()
 		return ErrClosed
 	}
 	raw := encodeRawUint16(nil, vec)
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
+		v.writeMu.Unlock()
 		return err
 	}
 	v.view.Store(ns)
 	v.maybeAutoCompactLocked(ns)
-	return nil
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
 }
 
 // AddFloat32 inserts one float32 vector.
@@ -1091,19 +1122,22 @@ func (v *VectorIdx) AddFloat32(id NodeID, vec []float32) error {
 		return ErrInvalidVector
 	}
 	v.writeMu.Lock()
-	defer v.writeMu.Unlock()
 	if v.closed.Load() {
+		v.writeMu.Unlock()
 		return ErrClosed
 	}
 	raw := encodeRawFloat32(nil, vec)
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
+		v.writeMu.Unlock()
 		return err
 	}
 	v.view.Store(ns)
 	v.maybeAutoCompactLocked(ns)
-	return nil
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
 }
 
 // queryEncoder writes the typed query into dst (reusing pooled capacity)
@@ -1660,6 +1694,36 @@ func (v *VectorIdx) flushWAL() {
 		return
 	}
 	v.walSyncs.Add(1)
+}
+
+// takePendingSyncLocked returns the segment handle recorded by the last
+// successful DurabilitySync append and clears it. Caller holds writeMu.
+func (v *VectorIdx) takePendingSyncLocked() *os.File {
+	wal := v.pendingSync
+	v.pendingSync = nil
+	return wal
+}
+
+// syncWALAfterWrite makes a DurabilitySync mutation durable after the
+// writer has released writeMu, so the fsync overlaps the next writer's
+// graph insertion instead of serializing behind the write lock; syncs
+// serialize on syncMu. The handle is the segment the record was appended
+// to. A closed handle means a rotation or Close already fsynced and closed
+// that segment, so the record is durable.
+func (v *VectorIdx) syncWALAfterWrite(wal *os.File) error {
+	if wal == nil || v.durability != DurabilitySync {
+		return nil
+	}
+	v.syncMu.Lock()
+	defer v.syncMu.Unlock()
+	if err := wal.Sync(); err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return nil
+		}
+		return err
+	}
+	v.walSyncs.Add(1)
+	return nil
 }
 
 // Sync fsyncs the WAL, establishing a durable boundary for every mutation

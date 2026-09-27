@@ -8,11 +8,10 @@
 //   - One metric per index {L2, cosine, dot} with scalar kernels and float64
 //     accumulation; public Result Score is a saturating uint32, monotonic
 //     per metric and zero for self matches.
-//   - SpaceID is the packed identity of one vector space: the high byte is the
-//     IndexType (IndexTypeImage, IndexTypeFace, or IndexTypeCustom) and the
-//     low byte is the space number within that type. IDs are stored and
-//     filtered as compact uint32 NodeIDs and widened to imageidx.ImageID in
-//     Result values.
+//   - Namespace is the shared schema identity of one vector space: a
+//     non-zero common.Namespace (KindVector) assigned by the application's
+//     schema. IDs are stored and filtered as compact uint32 NodeIDs and
+//     widened to common.ImageID in Result values.
 //   - Standard HNSW insertion/search with direct uint32 NodeID edges, a dense
 //     O(1) locator with sorted sparse fallback, and heuristic neighbor
 //     selection (closest-only available for benchmarking).
@@ -55,7 +54,7 @@
 // # Basic use
 //
 //	idx, err := vectoridx.Create(path, vectoridx.Config{
-//	    SpaceID:      vectoridx.NewSpaceID(vectoridx.IndexTypeImage, 1),
+//	    Namespace:   1, // common.Namespace registered as common.KindVector
 //	    Dimensions:  vectoridx.Dim512,
 //	    ElementType: vectoridx.ElementFloat32,
 //	}, vectoridx.DurabilitySync)

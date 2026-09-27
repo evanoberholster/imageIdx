@@ -9,7 +9,7 @@ import (
 
 func mustNewIndex(t *testing.T, cfg Config) *Index {
 	t.Helper()
-	idx, err := newIndex(t.TempDir(), cfg, DurabilityOS)
+	idx, err := newIndex(t.TempDir(), testPerceptualSpec(cfg), DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,11 +484,11 @@ func TestSearchZeroAllocations(t *testing.T) {
 
 func TestConfigValidation(t *testing.T) {
 	for _, recordsPerPage := range []uint32{1, 7, 9, maxRecordsPerPage + 8} {
-		if _, err := newIndex(t.TempDir(), Config{RecordsPerPage: recordsPerPage}, DurabilityOS); err != ErrInvalidConfig {
+		if _, err := newIndex(t.TempDir(), testPerceptualSpec(Config{RecordsPerPage: recordsPerPage}), DurabilityOS); err != ErrInvalidConfig {
 			t.Fatalf("records per page %d error = %v", recordsPerPage, err)
 		}
 	}
-	idx, err := newIndex(t.TempDir(), Config{RecordsPerPage: 8}, DurabilityOS)
+	idx, err := newIndex(t.TempDir(), testPerceptualSpec(Config{RecordsPerPage: 8}), DurabilityOS)
 	if err != nil {
 		t.Fatalf("minimum page size rejected: %v", err)
 	}

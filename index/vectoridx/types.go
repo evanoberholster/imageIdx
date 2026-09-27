@@ -9,53 +9,17 @@ package vectoridx
 import (
 	"errors"
 
-	imageidx "github.com/evanoberholster/imageIdx"
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // NodeID is the identifier stored in HNSW edges. It is a compact uint32
 // widened to the database-wide identifier type in Result values. What the ID
-// refers to (image, face, or application-defined) comes from the index's
-// IndexType.
+// refers to is defined by the schema namespace the index serves.
 type NodeID uint32
 
 // ImageID is the database-wide identifier type shared by all index packages.
-type ImageID = imageidx.ImageID
-
-// IndexType identifies the entity domain an index addresses (images, faces,
-// or an application-defined domain), mirroring bitmapidx.IndexType naming.
-// It is the high byte of SpaceID. Zero is reserved and never valid; the set
-// of constants is closed.
-type IndexType uint8
-
-const (
-	IndexTypeImage  IndexType = iota + 1 // database-wide image identifier
-	IndexTypeFace                        // face identifier
-	IndexTypeCustom                      // application-defined identifier
-)
-
-// Valid reports whether t is a recognized index type.
-func (t IndexType) Valid() bool { return t >= IndexTypeImage && t <= IndexTypeCustom }
-
-// SpaceID is the single identity of one vector space: the high byte is the
-// IndexType and the low byte is the space number within that type. NodeIDs
-// are stored as compact uint32 values and widened to the database-wide
-// identifier in Result values.
-type SpaceID uint16
-
-// NewSpaceID packs an index type and a within-type space number.
-func NewSpaceID(indexType IndexType, space uint8) SpaceID {
-	return SpaceID(uint16(indexType)<<8 | uint16(space))
-}
-
-// Type returns the index type encoded in s.
-func (s SpaceID) Type() IndexType { return IndexType(uint8(s >> 8)) }
-
-// Space returns the within-type space number encoded in s.
-func (s SpaceID) Space() uint8 { return uint8(s) }
-
-// Valid reports whether s carries a recognized index type.
-func (s SpaceID) Valid() bool { return s.Type().Valid() }
+type ImageID = common.ImageID
 
 // ElementType selects the fixed per-index vector representation.
 type ElementType uint8
@@ -120,13 +84,13 @@ const (
 	DefaultOversampleFactor = 8
 )
 
-// Config describes one vector space. The zero value is invalid: SpaceID and
-// Dimensions must identify a supported space and ElementType must be set
+// Config describes one vector space. The zero value is invalid: Namespace
+// must be non-zero and Dimensions supported, and ElementType must be set
 // explicitly. M/M0/Ef fields default when zero. Metric defaults to L2 when
 // zero. Dynamic-ef is disabled unless DynamicEfFactor != 0; FlatSearchCutoff
 // and FlatThreshold default when zero, negative FlatSearchCutoff forces ANN.
 type Config struct {
-	SpaceID        SpaceID
+	Namespace      common.Namespace
 	Dimensions     Dimensions
 	ElementType    ElementType
 	Metric         uint8
@@ -167,8 +131,15 @@ type Config struct {
 	AutoVacuumFragmentation float64
 }
 
+// NamespaceDef returns the common.Schema definition for this config's
+// namespace. The schema name lives at the schema layer, so Name is empty and
+// should be filled in by the caller.
+func (c Config) NamespaceDef() common.NamespaceDef {
+	return common.NamespaceDef{Namespace: c.Namespace, Kind: common.KindVector}
+}
+
 func (c Config) withDefaults() (Config, error) {
-	if !c.SpaceID.Valid() || !c.Dimensions.Valid() {
+	if !c.Namespace.Valid() || !c.Dimensions.Valid() {
 		return Config{}, ErrInvalidConfig
 	}
 	switch c.ElementType {
@@ -271,8 +242,8 @@ func (c Config) ElementSize() int {
 func (c Config) VectorBytes() int { return int(c.Dimensions) * c.ElementSize() }
 
 // Result is one nearest-neighbor match. ImageID is the stored NodeID widened
-// to the database-wide identifier type; its semantics come from
-// Config.SpaceID.Type(). Score is monotonic with the index metric distance:
+// to the database-wide identifier type; its semantics come from the index's
+// schema namespace. Score is monotonic with the index metric distance:
 // a smaller distance always yields a smaller-or-equal Score. For L2 it tracks
 // squared L2; for cosine it tracks (1-cos)*2^30; for dot it tracks
 // querySelfDot-dot (zero for self). See EncodeScore for the saturation rule.
@@ -291,7 +262,7 @@ func widenedID(id NodeID) ImageID { return ImageID(id) }
 // Adapt a bitmap index with a closure:
 //
 //	filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
-//	    return bitmap.Contains(imageidx.ImageID(id))
+//	    return bitmap.Contains(common.ImageID(id))
 //	})
 type CandidateFilter func(NodeID) bool
 
@@ -299,11 +270,11 @@ type CandidateFilter func(NodeID) bool
 // once the frame is visible to the OS; DurabilitySync fsyncs before
 // returning. It is a runtime policy passed to Create/Open, not part of the
 // persisted format.
-type Durability = imageidx.Durability
+type Durability = common.Durability
 
 const (
-	DurabilityOS   = imageidx.DurabilityOS
-	DurabilitySync = imageidx.DurabilitySync
+	DurabilityOS   = common.DurabilityOS
+	DurabilitySync = common.DurabilitySync
 )
 
 var (
@@ -318,8 +289,8 @@ var (
 	ErrInvalidQuery    = errors.New("vectoridx: invalid query")
 	ErrUnsupportedHost = errors.New("vectoridx: storage format requires a little-endian host")
 	// ErrStoreBusy reports another handle holding the index lock. It
-	// aliases indexutil.ErrBusy; see internal/indexutil.
-	ErrStoreBusy = indexutil.ErrBusy
+	// aliases storage.ErrBusy; see internal/storage.
+	ErrStoreBusy = storage.ErrBusy
 	// ErrCompactionInProgress reports a second Compact while one is running.
 	ErrCompactionInProgress = errors.New("vectoridx: compaction already in progress")
 )

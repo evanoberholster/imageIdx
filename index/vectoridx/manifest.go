@@ -7,8 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // Delta checkpoints and manifest (VectorIdx.MD section 8).
@@ -92,7 +91,7 @@ func encodeManifest(m *manifestData) []byte {
 		size += len(d.name)
 	}
 	size += 4
-	return persist.BuildManifest(size, manifestMagic, manifestVersion, size-4, size-4, func(data []byte) {
+	return storage.BuildManifest(size, manifestMagic, manifestVersion, size-4, size-4, func(data []byte) {
 		binary.LittleEndian.PutUint64(data[8:16], m.baseGeneration)
 		binary.LittleEndian.PutUint64(data[16:24], m.checkpointLSN)
 		binary.LittleEndian.PutUint16(data[24:26], uint16(len(m.deltas)))
@@ -114,7 +113,7 @@ func decodeManifest(data []byte) (*manifestData, error) {
 	if len(data) < 26+4 {
 		return nil, ErrCorruptStorage
 	}
-	if err := persist.VerifyManifest(data, len(data), manifestMagic, manifestVersion, len(data)-4, len(data)-4); err != nil {
+	if err := storage.VerifyManifest(data, len(data), manifestMagic, manifestVersion, len(data)-4, len(data)-4); err != nil {
 		return nil, ErrCorruptStorage
 	}
 	m := &manifestData{
@@ -150,7 +149,7 @@ func decodeManifest(data []byte) (*manifestData, error) {
 // writeManifestLocked publishes the manifest atomically. Caller holds writeMu.
 func (v *VectorIdx) writeManifestLocked(m *manifestData) error {
 	name := filepath.Base(v.path) + ".manifest"
-	if err := indexutil.WriteFileAtomic(filepath.Dir(v.path), name+".tmp", name, encodeManifest(m), 0o644); err != nil {
+	if err := storage.WriteFileAtomic(filepath.Dir(v.path), name+".tmp", name, encodeManifest(m), 0o644); err != nil {
 		return err
 	}
 	v.manifest.Store(m.clone())
@@ -307,7 +306,7 @@ func (v *VectorIdx) checkpointLocked() error {
 	name := filepath.Base(deltaName(v.path, gen))
 	data := encodeDeltaFile(gen, records)
 	dir := filepath.Dir(v.path)
-	if err := indexutil.WriteFileAtomic(dir, name+".tmp", name, data, 0o644); err != nil {
+	if err := storage.WriteFileAtomic(dir, name+".tmp", name, data, 0o644); err != nil {
 		return err
 	}
 	m := v.manifest.Load().clone()

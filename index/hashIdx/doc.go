@@ -93,7 +93,8 @@
 // columns:
 //
 //	store, err := NewStore(dir, StoreSpec{
-//		Exact: ExactSpec{Algorithm: AlgorithmBLAKE3},
+//		Perceptual: PerceptualSpec{Namespace: 1, Name: "perceptual"},
+//		Exact:      ExactSpec{Namespace: 2, Name: "exact", Algorithm: AlgorithmBLAKE3},
 //	}, DurabilityOS)
 //	ids := store.Exact().Lookup(dst, hash)
 //	found := store.Exact().Contains(hash)
@@ -136,22 +137,22 @@
 //	exact/         ExactIndex artifacts
 //
 // The single-writer lock is flock on Unix and LockFileEx on Windows (see
-// the filelock files in internal/indexutil); other platforms fail fast
+// the filelock files in internal/storage); other platforms fail fast
 // instead of running unlocked. Mmap-backed reads are Unix-only until
-// internal/indexutil gains a MapViewOfFile backend, so Windows support
+// internal/storage gains a MapViewOfFile backend, so Windows support
 // also waits on that.
 //
 // The perceptual index uses three artifact kinds under perceptual/:
 //
 //	hashidx.<generation>.data  generation header + page directory + pages
 //	hashidx.<epoch>.wal        append-batch write-ahead log
-//	manifest                   atomically published root (generation, WAL epoch, WAL offset)
+//	manifest                   atomically published root (namespace, generation, WAL epoch, WAL offset)
 //
 // The exact index uses its own artifacts under exact/:
 //
 //	exact-<generation>.idx  generation header + block directory + blocks
 //	exact-<epoch>.wal       append/remove write-ahead log
-//	manifest                atomically published root (generation, WAL epoch, WAL offset, algorithm)
+//	manifest                atomically published root (namespace, generation, WAL epoch, WAL offset, algorithm)
 //
 // The generation headers, page/block directories, and WAL frames use explicit
 // little-endian encoding with CRC32/IEEE checksums. Every SoA plane is 8-byte
@@ -164,11 +165,11 @@
 // exact blocks, and starts a fresh WAL epoch for both indexes; obsolete
 // generations and WAL epochs are removed after prior readers finish.
 //
-// Metadata reports the persisted generation, total record count, page count,
-// and records per page for the perceptual index, and the stable IndexID,
-// algorithm, generation, and block count for the exact index. Page size and
-// exact block sizing are persistent properties: OpenStore adopts the recorded
-// values rather than silently reinterpreting them.
+// Metadata reports the persisted namespace, generation, total record count,
+// page count, and records per page for the perceptual index, and the
+// namespace, algorithm, generation, and block count for the exact index.
+// Page size and exact block sizing are persistent properties: OpenStore
+// adopts the recorded values rather than silently reinterpreting them.
 //
 // Store.Checkpoint persists perceptual then exact, then the joint anchor
 // naming both generations; a failure between them leaves the indexes
@@ -182,7 +183,11 @@
 // Every artifact carries magic plus version, and every payload carries a
 // CRC32/IEEE: recognized magic with an unknown version fails open with
 // ErrUnsupported (never misread as same-version rot), corrupt bytes fail
-// with ErrCorrupt. WAL framing violations report ErrCorruptWAL either way:
+// with ErrCorrupt. The perceptual manifest version 2 adds the index
+// namespace; version 1 manifests fail open with ErrUnsupported. The exact
+// manifest and generation header keep their versions: the namespace reuses
+// the old uint64 identity field zero-extended, and values above uint16 are
+// rejected as corrupt. WAL framing violations report ErrCorruptWAL either way:
 // WALs are transient epochs, rolled on every Vacuum, so they carry no
 // upgrade path — Vacuum before upgrading. Batch limits, overlay bounds,
 // and durability are runtime policy, never persisted, so tuning them

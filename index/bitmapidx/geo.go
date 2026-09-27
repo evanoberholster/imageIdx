@@ -5,11 +5,12 @@ import (
 	"math"
 	"slices"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/golang/geo/s2"
 )
 
 const (
-	// GeoS2Level is the fixed cell level of a KindGeo field. All geo
+	// GeoS2Level is the fixed cell level of a KindGeo namespace. All geo
 	// postings bucket by level-16 keys; coarser inputs expand and finer
 	// inputs snap to their level-16 ancestor.
 	GeoS2Level = 16
@@ -40,21 +41,21 @@ func EncodeS2Key(cellID uint64) S2Key { return cellID >> geoKeyShift }
 // shifting. It does not validate level; use CellIDFromKey for that.
 func DecodeS2Key(key S2Key) uint64 { return uint64(key) << geoKeyShift }
 
-// GeoEntry is one image coordinate used to seed a KindGeo field via
-// NewGeoField.
+// GeoEntry is one image coordinate used to seed a KindGeo namespace via
+// NewGeoNamespace.
 type GeoEntry struct {
 	ImageID   ImageID
 	Latitude  float64
 	Longitude float64
 }
 
-// NewGeoField constructs a KindGeo field index seeded with entries. It
+// NewGeoNamespace constructs a KindGeo namespace index seeded with entries. It
 // builds a StoragePerType definition with GeoCodec version 1 and converts
-// every coordinate through KeyFromLatLng. Use NewFieldIndex directly for
+// every coordinate through KeyFromLatLng. Use NewNamespaceIndex directly for
 // full control of the definition. Failures close the partial index.
-func NewGeoField(t IndexType, entries []GeoEntry, config FieldConfig) (*FieldIndex, error) {
-	field := Field{Type: t, Kind: KindGeo, Storage: StoragePerType, Geo: GeoCodec{Version: 1}}
-	index, err := NewFieldIndex(field, config)
+func NewGeoNamespace(t common.Namespace, entries []GeoEntry, config NamespaceConfig) (*NamespaceIndex, error) {
+	spec := NamespaceSpec{Namespace: t, Kind: KindGeo, Storage: StoragePerType, Geo: GeoCodec{Version: 1}}
+	index, err := NewNamespaceIndex(spec, config)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +71,17 @@ func NewGeoField(t IndexType, entries []GeoEntry, config FieldConfig) (*FieldInd
 		}
 		adds = append(adds, Entry{ImageID: entry.ImageID, Value: GeoValue(key)})
 	}
-	if err := index.Add(adds...); err != nil {
+	batch := index.NewBatch()
+	defer batch.Close()
+	if err := batch.Add(adds...); err != nil {
+		_ = index.Close()
+		return nil, err
+	}
+	if err := batch.Apply(); err != nil {
+		_ = index.Close()
+		return nil, err
+	}
+	if err := index.Barrier(); err != nil {
 		_ = index.Close()
 		return nil, err
 	}
@@ -150,7 +161,7 @@ type RangeOptions struct {
 	// minLevel is the finest tracked cell level (largest number, smallest
 	// cell size). Zero defaults to GeoS2Level. Inputs finer than minLevel snap
 	// to their minLevel ancestor. It is private because GeoS2Level is the
-	// smallest size the index stores; the field exists so an internal
+	// smallest size the index stores; the namespace exists so an internal
 	// bucket-level change has one definition.
 	minLevel uint8
 }

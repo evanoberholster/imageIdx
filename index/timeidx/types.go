@@ -6,12 +6,11 @@ import (
 	"errors"
 	"math"
 
-	imageidx "github.com/evanoberholster/imageIdx"
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-type ImageID = imageidx.ImageID
+type ImageID = common.ImageID
 
 type timemarker uint32
 
@@ -49,17 +48,17 @@ var (
 	ErrUnsupportedEndian  = errors.New("timeidx: mmap format requires a little-endian host")
 	ErrUnsupported        = errors.New("timeidx: unsupported format")
 	// ErrStoreBusy reports another process holding the store lock. It
-	// aliases indexutil.ErrBusy; see internal/indexutil.
-	ErrStoreBusy = indexutil.ErrBusy
+	// aliases storage.ErrBusy; see internal/storage.
+	ErrStoreBusy = storage.ErrBusy
 	// ErrStoreExists reports creating a store in a non-empty directory.
-	// It aliases indexutil.ErrExists; see internal/indexutil.
-	ErrStoreExists = indexutil.ErrExists
+	// It aliases storage.ErrExists; see internal/storage.
+	ErrStoreExists = storage.ErrExists
 	// ErrRecoveryRequired reports a WAL failure that latched the index:
 	// every later write and maintenance call fails with it until the
-	// index is closed and reopened. It aliases persist.ErrWALFailed.
+	// index is closed and reopened. It aliases storage.ErrWALFailed.
 	// Recovery is close plus reopen: replay restores the last durable
 	// prefix and reports a torn tail as a clean stop or ErrCorruptWAL.
-	ErrRecoveryRequired = persist.ErrWALFailed
+	ErrRecoveryRequired = storage.ErrWALFailed
 )
 
 func encodeTimemarker(timestamp, offset uint64) timemarker {
@@ -94,18 +93,31 @@ type Entry struct {
 }
 
 // Spec describes an index's stable identity, compression offset, and initial
-// entries.
+// entries. Namespace is the shared schema identity of this index and may be
+// zero for an ephemeral in-memory index created with New; registering it in a
+// common.Schema requires a non-zero namespace. Name is the schema name and is
+// never persisted.
 type Spec struct {
-	IndexID uint64
-	Flags   uint32
-	Offset  uint64
-	Entries []Entry
+	Namespace common.Namespace
+	Name      string
+	Flags     uint32
+	Offset    uint64
+	Entries   []Entry
+}
+
+// NamespaceDef returns the common.Schema definition for this spec. The
+// timestamp index records no kind-specific schema configuration, so Config is
+// nil.
+func (s Spec) NamespaceDef() common.NamespaceDef {
+	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindTimestamp}
 }
 
 // Metadata is a copied summary of the current persisted/base generation.
 // BaseCount deliberately excludes pending Active and Frozen corrections.
+// Namespace is the index's schema namespace: zero identifies an ephemeral
+// in-memory index created with New, never a schema-registered one.
 type Metadata struct {
-	IndexID    uint64
+	Namespace  common.Namespace
 	Flags      uint32
 	Generation uint64
 	Offset     uint64
@@ -122,11 +134,11 @@ type Config struct {
 	CompactionQueue    int
 }
 
-type Durability = imageidx.Durability
+type Durability = common.Durability
 
 const (
-	DurabilityOS   = imageidx.DurabilityOS
-	DurabilitySync = imageidx.DurabilitySync
+	DurabilityOS   = common.DurabilityOS
+	DurabilitySync = common.DurabilitySync
 )
 
 func (c Config) withDefaults() (Config, error) {

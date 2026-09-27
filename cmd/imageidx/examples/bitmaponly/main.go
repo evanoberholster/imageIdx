@@ -1,5 +1,5 @@
-// Command bitmaponly exercises field-only execution shapes: AppendIDs, Count,
-// AppendPage, and Visit.
+// Command bitmaponly exercises namespace-only execution shapes: AppendIDs,
+// Count, AppendPage, and Visit.
 //
 // Usage:
 //
@@ -12,27 +12,29 @@ import (
 	"log"
 	"os"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
 func main() {
-	dir, err := os.MkdirTemp("", "imageidx-fields-")
+	dir, err := os.MkdirTemp("", "imageidx-namespaces-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	store, err := bitmapidx.NewIndex(dir, []bitmapidx.Field{
-		{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Type: bitmapidx.IndexTypeAlbum, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-	}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	store, err := bitmapidx.NewIndex(dir, []bitmapidx.NamespaceSpec{
+		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+		{Namespace: common.NamespaceAlbum, Name: "album", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+	}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer store.Close()
-	tags, _ := store.Lookup(bitmapidx.IndexTypeTag)
-	album, _ := store.Lookup(bitmapidx.IndexTypeAlbum)
-	if err := tags.Add(
+	tags, _ := store.Lookup(common.NamespaceTag)
+	album, _ := store.Lookup(common.NamespaceAlbum)
+	tagsBatch := tags.NewBatch()
+	if err := tagsBatch.Add(
 		bitmapidx.Entry{ImageID: 1, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("favorite")},
@@ -40,11 +42,26 @@ func main() {
 	); err != nil {
 		log.Fatal(err)
 	}
-	if err := album.Add(
+	if err := tagsBatch.Apply(); err != nil {
+		log.Fatal(err)
+	}
+	tagsBatch.Close()
+	if err := tags.Barrier(); err != nil {
+		log.Fatal(err)
+	}
+	albumBatch := album.NewBatch()
+	if err := albumBatch.Add(
 		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("holiday")},
 		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("holiday")},
 		bitmapidx.Entry{ImageID: 4, Value: bitmapidx.StringValue("holiday")},
 	); err != nil {
+		log.Fatal(err)
+	}
+	if err := albumBatch.Apply(); err != nil {
+		log.Fatal(err)
+	}
+	albumBatch.Close()
+	if err := album.Barrier(); err != nil {
 		log.Fatal(err)
 	}
 

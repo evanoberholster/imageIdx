@@ -23,7 +23,7 @@ import (
 //	| repeated maintenance           | none                     | idempotent no-ops     | TestMaintenanceIdempotent
 func TestStrayTmpFilesIgnored(t *testing.T) {
 	dir := t.TempDir()
-	store := mustNewStore(t, dir, StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}})
+	store := mustNewStore(t, dir, testStoreSpec())
 	if err := store.Perceptual().Apply(seedEntries(8)); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestStrayTmpFilesIgnored(t *testing.T) {
 
 func TestMaintenanceIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	store := mustNewStore(t, dir, StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}})
+	store := mustNewStore(t, dir, testStoreSpec())
 	if err := store.Perceptual().Apply(seedEntries(8)); err != nil {
 		t.Fatal(err)
 	}

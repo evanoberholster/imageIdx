@@ -9,7 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // blockHandle is one immutable sorted block. records holds Count*RecordSize
@@ -51,7 +52,7 @@ func (v *exactIndexView) effectiveCount() uint64 {
 // the read lock, maintenance takes the exclusive lock.
 type ExactIndex struct {
 	view    atomic.Pointer[exactIndexView]
-	readers *indexutil.ReaderTracker
+	readers *storage.ReaderTracker
 
 	writes    chan *exactBatch
 	barriers  chan chan barrierResult
@@ -61,7 +62,7 @@ type ExactIndex struct {
 	closeOnce sync.Once
 
 	config    ExactConfig
-	indexID   uint64
+	namespace common.Namespace
 	flags     uint32
 	algorithm Algorithm
 
@@ -146,7 +147,7 @@ func releaseExactBatch(batch *exactBatch) {
 // initial entries. Duplicate (Hash, ImageID) pairs are rejected; ImageID 0 is
 // reserved. An optional reader tracker lets Store share one tracker across its
 // indexes.
-func newExactIndex(spec ExactSpec, cfg ExactConfig, readers ...*indexutil.ReaderTracker) (*ExactIndex, error) {
+func newExactIndex(spec ExactSpec, cfg ExactConfig, readers ...*storage.ReaderTracker) (*ExactIndex, error) {
 	if !spec.Algorithm.Valid() {
 		return nil, ErrInvalidAlgorithm
 	}
@@ -179,7 +180,7 @@ func newExactIndex(spec ExactSpec, cfg ExactConfig, readers ...*indexutil.Reader
 		blocks[i] = blockHandle{first: part[0].Hash, records: rec}
 	}
 	idx := &ExactIndex{
-		config: cfg, indexID: spec.IndexID, flags: spec.Flags, algorithm: spec.Algorithm,
+		config: cfg, namespace: spec.Namespace, flags: spec.Flags, algorithm: spec.Algorithm,
 		readers: chooseReaders(readers), writes: make(chan *exactBatch, exactWriteQueue),
 		barriers: make(chan chan barrierResult), stop: make(chan struct{}),
 	}
@@ -203,7 +204,7 @@ func (i *ExactIndex) startWriterLoop() {
 func (i *ExactIndex) Metadata() ExactMetadata {
 	v := i.view.Load()
 	return ExactMetadata{
-		IndexID: i.indexID, Flags: i.flags, Algorithm: i.algorithm,
+		Namespace: i.namespace, Flags: i.flags, Algorithm: i.algorithm,
 		Generation: v.generation, BaseCount: v.liveCount, BlockCount: uint32(len(v.blocks)),
 		OverlayCount: uint64(v.overlay.ids()),
 	}

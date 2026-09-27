@@ -4,23 +4,23 @@ import (
 	"errors"
 	"slices"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
-var errACLStore = errors.New("search: WithACL requires a store with ACL fields")
+var errACLStore = errors.New("search: WithACL requires a store with ACL namespaces")
 
 func compileACL(store *bitmapidx.Index, clause aclClause) (stage, error) {
 	if store == nil {
 		return stage{}, errACLStore
 	}
-	user, err := NewUserACL(imageidx.UserID(clause.userID))
+	user, err := NewUserACL(common.UserID(clause.userID))
 	if err != nil {
 		return stage{}, err
 	}
-	users, ok := store.Lookup(bitmapidx.IndexTypeUserACL)
-	if !ok || users.Field().Kind != bitmapidx.KindEnum {
+	users, ok := store.Lookup(common.NamespaceUserACL)
+	if !ok || users.Spec().Kind != bitmapidx.KindEnum {
 		return stage{}, errACLStore
 	}
 	userQuery, err := users.Compile(user.Value())
@@ -30,13 +30,13 @@ func compileACL(store *bitmapidx.Index, clause aclClause) (stage, error) {
 	queries := make([]bitmapidx.Query, 0, 1+len(clause.groupIDs))
 	queries = append(queries, userQuery)
 	if len(clause.groupIDs) != 0 {
-		groups, ok := store.Lookup(bitmapidx.IndexTypeGroupACL)
-		if !ok || groups.Field().Kind != bitmapidx.KindEnum {
+		groups, ok := store.Lookup(common.NamespaceGroupACL)
+		if !ok || groups.Spec().Kind != bitmapidx.KindEnum {
 			return stage{}, errACLStore
 		}
 		seen := make([]uint64, 0, len(clause.groupIDs))
 		for _, id := range clause.groupIDs {
-			group, err := NewGroupACL(imageidx.GroupID(id))
+			group, err := NewGroupACL(common.GroupID(id))
 			if err != nil {
 				return stage{}, err
 			}

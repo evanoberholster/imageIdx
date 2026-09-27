@@ -10,17 +10,19 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
-// TestHeavyStress is an opt-in, large-scale soak: many fields, a large item
+// TestHeavyStress is an opt-in, large-scale soak: many namespaces, a large item
 // space, hundreds of readers, and multiple writers against one persistent
 // store, with a maintainer checkpointing concurrently. It is gated behind
 // BITMAPIDX_HEAVY so normal test runs stay fast. Scale with HEAVY_* env vars.
 //
 // Interpretation: HEAVY_ITEMS is the number of distinct database image IDs;
-// HEAVY_FIELDS is the number of field indexes; each item is indexed into
-// HEAVY_FIELDS_PER_ITEM of them. Total memberships is
-// items*fieldsPerItem, which is what bounds load time and WAL.
+// HEAVY_NAMESPACES is the number of namespace indexes; each item is indexed into
+// HEAVY_NAMESPACES_PER_ITEM of them. Total memberships is
+// items*namespacesPerItem, which is what bounds load time and WAL.
 func TestHeavyStress(t *testing.T) {
 	if os.Getenv("BITMAPIDX_HEAVY") == "" {
 		t.Skip("set BITMAPIDX_HEAVY=1 to run the heavy soak")
@@ -28,32 +30,32 @@ func TestHeavyStress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
 	}
-	fieldsN := heavyInt("HEAVY_FIELDS", 100)
+	namespacesN := heavyInt("HEAVY_NAMESPACES", 100)
 	items := heavyInt("HEAVY_ITEMS", 10_000_000)
-	perItem := heavyInt("HEAVY_FIELDS_PER_ITEM", 2)
+	perItem := heavyInt("HEAVY_NAMESPACES_PER_ITEM", 2)
 	readers := heavyInt("HEAVY_READERS", 200)
 	writers := heavyInt("HEAVY_WRITERS", 10)
 	seconds := heavyInt("HEAVY_SECONDS", 30)
-	valuesN := heavyInt("HEAVY_VALUES_PER_FIELD", 64)
+	valuesN := heavyInt("HEAVY_VALUES_PER_NAMESPACE", 64)
 	checkpointEvery := heavyInt("HEAVY_CHECKPOINT_EVERY", 2_000_000)
 	batchSize := heavyInt("HEAVY_BATCH", 64)
 	durability := DurabilityOS
 	if os.Getenv("HEAVY_DURABILITY") == "sync" {
 		durability = DurabilitySync
 	}
-	if fieldsN < 1 || items < 1 || perItem < 1 || valuesN < 1 || writers < 0 || readers < 0 || batchSize < 1 {
+	if namespacesN < 1 || items < 1 || perItem < 1 || valuesN < 1 || writers < 0 || readers < 0 || batchSize < 1 {
 		t.Fatal("invalid heavy parameters")
 	}
-	if perItem > fieldsN {
-		perItem = fieldsN
+	if perItem > namespacesN {
+		perItem = namespacesN
 	}
-	const firstType = IndexType(100)
+	const firstType = common.Namespace(100)
 
-	fields := make([]Field, fieldsN)
-	for f := 0; f < fieldsN; f++ {
-		fields[f] = enumField(firstType + IndexType(f))
+	namespaces := make([]NamespaceSpec, namespacesN)
+	for f := 0; f < namespacesN; f++ {
+		namespaces[f] = enumNamespace(firstType + common.Namespace(f))
 	}
-	config := FieldConfig{}
+	config := NamespaceConfig{}
 	dir := t.TempDir()
 	// Bulk load is always written with OS durability; a sync-mode run reopens
 	// the checkpointed store so the measured phase pays per-write fsync.
@@ -61,29 +63,29 @@ func TestHeavyStress(t *testing.T) {
 	if durability == DurabilitySync {
 		loadDurability = DurabilityOS
 	}
-	store, err := NewIndex(dir, fields, config, loadDurability)
+	store, err := NewIndex(dir, namespaces, config, loadDurability)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	indexes := make([]*FieldIndex, fieldsN)
-	for f := 0; f < fieldsN; f++ {
-		index, ok := store.Lookup(firstType + IndexType(f))
+	indexes := make([]*NamespaceIndex, namespacesN)
+	for f := 0; f < namespacesN; f++ {
+		index, ok := store.Lookup(firstType + common.Namespace(f))
 		if !ok {
-			t.Fatalf("field %d missing", f)
+			t.Fatalf("namespace %d missing", f)
 		}
 		indexes[f] = index
 	}
 
-	values := make([][][]byte, fieldsN)
-	for f := 0; f < fieldsN; f++ {
+	values := make([][][]byte, namespacesN)
+	for f := 0; f < namespacesN; f++ {
 		values[f] = make([][]byte, valuesN)
 		for v := 0; v < valuesN; v++ {
 			values[f][v] = []byte(fmt.Sprintf("f%d-v%d", f, v))
 		}
 	}
-	fieldFor := func(item, k int) int {
-		return int((uint64(item)*2654435761 + uint64(k)*40503) % uint64(fieldsN))
+	namespaceFor := func(item, k int) int {
+		return int((uint64(item)*2654435761 + uint64(k)*40503) % uint64(namespacesN))
 	}
 	valueFor := func(item int) int {
 		return int((uint64(item) * 2246822519) % uint64(valuesN))
@@ -94,7 +96,7 @@ func TestHeavyStress(t *testing.T) {
 	runtime.ReadMemStats(&memBefore)
 	loadStart := time.Now()
 
-	batches := make([][]Entry, fieldsN)
+	batches := make([][]Entry, namespacesN)
 	for f := range batches {
 		batches[f] = make([]Entry, 0, 4096)
 	}
@@ -105,7 +107,12 @@ func TestHeavyStress(t *testing.T) {
 			return nil
 		}
 		entries := batches[f]
-		if err := indexes[f].Apply(FieldMutation{Add: entries}); err != nil {
+		batch := indexes[f].NewBatch()
+		defer batch.Close()
+		if err := batch.Add(entries...); err != nil {
+			return err
+		}
+		if err := batch.Apply(); err != nil {
 			return err
 		}
 		batches[f] = entries[:0]
@@ -134,7 +141,7 @@ func TestHeavyStress(t *testing.T) {
 		var chosen [16]int
 		n := 0
 		for k := 0; k < perItem; k++ {
-			f := fieldFor(item, k)
+			f := namespaceFor(item, k)
 			duplicate := false
 			for j := 0; j < n; j++ {
 				if chosen[j] == f {
@@ -181,10 +188,10 @@ func TestHeavyStress(t *testing.T) {
 			t.Fatalf("reopen for sync durability: %v", err)
 		}
 		indexes = indexes[:0]
-		for f := 0; f < fieldsN; f++ {
-			index, ok := store.Lookup(firstType + IndexType(f))
+		for f := 0; f < namespacesN; f++ {
+			index, ok := store.Lookup(firstType + common.Namespace(f))
 			if !ok {
-				t.Fatalf("field %d missing after reopen", f)
+				t.Fatalf("namespace %d missing after reopen", f)
 			}
 			indexes = append(indexes, index)
 		}
@@ -209,7 +216,7 @@ func TestHeavyStress(t *testing.T) {
 	var writersWG sync.WaitGroup
 	perWriter := 1
 	if writers > 0 {
-		perWriter = fieldsN / writers
+		perWriter = namespacesN / writers
 		if perWriter < 1 {
 			perWriter = 1
 		}
@@ -219,31 +226,35 @@ func TestHeavyStress(t *testing.T) {
 		go func(w int) {
 			defer writersWG.Done()
 			src := rand.New(rand.NewSource(int64(w) + 1))
-			lo := (w * perWriter) % fieldsN
-			batch := make([]Entry, 0, batchSize)
+			lo := (w * perWriter) % namespacesN
+			entries := make([]Entry, 0, batchSize)
 			for {
 				select {
 				case <-stop:
 					return
 				default:
 				}
-				f := (lo + src.Intn(perWriter)) % fieldsN
-				batch = batch[:0]
+				f := (lo + src.Intn(perWriter)) % namespacesN
+				entries = entries[:0]
 				for n := 0; n < batchSize; n++ {
 					id := ImageID(src.Intn(items) + 1)
 					v := src.Intn(valuesN)
-					batch = append(batch, Entry{ImageID: id, Value: BytesValue(values[f][v])})
+					entries = append(entries, Entry{ImageID: id, Value: BytesValue(values[f][v])})
 				}
+				wb := indexes[f].NewBatch()
+				var err error
 				if src.Intn(4) == 0 {
-					if err := indexes[f].Remove(batch...); err != nil {
-						fail(err)
-						return
-					}
+					err = wb.Remove(entries...)
 				} else {
-					if err := indexes[f].Add(batch...); err != nil {
-						fail(err)
-						return
-					}
+					err = wb.Add(entries...)
+				}
+				if err == nil {
+					err = wb.Apply()
+				}
+				wb.Close()
+				if err != nil {
+					fail(err)
+					return
 				}
 				writeOps.Add(int64(batchSize))
 			}
@@ -261,7 +272,7 @@ func TestHeavyStress(t *testing.T) {
 					return
 				default:
 				}
-				f := src.Intn(fieldsN)
+				f := src.Intn(namespacesN)
 				v := src.Intn(valuesN)
 				value := BytesValue(values[f][v])
 				if _, err := indexes[f].CountValues(value); err != nil {
@@ -339,8 +350,8 @@ func TestHeavyStress(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&memAfter)
 
-	t.Logf("HEAVY results: fields=%d items=%d memberships=%d readers=%d writers=%d values/field=%d",
-		fieldsN, items, memberships, readers, writers, valuesN)
+	t.Logf("HEAVY results: namespaces=%d items=%d memberships=%d readers=%d writers=%d values/namespace=%d",
+		namespacesN, items, memberships, readers, writers, valuesN)
 	t.Logf("load: %s (%.0f memberships/s), phase: %ds", loadDuration.Round(time.Millisecond),
 		float64(memberships)/loadDuration.Seconds(), seconds)
 	t.Logf("ops: reads=%d (%.0f/s) writes=%d (%.0f/s) checkpoints=%d",
@@ -360,12 +371,12 @@ func TestHeavyStress(t *testing.T) {
 	}
 	for s := 0; s < 1000; s++ {
 		item := (s*sample)%items + 1
-		f := fieldFor(item, 0)
+		f := namespaceFor(item, 0)
 		v := valueFor(item)
-		idx, _ := reopened.Lookup(firstType + IndexType(f))
+		idx, _ := reopened.Lookup(firstType + common.Namespace(f))
 		ok, err := idx.Contains(ImageID(item), BytesValue(values[f][v]))
 		if err != nil || !ok {
-			t.Fatalf("reopen spot-check item=%d field=%d ok=%v err=%v", item, f, ok, err)
+			t.Fatalf("reopen spot-check item=%d namespace=%d ok=%v err=%v", item, f, ok, err)
 		}
 	}
 }

@@ -13,10 +13,10 @@ import (
 )
 
 func TestBulkExecutionReportsStageErrors(t *testing.T) {
-	field := benchmarkEnumField(t, 120, "x", []uint64{1})
-	// Compile rejects a range over an enum field. Construct the internal
+	namespaceIndex := benchmarkEnumNamespace(t, 120, "x", []uint64{1})
+	// Compile rejects a range over an enum namespace. Construct the internal
 	// stage directly to verify the bulk executor does not hide index errors.
-	plan := Plan{stages: []stage{{kind: StageField, fieldIndex: field, fieldKind: fieldRange, fieldRange: bitmapidx.Between(1, 2)}}}
+	plan := Plan{stages: []stage{{kind: StageNamespace, namespaceIndex: namespaceIndex, namespaceKind: namespaceRange, namespaceRange: bitmapidx.Between(1, 2)}}}
 	prefix := []ImageID{99}
 	got, err := plan.AppendIDs(context.Background(), prefix, nil)
 	if !errors.Is(err, bitmapidx.ErrInvalidRange) || !slices.Equal(got, prefix) {
@@ -32,15 +32,15 @@ func TestBulkExecutionReportsStageErrors(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = SearchOnce(cancelled, nil, AllValues(field, bitmapidx.StringValue("x")))
+	_, err = SearchOnce(cancelled, nil, AllValues(namespaceIndex, bitmapidx.StringValue("x")))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 }
 
 func TestPlanGeoEstimateIsOnlyAHint(t *testing.T) {
-	tags := benchmarkEnumField(t, 100, "x", nil)
-	geo, err := bitmapidx.NewGeoField(101, nil, bitmapidx.FieldConfig{})
+	tags := benchmarkEnumNamespace(t, 100, "x", nil)
+	geo, err := bitmapidx.NewGeoNamespace(101, nil, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,12 +50,12 @@ func TestPlanGeoEstimateIsOnlyAHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tags.Add(bitmapidx.Entry{ImageID: 1, Value: bitmapidx.StringValue("x")}); err != nil {
-		t.Fatal(err)
-	}
-	if err := geo.Move(bitmapidx.Move{ImageID: 1, To: int64(key), HasTo: true}); err != nil {
-		t.Fatal(err)
-	}
+	commitBitmap(t, tags, func(b *bitmapidx.Batch) error {
+		return b.Add(bitmapidx.Entry{ImageID: 1, Value: bitmapidx.StringValue("x")})
+	})
+	commitBitmap(t, geo, func(b *bitmapidx.Batch) error {
+		return b.Move(bitmapidx.Move{ImageID: 1, To: int64(key), HasTo: true})
+	})
 	if got, err := p.AppendIDs(context.Background(), nil, nil); err != nil || !slices.Equal(got, []ImageID{1}) {
 		t.Fatal(got)
 	}
@@ -98,7 +98,7 @@ func TestPagesCountVisitAndBufferedTimestamps(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ti.Close()
-	tags := benchmarkEnumField(t, 110, "x", []uint64{3, 6, 9, 20})
+	tags := benchmarkEnumNamespace(t, 110, "x", []uint64{3, 6, 9, 20})
 	for _, exact := range []bool{false, true} {
 		var opts []TimestampOption
 		if exact {
@@ -134,7 +134,7 @@ func TestPagesCountVisitAndBufferedTimestamps(t *testing.T) {
 }
 
 func TestFilterIDsDeltasAndRange(t *testing.T) {
-	f := benchmarkEnumField(t, 100, "x", []uint64{1, 3, 5})
+	f := benchmarkEnumNamespace(t, 100, "x", []uint64{1, 3, 5})
 	if err := f.Compact(); err != nil {
 		t.Fatal(err)
 	}
@@ -142,25 +142,25 @@ func TestFilterIDsDeltasAndRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Remove(bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("x")}); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Add(bitmapidx.Entry{ImageID: 4, Value: bitmapidx.StringValue("x")}); err != nil {
-		t.Fatal(err)
-	}
+	commitBitmap(t, f, func(b *bitmapidx.Batch) error {
+		return b.Remove(bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("x")})
+	})
+	commitBitmap(t, f, func(b *bitmapidx.Batch) error {
+		return b.Add(bitmapidx.Entry{ImageID: 4, Value: bitmapidx.StringValue("x")})
+	})
 	got, err := p.FilterIDs(context.Background(), nil, []ImageID{3, 4, 5, 1, 4}, nil)
 	if err != nil || !slices.Equal(got, []ImageID{4, 5, 1, 4}) {
 		t.Fatal(got, err)
 	}
-	numeric, err := bitmapidx.NewFieldIndex(bitmapidx.Field{Type: 102, Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}}, bitmapidx.FieldConfig{})
+	numeric, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{Namespace: 102, Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer numeric.Close()
 	for n := 1; n <= 20; n++ {
-		if err := numeric.Move(bitmapidx.Move{ImageID: uint64(n), To: int64(n), HasTo: true}); err != nil {
-			t.Fatal(err)
-		}
+		commitBitmap(t, numeric, func(b *bitmapidx.Batch) error {
+			return b.Move(bitmapidx.Move{ImageID: uint64(n), To: int64(n), HasTo: true})
+		})
 	}
 	for _, compact := range []bool{false, true} {
 		if compact {
@@ -168,7 +168,7 @@ func TestFilterIDsDeltasAndRange(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		rangePlan, err := Compile(FieldRange(numeric, bitmapidx.Between(4, 10)))
+		rangePlan, err := Compile(NamespaceRange(numeric, bitmapidx.Between(4, 10)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -180,7 +180,7 @@ func TestFilterIDsDeltasAndRange(t *testing.T) {
 }
 
 func TestPersistentSourceDoesNotPinCallbacks(t *testing.T) {
-	s, err := bitmapidx.NewIndex(t.TempDir(), []bitmapidx.Field{{Type: 100, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType}}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	s, err := bitmapidx.NewIndex(t.TempDir(), []bitmapidx.NamespaceSpec{{Namespace: 100, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType}}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,9 +190,7 @@ func TestPersistentSourceDoesNotPinCallbacks(t *testing.T) {
 	for n := range entries {
 		entries[n] = bitmapidx.Entry{ImageID: uint64(n + 1), Value: bitmapidx.StringValue("x")}
 	}
-	if err := idx.Add(entries...); err != nil {
-		t.Fatal(err)
-	}
+	commitBitmap(t, idx, func(b *bitmapidx.Batch) error { return b.Add(entries...) })
 	if err := s.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
@@ -248,20 +246,20 @@ func TestExecutorRetentionRefreshAndValidation(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	a := benchmarkEnumField(t, 111, "x", []uint64{1})
-	b := benchmarkEnumField(t, 112, "x", []uint64{1, 2})
+	a := benchmarkEnumNamespace(t, 111, "x", []uint64{1})
+	b := benchmarkEnumNamespace(t, 112, "x", []uint64{1, 2})
 	p, err = Compile(AllValues(a, bitmapidx.StringValue("x")), AllValues(b, bitmapidx.StringValue("x")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Add(bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("x")}, bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("x")}); err != nil {
-		t.Fatal(err)
-	}
+	commitBitmap(t, a, func(b *bitmapidx.Batch) error {
+		return b.Add(bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("x")}, bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("x")})
+	})
 	fresh, err := p.Refresh(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Stages()[0].Field != 111 || fresh.Stages()[0].Field != 112 {
+	if p.Stages()[0].Namespace != 111 || fresh.Stages()[0].Namespace != 112 {
 		t.Fatal(p.Stages(), fresh.Stages())
 	}
 	if !fresh.Stages()[0].CanProbe || !fresh.Stages()[0].OrderedSource {

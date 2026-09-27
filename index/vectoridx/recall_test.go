@@ -11,7 +11,7 @@ import (
 func buildRecallIndex(t *testing.T, n int, seed int64) (*VectorIdx, [][]float32) {
 	t.Helper()
 	idx, err := New(Config{
-		SpaceID:        NewSpaceID(IndexTypeImage, 9),
+		Namespace:      testNamespace,
 		Dimensions:     Dim512,
 		ElementType:    ElementFloat32,
 		M:              DefaultM,

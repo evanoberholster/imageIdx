@@ -1,8 +1,10 @@
 package hashidx
 
 import (
+	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,7 +12,7 @@ import (
 
 func mustNewPersistent(t *testing.T, dir string, cfg Config) *Index {
 	t.Helper()
-	idx, err := newIndex(dir, cfg, DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(cfg), DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +256,7 @@ func TestManifestVersionRejected(t *testing.T) {
 	}
 
 	storeDir := t.TempDir()
-	mustNewStore(t, storeDir, StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}})
+	mustNewStore(t, storeDir, testStoreSpec())
 	if pGen, eGen, err := ReadStoreManifest(storeDir); err != nil || pGen != 1 || eGen != 1 {
 		t.Fatalf("fresh joint anchor = (%d, %d, %v), want (1, 1, nil)", pGen, eGen, err)
 	}
@@ -546,7 +548,7 @@ func TestVacuumReclaimsWALStorage(t *testing.T) {
 
 func TestPersistentDurabilitySync(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := newIndex(dir, Config{RecordsPerPage: 16}, DurabilitySync)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{RecordsPerPage: 16}), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +573,7 @@ func persistentDir(t *testing.T) string {
 func TestCreateOpenCheckpoint(t *testing.T) {
 	dir := persistentDir(t)
 	entries := entriesForRange(0, 30, 1)
-	idx, err := newExact(dir, ExactSpec{IndexID: 3, Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 1024}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Namespace: testExactNamespace, Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 1024}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +599,7 @@ func TestCreateOpenCheckpoint(t *testing.T) {
 			t.Fatalf("post-open lookup %d = %v", i, got)
 		}
 	}
-	if md := reopened.Metadata(); md.IndexID != 3 || md.Algorithm != AlgorithmSHA256 || md.BaseCount != 30 {
+	if md := reopened.Metadata(); md.Namespace != testExactNamespace || md.Algorithm != AlgorithmSHA256 || md.BaseCount != 30 {
 		t.Fatalf("metadata = %+v", md)
 	}
 }
@@ -710,6 +712,30 @@ func TestExactCorruptManifestRejected(t *testing.T) {
 	}
 	if _, err := openExact(dir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("manifest corruption err = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestExactOversizedNamespaceRejected(t *testing.T) {
+	manifest := exactManifest{
+		generation: 3, namespace: 7, liveCount: 11, blockCount: 2,
+		walOffset: 128, flags: 0, blockSize: DefaultBlockSize,
+		algorithm: AlgorithmSHA256, targetFillPct: DefaultTargetFillPct,
+		walEpoch: 1,
+	}
+	oversized := uint64(math.MaxUint16) + 1
+	data := encodeManifest(manifest)
+	binary.LittleEndian.PutUint64(data[16:24], oversized)
+	binary.LittleEndian.PutUint32(data[60:64], crc32.ChecksumIEEE(data[:60]))
+	if _, err := decodeManifest(data); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("oversized manifest namespace err = %v, want ErrCorrupt", err)
+	}
+
+	header := make([]byte, exactGenHeaderSize)
+	encodeExactGenHeader(header, manifest)
+	binary.LittleEndian.PutUint64(header[16:24], oversized)
+	binary.LittleEndian.PutUint32(header[124:128], crc32.ChecksumIEEE(header[:124]))
+	if _, err := decodeExactGenHeader(header); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("oversized generation namespace err = %v, want ErrCorrupt", err)
 	}
 }
 
@@ -918,7 +944,7 @@ func TestVacuumAndReopen(t *testing.T) {
 
 func TestAlgorithmPersistedAuthoritatively(t *testing.T) {
 	dir := t.TempDir()
-	spec := ExactSpec{IndexID: 8, Algorithm: AlgorithmBLAKE3, Entries: []ExactEntry{{Hash: SumBLAKE3([]byte("x")), ImageID: 1}}}
+	spec := ExactSpec{Namespace: testExactNamespace, Algorithm: AlgorithmBLAKE3, Entries: []ExactEntry{{Hash: SumBLAKE3([]byte("x")), ImageID: 1}}}
 	idx, err := newExact(dir, spec, ExactConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)

@@ -17,7 +17,7 @@ func breakWAL(t *testing.T, close func() error) {
 
 func TestPerceptualFailedWALRequiresRecovery(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := newIndex(dir, Config{}, DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{}), DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

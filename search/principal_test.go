@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
@@ -17,11 +17,11 @@ func TestPrincipalValidation(t *testing.T) {
 	}
 	// Only zero is rejected: every other ID, extremes included, is a
 	// valid principal with no syntax to validate.
-	for _, id := range []imageidx.UserID{1, 42, ^imageidx.UserID(0)} {
+	for _, id := range []common.UserID{1, 42, ^common.UserID(0)} {
 		if _, err := NewUserACL(id); err != nil {
 			t.Fatalf("NewUserACL(%d) err = %v, want nil", id, err)
 		}
-		if _, err := NewGroupACL(imageidx.GroupID(id)); err != nil {
+		if _, err := NewGroupACL(common.GroupID(id)); err != nil {
 			t.Fatalf("NewGroupACL(%d) err = %v, want nil", id, err)
 		}
 	}
@@ -53,8 +53,8 @@ func TestPrincipalValueRoundTrip(t *testing.T) {
 			t.Fatalf("group parse accepted %d bytes", len(garbage))
 		}
 	}
-	// Equal IDs hash distinctly per field; there is no cross-namespace
-	// confusion left to test — that property now belongs to the field.
+	// Equal IDs hash distinctly per namespace; hash domain separation over
+	// the namespace number is what keeps them apart.
 	group, _ := NewGroupACL(42)
 	if _, ok := ParseGroupACL(group.Value().Bytes); !ok {
 		t.Fatal("group round trip failed")

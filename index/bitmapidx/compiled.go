@@ -4,16 +4,16 @@ import (
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
-// Query is a compiled, reusable field conjunction. Values are
+// Query is a compiled, reusable namespace conjunction. Values are
 // canonicalized, hashed, deduplicated, and dictionary-resolved once at
 // Compile time; each execution reads the index's current published view,
 // so writes made after compiling are visible without recompiling. A Query
 // is safe for concurrent use and holds no query scratch: execution uses
 // pooled buffers internally. The zero value is valid and matches nothing.
 type Query struct {
-	index    *FieldIndex
-	keys     []FieldKey
-	bases    []FieldKey
+	index    *NamespaceIndex
+	keys     []NamespaceKey
+	bases    []NamespaceKey
 	canon    [][]byte
 	dictGen  uint64
 	complete bool
@@ -25,7 +25,7 @@ type Query struct {
 // compiling against a closed index. Values absent from the dictionary keep
 // their base hash and canonical bytes and resolve lazily at execution, so
 // images added after compiling are visible without recompiling.
-func (i *FieldIndex) Compile(values ...Value) (Query, error) {
+func (i *NamespaceIndex) Compile(values ...Value) (Query, error) {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
 	view := i.view.Load()
@@ -35,11 +35,11 @@ func (i *FieldIndex) Compile(values ...Value) (Query, error) {
 	if i.closed.Load() {
 		return q, nil
 	}
-	items, err := i.canonicalizeValues(i.field(), values, true)
+	items, err := i.canonicalizeValues(i.spec(), values, true)
 	if err != nil {
 		return Query{}, err
 	}
-	bases := make([]FieldKey, len(items))
+	bases := make([]NamespaceKey, len(items))
 	canon := make([][]byte, len(items))
 	for index, item := range items {
 		bases[index] = item.base
@@ -57,9 +57,9 @@ func (i *FieldIndex) Compile(values ...Value) (Query, error) {
 // with AND semantics. Execution needs no analyzer and allocates no
 // tokens. A query producing no tokens compiles to a Query that matches
 // nothing.
-func (i *FieldIndex) CompileText(query string) (Query, error) {
-	if i.field().Kind != KindText {
-		return Query{}, ErrFieldMismatch
+func (i *NamespaceIndex) CompileText(query string) (Query, error) {
+	if i.spec().Kind != KindText {
+		return Query{}, ErrNamespaceMismatch
 	}
 	tokens, err := i.analyzer.TokenSet(query, nil)
 	if err != nil {
@@ -82,17 +82,17 @@ func (i *FieldIndex) CompileText(query string) (Query, error) {
 // last use of keys. keys aliases scratch when scratch is non-nil; the caller
 // must release scratch only after consuming keys. ok is false when a hashed
 // value no longer resolves, which empties the conjunction.
-func (q Query) keysFor(view *fieldView) (keys []FieldKey, scratch *[]FieldKey, ok bool) {
+func (q Query) keysFor(view *namespaceView) (keys []NamespaceKey, scratch *[]NamespaceKey, ok bool) {
 	if len(q.bases) == 0 {
 		return nil, nil, true
 	}
 	if q.complete && view.dictGen == q.dictGen {
 		return q.keys, nil, true
 	}
-	scratch = acquireFieldKeys(len(q.bases))
+	scratch = acquireNamespaceKeys(len(q.bases))
 	keys, ok = q.resolveInto(view, scratch)
 	if !ok {
-		releaseFieldKeys(scratch)
+		releaseNamespaceKeys(scratch)
 		return nil, nil, false
 	}
 	return keys, scratch, true
@@ -101,7 +101,7 @@ func (q Query) keysFor(view *fieldView) (keys []FieldKey, scratch *[]FieldKey, o
 // resolveInto writes re-resolved keys into scratch, whose capacity must hold
 // len(bases). The returned slice aliases scratch; the caller must not retain
 // it past release.
-func (q Query) resolveInto(view *fieldView, scratch *[]FieldKey) ([]FieldKey, bool) {
+func (q Query) resolveInto(view *namespaceView, scratch *[]NamespaceKey) ([]NamespaceKey, bool) {
 	keys := (*scratch)[:0]
 	for index, base := range q.bases {
 		canonical := q.canon[index]
@@ -109,7 +109,7 @@ func (q Query) resolveInto(view *fieldView, scratch *[]FieldKey) ([]FieldKey, bo
 			keys = append(keys, base)
 			continue
 		}
-		baseKey := FieldKey{Type: base.Type, Hash: base.Hash}
+		baseKey := NamespaceKey{Namespace: base.Namespace, Hash: base.Hash}
 		key, ok := view.dict.resolve(baseKey, canonical)
 		if !ok {
 			return nil, false
@@ -134,7 +134,7 @@ func (q Query) Match() (result roar.Bitmap, resultErr error) {
 	}
 	keys, scratch, ok := q.keysFor(view)
 	if scratch != nil {
-		defer releaseFieldKeys(scratch)
+		defer releaseNamespaceKeys(scratch)
 	}
 	if !ok {
 		return roar.Bitmap{}, nil
@@ -159,7 +159,7 @@ func (q Query) Count() (uint64, error) {
 	}
 	keys, scratch, ok := q.keysFor(view)
 	if scratch != nil {
-		defer releaseFieldKeys(scratch)
+		defer releaseNamespaceKeys(scratch)
 	}
 	if !ok {
 		return 0, nil
@@ -199,11 +199,17 @@ func (q Query) Filter(dst, candidates []ImageID) ([]ImageID, error) {
 	}
 	keys, scratch, ok := q.keysFor(view)
 	if scratch != nil {
-		defer releaseFieldKeys(scratch)
+		defer releaseNamespaceKeys(scratch)
 	}
 	if !ok || len(keys) == 0 {
 		return dst, nil
 	}
+	return view.filterResolved(dst, candidates, keys), nil
+}
+
+// filterResolved probes one published view with resolved keys. It preserves
+// candidate order and duplicates, including when dst aliases candidates.
+func (view *namespaceView) filterResolved(dst, candidates []ImageID, keys []NamespaceKey) []ImageID {
 	start := len(dst)
 	for n, key := range keys {
 		if n != 0 {
@@ -213,7 +219,7 @@ func (q Query) Filter(dst, candidates []ImageID) ([]ImageID, error) {
 		if !view.hasDeltas() {
 			p, ok := view.base.get(key)
 			if !ok {
-				return dst[:start], nil
+				return dst[:start]
 			}
 			if !p.isTiny() {
 				out = filterBitmap(out, candidates, p.bit)
@@ -236,7 +242,7 @@ func (q Query) Filter(dst, candidates []ImageID) ([]ImageID, error) {
 			break
 		}
 	}
-	return dst, nil
+	return dst
 }
 
 // Estimate returns a live upper bound using the smallest effective posting
@@ -254,7 +260,7 @@ func (q Query) Estimate() uint64 {
 	}
 	keys, scratch, ok := q.keysFor(view)
 	if scratch != nil {
-		defer releaseFieldKeys(scratch)
+		defer releaseNamespaceKeys(scratch)
 	}
 	if !ok || len(keys) == 0 {
 		return 0

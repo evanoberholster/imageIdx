@@ -105,8 +105,8 @@ for _, stage := range metrics.Stages {
 
 ## Predicates and planning
 
-`AllValues` requires every value; `FieldText` requires every analyzed
-token; `FieldRange` uses stored-grid bounds; `During` uses `[start,end)`
+`AllValues` requires every value; `NamespaceText` requires every analyzed
+token; `NamespaceRange` uses stored-grid bounds; `During` uses `[start,end)`
 with optional `ExactTimestamp` verification; `InCells` expands S2 cells.
 Validation happens at `Compile`. There are no OR/NOT combinators, except
 `WithACL`, which unions user/group bitmaps and intersects the result.

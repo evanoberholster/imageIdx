@@ -5,10 +5,12 @@ import (
 	"slices"
 	"sync"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func TestCompiledQueryParity(t *testing.T) {
-	index, names := benchmarkEnumField(t, 4, 20)
+	index, names := benchmarkEnumNamespace(t, 4, 20)
 	defer func() { _ = index.Close() }()
 
 	compiled, err := index.Compile(names...)
@@ -52,10 +54,10 @@ func TestCompiledQueryParity(t *testing.T) {
 }
 
 func TestCompiledQuerySeesLaterWrites(t *testing.T) {
-	index := mustField(t, enumField(IndexTypeTag), FieldConfig{})
-	if err := index.Add(Entry{ImageID: 1, Value: StringValue("a")}); err != nil {
-		t.Fatal(err)
-	}
+	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	commit(t, index, func(b *Batch) error {
+		return b.Add(Entry{ImageID: 1, Value: StringValue("a")})
+	})
 	compiled, err := index.Compile(StringValue("b"))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -68,9 +70,9 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 		t.Fatal("compiled query matched before the value existed")
 	}
 	// A value added after compiling is visible without recompiling.
-	if err := index.Add(Entry{ImageID: 2, Value: StringValue("b")}); err != nil {
-		t.Fatal(err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Add(Entry{ImageID: 2, Value: StringValue("b")})
+	})
 	got, err := compiled.Match()
 	if err != nil {
 		t.Fatalf("Match: %v", err)
@@ -80,12 +82,12 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	}
 
 	// Multi-value conjunctions see later writes too: image 3 holds both.
-	if err := index.Add(
-		Entry{ImageID: 3, Value: StringValue("a")},
-		Entry{ImageID: 3, Value: StringValue("b")},
-	); err != nil {
-		t.Fatal(err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Add(
+			Entry{ImageID: 3, Value: StringValue("a")},
+			Entry{ImageID: 3, Value: StringValue("b")},
+		)
+	})
 	both, err := index.Compile(StringValue("a"), StringValue("b"))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -103,12 +105,12 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	}
 
 	// A value vacuumed away empties the conjunction.
-	if err := index.Remove(
-		Entry{ImageID: 2, Value: StringValue("b")},
-		Entry{ImageID: 3, Value: StringValue("b")},
-	); err != nil {
-		t.Fatal(err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Remove(
+			Entry{ImageID: 2, Value: StringValue("b")},
+			Entry{ImageID: 3, Value: StringValue("b")},
+		)
+	})
 	if err := index.Vacuum(); err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +124,7 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 }
 
 func TestCompiledQueryValidation(t *testing.T) {
-	index := mustField(t, enumField(IndexTypeTag), FieldConfig{})
+	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 
 	empty, err := index.Compile()
 	if err != nil {
@@ -136,14 +138,14 @@ func TestCompiledQueryValidation(t *testing.T) {
 	if _, err := index.Compile(IntValue(7)); !errors.Is(err, ErrValueKind) {
 		t.Fatalf("wrong-kind Compile error = %v", err)
 	}
-	if _, err := index.CompileText("anything"); !errors.Is(err, ErrFieldMismatch) {
+	if _, err := index.CompileText("anything"); !errors.Is(err, ErrNamespaceMismatch) {
 		t.Fatalf("CompileText on enum error = %v", err)
 	}
 
-	text := mustField(t, textField(IndexTypeTag), FieldConfig{})
-	if err := text.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha beta"}}); err != nil {
-		t.Fatal(err)
-	}
+	text := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	commit(t, text, func(b *Batch) error {
+		return b.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha beta"}})
+	})
 	compiled, err := text.CompileText("alpha beta")
 	if err != nil {
 		t.Fatalf("CompileText: %v", err)
@@ -160,7 +162,7 @@ func TestCompiledQueryValidation(t *testing.T) {
 		t.Fatal("compiled text differs from MatchText")
 	}
 
-	closed, err := NewFieldIndex(enumField(IndexTypeTag), FieldConfig{})
+	closed, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +202,7 @@ func TestZeroQueryMatchesNothing(t *testing.T) {
 }
 
 func TestCompiledQueryReResolveDoesNotAllocate(t *testing.T) {
-	index, names := benchmarkEnumField(t, 4, 20)
+	index, names := benchmarkEnumNamespace(t, 4, 20)
 	query, err := index.Compile(names[0])
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -208,19 +210,19 @@ func TestCompiledQueryReResolveDoesNotAllocate(t *testing.T) {
 	// An unrelated value advances the dictionary generation, forcing every
 	// resolve through the re-resolution path rather than the compiled-key
 	// fast path.
-	if err := index.Add(Entry{ImageID: 1_000_000, Value: StringValue("unrelated-value")}); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Add(Entry{ImageID: 1_000_000, Value: StringValue("unrelated-value")})
+	})
 	view := index.view.Load()
 	if view.dictGen == query.dictGen {
 		t.Fatal("dictionary generation did not advance")
 	}
-	scratch := acquireFieldKeys(len(query.bases))
-	defer releaseFieldKeys(scratch)
+	scratch := acquireNamespaceKeys(len(query.bases))
+	defer releaseNamespaceKeys(scratch)
 	if _, ok := query.resolveInto(view, scratch); !ok {
 		t.Fatal("resolve unexpectedly failed")
 	}
-	// Pooled FieldKey scratch keeps re-resolution allocation-free.
+	// Pooled NamespaceKey scratch keeps re-resolution allocation-free.
 	allocs := testing.AllocsPerRun(100, func() {
 		if _, ok := query.resolveInto(view, scratch); !ok {
 			t.Error("resolve unexpectedly failed")
@@ -232,7 +234,7 @@ func TestCompiledQueryReResolveDoesNotAllocate(t *testing.T) {
 }
 
 func TestCompiledQueryConcurrent(t *testing.T) {
-	index, names := benchmarkEnumField(t, 4, 1_000)
+	index, names := benchmarkEnumNamespace(t, 4, 1_000)
 	defer func() { _ = index.Close() }()
 	compiled, err := index.Compile(names...)
 	if err != nil {

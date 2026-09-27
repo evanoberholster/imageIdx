@@ -7,34 +7,78 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/commit"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
+// hashCommitQueueCapacity bounds queued Apply requests. Apply blocks when
+// the queue is full, so bursty writers exert backpressure instead of
+// growing memory without bound.
+const hashCommitQueueCapacity = 64
+
+// applyRequest is one queued Apply call. Requests are pooled so the
+// per-call completion channel does not allocate in steady state.
+type applyRequest struct {
+	entries []Entry
+	done    chan error
+}
+
+var applyRequestPool = sync.Pool{New: func() any {
+	return &applyRequest{done: make(chan error, 1)}
+}}
+
+func acquireApplyRequest(entries []Entry) *applyRequest {
+	req := applyRequestPool.Get().(*applyRequest)
+	req.entries = entries
+	return req
+}
+
+func releaseApplyRequest(req *applyRequest) {
+	req.entries = nil
+	applyRequestPool.Put(req)
+}
+
 // Index is a persistent, mmap-backed perceptual-hash index. Readers load one
-// immutable view and search without locks; one serialized writer owns appends,
-// page sealing, checkpoint, and vacuum publication. There is no in-memory
-// mode: every Index owns its directory and WAL.
+// immutable view and search without locks; writes queue onto one
+// group-commit loop that coalesces whatever is waiting into a single WAL
+// sync and a single view publication. Apply blocks until its own commit
+// completes, so a call returns only after its entries are WAL-durable and
+// visible. There is no in-memory mode: every Index owns its directory and
+// WAL.
 type Index struct {
 	view    atomic.Pointer[indexView]
-	readers *indexutil.ReaderTracker
+	readers *storage.ReaderTracker
 
-	writerMu sync.Mutex
-	config   Config
-	closed   atomic.Bool
+	writerMu  sync.Mutex
+	config    Config
+	namespace common.Namespace
+	closed    atomic.Bool
 	// failed latches the first WAL error, guarded by writerMu. While set,
 	// writes and maintenance fail fast with it until close and reopen.
 	failed error
 
+	// commits is the single-owner group-commit loop. Requests queued while
+	// the loop is busy commit as one group sharing one WAL sync, one lock
+	// hold, and one view publication.
+	commits *commit.Queue[*applyRequest]
+	// groupEntries merges one commit group into a single publication. It
+	// is commit-loop owned and reused across groups.
+	groupEntries []Entry
+
 	persistence persistedState
 }
 
-// Metadata returns a copied summary of the current published view.
+// Metadata returns a copied summary of the current published view. Namespace
+// is the perceptual index's schema namespace and is zero for an index
+// constructed directly without a Store.
 func (i *Index) Metadata() Metadata {
 	v := i.view.Load()
 	if v == nil {
-		return Metadata{RecordsPerPage: i.config.RecordsPerPage}
+		return Metadata{Namespace: i.namespace, RecordsPerPage: i.config.RecordsPerPage}
 	}
 	return Metadata{
+		Namespace:      i.namespace,
 		Generation:     v.generation,
 		RecordCount:    v.count,
 		PageCount:      v.logicalPageCount(),
@@ -45,13 +89,15 @@ func (i *Index) Metadata() Metadata {
 // Add appends one entry. It is convenience syntax around Apply.
 func (i *Index) Add(entry Entry) error { return i.Apply([]Entry{entry}) }
 
-// Apply appends one batch of entries. The whole batch publishes once: all
-// six planes advance together, so a reader observes either none or all of
-// the batch. Batches past Config.MaxBatchEntries fail with ErrBatchTooLarge
-// before any WAL or view work. Apply validates entries, appends the WAL
-// batch first when the index is persistent, then publishes the new
-// immutable view. A WAL failure latches ErrRecoveryRequired: the view is
-// untouched, and later writes fail fast with it until close and reopen.
+// Apply appends one batch of entries and blocks until it is committed. The
+// whole batch publishes once: all six planes advance together, so a reader
+// observes either none or all of the batch. Batches past
+// Config.MaxBatchEntries fail with ErrBatchTooLarge before any WAL or view
+// work. Batches queued while the commit loop is busy are coalesced into one
+// WAL sync and one view publication, so N concurrent writers pay one fsync
+// per group under DurabilitySync. A WAL failure latches
+// ErrRecoveryRequired: the view is untouched, and later writes fail fast
+// with it until close and reopen.
 func (i *Index) Apply(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
@@ -64,23 +110,74 @@ func (i *Index) Apply(entries []Entry) error {
 			return ErrInvalidEntry
 		}
 	}
-	i.writerMu.Lock()
-	defer i.writerMu.Unlock()
 	if i.closed.Load() {
 		return ErrClosed
 	}
+	req := acquireApplyRequest(entries)
+	if !i.commits.Submit(req) {
+		releaseApplyRequest(req)
+		return ErrClosed
+	}
+	// A successful Submit is always committed, even across Close, so the
+	// completion signal is guaranteed.
+	err := <-req.done
+	releaseApplyRequest(req)
+	return err
+}
+
+// commitGroup is the commit.Queue callback. It holds writerMu for the whole
+// group, so it serializes with Checkpoint, Vacuum, and Close. It appends
+// one WAL frame per request, syncs once for the group under
+// DurabilitySync, merges the group into a single page append, and then
+// completes every waiter. Readers never interact with it: publication
+// stays one atomic view store, so reads keep their zero-lock guarantee.
+//
+// A WAL failure fails the whole group and publishes nothing; complete
+// frames written before the failure may still replay after recovery, the
+// same redo contract as a single synchronous Apply.
+func (i *Index) commitGroup(group []*applyRequest) {
+	i.writerMu.Lock()
+	defer i.writerMu.Unlock()
+	if i.closed.Load() {
+		respondApply(group, ErrClosed)
+		return
+	}
 	if i.failed != nil {
-		return i.failed
+		respondApply(group, i.failed)
+		return
 	}
 	i.persistence.mu.Lock()
-	err := appendHashWAL(i.persistence.wal, entries, i.persistence.durability)
-	i.persistence.mu.Unlock()
-	if err != nil {
-		i.failed = errors.Join(ErrRecoveryRequired, err)
-		return i.failed
+	var walErr error
+	for _, req := range group {
+		if err := appendHashWAL(i.persistence.wal, req.entries, false); err != nil {
+			walErr = err
+			break
+		}
 	}
-	i.appendEntriesLocked(entries)
-	return nil
+	if walErr == nil && i.persistence.durability == DurabilitySync {
+		walErr = i.persistence.wal.Sync()
+	}
+	i.persistence.mu.Unlock()
+	if walErr != nil {
+		i.failed = errors.Join(ErrRecoveryRequired, walErr)
+		respondApply(group, i.failed)
+		return
+	}
+	i.groupEntries = i.groupEntries[:0]
+	for _, req := range group {
+		i.groupEntries = append(i.groupEntries, req.entries...)
+	}
+	i.appendEntriesLocked(i.groupEntries)
+	respondApply(group, nil)
+}
+
+// respondApply completes every waiter in group with err. It runs only
+// after the group's last read of any request's entries, so a caller may
+// release its pooled request as soon as it observes the signal.
+func respondApply(group []*applyRequest, err error) {
+	for _, req := range group {
+		req.done <- err
+	}
 }
 
 // appendEntriesLocked writes entries into the active page, sealing full pages
@@ -176,14 +273,18 @@ func (i *Index) EntryAt(ordinal Ordinal) (Entry, bool) {
 // maintenance driver can poll every index type uniformly.
 func (i *Index) PendingCompactions() int64 { return 0 }
 
-// WaitIdle returns immediately; there is no background work to drain. It
+// WaitIdle returns immediately: every Apply blocks until its own commit is
+// published, so there is no caller-visible background work to drain. It
 // exists for the same cross-package symmetry as PendingCompactions.
 func (i *Index) WaitIdle(_ context.Context) error { return nil }
 
-// Close marks the index closed, drains readers, and releases the WAL and mmap
-// regions. Further Apply calls return ErrClosed and searches return no
-// results.
+// Close marks the index closed, drains queued commits, drains readers, and
+// releases the WAL and mmap regions. Queued Apply requests commit before
+// Close returns; an Apply racing Close may observe ErrClosed. Further Apply
+// calls return ErrClosed and searches return no results.
 func (i *Index) Close() error {
+	i.commits.Stop()
+	i.commits.Wait()
 	i.writerMu.Lock()
 	defer i.writerMu.Unlock()
 	if i.closed.Swap(true) {

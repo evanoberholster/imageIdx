@@ -34,8 +34,8 @@ var (
 		s := make([]roar.Bitmap, 0, 64)
 		return &s
 	}}
-	fieldKeySlicePool = sync.Pool{New: func() any {
-		s := make([]FieldKey, 0, 64)
+	namespaceKeySlicePool = sync.Pool{New: func() any {
+		s := make([]NamespaceKey, 0, 64)
 		return &s
 	}}
 )
@@ -114,25 +114,25 @@ func releaseBitmaps(p *[]roar.Bitmap) {
 	bitmapSlicePool.Put(p)
 }
 
-// acquireFieldKeys returns a scratch FieldKey buffer with capacity for at
+// acquireNamespaceKeys returns a scratch NamespaceKey buffer with capacity for at
 // least n entries, reset to length zero.
-func acquireFieldKeys(n int) *[]FieldKey {
-	p := fieldKeySlicePool.Get().(*[]FieldKey)
+func acquireNamespaceKeys(n int) *[]NamespaceKey {
+	p := namespaceKeySlicePool.Get().(*[]NamespaceKey)
 	if cap(*p) < n {
-		*p = make([]FieldKey, 0, n)
+		*p = make([]NamespaceKey, 0, n)
 	} else {
 		*p = (*p)[:0]
 	}
 	return p
 }
 
-// releaseFieldKeys returns scratch to the pool, dropping buffers whose
-// capacity exceeds maxPooledKeys. FieldKey carries no pointers, so no
+// releaseNamespaceKeys returns scratch to the pool, dropping buffers whose
+// capacity exceeds maxPooledKeys. NamespaceKey carries no pointers, so no
 // clearing is required.
-func releaseFieldKeys(p *[]FieldKey) {
+func releaseNamespaceKeys(p *[]NamespaceKey) {
 	if cap(*p) > maxPooledKeys {
 		return
 	}
 	*p = (*p)[:0]
-	fieldKeySlicePool.Put(p)
+	namespaceKeySlicePool.Put(p)
 }

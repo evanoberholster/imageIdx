@@ -192,7 +192,7 @@ func TestConfigVectorBytesTable(t *testing.T) {
 		{ElementFloat32, Dim1024, 4096},
 	}
 	for _, c := range cases {
-		cfg, err := Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: c.dims, ElementType: c.elem}.withDefaults()
+		cfg, err := Config{Namespace: testNamespace, Dimensions: c.dims, ElementType: c.elem}.withDefaults()
 		if err != nil {
 			t.Fatalf("elem %d dim %d: %v", c.elem, c.dims, err)
 		}

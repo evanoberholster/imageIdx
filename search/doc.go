@@ -1,4 +1,4 @@
-// Package search compiles conjunctive queries over bitmap fields, S2 cells,
+// Package search compiles conjunctive queries over bitmap namespaces, S2 cells,
 // and timestamps into immutable, reusable Plans.
 //
 // AppendIDs collects sorted unique IDs; AppendPage seeks after an ID and stops
@@ -22,7 +22,7 @@
 // order. Top-k is selected using native scores, never saturated uint16 values.
 // Optional score quantization belongs after ranking, at the presentation boundary.
 //
-// AllValues, FieldText, FieldRange, During, and InCells defer validation to
+// AllValues, NamespaceText, NamespaceRange, During, and InCells defer validation to
 // Compile. SearchOnce compiles and executes once; Executor pools workspaces
 // across plans. Timestamp writer batches remain owned by timeidx callers.
 package search

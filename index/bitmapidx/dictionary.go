@@ -18,10 +18,10 @@ const (
 
 // dictEntry locates one canonical value inside a dictionary view. chunk
 // indexes the view's chunk list; offset is a byte offset within that chunk,
-// wide enough for snapshots beyond 4 GiB. Entries are ordered by FieldKey;
+// wide enough for snapshots beyond 4 GiB. Entries are ordered by NamespaceKey;
 // layers are append-only once published.
 type dictEntry struct {
-	key    FieldKey
+	key    NamespaceKey
 	chunk  uint32
 	offset uint64
 	length uint32
@@ -39,7 +39,7 @@ type dictionaryView struct {
 
 // entry returns the highest-precedence entry for key: active first, then
 // base.
-func (v *dictionaryView) entry(key FieldKey) (dictEntry, bool) {
+func (v *dictionaryView) entry(key NamespaceKey) (dictEntry, bool) {
 	if e, ok := findDictEntry(v.active, key); ok {
 		return e, true
 	}
@@ -56,7 +56,7 @@ func (v *dictionaryView) bytes(e dictEntry) []byte {
 
 // lookup appends the canonical bytes for key to dst. It reports
 // hash-plus-slot presence; callers needing byte equality use resolve.
-func (v *dictionaryView) lookup(dst []byte, key FieldKey) ([]byte, bool) {
+func (v *dictionaryView) lookup(dst []byte, key NamespaceKey) ([]byte, bool) {
 	e, ok := v.entry(key)
 	if !ok {
 		return dst, false
@@ -64,31 +64,15 @@ func (v *dictionaryView) lookup(dst []byte, key FieldKey) ([]byte, bool) {
 	return append(dst, v.bytes(e)...), true
 }
 
-// merged returns one entry per key, sorted by key, with active shadowing
-// base. It allocates and sorts, so it is O(N log N): use it for
-// checkpoints, vacuum, and iteration, never on the query hot path.
+// merged returns one entry per key in sorted order, with active shadowing
+// base. Both layers are already sorted, so one linear merge suffices.
 func (v *dictionaryView) merged() []dictEntry {
-	total := len(v.base) + len(v.active)
-	if total == 0 {
-		return nil
-	}
-	entries := make([]dictEntry, 0, total)
-	entries = append(entries, v.base...)
-	entries = append(entries, v.active...)
-	slices.SortStableFunc(entries, func(a, b dictEntry) int { return compareFieldKey(a.key, b.key) })
-	out := entries[:0]
-	for _, e := range entries {
-		if len(out) != 0 && out[len(out)-1].key == e.key {
-			continue
-		}
-		out = append(out, e)
-	}
-	return out
+	return mergeDictEntries(v.base, v.active)
 }
 
 // iterate visits one entry per key in key order. Returning false stops
 // early. It materializes merged state, so it allocates.
-func (v *dictionaryView) iterate(fn func(key FieldKey, value []byte) bool) {
+func (v *dictionaryView) iterate(fn func(key NamespaceKey, value []byte) bool) {
 	for _, e := range v.merged() {
 		if !fn(e.key, v.bytes(e)) {
 			return
@@ -99,7 +83,7 @@ func (v *dictionaryView) iterate(fn func(key FieldKey, value []byte) bool) {
 // prefix visits entries whose canonical bytes start with prefix, in byte
 // order. It materializes and re-sorts by value, so it is O(N log N) and
 // allocates; it suits small dictionaries and prefix scans, not hot queries.
-func (v *dictionaryView) prefix(prefix []byte, fn func(key FieldKey, value []byte) bool) {
+func (v *dictionaryView) prefix(prefix []byte, fn func(key NamespaceKey, value []byte) bool) {
 	entries := v.merged()
 	slices.SortFunc(entries, func(a, b dictEntry) int {
 		return bytes.Compare(v.bytes(a), v.bytes(b))
@@ -115,10 +99,10 @@ func (v *dictionaryView) prefix(prefix []byte, fn func(key FieldKey, value []byt
 	}
 }
 
-// findDictEntry binary-searches a layer sorted by FieldKey.
-func findDictEntry(entries []dictEntry, key FieldKey) (dictEntry, bool) {
-	index, ok := slices.BinarySearchFunc(entries, key, func(e dictEntry, k FieldKey) int {
-		return compareFieldKey(e.key, k)
+// findDictEntry binary-searches a layer sorted by NamespaceKey.
+func findDictEntry(entries []dictEntry, key NamespaceKey) (dictEntry, bool) {
+	index, ok := slices.BinarySearchFunc(entries, key, func(e dictEntry, k NamespaceKey) int {
+		return compareNamespaceKey(e.key, k)
 	})
 	if !ok {
 		return dictEntry{}, false
@@ -128,14 +112,14 @@ func findDictEntry(entries []dictEntry, key FieldKey) (dictEntry, bool) {
 
 // groupEntries returns the contiguous entries sharing base's (Type,
 // Hash), ignoring Slot. This works because layers sort by the full
-// FieldKey (Type, Hash, Slot), so equal (Type, Hash) prefixes are
+// NamespaceKey (Type, Hash, Slot), so equal (Type, Hash) prefixes are
 // contiguous.
-func groupEntries(entries []dictEntry, base FieldKey) []dictEntry {
+func groupEntries(entries []dictEntry, base NamespaceKey) []dictEntry {
 	start := sort.Search(len(entries), func(index int) bool {
-		return compareFieldHash(entries[index].key, base) >= 0
+		return compareNamespaceHash(entries[index].key, base) >= 0
 	})
 	end := start
-	for end < len(entries) && compareFieldHash(entries[end].key, base) == 0 {
+	for end < len(entries) && compareNamespaceHash(entries[end].key, base) == 0 {
 		end++
 	}
 	return entries[start:end]
@@ -144,7 +128,7 @@ func groupEntries(entries []dictEntry, base FieldKey) []dictEntry {
 // entriesWithHash returns the entries sharing base's (Type, Hash) across
 // all layers, active first. It allocates on every call; assign uses it once
 // per new value, which keeps the write path bounded.
-func (v *dictionaryView) entriesWithHash(base FieldKey) []dictEntry {
+func (v *dictionaryView) entriesWithHash(base NamespaceKey) []dictEntry {
 	var out []dictEntry
 	for _, layer := range [][]dictEntry{v.active, v.base} {
 		out = append(out, groupEntries(layer, base)...)
@@ -156,7 +140,7 @@ func (v *dictionaryView) entriesWithHash(base FieldKey) []dictEntry {
 // whose canonical bytes equal canonical. It scans the hash group in
 // precedence order and compares bytes. Layers range over a stack array so
 // reads allocate nothing.
-func (v *dictionaryView) resolve(base FieldKey, canonical []byte) (FieldKey, bool) {
+func (v *dictionaryView) resolve(base NamespaceKey, canonical []byte) (NamespaceKey, bool) {
 	for _, layer := range [2][]dictEntry{v.active, v.base} {
 		for _, entry := range groupEntries(layer, base) {
 			if bytes.Equal(v.bytes(entry), canonical) {
@@ -164,12 +148,12 @@ func (v *dictionaryView) resolve(base FieldKey, canonical []byte) (FieldKey, boo
 			}
 		}
 	}
-	return FieldKey{}, false
+	return NamespaceKey{}, false
 }
 
-func compareFieldKey(a, b FieldKey) int {
-	if a.Type != b.Type {
-		if a.Type < b.Type {
+func compareNamespaceKey(a, b NamespaceKey) int {
+	if a.Namespace != b.Namespace {
+		if a.Namespace < b.Namespace {
 			return -1
 		}
 		return 1
@@ -189,10 +173,10 @@ func compareFieldKey(a, b FieldKey) int {
 	return 0
 }
 
-// compareFieldHash orders keys by field type and hash, ignoring Slot.
-func compareFieldHash(a, b FieldKey) int {
-	if a.Type != b.Type {
-		if a.Type < b.Type {
+// compareNamespaceHash orders keys by namespace type and hash, ignoring Slot.
+func compareNamespaceHash(a, b NamespaceKey) int {
+	if a.Namespace != b.Namespace {
+		if a.Namespace < b.Namespace {
 			return -1
 		}
 		return 1
@@ -209,13 +193,13 @@ func compareFieldHash(a, b FieldKey) int {
 // dictionaryWriter owns mutable dictionary state between publications.
 // Base and active slices are immutable once published; new values
 // accumulate in pending and seal into a fresh active slice. The writer is
-// confined to the FieldIndex writer lock and never read concurrently.
+// confined to the NamespaceIndex writer lock and never read concurrently.
 type dictionaryWriter struct {
 	chunks        [][]byte
 	base          []dictEntry
 	active        []dictEntry
 	pending       []dictEntry
-	pendingByHash map[FieldKey][]int
+	pendingByHash map[NamespaceKey][]int
 	// generation identifies the visible value set. It advances only when the
 	// set changes: folding staged values in seal, or dropping dead values in
 	// rebuild. Merges that preserve the set (rotate, compact) leave it alone,
@@ -235,7 +219,7 @@ func (d *dictionaryWriter) view() *dictionaryView {
 
 // appendBytes copies canonical bytes into the active chunk and returns
 // their location. Callers must not mutate b afterwards. The first chunk
-// starts small so a field with few values does not reserve the full target;
+// starts small so a namespace with few values does not reserve the full target;
 // chunks grow toward dictChunkTargetBytes, after which a value that would
 // exceed it starts a fresh chunk. An oversized value gets its own chunk.
 func (d *dictionaryWriter) appendBytes(b []byte) (chunk uint32, offset uint32) {
@@ -255,14 +239,14 @@ func (d *dictionaryWriter) appendBytes(b []byte) (chunk uint32, offset uint32) {
 // stage copies a new canonical value into the active chunk and queues its
 // entry for sealing. It also indexes the pending position by (Type, Hash)
 // so same-batch duplicates resolve without scanning.
-func (d *dictionaryWriter) stage(key FieldKey, canonical []byte) {
+func (d *dictionaryWriter) stage(key NamespaceKey, canonical []byte) {
 	chunk, offset := d.appendBytes(canonical)
 	entry := dictEntry{key: key, chunk: chunk, offset: uint64(offset), length: uint32(len(canonical))}
 	d.pending = append(d.pending, entry)
 	if d.pendingByHash == nil {
-		d.pendingByHash = make(map[FieldKey][]int)
+		d.pendingByHash = make(map[NamespaceKey][]int)
 	}
-	hashKey := FieldKey{Hash: key.Hash, Type: key.Type}
+	hashKey := NamespaceKey{Hash: key.Hash, Namespace: key.Namespace}
 	d.pendingByHash[hashKey] = append(d.pendingByHash[hashKey], len(d.pending)-1)
 }
 
@@ -277,8 +261,8 @@ func (d *dictionaryWriter) pendingBytes(entry dictEntry) []byte {
 // Newly assigned values are staged immediately. Collision groups are
 // almost always size one, so slot tracking is a small-stack scan with no
 // map allocation.
-func (d *dictionaryWriter) assign(view *dictionaryView, base FieldKey, canonical []byte) (FieldKey, error) {
-	hashKey := FieldKey{Hash: base.Hash, Type: base.Type}
+func (d *dictionaryWriter) assign(view *dictionaryView, base NamespaceKey, canonical []byte) (NamespaceKey, error) {
+	hashKey := NamespaceKey{Hash: base.Hash, Namespace: base.Namespace}
 	group := view.entriesWithHash(base)
 	pending := d.pendingByHash[hashKey]
 	if len(group) == 0 && len(pending) == 0 {
@@ -317,12 +301,12 @@ func (d *dictionaryWriter) assign(view *dictionaryView, base FieldKey, canonical
 		}
 		for slot := uint16(0); ; slot++ {
 			if _, exists := set[slot]; !exists {
-				key := FieldKey{Hash: base.Hash, Type: base.Type, Slot: slot}
+				key := NamespaceKey{Hash: base.Hash, Namespace: base.Namespace, Slot: slot}
 				d.stage(key, canonical)
 				return key, nil
 			}
 			if slot == ^uint16(0) {
-				return FieldKey{}, ErrTooManyCollisions
+				return NamespaceKey{}, ErrTooManyCollisions
 			}
 		}
 	}
@@ -335,32 +319,32 @@ func (d *dictionaryWriter) assign(view *dictionaryView, base FieldKey, canonical
 			}
 		}
 		if !claimed {
-			key := FieldKey{Hash: base.Hash, Type: base.Type, Slot: slot}
+			key := NamespaceKey{Hash: base.Hash, Namespace: base.Namespace, Slot: slot}
 			d.stage(key, canonical)
 			return key, nil
 		}
 		if slot == ^uint16(0) {
-			return FieldKey{}, ErrTooManyCollisions
+			return NamespaceKey{}, ErrTooManyCollisions
 		}
 	}
 }
 
 // resolvePending returns the key of a value staged earlier in the same
 // batch, so removal-only changes can resolve same-batch additions.
-func (d *dictionaryWriter) resolvePending(base FieldKey, canonical []byte) (FieldKey, bool) {
-	hashKey := FieldKey{Hash: base.Hash, Type: base.Type}
+func (d *dictionaryWriter) resolvePending(base NamespaceKey, canonical []byte) (NamespaceKey, bool) {
+	hashKey := NamespaceKey{Hash: base.Hash, Namespace: base.Namespace}
 	for _, index := range d.pendingByHash[hashKey] {
 		entry := d.pending[index]
 		if bytes.Equal(d.pendingBytes(entry), canonical) {
 			return entry.key, true
 		}
 	}
-	return FieldKey{}, false
+	return NamespaceKey{}, false
 }
 
 // abort discards entries staged by a batch that failed before
 // publication, so a later seal cannot publish values whose postings were
-// never written. The caller holds the FieldIndex writer lock.
+// never written. The caller holds the NamespaceIndex writer lock.
 func (d *dictionaryWriter) abort() {
 	d.pending = nil
 	d.pendingByHash = nil
@@ -373,14 +357,14 @@ func (d *dictionaryWriter) abort() {
 // set changes, so compiled queries can skip re-resolution while stable.
 func (d *dictionaryWriter) seal() {
 	if len(d.pending) != 0 {
-		slices.SortFunc(d.pending, func(a, b dictEntry) int { return compareFieldKey(a.key, b.key) })
+		slices.SortFunc(d.pending, func(a, b dictEntry) int { return compareNamespaceKey(a.key, b.key) })
 		if len(d.active) == 0 {
 			d.active = d.pending
 		} else {
 			next := make([]dictEntry, 0, len(d.active)+len(d.pending))
 			left, right := 0, 0
 			for left < len(d.active) && right < len(d.pending) {
-				if compareFieldKey(d.active[left].key, d.pending[right].key) <= 0 {
+				if compareNamespaceKey(d.active[left].key, d.pending[right].key) <= 0 {
 					next = append(next, d.active[left])
 					left++
 				} else {
@@ -423,7 +407,7 @@ func (d *dictionaryWriter) rebuild(entries []dictEntry, chunks [][]byte) {
 	d.generation++
 }
 
-// mergeDictEntries merges two layers sorted by FieldKey, with active
+// mergeDictEntries merges two layers sorted by NamespaceKey, with active
 // shadowing base on duplicate keys. Both inputs stay sorted, so the merge
 // is a single linear pass with no map and no re-sort.
 func mergeDictEntries(base, active []dictEntry) []dictEntry {
@@ -436,7 +420,7 @@ func mergeDictEntries(base, active []dictEntry) []dictEntry {
 	out := make([]dictEntry, 0, len(base)+len(active))
 	i, j := 0, 0
 	for i < len(base) && j < len(active) {
-		cmp := compareFieldKey(base[i].key, active[j].key)
+		cmp := compareNamespaceKey(base[i].key, active[j].key)
 		switch {
 		case cmp < 0:
 			out = append(out, base[i])

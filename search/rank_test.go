@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
@@ -13,8 +14,8 @@ import (
 // TestPlanRankAndFilter covers the ranked and time/geo filter API.
 func TestPlanRankAndFilter(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
-	field := benchmarkEnumField(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3, 4})
-	plan, err := Compile(AllValues(field, bitmapidx.StringValue("favorite")))
+	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 4})
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -63,14 +64,14 @@ func TestPlanRankAndFilter(t *testing.T) {
 	}
 
 	// Geo ranking and filtering.
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexTypeLocation, []bitmapidx.GeoEntry{
+	geo, err := bitmapidx.NewGeoNamespace(common.NamespaceLocation, []bitmapidx.GeoEntry{
 		{ImageID: 1, Latitude: 37.7749, Longitude: -122.4194},
 		{ImageID: 2, Latitude: 37.8044, Longitude: -122.2712},
 		{ImageID: 3, Latitude: 34.0522, Longitude: -118.2437},
 		{ImageID: 4, Latitude: 40.7128, Longitude: -74.0060},
-	}, bitmapidx.FieldConfig{})
+	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
-		t.Fatalf("NewGeoField: %v", err)
+		t.Fatalf("NewGeoNamespace: %v", err)
 	}
 	t.Cleanup(func() { _ = geo.Close() })
 	coordinates := map[ImageID][2]float64{
@@ -108,8 +109,8 @@ func TestPlanRankAndFilter(t *testing.T) {
 	if !slices.Equal(filtered, []ImageID{1}) {
 		t.Fatalf("FilterGeo = %v, want [1]", filtered)
 	}
-	if _, err := FilterGeo(nil, []ImageID{1}, field, cell); err == nil {
-		t.Fatal("FilterGeo on non-geo field succeeded")
+	if _, err := FilterGeo(nil, []ImageID{1}, namespaceIndex, cell); err == nil {
+		t.Fatal("FilterGeo on non-geo namespace succeeded")
 	}
 	if got, err := FilterGeo(nil, []ImageID{1}, geo); err != nil || len(got) != 0 {
 		t.Fatalf("FilterGeo empty cells = %v, %v", got, err)
@@ -126,8 +127,8 @@ type fakeANN struct {
 // TestFilterRankedANNResults checks that a scored ANN list maps to scored
 // search results in source order, dropping entries outside the plan.
 func TestFilterRankedANNResults(t *testing.T) {
-	field := benchmarkEnumField(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3, 4})
-	plan, err := Compile(AllValues(field, bitmapidx.StringValue("favorite")))
+	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 4})
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -150,8 +151,8 @@ func TestFilterRankedANNResults(t *testing.T) {
 }
 
 func TestScorePrecision(t *testing.T) {
-	field := benchmarkEnumField(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
-	plan, err := Compile(AllValues(field, bitmapidx.StringValue("favorite")))
+	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -206,8 +207,8 @@ func TestScorePrecision(t *testing.T) {
 
 func TestRankingCancellation(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
-	field := benchmarkEnumField(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3, 4})
-	plan, err := Compile(AllValues(field, bitmapidx.StringValue("favorite")))
+	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 4})
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}

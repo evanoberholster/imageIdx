@@ -14,7 +14,7 @@ import (
 	"log"
 	"os"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/search"
@@ -23,35 +23,43 @@ import (
 const quantum = uint64(1) << timeidx.TimestampShift
 
 func main() {
-	fieldDir, err := os.MkdirTemp("", "imageidx-fields-")
+	namespaceDir, err := os.MkdirTemp("", "imageidx-namespaces-")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fields, err := bitmapidx.NewIndex(fieldDir, []bitmapidx.Field{
-		{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Type: bitmapidx.IndexTypeLocation, Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
-	}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	namespaces, err := bitmapidx.NewIndex(namespaceDir, []bitmapidx.NamespaceSpec{
+		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+		{Namespace: common.NamespaceLocation, Name: "location", Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
+	}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = fields.Close(); _ = os.RemoveAll(fieldDir) }()
-	favorites, ok := fields.Lookup(bitmapidx.IndexTypeTag)
+	defer func() { _ = namespaces.Close(); _ = os.RemoveAll(namespaceDir) }()
+	favorites, ok := namespaces.Lookup(common.NamespaceTag)
 	if !ok {
-		log.Fatal("tag field missing")
+		log.Fatal("tag namespace missing")
 	}
-	if err := favorites.Add(
+	favoritesBatch := favorites.NewBatch()
+	if err := favoritesBatch.Add(
 		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("favorite")},
 	); err != nil {
 		log.Fatal(err)
 	}
-	geo, ok := fields.Lookup(bitmapidx.IndexTypeLocation)
+	if err := favoritesBatch.Apply(); err != nil {
+		log.Fatal(err)
+	}
+	favoritesBatch.Close()
+	if err := favorites.Barrier(); err != nil {
+		log.Fatal(err)
+	}
+	geo, ok := namespaces.Lookup(common.NamespaceLocation)
 	if !ok {
-		log.Fatal("location field missing")
+		log.Fatal("location namespace missing")
 	}
 	for _, entry := range []struct {
-		id  imageidx.ImageID
+		id  common.ImageID
 		lat float64
 		lng float64
 	}{
@@ -62,19 +70,28 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := geo.Move(bitmapidx.Move{ImageID: entry.id, To: int64(key)}); err != nil {
+		geoBatch := geo.NewBatch()
+		if err := geoBatch.Move(bitmapidx.Move{ImageID: entry.id, To: int64(key)}); err != nil {
+			log.Fatal(err)
+		}
+		if err := geoBatch.Apply(); err != nil {
+			log.Fatal(err)
+		}
+		geoBatch.Close()
+		if err := geo.Barrier(); err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	canonical := map[imageidx.ImageID]uint64{
+	canonical := map[common.ImageID]uint64{
 		100: quantum,
 		200: 2 * quantum,
 		300: 3 * quantum,
 		400: 4 * quantum,
 	}
 	times, err := timeidx.New(timeidx.Spec{
-		IndexID: 2,
+		Namespace: common.Namespace(100),
+		Name:      "timestamp",
 		Entries: []timeidx.Entry{
 			{ImageID: 100, Timestamp: canonical[100]},
 			{ImageID: 200, Timestamp: canonical[200]},
@@ -90,7 +107,7 @@ func main() {
 	plan, err := search.Compile(
 		search.AllValues(favorites, bitmapidx.StringValue("favorite")),
 		search.During(times, quantum, 3*quantum,
-			search.ExactTimestamp(func(id imageidx.ImageID) (uint64, bool) {
+			search.ExactTimestamp(func(id common.ImageID) (uint64, bool) {
 				value, ok := canonical[id]
 				return value, ok
 			})),

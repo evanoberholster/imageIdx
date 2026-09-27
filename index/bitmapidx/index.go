@@ -7,16 +7,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-const fieldManifestMagic uint32 = 0x424d464d
+const namespaceManifestMagic uint32 = 0x424d464d
 
-// Index persists a fixed registry of fields with one serialized WAL
+// Index persists a fixed registry of namespaces with one serialized WAL
 // writer. Child Add/Apply/Move/ReplaceText calls automatically append to
-// that WAL. Each batch is atomic within one field; cross-field
+// that WAL. Each batch is atomic within one namespace; cross-namespace
 // transactions are not provided. Reads remain lock-free across writes and
 // checkpoints. Close owns all child and mmap lifetimes.
 //
@@ -28,16 +30,16 @@ const fieldManifestMagic uint32 = 0x424d464d
 // budgets.
 type Index struct {
 	dir        string
-	fields     map[IndexType]*FieldIndex // immutable after construction
-	order      []*FieldIndex
-	config     FieldConfig
+	namespaces map[common.Namespace]*NamespaceIndex // immutable after construction
+	order      []*NamespaceIndex
+	config     NamespaceConfig
 	durability Durability
 	storeID    [16]byte // binds manifest, snapshots, and WAL to one store
 	writeMu    sync.Mutex
 	closed     bool
 	failed     error
 	lock       *os.File
-	wal        *persist.WAL
+	wal        *storage.WAL
 	generation uint64
 	mapping    []byte
 }
@@ -53,12 +55,12 @@ func newStoreID() ([16]byte, error) {
 	return id, nil
 }
 
-// NewIndex creates a new mmap-backed field store. The
-// directory must be empty (besides the lock file). Field definitions are
+// NewIndex creates a new mmap-backed namespace store. The
+// directory must be empty (besides the lock file). NamespaceSpec definitions are
 // validated, persisted in the first checkpoint, and immutable after;
 // config is runtime-only policy. Handles become store-owned on success
 // and must be closed via the store.
-func NewIndex(dir string, fields []Field, config FieldConfig, durability Durability) (*Index, error) {
+func NewIndex(dir string, namespaces []NamespaceSpec, config NamespaceConfig, durability Durability) (*Index, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -66,26 +68,27 @@ func NewIndex(dir string, fields []Field, config FieldConfig, durability Durabil
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	registry := NewRegistry()
-	if err := registry.Register(fields...); err != nil {
+	specs := slices.Clone(namespaces)
+	slices.SortFunc(specs, func(a, b NamespaceSpec) int { return int(a.Namespace) - int(b.Namespace) })
+	if err := validateNamespaceSpecs(specs); err != nil {
 		return nil, err
 	}
 	storeID, err := newStoreID()
 	if err != nil {
 		return nil, err
 	}
-	lock, err := lockStore(dir, true)
+	lock, err := storage.AcquireLock(dir, storeLockName, true)
 	if err != nil {
 		return nil, err
 	}
-	s := &Index{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, fields: make(map[IndexType]*FieldIndex)}
-	for _, field := range registry.Fields() {
-		index, err := NewFieldIndex(field, config)
+	s := &Index{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, namespaces: make(map[common.Namespace]*NamespaceIndex)}
+	for _, spec := range specs {
+		index, err := NewNamespaceIndex(spec, config)
 		if err != nil {
 			s.Close()
 			return nil, err
 		}
-		s.fields[field.Type] = index
+		s.namespaces[spec.Namespace] = index
 		s.order = append(s.order, index)
 	}
 	if err := s.Checkpoint(); err != nil {
@@ -99,10 +102,10 @@ func NewIndex(dir string, fields []Field, config FieldConfig, durability Durabil
 }
 
 // OpenIndex opens a checkpoint, replays its WAL, and repairs
-// only an incomplete terminal frame before making field handles
-// available. Generation, field count, segment checksums, and WAL offsets
+// only an incomplete terminal frame before making namespace handles
+// available. Generation, namespace count, segment checksums, and WAL offsets
 // all validate; any other corruption fails the open for external recovery.
-func OpenIndex(dir string, config FieldConfig, durability Durability) (*Index, error) {
+func OpenIndex(dir string, config NamespaceConfig, durability Durability) (*Index, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -110,7 +113,7 @@ func OpenIndex(dir string, config FieldConfig, durability Durability) (*Index, e
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := lockStore(dir, false)
+	lock, err := storage.AcquireLock(dir, storeLockName, false)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +128,7 @@ func OpenIndex(dir string, config FieldConfig, durability Durability) (*Index, e
 	if err != nil {
 		return nil, err
 	}
-	if err := persist.VerifyManifest(data, 48, fieldManifestMagic, 2, 44, 44); err != nil {
+	if err := storage.VerifyManifest(data, 48, namespaceManifestMagic, 2, 44, 44); err != nil {
 		return nil, ErrCorruptManifest
 	}
 	copy(s.storeID[:], data[24:40])
@@ -136,16 +139,16 @@ func OpenIndex(dir string, config FieldConfig, durability Durability) (*Index, e
 	if s.generation == 0 {
 		return nil, ErrCorruptManifest
 	}
-	s.order, s.mapping, err = openFieldSegment(s.snapshotPath(s.generation), s.generation, config, s.storeID)
+	s.order, s.mapping, err = openNamespaceSegment(s.snapshotPath(s.generation), s.generation, config, s.storeID)
 	if err != nil {
 		return nil, err
 	}
 	if uint64(len(s.order)) != binary.LittleEndian.Uint64(data[16:24]) {
 		return nil, ErrCorruptManifest
 	}
-	s.fields = make(map[IndexType]*FieldIndex, len(s.order))
+	s.namespaces = make(map[common.Namespace]*NamespaceIndex, len(s.order))
 	for _, index := range s.order {
-		s.fields[index.field().Type] = index
+		s.namespaces[index.spec().Namespace] = index
 	}
 	walPath := s.walPath(s.generation)
 	if _, err := os.Stat(walPath); err != nil {
@@ -155,7 +158,7 @@ func OpenIndex(dir string, config FieldConfig, durability Durability) (*Index, e
 	if err != nil {
 		return nil, err
 	}
-	s.wal, err = persist.OpenWAL(walPath, 0)
+	s.wal, err = storage.OpenWAL(walPath, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -169,19 +172,19 @@ func OpenIndex(dir string, config FieldConfig, durability Durability) (*Index, e
 	return s, nil
 }
 
-// Lookup returns the store-owned field for t. All mutations append to the
+// Lookup returns the store-owned namespace for t. All mutations append to the
 // store WAL. The handle must not be closed directly.
-func (s *Index) Lookup(t IndexType) (*FieldIndex, bool) {
-	index, ok := s.fields[t]
+func (s *Index) Lookup(t common.Namespace) (*NamespaceIndex, bool) {
+	index, ok := s.namespaces[t]
 	return index, ok
 }
 
-// Len returns the number of fields in physical storage order.
+// Len returns the number of namespaces in physical storage order.
 func (s *Index) Len() int { return len(s.order) }
 
-// Fields returns store-owned handles in physical storage order. The slice
+// Namespaces returns store-owned handles in physical storage order. The slice
 // is a copy; the handles are shared and must not be closed directly.
-func (s *Index) Fields() []*FieldIndex { return append([]*FieldIndex(nil), s.order...) }
+func (s *Index) Namespaces() []*NamespaceIndex { return append([]*NamespaceIndex(nil), s.order...) }
 
 func (s *Index) writable() error {
 	if s.closed {
@@ -191,15 +194,15 @@ func (s *Index) writable() error {
 }
 
 func (s *Index) snapshotPath(gen uint64) string {
-	return filepath.Join(s.dir, fmt.Sprintf("fields-%020d.idx", gen))
+	return filepath.Join(s.dir, fmt.Sprintf("namespaces-%020d.idx", gen))
 }
 func (s *Index) walPath(gen uint64) string {
-	return filepath.Join(s.dir, fmt.Sprintf("fields-%020d.wal", gen))
+	return filepath.Join(s.dir, fmt.Sprintf("namespaces-%020d.wal", gen))
 }
 
 // Checkpoint blocks writers, not readers. It syncs the WAL, writes and
 // revalidates a new mmap snapshot, syncs an empty successor WAL and the
-// directory, then publishes the manifest. Afterwards it swaps field
+// directory, then publishes the manifest. Afterwards it swaps namespace
 // roots, drains prior readers, and unmaps the old snapshot. A completed
 // checkpoint bounds subsequent replay to its WAL.
 func (s *Index) Checkpoint() error {
@@ -217,10 +220,10 @@ func (s *Index) Vacuum() error {
 	if err := s.checkpointLocked(true); err != nil {
 		return err
 	}
-	if err := persist.RemoveObsolete(s.dir, "fields-*.idx", s.snapshotPath(s.generation)); err != nil {
+	if err := storage.RemoveObsolete(s.dir, "namespaces-*.idx", s.snapshotPath(s.generation)); err != nil {
 		return err
 	}
-	return persist.RemoveObsolete(s.dir, "fields-*.wal", s.walPath(s.generation))
+	return storage.RemoveObsolete(s.dir, "namespaces-*.wal", s.walPath(s.generation))
 }
 
 // checkpointLocked writes, validates, and publishes one generation. Crash
@@ -256,20 +259,20 @@ func (s *Index) checkpointLocked(vacuum bool) error {
 	}()
 	gen := s.generation + 1
 	target := s.snapshotPath(gen)
-	if err := writeFieldSegment(target+".tmp", gen, s.order, vacuum, s.storeID); err != nil {
+	if err := writeNamespaceSegment(target+".tmp", gen, s.order, vacuum, s.storeID); err != nil {
 		return err
 	}
 	if err := os.Rename(target+".tmp", target); err != nil {
 		return err
 	}
-	loaded, mapping, err := openFieldSegment(target, gen, s.config, s.storeID)
+	loaded, mapping, err := openNamespaceSegment(target, gen, s.config, s.storeID)
 	if err != nil {
 		return err
 	}
 	keepMapping := false
 	defer func() {
 		if !keepMapping {
-			persist.Unmap(mapping)
+			storage.Unmap(mapping)
 		}
 	}()
 	// An unpublished successor left by a crash is safe to replace while we
@@ -283,21 +286,21 @@ func (s *Index) checkpointLocked(vacuum bool) error {
 	if err = errors.Join(err, closeErr); err != nil {
 		return err
 	}
-	nextWAL, err := persist.OpenWAL(s.walPath(gen), 0)
+	nextWAL, err := storage.OpenWAL(s.walPath(gen), 0)
 	if err != nil {
 		return err
 	}
-	manifest := persist.BuildManifest(48, fieldManifestMagic, 2, 44, 44, func(data []byte) {
+	manifest := storage.BuildManifest(48, namespaceManifestMagic, 2, 44, 44, func(data []byte) {
 		binary.LittleEndian.PutUint64(data[8:16], gen)
 		binary.LittleEndian.PutUint64(data[16:24], uint64(len(s.order)))
 		copy(data[24:40], s.storeID[:])
 	})
 	// Sync names before publishing their manifest reference.
-	if err = syncStoreDir(s.dir); err != nil {
+	if err = storage.SyncDir(s.dir); err != nil {
 		nextWAL.Close()
 		return err
 	}
-	if err = persist.WriteManifest(s.dir, manifest); err != nil {
+	if err = storage.WriteManifest(s.dir, manifest); err != nil {
 		nextWAL.Close()
 		s.failed = errors.Join(ErrRecoveryRequired, err)
 		return s.failed
@@ -329,24 +332,25 @@ func (s *Index) checkpointLocked(vacuum bool) error {
 	if oldWAL != nil {
 		retireErr = oldWAL.Close()
 	}
-	return errors.Join(retireErr, persist.Unmap(oldMapping),
-		persist.RemoveObsolete(s.dir, "fields-*.wal", s.walPath(s.generation)))
-}
-
-// syncStoreDir fsyncs a directory so newly renamed segment names and the
-// truncated successor WAL are durable before the manifest publishes them.
-func syncStoreDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(f.Sync(), f.Close())
+	return errors.Join(retireErr, storage.Unmap(oldMapping),
+		storage.RemoveObsolete(s.dir, "namespaces-*.wal", s.walPath(s.generation)))
 }
 
 // Close marks the store closed, closes children without per-index
 // locks, then closes the WAL, unmaps the snapshot, and releases the
-// directory lock. It is idempotent.
+// directory lock. It is idempotent. Commit loops stop before the write
+// lock is taken: their final groups need it, and queued batches commit
+// before Close returns.
 func (s *Index) Close() error {
+	for _, index := range s.order {
+		index.commits.Stop()
+	}
+	for _, index := range s.order {
+		index.commits.Wait()
+	}
+	for _, index := range s.order {
+		index.workers.Wait()
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closed {
@@ -360,5 +364,5 @@ func (s *Index) Close() error {
 	if s.wal != nil {
 		err = s.wal.Close()
 	}
-	return errors.Join(err, persist.Unmap(s.mapping), unlockStore(s.lock))
+	return errors.Join(err, storage.Unmap(s.mapping), storage.ReleaseLock(s.lock))
 }

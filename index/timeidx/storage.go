@@ -5,12 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 const (
@@ -37,7 +38,10 @@ func walPath(dir string, epoch uint64) string {
 
 type diskManifest struct {
 	generation uint64
-	indexID    uint64
+	// namespace occupies the field that held the old uint64 IndexID. It is
+	// persisted zero-extended in the same 8 bytes, so no format version bump
+	// is needed; decode rejects values above math.MaxUint16 as corruption.
+	namespace  common.Namespace
 	count      uint64
 	startTime  uint64
 	endTime    uint64
@@ -64,14 +68,14 @@ func NewPersistent(storeDir string, spec Spec, config Config, durability Durabil
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := indexutil.AcquireLock(storeDir, storeLockName, true)
+	lock, err := storage.AcquireLock(storeDir, storeLockName, true)
 	if err != nil {
 		return nil, err
 	}
 	locked := true
 	defer func() {
 		if locked {
-			_ = indexutil.ReleaseLock(lock)
+			_ = storage.ReleaseLock(lock)
 		}
 	}()
 	index, err := New(spec, config)
@@ -106,14 +110,14 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 	if err != nil {
 		return nil, err
 	}
-	lock, err := indexutil.AcquireLock(storeDir, storeLockName, false)
+	lock, err := storage.AcquireLock(storeDir, storeLockName, false)
 	if err != nil {
 		return nil, err
 	}
 	ok := false
 	defer func() {
 		if !ok {
-			_ = indexutil.ReleaseLock(lock)
+			_ = storage.ReleaseLock(lock)
 		}
 	}()
 	manifest, err := readManifest(filepath.Join(storeDir, "manifest"))
@@ -121,60 +125,60 @@ func OpenPersistent(storeDir string, config Config, durability Durability) (*Ind
 		return nil, err
 	}
 	markersPath, idsPath, blocksPath := generationPaths(storeDir, manifest.generation)
-	markersMapping, err := persist.MapFile(markersPath, nil)
+	markersMapping, err := storage.MapFile(markersPath, nil)
 	if err != nil {
 		return nil, err
 	}
-	idsMapping, err := persist.MapFile(idsPath, nil)
+	idsMapping, err := storage.MapFile(idsPath, nil)
 	if err != nil {
-		_ = persist.Unmap(markersMapping)
+		_ = storage.Unmap(markersMapping)
 		return nil, err
 	}
 	if len(markersMapping)%formatAlignment != 0 || len(idsMapping)%formatAlignment != 0 {
-		_ = persist.Unmap(markersMapping)
-		_ = persist.Unmap(idsMapping)
+		_ = storage.Unmap(markersMapping)
+		_ = storage.Unmap(idsMapping)
 		return nil, ErrCorruptManifest
 	}
 	directoryBytes, err := os.ReadFile(blocksPath)
 	if err != nil {
-		_ = persist.Unmap(markersMapping)
-		_ = persist.Unmap(idsMapping)
+		_ = storage.Unmap(markersMapping)
+		_ = storage.Unmap(idsMapping)
 		return nil, err
 	}
 	if len(directoryBytes)%formatAlignment != 0 {
-		_ = persist.Unmap(markersMapping)
-		_ = persist.Unmap(idsMapping)
+		_ = storage.Unmap(markersMapping)
+		_ = storage.Unmap(idsMapping)
 		return nil, ErrCorruptManifest
 	}
 	directory, err := decodeDirectory(directoryBytes, markersMapping, idsMapping, config)
 	if err != nil {
-		_ = persist.Unmap(markersMapping)
-		_ = persist.Unmap(idsMapping)
+		_ = storage.Unmap(markersMapping)
+		_ = storage.Unmap(idsMapping)
 		return nil, err
 	}
 	if uint64(len(directory.entries)) != manifest.blockCount {
-		_ = persist.Unmap(markersMapping)
-		_ = persist.Unmap(idsMapping)
+		_ = storage.Unmap(markersMapping)
+		_ = storage.Unmap(idsMapping)
 		return nil, ErrCorruptManifest
 	}
 	var persistedCount uint64
 	for _, entry := range directory.entries {
 		if entry.meta.Generation != manifest.generation {
-			_ = persist.Unmap(markersMapping)
-			_ = persist.Unmap(idsMapping)
+			_ = storage.Unmap(markersMapping)
+			_ = storage.Unmap(idsMapping)
 			return nil, ErrCorruptManifest
 		}
 		persistedCount += uint64(entry.meta.Count)
 	}
 	if persistedCount != manifest.count || directory.entries[0].startMarker != 0 ||
 		directory.entries[len(directory.entries)-1].endMarker != markerSpaceEnd {
-		_ = persist.Unmap(markersMapping)
-		_ = persist.Unmap(idsMapping)
+		_ = storage.Unmap(markersMapping)
+		_ = storage.Unmap(idsMapping)
 		return nil, ErrCorruptManifest
 	}
 
 	index := &Index{
-		indexID:       manifest.indexID,
+		namespace:     manifest.namespace,
 		flags:         manifest.flags,
 		offset:        manifest.offsetTime,
 		startTime:     manifest.startTime,
@@ -250,16 +254,16 @@ func Verify(dir string) error {
 		return err
 	}
 	markersPath, idsPath, blocksPath := generationPaths(dir, manifest.generation)
-	markersMapping, err := persist.MapFile(markersPath, nil)
+	markersMapping, err := storage.MapFile(markersPath, nil)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = persist.Unmap(markersMapping) }()
-	idsMapping, err := persist.MapFile(idsPath, nil)
+	defer func() { _ = storage.Unmap(markersMapping) }()
+	idsMapping, err := storage.MapFile(idsPath, nil)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = persist.Unmap(idsMapping) }()
+	defer func() { _ = storage.Unmap(idsMapping) }()
 	if len(markersMapping)%formatAlignment != 0 || len(idsMapping)%formatAlignment != 0 {
 		return ErrCorruptManifest
 	}
@@ -414,7 +418,7 @@ func (i *Index) Checkpoint() error {
 	}
 	manifest := diskManifest{
 		generation: generation,
-		indexID:    i.indexID,
+		namespace:  i.namespace,
 		count:      totalCount,
 		startTime:  i.startTime,
 		endTime:    i.endTime,
@@ -493,16 +497,16 @@ func (i *Index) Vacuum() error {
 	}
 	i.persistence.walEpoch = epoch
 	markersPath, idsPath, blocksPath := generationPaths(i.persistence.dir, manifest.generation)
-	if err := persist.RemoveObsolete(i.persistence.dir, "markers.*.base", markersPath); err != nil {
+	if err := storage.RemoveObsolete(i.persistence.dir, "markers.*.base", markersPath); err != nil {
 		return err
 	}
-	if err := persist.RemoveObsolete(i.persistence.dir, "ids.*.base", idsPath); err != nil {
+	if err := storage.RemoveObsolete(i.persistence.dir, "ids.*.base", idsPath); err != nil {
 		return err
 	}
-	if err := persist.RemoveObsolete(i.persistence.dir, "blocks.*.idx", blocksPath); err != nil {
+	if err := storage.RemoveObsolete(i.persistence.dir, "blocks.*.idx", blocksPath); err != nil {
 		return err
 	}
-	if err := persist.RemoveObsolete(i.persistence.dir, walGlob, walPath(i.persistence.dir, epoch)); err != nil {
+	if err := storage.RemoveObsolete(i.persistence.dir, walGlob, walPath(i.persistence.dir, epoch)); err != nil {
 		return err
 	}
 	matches, _ := filepath.Glob(filepath.Join(i.persistence.dir, "*.tmp"))
@@ -563,7 +567,7 @@ func (i *Index) OnDiskBytes() uint64 {
 	if i.persistence == nil {
 		return 0
 	}
-	return indexutil.DirSize(i.persistence.dir, "markers.*.base", "ids.*.base", "blocks.*.idx", walGlob, "manifest")
+	return storage.DirSize(i.persistence.dir, "markers.*.base", "ids.*.base", "blocks.*.idx", walGlob, "manifest")
 }
 
 func snapshotBase(view *blockView) *base {
@@ -594,7 +598,7 @@ func alignFile(file *os.File, alignment uint64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	aligned := int64(indexutil.Align(uint64(offset), alignment))
+	aligned := int64(storage.Align(uint64(offset), alignment))
 	if padding := aligned - offset; padding != 0 {
 		zeros := make([]byte, padding)
 		if _, err = file.Write(zeros); err != nil {
@@ -682,11 +686,11 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 		if meta.MarkerOffset%formatAlignment != 0 || meta.IDOffset%formatAlignment != 0 {
 			return nil, ErrCorruptManifest
 		}
-		markers, err := persist.View[timemarker](markerData, meta.MarkerOffset, uint64(meta.Count), ErrInvalidBase, ErrUnsupportedEndian)
+		markers, err := storage.View[timemarker](markerData, meta.MarkerOffset, uint64(meta.Count), ErrInvalidBase, ErrUnsupportedEndian)
 		if err != nil {
 			return nil, err
 		}
-		ids, err := persist.View[ImageID](idData, meta.IDOffset, uint64(meta.Count), ErrInvalidBase, ErrUnsupportedEndian)
+		ids, err := storage.View[ImageID](idData, meta.IDOffset, uint64(meta.Count), ErrInvalidBase, ErrUnsupportedEndian)
 		if err != nil {
 			return nil, err
 		}
@@ -710,14 +714,14 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 
 func writeManifestAtomic(dir string, manifest diskManifest) error {
 	data := encodeManifest(manifest)
-	return persist.WriteManifestOnce(dir, data)
+	return storage.WriteManifest(dir, data)
 }
 
 func encodeManifest(manifest diskManifest) []byte {
-	return persist.BuildManifest(manifestSize, manifestMagic, manifestVersion, 84, 84, func(data []byte) {
+	return storage.BuildManifest(manifestSize, manifestMagic, manifestVersion, 84, 84, func(data []byte) {
 		data[6] = TimestampShift
 		binary.LittleEndian.PutUint64(data[8:16], manifest.generation)
-		binary.LittleEndian.PutUint64(data[16:24], manifest.indexID)
+		binary.LittleEndian.PutUint64(data[16:24], uint64(manifest.namespace))
 		binary.LittleEndian.PutUint64(data[24:32], manifest.count)
 		binary.LittleEndian.PutUint64(data[32:40], manifest.startTime)
 		binary.LittleEndian.PutUint64(data[40:48], manifest.endTime)
@@ -744,15 +748,19 @@ func decodeManifest(data []byte) (diskManifest, error) {
 	// A recognized magic with an unknown version is a newer format, not
 	// corruption: fail open with ErrUnsupported so callers never misread
 	// it as same-version bit rot.
-	if magic, version, ok := persist.PeekHeader(data); ok && magic == manifestMagic && version != manifestVersion {
+	if magic, version, ok := storage.PeekHeader(data); ok && magic == manifestMagic && version != manifestVersion {
 		return diskManifest{}, ErrUnsupported
 	}
-	if err := persist.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 84, 84); err != nil {
+	if err := storage.VerifyManifest(data, manifestSize, manifestMagic, manifestVersion, 84, 84); err != nil {
+		return diskManifest{}, ErrCorruptManifest
+	}
+	rawNamespace := binary.LittleEndian.Uint64(data[16:24])
+	if rawNamespace > math.MaxUint16 {
 		return diskManifest{}, ErrCorruptManifest
 	}
 	manifest := diskManifest{
 		generation: binary.LittleEndian.Uint64(data[8:16]),
-		indexID:    binary.LittleEndian.Uint64(data[16:24]),
+		namespace:  common.Namespace(rawNamespace),
 		count:      binary.LittleEndian.Uint64(data[24:32]),
 		startTime:  binary.LittleEndian.Uint64(data[32:40]),
 		endTime:    binary.LittleEndian.Uint64(data[40:48]),
