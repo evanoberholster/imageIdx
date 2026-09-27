@@ -3,7 +3,6 @@ package storage
 import (
 	"os"
 	"runtime"
-	"syscall"
 	"unsafe"
 )
 
@@ -14,7 +13,8 @@ type FixedWidth interface {
 
 // MapFile mmaps path read-only. A zero-length file yields nil data unless
 // emptyErr is non-nil, in which case emptyErr is returned; pass nil for
-// formats that validate size themselves.
+// formats that validate size themselves. Platform backends live in
+// mmap_unix.go, mmap_windows.go, and mmap_other.go.
 func MapFile(path string, emptyErr error) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -31,7 +31,7 @@ func MapFile(path string, emptyErr error) ([]byte, error) {
 		}
 		return nil, nil
 	}
-	return syscall.Mmap(int(file.Fd()), 0, int(info.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+	return mmapFile(file, info.Size())
 }
 
 // Unmap releases a mapping acquired by MapFile. A nil mapping is a no-op.
@@ -39,7 +39,7 @@ func Unmap(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
-	return syscall.Munmap(data)
+	return unmapFile(data)
 }
 
 // HostIsLittleEndian reports whether the host byte order matches every

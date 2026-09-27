@@ -6,6 +6,9 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.1.5
 	github.com/golang/geo v0.0.0-20260818125358-b200a1149890
 	github.com/weaviate/sroar v0.0.16
+	github.com/zeebo/blake3 v0.2.4
+	github.com/zeebo/xxh3 v1.1.0
+	golang.org/x/sys v0.30.0
 )
 
 require (
@@ -36,10 +39,7 @@ require (
 	github.com/prometheus/common v0.42.0 // indirect
 	github.com/prometheus/procfs v0.10.1 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
-	github.com/zeebo/blake3 v0.2.4 // indirect
-	github.com/zeebo/xxh3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
-	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 )
