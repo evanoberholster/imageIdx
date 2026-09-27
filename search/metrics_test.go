@@ -14,7 +14,7 @@ import (
 func TestSearchWithMetricsCountsAndReuse(t *testing.T) {
 	first := benchmarkEnumNamespace(t, 130, "x", []uint64{1, 2, 3, 4, 5})
 	second := benchmarkEnumNamespace(t, 131, "x", []uint64{2, 4, 6})
-	plan, err := Compile(AllValues(first, bitmapidx.StringValue("x")), AllValues(second, bitmapidx.StringValue("x")))
+	plan, err := Compile(AllValues(first, bitmapidx.EnumStringValue("x")), AllValues(second, bitmapidx.EnumStringValue("x")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestSearchWithMetricsCountsAndReuse(t *testing.T) {
 		t.Fatal(plain, err)
 	}
 	// Reusing the same report must reset counters and adapt to another plan.
-	one, err := Compile(AllValues(first, bitmapidx.StringValue("x")))
+	one, err := Compile(AllValues(first, bitmapidx.EnumStringValue("x")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestSearchWithMetricsCountsAndReuse(t *testing.T) {
 func TestMeasuredFilteringAndRanking(t *testing.T) {
 	first := benchmarkEnumNamespace(t, 132, "x", []uint64{1, 2, 3, 4, 5})
 	second := benchmarkEnumNamespace(t, 133, "x", []uint64{2, 4, 6})
-	plan, err := Compile(AllValues(first, bitmapidx.StringValue("x")), AllValues(second, bitmapidx.StringValue("x")))
+	plan, err := Compile(AllValues(first, bitmapidx.EnumStringValue("x")), AllValues(second, bitmapidx.EnumStringValue("x")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,14 +129,14 @@ func TestSearchWithMetricsBufferedTimestampAndEmptyFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = timestamps.Close() })
-	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("x")), During(timestamps, quantum, 3*quantum))
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("x")), During(timestamps, quantum, 3*quantum))
 	if err != nil {
 		t.Fatal(err)
 	}
 	commitBitmap(t, namespaceIndex, func(bt *bitmapidx.Batch) error {
 		return bt.Add(
-			bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("x")},
-			bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("x")},
+			bitmapidx.Entry{ImageID: 2, Value: bitmapidx.EnumStringValue("x")},
+			bitmapidx.Entry{ImageID: 3, Value: bitmapidx.EnumStringValue("x")},
 		)
 	})
 	metrics := NewSearchMetrics(plan)

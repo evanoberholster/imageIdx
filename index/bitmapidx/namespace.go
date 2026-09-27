@@ -12,17 +12,6 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// Storage is a reserved policy hint for a namespace. Both values are accepted
-// and behave identically today: they share one lookup path and one mmap
-// persistence layout. The distinction is persisted so a future cache policy
-// can diverge without a format migration.
-type Storage uint8
-
-const (
-	StoragePerValue Storage = iota + 1 // one lightweight handle per value
-	StoragePerType                     // one namespace handle over mmap entries
-)
-
 // Normalizer codes for a namespace's enum canonicalization. Identity keeps
 // caller-supplied bytes; Lowercase folds UTF-8 enum bytes with Unicode
 // lowercase.
@@ -88,16 +77,13 @@ type GeoCodec struct {
 	Level   uint8
 }
 
-// NamespaceSpec is one registered metadata namespace: its stable number and
-// schema name, value shape, reserved storage hint, and the codecs that
-// interpret values. Only the codecs for the namespace's kind are consulted;
-// the rest must be zero. Definitions are immutable once registered. Name is
-// schema metadata only and is never persisted to a bitmap segment.
+// NamespaceSpec is one registered metadata namespace: its stable number,
+// value shape, and the codecs that interpret values. Only the codecs for the
+// namespace's kind are consulted; the rest must be zero. Definitions are
+// immutable once registered. Schema names belong to common.NamespaceDef.
 type NamespaceSpec struct {
 	Namespace  common.Namespace
-	Name       string
 	Kind       common.NamespaceKind
-	Storage    Storage
 	Quant      Quantizer // KindBitmapContinuous only
 	Geo        GeoCodec  // KindBitmapGeo only
 	Normalizer CodecSpec // KindBitmapEnum only
@@ -186,11 +172,6 @@ func validateNamespace(f NamespaceSpec) error {
 		if f.Geo.Version > 1 || (f.Geo.Level != 0 && f.Geo.Level != GeoS2Level) {
 			return ErrInvalidNamespace
 		}
-	default:
-		return ErrInvalidNamespace
-	}
-	switch f.Storage {
-	case StoragePerValue, StoragePerType:
 	default:
 		return ErrInvalidNamespace
 	}
@@ -287,17 +268,17 @@ type Value struct {
 	Bool  bool
 }
 
-// StringValue returns an enum value. The string is copied to a fresh byte
+// EnumStringValue returns an enum value. The string is copied to a fresh byte
 // slice; the caller retains its string.
-func StringValue(value string) Value {
+func EnumStringValue(value string) Value {
 	return Value{Kind: common.KindBitmapEnum, Bytes: []byte(value)}
 }
 
-// BytesValue returns an enum value borrowing value. The slice is borrowed
+// EnumBytesValue returns an enum value borrowing value. The slice is borrowed
 // through preparation and copied under the writer lock only if the value
 // is new to the dictionary; callers must not mutate it until the write
 // returns.
-func BytesValue(value []byte) Value {
+func EnumBytesValue(value []byte) Value {
 	return Value{Kind: common.KindBitmapEnum, Bytes: value}
 }
 
@@ -317,7 +298,7 @@ func GeoValue(key uint64) Value { return Value{Kind: common.KindBitmapGeo, Int: 
 // Entry is one ImageID to value membership change. ImageID zero is
 // reserved and rejected with ErrInvalidImageID.
 type Entry struct {
-	ImageID ImageID
+	ImageID common.ImageID
 	Value   Value
 }
 
@@ -335,7 +316,7 @@ type namespaceMutation struct {
 // because zero is a valid grid value; geo may omit them because a
 // level-16 S2 key is never zero, so zero is the absent sentinel.
 type Move struct {
-	ImageID ImageID
+	ImageID common.ImageID
 	From    int64
 	To      int64
 	HasFrom bool
@@ -346,27 +327,29 @@ type Move struct {
 // Callers supply the old and new source strings so the index can diff
 // analyzer token sets without keeping a reverse index.
 type TextReplacement struct {
-	ImageID ImageID
+	ImageID common.ImageID
 	Before  []string
 	After   []string
 }
 
-// SchemaDef converts the spec into its common.Schema definition, encoding
-// the codecs into Config with the persisted namespace layout. Name is carried
-// on the definition only and is never written into a bitmap segment.
-func (s NamespaceSpec) SchemaDef() (common.NamespaceDef, error) {
+// NamespaceDef converts the spec into a common.Schema definition, encoding
+// the codecs into Config with the persisted namespace layout.
+func (s NamespaceSpec) NamespaceDef(name string) (common.NamespaceDef, error) {
+	if name == "" {
+		return common.NamespaceDef{}, common.ErrNamespaceName
+	}
 	if err := validateNamespace(s); err != nil {
 		return common.NamespaceDef{}, err
 	}
 	return common.NamespaceDef{
 		Namespace: s.Namespace,
-		Name:      s.Name,
+		Name:      name,
 		Kind:      s.Kind,
 		Config:    appendNamespace(nil, s),
 	}, nil
 }
 
-// NamespaceSpecFromSchemaDef is the inverse of SchemaDef. It rejects
+// NamespaceSpecFromSchemaDef is the inverse of NamespaceDef. It rejects
 // definitions that do not describe a bitmap namespace with ErrNamespaceMismatch.
 func NamespaceSpecFromSchemaDef(def common.NamespaceDef) (NamespaceSpec, error) {
 	if !def.Kind.IsBitmap() {
@@ -379,34 +362,11 @@ func NamespaceSpecFromSchemaDef(def common.NamespaceDef) (NamespaceSpec, error) 
 	if next != len(def.Config) || spec.Namespace != def.Namespace || def.Kind != spec.Kind {
 		return NamespaceSpec{}, ErrNamespaceMismatch
 	}
-	spec.Name = def.Name
 	return spec, nil
 }
 
-// NewNamespaceSchema converts specs into a common.Schema. Every spec must
-// have a non-empty name and a valid namespace; duplicate namespace numbers
-// and duplicate names are rejected by common.Schema.RegisterAll.
-func NewNamespaceSchema(specs ...NamespaceSpec) (*common.Schema, error) {
-	defs := make([]common.NamespaceDef, 0, len(specs))
-	for _, spec := range specs {
-		if spec.Name == "" {
-			return nil, common.ErrNamespaceName
-		}
-		def, err := spec.SchemaDef()
-		if err != nil {
-			return nil, err
-		}
-		defs = append(defs, def)
-	}
-	schema := common.NewSchema()
-	if err := schema.RegisterAll(defs...); err != nil {
-		return nil, err
-	}
-	return schema, nil
-}
-
 // validateNamespaceSpecs validates each definition and rejects duplicate
-// namespace numbers. NewIndex uses it to keep store definitions unique
+// namespace numbers. NewStore uses it to keep store definitions unique
 // without requiring schema names, which are not persisted.
 func validateNamespaceSpecs(specs []NamespaceSpec) error {
 	seen := make(map[common.Namespace]struct{}, len(specs))
@@ -511,7 +471,7 @@ func bitmapKindFromCode(code byte) common.NamespaceKind {
 
 func appendNamespace(out []byte, namespace NamespaceSpec) []byte {
 	out = binary.LittleEndian.AppendUint16(out, uint16(namespace.Namespace))
-	out = append(out, bitmapKindCode(namespace.Kind), byte(namespace.Storage))
+	out = append(out, bitmapKindCode(namespace.Kind), 2) // reserved legacy storage byte
 	out = binary.LittleEndian.AppendUint32(out, namespace.Flags)
 	out = binary.LittleEndian.AppendUint16(out, namespace.Quant.Code)
 	out = binary.LittleEndian.AppendUint16(out, namespace.Quant.Version)
@@ -536,10 +496,12 @@ func decodeNamespace(data []byte, offset int) (NamespaceSpec, int, error) {
 	if offset+32 > len(data) {
 		return NamespaceSpec{}, 0, ErrInvalidNamespace
 	}
+	if data[offset+3] != 1 && data[offset+3] != 2 {
+		return NamespaceSpec{}, 0, ErrInvalidNamespace
+	}
 	namespace := NamespaceSpec{
 		Namespace: common.Namespace(binary.LittleEndian.Uint16(data[offset : offset+2])),
 		Kind:      bitmapKindFromCode(data[offset+2]),
-		Storage:   Storage(data[offset+3]),
 		Flags:     binary.LittleEndian.Uint32(data[offset+4 : offset+8]),
 		Quant: Quantizer{
 			Code:    binary.LittleEndian.Uint16(data[offset+8 : offset+10]),

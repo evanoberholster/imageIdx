@@ -3,11 +3,11 @@ package bitmapidx
 import (
 	"context"
 	"errors"
-	common "github.com/evanoberholster/imageIdx/common"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	commitqueue "github.com/evanoberholster/imageIdx/internal/commit"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/internal/textanalyzer"
@@ -24,7 +24,7 @@ var (
 )
 
 // NamespaceConfig controls namespace delta rotation and compaction. The zero
-// value is valid; NewNamespaceIndex fills defaults. ActiveTarget rotates
+// value is valid; NewIndex fills defaults. ActiveTarget rotates
 // Active to Frozen and schedules background compaction; HardDeltaLimit
 // and MaxDeltaValues instead fold the batch directly into Base on the
 // write path, bounding every reader-visible delta.
@@ -80,7 +80,7 @@ type NamespaceMetadata struct {
 	BaseValues uint64
 }
 
-// NamespaceIndex is one immutable-namespace, multi-value index. Readers load one
+// Index is one immutable-namespace, multi-value index. Readers load one
 // atomically published namespaceView and take no locks beyond the reader
 // tracker; writers stage Pebble-style batches that commit through one
 // background pipeline per index, coalescing concurrent batches into a
@@ -89,11 +89,11 @@ type NamespaceMetadata struct {
 //
 // Reads against a closed index report empty results, as do queries
 // compiled after close; writes and maintenance report ErrClosed. The zero
-// value is not usable; construct with NewNamespaceIndex. Store-owned indexes
+// value is not usable; construct with NewIndex. Store-owned indexes
 // (owner != nil) route writes through the store WAL and must be closed via
 // the store.
-type NamespaceIndex struct {
-	owner    *Index // immutable before exposing the handle
+type Index struct {
+	owner    *Store // immutable before exposing the handle
 	view     atomic.Pointer[namespaceView]
 	readers  *storage.ReaderTracker
 	writerMu sync.Mutex
@@ -112,11 +112,11 @@ type NamespaceIndex struct {
 	barrierErr error
 }
 
-// NewNamespaceIndex constructs an empty namespace index from a validated
+// NewIndex constructs an empty namespace index from a validated
 // definition. Config zero values take defaults. The definition is
 // deep-copied; text namespaces also build their analyzer here so writes and
 // queries never construct one per batch.
-func NewNamespaceIndex(namespace NamespaceSpec, config NamespaceConfig) (*NamespaceIndex, error) {
+func NewIndex(namespace NamespaceSpec, config NamespaceConfig) (*Index, error) {
 	if err := validateNamespace(namespace); err != nil {
 		return nil, err
 	}
@@ -126,7 +126,7 @@ func NewNamespaceIndex(namespace NamespaceSpec, config NamespaceConfig) (*Namesp
 	}
 	namespace.Normalizer = namespace.Normalizer.clone()
 	namespace.Analyzer = namespace.Analyzer.clone()
-	index := &NamespaceIndex{
+	index := &Index{
 		config:  config,
 		readers: &storage.ReaderTracker{},
 	}
@@ -142,33 +142,33 @@ func NewNamespaceIndex(namespace NamespaceSpec, config NamespaceConfig) (*Namesp
 }
 
 // Spec returns a deep copy of the immutable namespace definition.
-func (i *NamespaceIndex) Spec() NamespaceSpec { return i.view.Load().namespace.clone() }
+func (i *Index) Spec() NamespaceSpec { return i.view.Load().namespace.clone() }
 
 // spec returns the current immutable definition without copying. Internal
 // paths only read it; callers that may retain or mutate the definition use
 // the cloning Spec method.
-func (i *NamespaceIndex) spec() NamespaceSpec { return i.view.Load().namespace }
+func (i *Index) spec() NamespaceSpec { return i.view.Load().namespace }
 
 // Metadata returns a copied summary of the current snapshot.
-func (i *NamespaceIndex) Metadata() NamespaceMetadata {
+func (i *Index) Metadata() NamespaceMetadata {
 	view := i.view.Load()
 	return NamespaceMetadata{Spec: view.namespace.clone(), Generation: view.generation, BaseValues: uint64(len(view.base.keys))}
 }
 
 // PendingCompactions reports the number of in-flight background
 // compactions folding Frozen into Base.
-func (i *NamespaceIndex) PendingCompactions() int64 { return i.pending.Load() }
+func (i *Index) PendingCompactions() int64 { return i.pending.Load() }
 
 // WaitIdle blocks until background compactions drain or ctx is cancelled.
 // It polls every 100µs via storage.WaitForCondition and never takes the writer lock.
-func (i *NamespaceIndex) WaitIdle(ctx context.Context) error {
+func (i *Index) WaitIdle(ctx context.Context) error {
 	return storage.WaitForCondition(ctx, func() bool { return i.pending.Load() == 0 })
 }
 
 // Contains reports whether id holds value in this namespace. Unknown values
 // report false with no error; kind mismatches and oversized values report
 // errors. Closed indexes report false.
-func (i *NamespaceIndex) Contains(id ImageID, value Value) (bool, error) {
+func (i *Index) Contains(id common.ImageID, value Value) (bool, error) {
 	base, canonical, err := i.keyForValue(i.spec(), value)
 	if err != nil {
 		return false, err
@@ -196,7 +196,7 @@ func (i *NamespaceIndex) Contains(id ImageID, value Value) (bool, error) {
 // ContainsKey reports whether id holds the posting named by key,
 // including its collision slot. It skips canonicalization for callers
 // that already resolved keys.
-func (i *NamespaceIndex) ContainsKey(id ImageID, key NamespaceKey) bool {
+func (i *Index) ContainsKey(id common.ImageID, key NamespaceKey) bool {
 	token := i.readers.Acquire()
 	view := i.view.Load()
 	present := !i.closed.Load() && view.contains(key, id)
@@ -211,7 +211,7 @@ func (i *NamespaceIndex) ContainsKey(id ImageID, key NamespaceKey) bool {
 // Compact synchronously merges Frozen and Active into a new Base and
 // seals the dictionary. It preserves the visible value set, so only
 // posting storage moves.
-func (i *NamespaceIndex) Compact() error {
+func (i *Index) Compact() error {
 	if i.owner != nil {
 		i.owner.writeMu.Lock()
 		defer i.owner.writeMu.Unlock()
@@ -237,7 +237,7 @@ func (i *NamespaceIndex) Compact() error {
 // remaining posting. It is the only operation that removes dead
 // dictionary entries, and the only one that advances the dictionary
 // generation without new values.
-func (i *NamespaceIndex) Vacuum() error {
+func (i *Index) Vacuum() error {
 	if i.owner != nil {
 		i.owner.writeMu.Lock()
 		defer i.owner.writeMu.Unlock()
@@ -262,14 +262,14 @@ func (i *NamespaceIndex) Vacuum() error {
 // Close marks a standalone namespace closed, waits for compactions and prior
 // readers, and rejects further writes. Store-owned indexes reject Close;
 // close the store instead.
-func (i *NamespaceIndex) Close() error {
+func (i *Index) Close() error {
 	if i.owner != nil {
 		return ErrOwnedIndex
 	}
 	return i.closeInternal()
 }
 
-func (i *NamespaceIndex) closeInternal() error {
+func (i *Index) closeInternal() error {
 	// Stop the commit queue first so queued batches commit before the
 	// writer locks below are taken: the loop's final groups need
 	// writerMu, which close holds only briefly here.
@@ -286,7 +286,7 @@ func (i *NamespaceIndex) closeInternal() error {
 // LookupValue appends the canonical bytes for key to dst. It reports
 // hash-plus-slot presence without byte verification; use KeyForValue to
 // resolve a value to its verified slot first.
-func (i *NamespaceIndex) LookupValue(dst []byte, key NamespaceKey) ([]byte, bool) {
+func (i *Index) LookupValue(dst []byte, key NamespaceKey) ([]byte, bool) {
 	token := i.readers.Acquire()
 	view := i.view.Load()
 	if i.closed.Load() {
@@ -302,7 +302,7 @@ func (i *NamespaceIndex) LookupValue(dst []byte, key NamespaceKey) ([]byte, bool
 // false stops early. Values alias chunk/mmap storage valid only for the
 // call. It materializes merged state, so it allocates. The reader guard is
 // released even if fn panics; fn must not call maintenance operations.
-func (i *NamespaceIndex) Iterate(fn func(key NamespaceKey, value []byte) bool) {
+func (i *Index) Iterate(fn func(key NamespaceKey, value []byte) bool) {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
 	view := i.view.Load()
@@ -316,7 +316,7 @@ func (i *NamespaceIndex) Iterate(fn func(key NamespaceKey, value []byte) bool) {
 // re-sorts by value, so it is O(N log N); see dictionaryView.prefix. The
 // reader guard is released even if fn panics; fn must not call maintenance
 // operations.
-func (i *NamespaceIndex) Prefix(prefix []byte, fn func(key NamespaceKey, value []byte) bool) {
+func (i *Index) Prefix(prefix []byte, fn func(key NamespaceKey, value []byte) bool) {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
 	view := i.view.Load()
@@ -329,7 +329,7 @@ func (i *NamespaceIndex) Prefix(prefix []byte, fn func(key NamespaceKey, value [
 // key including its collision slot. Absent values, and any value on a
 // closed index, report ok=false. Continuous values have no dictionary
 // entry and report their order key directly.
-func (i *NamespaceIndex) KeyForValue(value Value) (NamespaceKey, bool, error) {
+func (i *Index) KeyForValue(value Value) (NamespaceKey, bool, error) {
 	namespace := i.spec()
 	key, canonical, err := i.keyForValue(namespace, value)
 	if err != nil {

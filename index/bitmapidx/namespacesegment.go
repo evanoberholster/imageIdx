@@ -40,7 +40,7 @@ type namespaceSnapshotEntry struct {
 // to 8. The header CRC covers the header prefix and the payload CRC covers
 // everything after the header, so the fresh file re-reads once for
 // integrity before Sync. Temporary files must be renamed by the caller.
-func writeNamespaceSegment(path string, gen uint64, indexes []*NamespaceIndex, vacuum bool, storeID [16]byte) error {
+func writeNamespaceSegment(path string, gen uint64, indexes []*Index, vacuum bool, storeID [16]byte) error {
 	specs := make([]NamespaceSpec, 0, len(indexes))
 	var entries []namespaceSnapshotEntry
 	for _, index := range indexes {
@@ -169,12 +169,12 @@ func writeZeros(f *os.File, n uint64) error {
 // no trailing bytes. Bitmaps and canonical values alias the mapping for
 // zero-copy reads; dictionary value offsets are 64-bit, so snapshots
 // beyond 4 GiB need no extra chunks.
-func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, storeID [16]byte) ([]*NamespaceIndex, []byte, error) {
+func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, storeID [16]byte) ([]*Index, []byte, error) {
 	mapping, err := storage.MapFile(path, ErrCorruptSegment)
 	if err != nil {
 		return nil, nil, err
 	}
-	fail := func() ([]*NamespaceIndex, []byte, error) { storage.Unmap(mapping); return nil, nil, ErrCorruptSegment }
+	fail := func() ([]*Index, []byte, error) { storage.Unmap(mapping); return nil, nil, ErrCorruptSegment }
 	if len(mapping) < namespaceSegmentHeaderSize || len(mapping)%8 != 0 {
 		return fail()
 	}
@@ -209,10 +209,10 @@ func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, store
 	if payloadStart > uint64(len(mapping)) {
 		return fail()
 	}
-	var indexes []*NamespaceIndex
-	byType := make(map[common.Namespace]*NamespaceIndex)
+	var indexes []*Index
+	byType := make(map[common.Namespace]*Index)
 	for _, spec := range specs {
-		index, err := NewNamespaceIndex(spec, config)
+		index, err := NewIndex(spec, config)
 		if err != nil {
 			return fail()
 		}

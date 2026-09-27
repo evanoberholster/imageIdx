@@ -44,18 +44,18 @@ func DecodeS2Key(key S2Key) uint64 { return uint64(key) << geoKeyShift }
 // GeoEntry is one image coordinate used to seed a KindBitmapGeo namespace via
 // NewGeoNamespace.
 type GeoEntry struct {
-	ImageID   ImageID
+	ImageID   common.ImageID
 	Latitude  float64
 	Longitude float64
 }
 
 // NewGeoNamespace constructs a KindBitmapGeo namespace index seeded with entries. It
-// builds a StoragePerType definition with GeoCodec version 1 and converts
-// every coordinate through KeyFromLatLng. Use NewNamespaceIndex directly for
+// builds a geographic definition with GeoCodec version 1 and converts
+// every coordinate through KeyFromLatLng. Use NewIndex directly for
 // full control of the definition. Failures close the partial index.
-func NewGeoNamespace(t common.Namespace, entries []GeoEntry, config NamespaceConfig) (*NamespaceIndex, error) {
-	spec := NamespaceSpec{Namespace: t, Kind: common.KindBitmapGeo, Storage: StoragePerType, Geo: GeoCodec{Version: 1}}
-	index, err := NewNamespaceIndex(spec, config)
+func NewGeoNamespace(t common.Namespace, entries []GeoEntry, config NamespaceConfig) (*Index, error) {
+	spec := NamespaceSpec{Namespace: t, Kind: common.KindBitmapGeo, Geo: GeoCodec{Version: 1}}
+	index, err := NewIndex(spec, config)
 	if err != nil {
 		return nil, err
 	}

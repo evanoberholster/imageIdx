@@ -11,7 +11,7 @@ import (
 
 var errACLStore = errors.New("search: WithACL requires a store with ACL namespaces")
 
-func compileACL(store *bitmapidx.Index, clause aclClause) (stage, error) {
+func compileACL(store *bitmapidx.Store, clause aclClause) (stage, error) {
 	if store == nil {
 		return stage{}, errACLStore
 	}

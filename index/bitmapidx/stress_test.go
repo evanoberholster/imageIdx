@@ -25,7 +25,7 @@ func stressInt(name string, def int) int {
 }
 
 // idsSortedUnique reports whether ids is ascending with no duplicates.
-func idsSortedUnique(ids []ImageID) bool {
+func idsSortedUnique(ids []common.ImageID) bool {
 	for i := 1; i < len(ids); i++ {
 		if ids[i] <= ids[i-1] {
 			return false
@@ -67,7 +67,7 @@ func TestStressMixedWorkload(t *testing.T) {
 
 	dir := t.TempDir()
 	config := NamespaceConfig{ActiveTarget: 64, HardDeltaLimit: 256, MaxDeltaValues: 32}
-	store, err := NewIndex(dir, []NamespaceSpec{
+	store, err := NewStore(dir, []NamespaceSpec{
 		enumNamespace(enumType), textNamespace(textType), continuousNamespace(continuousType), geoNamespaceFor(geoType),
 	}, config, common.DurabilityOS)
 	if err != nil {
@@ -138,9 +138,9 @@ func TestStressMixedWorkload(t *testing.T) {
 				contMoves := make([]Move, 0, idsPerWriter)
 				geoMoves := make([]Move, 0, idsPerWriter)
 				for i := 0; i < idsPerWriter; i++ {
-					id := ImageID(w*idsPerWriter + i + 1)
+					id := common.ImageID(w*idsPerWriter + i + 1)
 					enumValue := fmt.Sprintf("tag-%d-%d", w, id)
-					enumAdds = append(enumAdds, Entry{ImageID: id, Value: StringValue(enumValue)})
+					enumAdds = append(enumAdds, Entry{ImageID: id, Value: EnumStringValue(enumValue)})
 
 					nextText := []string{"shared", fmt.Sprintf("w%d-r%d", w, round)}
 					textChanges = append(textChanges, TextReplacement{ImageID: id, Before: prevText[i], After: nextText})
@@ -178,7 +178,7 @@ func TestStressMixedWorkload(t *testing.T) {
 				if !apply(locBatch, func(b *Batch) error { return b.Move(geoMoves...) }) {
 					return
 				}
-				for _, index := range []*NamespaceIndex{tag, title, iso, loc} {
+				for _, index := range []*Index{tag, title, iso, loc} {
 					if err := index.Barrier(); err != nil {
 						fail(err)
 						return
@@ -237,7 +237,7 @@ func TestStressMixedWorkload(t *testing.T) {
 					return
 				default:
 				}
-				if ids, err := tag.ValueIDs(nil, StringValue("tag-0-1")); err != nil {
+				if ids, err := tag.ValueIDs(nil, EnumStringValue("tag-0-1")); err != nil {
 					fail(err)
 					return
 				} else if !idsSortedUnique(ids) {
@@ -299,7 +299,7 @@ func TestStressMixedWorkload(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := OpenIndex(dir, config, common.DurabilityOS)
+	reopened, err := OpenStore(dir, config, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -312,9 +312,9 @@ func TestStressMixedWorkload(t *testing.T) {
 	total := writers * idsPerWriter
 	for w := 0; w < writers; w++ {
 		for i := 0; i < idsPerWriter; i++ {
-			id := ImageID(w*idsPerWriter + i + 1)
+			id := common.ImageID(w*idsPerWriter + i + 1)
 			exp := reference[w][i]
-			if ok, err := rtag.Contains(id, StringValue(exp.enumValue)); err != nil || !ok {
+			if ok, err := rtag.Contains(id, EnumStringValue(exp.enumValue)); err != nil || !ok {
 				t.Fatalf("enum id=%d value=%q ok=%v err=%v", id, exp.enumValue, ok, err)
 			}
 			if ok, err := riso.Contains(id, IntValue(exp.cont)); err != nil || !ok {
@@ -345,7 +345,7 @@ func TestStressMixedWorkload(t *testing.T) {
 	if ids := rtag.AppendTo(nil); len(ids) != total || !idsSortedUnique(ids) {
 		t.Fatalf("AppendTo returned %d ids (sorted unique=%v), want %d", len(ids), idsSortedUnique(ids), total)
 	}
-	if ok, err := rtag.Contains(1, StringValue("definitely-absent")); err != nil || ok {
+	if ok, err := rtag.Contains(1, EnumStringValue("definitely-absent")); err != nil || ok {
 		t.Fatalf("absent value reported ok=%v err=%v", ok, err)
 	}
 }
@@ -359,7 +359,7 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 		t.Skip("stress test")
 	}
 	dir := t.TempDir()
-	store, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
+	store, err := NewStore(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 	key := sfKey(t)
 	seed := loc.NewBatch()
 	for id := 1; id <= 512; id++ {
-		if err := seed.Move(Move{ImageID: ImageID(id), To: int64(key)}); err != nil {
+		if err := seed.Move(Move{ImageID: common.ImageID(id), To: int64(key)}); err != nil {
 			t.Fatalf("Move: %v", err)
 		}
 	}
@@ -382,7 +382,7 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 		t.Fatalf("Checkpoint: %v", err)
 	}
 	ranges := []GeoRange{{Start: key, End: key}}
-	lookup := func(ImageID) (float64, float64, bool) { return 37.7749, -122.4194, true }
+	lookup := func(common.ImageID) (float64, float64, bool) { return 37.7749, -122.4194, true }
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -401,7 +401,7 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 				loc.GeoRanges(ranges)
 				loc.CountGeoRanges(ranges)
 				loc.Nearest(nil, 37.7749, -122.4194, 4, lookup)
-				loc.FilterGeoRanges(nil, []ImageID{1, 2, 3}, ranges)
+				loc.FilterGeoRanges(nil, []common.ImageID{1, 2, 3}, ranges)
 			}
 		}()
 	}

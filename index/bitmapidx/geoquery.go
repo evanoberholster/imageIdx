@@ -2,11 +2,11 @@ package bitmapidx
 
 import (
 	"cmp"
-	common "github.com/evanoberholster/imageIdx/common"
 	"math"
 	"slices"
 	"sort"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -72,7 +72,7 @@ func geoBaseRangeIn(entries []NamespaceKey, keyRange GeoRange) (int, int) {
 // and unique. Ranges may be unnormalized and overlapping. The no-delta
 // path references base postings directly; the delta path unions effective
 // postings for occupied keys.
-func (i *NamespaceIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr error) {
+func (i *Index) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr error) {
 	if i.spec().Kind != common.KindBitmapGeo {
 		return roar.Bitmap{}, ErrNamespaceMismatch
 	}
@@ -120,7 +120,7 @@ func (i *NamespaceIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resul
 // candidates' order and allocates nothing beyond dst growth for typical range
 // counts. Prefer CollectGeoRanges plus bitmap probes when buckets are many or
 // the match will be reused; see CountGeoCells for the planning probe.
-func (i *NamespaceIndex) FilterGeoRanges(dst, candidates []ImageID, ranges []GeoRange) ([]ImageID, error) {
+func (i *Index) FilterGeoRanges(dst, candidates []common.ImageID, ranges []GeoRange) ([]common.ImageID, error) {
 	if i.spec().Kind != common.KindBitmapGeo {
 		return dst, ErrNamespaceMismatch
 	}
@@ -190,7 +190,7 @@ func (v *namespaceView) prepareGeoProbe(ranges []GeoRange, spanBuf []geoBaseSpan
 // geoProbeContains reports whether id holds any bucket inside the prepared
 // spans, walking base postings directly when no deltas are visible and the
 // full active/frozen/base precedence otherwise.
-func (v *namespaceView) geoProbeContains(p *geoProbe, id ImageID) bool {
+func (v *namespaceView) geoProbeContains(p *geoProbe, id common.ImageID) bool {
 	if p.deltaKeys == nil {
 		for _, span := range p.spans {
 			postings := v.base.postings[span.start:span.end]
@@ -220,7 +220,7 @@ func (v *namespaceView) geoProbeContains(p *geoProbe, id ImageID) bool {
 // EstimateGeoRanges returns the effective candidate count for occupied
 // buckets inside ranges without materializing. Multi-valued overlap
 // makes it an upper bound; it is a planning hint, not an exact count.
-func (i *NamespaceIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
+func (i *Index) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
 	if i.spec().Kind != common.KindBitmapGeo {
 		return 0, ErrNamespaceMismatch
 	}
@@ -246,7 +246,7 @@ func (i *NamespaceIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
 // CountGeoRanges returns the number of images inside any key range by
 // unioning bitmaps and counting, without appending IDs. The no-delta
 // path pre-sizes scratch once from the occupied bucket count.
-func (i *NamespaceIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
+func (i *Index) CountGeoRanges(ranges []GeoRange) (uint64, error) {
 	if i.spec().Kind != common.KindBitmapGeo {
 		return 0, ErrNamespaceMismatch
 	}
@@ -281,7 +281,7 @@ func (i *NamespaceIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
 // CollectGeoRanges folds every effective posting inside ranges into m.
 // The caller resets m first and materializes once with AppendTo. The
 // delta path uses deduplicated keys so each posting folds once.
-func (i *NamespaceIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) {
+func (i *Index) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) {
 	if m == nil || len(ranges) == 0 || i.spec().Kind != common.KindBitmapGeo {
 		return
 	}
@@ -311,7 +311,7 @@ func (i *NamespaceIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRan
 // planning probe: small counts favor FilterGeoRanges probes, large counts
 // favor CollectGeoRanges materialization. Delta keys present in multiple
 // layers count twice, so it is an upper bound.
-func (i *NamespaceIndex) CountGeoCells(ranges []GeoRange) int {
+func (i *Index) CountGeoCells(ranges []GeoRange) int {
 	if len(ranges) == 0 || i.spec().Kind != common.KindBitmapGeo {
 		return 0
 	}
@@ -393,7 +393,7 @@ func (v *namespaceView) countGeoKeys(ranges []GeoRange) int {
 // so per-key appends do not regrow. Postings append per key, then the
 // tail sorts and compacts once; disjoint single-valued namespaces could merge
 // without a global sort, but one sort keeps the path simple and uniform.
-func (i *NamespaceIndex) AppendTo(dst []ImageID) []ImageID {
+func (i *Index) AppendTo(dst []common.ImageID) []common.ImageID {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
 	view := i.view.Load()
@@ -452,7 +452,7 @@ func validateGeoChanges(view *namespaceView, changes []stagedChange) error {
 			}
 		}
 	}
-	added := make(map[ImageID]struct{}, len(changes))
+	added := make(map[common.ImageID]struct{}, len(changes))
 	for _, change := range changes {
 		for _, id := range change.add {
 			if _, ok := added[id]; ok {
@@ -469,11 +469,11 @@ func validateGeoChanges(view *namespaceView, changes []stagedChange) error {
 
 // GeoCoordinateLookup supplies canonical coordinates for nearest search.
 // Images without coordinates report ok=false and are skipped.
-type GeoCoordinateLookup func(ImageID) (latitude, longitude float64, ok bool)
+type GeoCoordinateLookup func(common.ImageID) (latitude, longitude float64, ok bool)
 
 // NearestResult is one nearest match with its haversine distance.
 type NearestResult struct {
-	ImageID        ImageID
+	ImageID        common.ImageID
 	DistanceMeters float64
 }
 
@@ -482,7 +482,7 @@ type NearestResult struct {
 // in namespace size. It suits modest namespaces, not full-catalog nearest search.
 // Invalid origins, non-positive k, nil lookups, and wrong kinds append
 // nothing.
-func (i *NamespaceIndex) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup GeoCoordinateLookup) []NearestResult {
+func (i *Index) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup GeoCoordinateLookup) []NearestResult {
 	if i.spec().Kind != common.KindBitmapGeo || k <= 0 || lookup == nil {
 		return dst
 	}

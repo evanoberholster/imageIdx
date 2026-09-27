@@ -13,13 +13,13 @@ ranges), `vectoridx` (HNSW ANN), `search` (combined queries).
 ### Namespace index (enum, bool, text, continuous, geo)
 
 ```go
-store, err := bitmapidx.NewIndex(
+store, err := bitmapidx.NewStore(
 	"./data/namespaces",
 	[]bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Namespace: common.NamespaceLocation, Name: "location", Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
-		{Namespace: common.Namespace(101), Name: "focal-length", Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}},
-		{Namespace: common.Namespace(102), Name: "title", Kind: bitmapidx.KindText, Storage: bitmapidx.StoragePerType, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion}},
+		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
+		{Namespace: common.NamespaceLocation, Kind: common.KindBitmapGeo, Geo: bitmapidx.GeoCodec{Version: 1}},
+		{Namespace: common.Namespace(101), Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}},
+		{Namespace: common.Namespace(102), Kind: common.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion}},
 	},
 	bitmapidx.NamespaceConfig{},
 	common.DurabilityOS,
@@ -35,7 +35,7 @@ focals, _ := store.Lookup(common.Namespace(101))
 titles, _ := store.Lookup(common.Namespace(102))
 ```
 
-Reopen the same store with `bitmapidx.OpenIndex(dir, config, durability)`.
+Reopen the same store with `bitmapidx.OpenStore(dir, config, durability)`.
 
 ### Timestamp index
 
@@ -86,8 +86,8 @@ Stage one or more entries in a reusable `Batch`, `Apply` to queue them, then
 ```go
 batch := tags.NewBatch()
 if err := batch.Add(
-	bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("Trekking")},
-	bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("Travel")},
+	bitmapidx.Entry{ImageID: 100, Value: bitmapidx.EnumStringValue("Trekking")},
+	bitmapidx.Entry{ImageID: 200, Value: bitmapidx.EnumStringValue("Travel")},
 ); err != nil {
 	log.Fatal(err)
 }

@@ -10,9 +10,9 @@ import (
 // seedStore builds a persistent store with values distinct enum values,
 // each holding perValue images, adding in bounded batches. The newly added
 // memberships stay in the WAL until the caller checkpoints.
-func seedStore(b *testing.B, dir string, values, perValue int) *Index {
+func seedStore(b *testing.B, dir string, values, perValue int) *Store {
 	b.Helper()
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilitySync)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -26,9 +26,9 @@ func seedStore(b *testing.B, dir string, values, perValue int) *Index {
 		entries = entries[:0]
 	}
 	for value := 0; value < values; value++ {
-		name := StringValue(fmt.Sprintf("value-%d", value))
+		name := EnumStringValue(fmt.Sprintf("value-%d", value))
 		for n := 0; n < perValue; n++ {
-			entries = append(entries, Entry{ImageID: ImageID(value*perValue + n + 1), Value: name})
+			entries = append(entries, Entry{ImageID: common.ImageID(value*perValue + n + 1), Value: name})
 			if len(entries) == cap(entries) {
 				flush()
 			}
@@ -40,15 +40,15 @@ func seedStore(b *testing.B, dir string, values, perValue int) *Index {
 
 // addTail appends updates memberships spread over distinct values, split
 // into MaxNamespaceBatchUpdates-sized write batches.
-func addTail(index *NamespaceIndex, baseImage ImageID, updates, distinct int) error {
+func addTail(index *Index, baseImage common.ImageID, updates, distinct int) error {
 	if updates <= 0 {
 		return nil
 	}
 	batch := make([]Entry, 0, updates)
 	for n := 0; n < updates; n++ {
 		batch = append(batch, Entry{
-			ImageID: baseImage + ImageID(n),
-			Value:   StringValue(fmt.Sprintf("tail-%d", n%distinct)),
+			ImageID: baseImage + common.ImageID(n),
+			Value:   EnumStringValue(fmt.Sprintf("tail-%d", n%distinct)),
 		})
 	}
 	bt := index.NewBatch()
@@ -108,7 +108,7 @@ func BenchmarkNamespaceReopen(b *testing.B) {
 			}
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
-				opened, err := OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+				opened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -120,18 +120,18 @@ func BenchmarkNamespaceReopen(b *testing.B) {
 	}
 }
 
-func benchmarkMaxCardinalityIndex(b *testing.B) *NamespaceIndex {
+func benchmarkMaxCardinalityIndex(b *testing.B) *Index {
 	b.Helper()
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = index.Close() })
 	const ids = 1 << 18
-	value := StringValue("shared")
+	value := EnumStringValue("shared")
 	entries := make([]Entry, 0, 4096)
 	for n := 1; n <= ids; n++ {
-		entries = append(entries, Entry{ImageID: ImageID(n), Value: value})
+		entries = append(entries, Entry{ImageID: common.ImageID(n), Value: value})
 		if len(entries) == cap(entries) {
 			commit(b, index, func(bt *Batch) error { return bt.Add(entries...) })
 			entries = entries[:0]
@@ -148,7 +148,7 @@ func benchmarkMaxCardinalityIndex(b *testing.B) *NamespaceIndex {
 // returning a posting with no persistence copy.
 func BenchmarkNamespaceMaxCardinalityMatchInMemory(b *testing.B) {
 	index := benchmarkMaxCardinalityIndex(b)
-	value := StringValue("shared")
+	value := EnumStringValue("shared")
 	b.ResetTimer()
 	b.ReportAllocs()
 	for n := 0; n < b.N; n++ {
@@ -168,7 +168,7 @@ func BenchmarkNamespaceMaxCardinalityMatchPersistent(b *testing.B) {
 		b.Fatal(err)
 	}
 	index, _ := s.Lookup(common.NamespaceTag)
-	value := StringValue("value-0")
+	value := EnumStringValue("value-0")
 	b.ResetTimer()
 	b.ReportAllocs()
 	for n := 0; n < b.N; n++ {

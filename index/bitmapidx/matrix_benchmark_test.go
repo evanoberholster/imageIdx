@@ -26,9 +26,9 @@ const (
 // (Bench.MD 22).
 var (
 	sinkNamespaceBitmap   roar.Bitmap
-	sinkNamespaceIDs      []ImageID
-	sinkNamespaceFiltered []ImageID
-	sinkNamespaceAppended []ImageID
+	sinkNamespaceIDs      []common.ImageID
+	sinkNamespaceFiltered []common.ImageID
+	sinkNamespaceAppended []common.ImageID
 	sinkNamespaceBool     bool
 	sinkNamespaceCount    uint64
 )
@@ -36,12 +36,12 @@ var (
 // namespaceMatrix is one seeded enum fixture shared by all query benchmarks of a
 // dataset size. The caller owns index and must close it.
 type namespaceMatrix struct {
-	index      *NamespaceIndex
+	index      *Index
 	ids        []uint64
 	values     []Value
 	hits       []Entry
 	misses     []Entry
-	candidates []ImageID
+	candidates []common.ImageID
 }
 
 // buildNamespaceMatrix seeds the fixture described above. hits/misses are sampled
@@ -60,20 +60,20 @@ func buildNamespaceMatrix(tb testing.TB, n int) *namespaceMatrix {
 	perm := bench.NewRNG(matrixSeed + 1).Perm(n)
 	values := make([]Value, distinct)
 	for i := range values {
-		values[i] = StringValue(fmt.Sprintf("value-%d", i))
+		values[i] = EnumStringValue(fmt.Sprintf("value-%d", i))
 	}
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		tb.Fatalf("NewNamespaceIndex: %v", err)
+		tb.Fatalf("NewIndex: %v", err)
 	}
 	matrix := &namespaceMatrix{index: index, ids: ids, values: values}
 	matrix.hits = make([]Entry, 0, min(n, matrixSampleSize))
 	matrix.misses = make([]Entry, 0, min(n, matrixSampleSize))
-	absentValue := StringValue("__absent__")
+	absentValue := EnumStringValue("__absent__")
 	entries := make([]Entry, 0, MaxNamespaceBatchUpdates)
 	for i, id := range ids {
 		valueIndex := perm[i] % distinct
-		entry := Entry{ImageID: ImageID(id), Value: values[valueIndex]}
+		entry := Entry{ImageID: common.ImageID(id), Value: values[valueIndex]}
 		entries = append(entries, entry)
 		if len(matrix.hits) < matrixSampleSize {
 			missValue := absentValue
@@ -102,9 +102,9 @@ func buildNamespaceMatrix(tb testing.TB, n int) *namespaceMatrix {
 	}
 	count := min(n, matrixCandidateMax)
 	picks := bench.Workload(matrixSeed+2, bench.Uniform, n, count)
-	matrix.candidates = make([]ImageID, count)
+	matrix.candidates = make([]common.ImageID, count)
 	for i, pick := range picks {
-		matrix.candidates[i] = ImageID(ids[pick])
+		matrix.candidates[i] = common.ImageID(ids[pick])
 	}
 	return matrix
 }
@@ -121,7 +121,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 	matrix := buildNamespaceMatrix(b, n)
 	defer func() { _ = matrix.index.Close() }()
 	heapAfter := bench.HeapBytes()
-	bench.ReportIndexSize(b, fmt.Sprintf("NamespaceIndex/N=%d", n), heapBefore, heapAfter, 0, n)
+	bench.ReportIndexSize(b, fmt.Sprintf("Index/N=%d", n), heapBefore, heapAfter, 0, n)
 
 	for _, k := range []int{1, 2, 4} {
 		if k > len(matrix.values) {
@@ -167,7 +167,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 	})
 
 	b.Run(fmt.Sprintf("ValueIDs/N=%d", n), func(b *testing.B) {
-		buffer := make([]ImageID, 0, matrixPerValue)
+		buffer := make([]common.ImageID, 0, matrixPerValue)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -186,7 +186,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 		}
 		b.Run(fmt.Sprintf("FilterValues/K=%d/N=%d/Dst=Preallocated", k, n), func(b *testing.B) {
 			query := matrix.values[:k]
-			dst := make([]ImageID, 0, len(matrix.candidates))
+			dst := make([]common.ImageID, 0, len(matrix.candidates))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
@@ -200,7 +200,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 		})
 		b.Run(fmt.Sprintf("FilterValues/K=%d/N=%d/Dst=Growing", k, n), func(b *testing.B) {
 			query := matrix.values[:k]
-			var dst []ImageID
+			var dst []common.ImageID
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
@@ -222,7 +222,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 		}
 	})
 
-	absent := StringValue("__absent__")
+	absent := EnumStringValue("__absent__")
 	b.Run(fmt.Sprintf("Adversarial/UnknownValue/N=%d/MatchValues", n), func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -246,7 +246,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 		}
 	})
 	b.Run(fmt.Sprintf("Adversarial/UnknownValue/N=%d/ValueIDs", n), func(b *testing.B) {
-		var dst []ImageID
+		var dst []common.ImageID
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -259,7 +259,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 		sinkNamespaceIDs = dst
 	})
 	b.Run(fmt.Sprintf("Adversarial/AppendTo/N=%d", n), func(b *testing.B) {
-		dst := make([]ImageID, 0, n)
+		dst := make([]common.ImageID, 0, n)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -273,13 +273,13 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 // that do not depend on a dataset size: empty index, single entry, and a
 // membership at math.MaxUint64.
 func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
-	empty, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	empty, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer func() { _ = empty.Close() }()
 
-	absent := StringValue("absent")
+	absent := EnumStringValue("absent")
 	b.Run("Adversarial/EmptyIndex/MatchValues", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -303,7 +303,7 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		}
 	})
 	b.Run("Adversarial/EmptyIndex/ValueIDs", func(b *testing.B) {
-		var dst []ImageID
+		var dst []common.ImageID
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -316,11 +316,11 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		sinkNamespaceIDs = dst
 	})
 	b.Run("Adversarial/EmptyIndex/FilterValues", func(b *testing.B) {
-		candidates := make([]ImageID, 0, 64)
-		for id := ImageID(1); id <= 64; id++ {
+		candidates := make([]common.ImageID, 0, 64)
+		for id := common.ImageID(1); id <= 64; id++ {
 			candidates = append(candidates, id)
 		}
-		var dst []ImageID
+		var dst []common.ImageID
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -340,7 +340,7 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		}
 	})
 	b.Run("Adversarial/EmptyIndex/AppendTo", func(b *testing.B) {
-		var dst []ImageID
+		var dst []common.ImageID
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -349,12 +349,12 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		sinkNamespaceAppended = dst
 	})
 
-	single, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	single, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer func() { _ = single.Close() }()
-	only := StringValue("only")
+	only := EnumStringValue("only")
 	commit(b, single, func(batch *Batch) error {
 		return batch.Add(Entry{ImageID: 1, Value: only})
 	})
@@ -392,7 +392,7 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		}
 	})
 	b.Run("Adversarial/SingleEntry/AppendTo", func(b *testing.B) {
-		var dst []ImageID
+		var dst []common.ImageID
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -401,13 +401,13 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		sinkNamespaceAppended = dst
 	})
 
-	maxNamespace, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	maxNamespace, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer func() { _ = maxNamespace.Close() }()
-	maxValue := StringValue("max")
-	maxID := ImageID(math.MaxUint64)
+	maxValue := EnumStringValue("max")
+	maxID := common.ImageID(math.MaxUint64)
 	commit(b, maxNamespace, func(batch *Batch) error {
 		return batch.Add(Entry{ImageID: maxID, Value: maxValue})
 	})
@@ -440,7 +440,7 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		}
 	})
 	b.Run("Adversarial/MaxImageID/ValueIDs", func(b *testing.B) {
-		var dst []ImageID
+		var dst []common.ImageID
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -453,7 +453,7 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		sinkNamespaceIDs = dst
 	})
 	b.Run("Adversarial/MaxImageID/AppendTo", func(b *testing.B) {
-		var dst []ImageID
+		var dst []common.ImageID
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {

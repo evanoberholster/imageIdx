@@ -45,13 +45,13 @@ var geoBenchCities = []geoBenchCity{
 // around each benchmark city and returns the namespace, one level-8 query cell per
 // city (the coarse cell used by "search Paris" style queries), and the
 // canonical coordinate lookup used by Nearest.
-func benchmarkGeoNamespace(b *testing.B, perCity int) (*NamespaceIndex, []uint64, GeoCoordinateLookup) {
+func benchmarkGeoNamespace(b *testing.B, perCity int) (*Index, []uint64, GeoCoordinateLookup) {
 	b.Helper()
 	rng := rand.New(rand.NewSource(42))
 	total := perCity * len(geoBenchCities)
 	entries := make([]GeoEntry, 0, total)
-	coordinates := make(map[ImageID][2]float64, total)
-	id := ImageID(1)
+	coordinates := make(map[common.ImageID][2]float64, total)
+	id := common.ImageID(1)
 	for _, city := range geoBenchCities {
 		for range perCity {
 			latitude := city.lat + (rng.Float64()-0.5)*0.3
@@ -71,7 +71,7 @@ func benchmarkGeoNamespace(b *testing.B, perCity int) (*NamespaceIndex, []uint64
 	for index, city := range geoBenchCities {
 		cells[index] = uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(city.lat, city.lng)).Parent(8))
 	}
-	lookup := func(id ImageID) (float64, float64, bool) {
+	lookup := func(id common.ImageID) (float64, float64, bool) {
 		coordinate, ok := coordinates[id]
 		return coordinate[0], coordinate[1], ok
 	}
@@ -108,7 +108,7 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 			}
 		})
 		b.Run(city.name+"/append", func(b *testing.B) {
-			dst := make([]ImageID, 0, int(match.Cardinality()))
+			dst := make([]common.ImageID, 0, int(match.Cardinality()))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
@@ -121,11 +121,11 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 		// list, matching the planner's verify gate; large candidate sets take
 		// the collect path instead.
 		b.Run(city.name+"/filter", func(b *testing.B) {
-			candidates := make([]ImageID, 0, 128)
-			for id := ImageID(1); len(candidates) < 128; id += 937 {
+			candidates := make([]common.ImageID, 0, 128)
+			for id := common.ImageID(1); len(candidates) < 128; id += 937 {
 				candidates = append(candidates, id)
 			}
-			dst := make([]ImageID, 0, len(candidates))
+			dst := make([]common.ImageID, 0, len(candidates))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
@@ -135,7 +135,7 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 		})
 		b.Run(city.name+"/collect", func(b *testing.B) {
 			m := roar.NewMutableBitmap()
-			dst := make([]ImageID, 0, int(match.Cardinality()))
+			dst := make([]common.ImageID, 0, int(match.Cardinality()))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {

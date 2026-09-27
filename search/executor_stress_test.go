@@ -32,9 +32,9 @@ type stressFixture struct {
 	plan     Plan
 	executor *Executor
 	batches  sync.Pool
-	bitmap   *bitmapidx.NamespaceIndex
+	bitmap   *bitmapidx.Index
 	times    *timeidx.Index
-	geo      *bitmapidx.NamespaceIndex
+	geo      *bitmapidx.Index
 	cell     bitmapidx.S2Key
 	quantum  uint64
 }
@@ -55,15 +55,14 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 		geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122})
 	}
 
-	bitmap, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType,
-	}, bitmapidx.NamespaceConfig{})
+	bitmap, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
 	initialEntries := make([]bitmapidx.Entry, len(bitmapIDs))
 	for n, id := range bitmapIDs {
-		initialEntries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("favorite")}
+		initialEntries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.EnumStringValue("favorite")}
 	}
 	commitBitmap(tb, bitmap, func(bt *bitmapidx.Batch) error { return bt.Add(initialEntries...) })
 	tb.Cleanup(func() { _ = bitmap.Close() })
@@ -85,7 +84,7 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 		tb.Fatal(err)
 	}
 	plan, err := Compile(
-		AllValues(bitmap, bitmapidx.StringValue("favorite")),
+		AllValues(bitmap, bitmapidx.EnumStringValue("favorite")),
 		During(timeIndex, quantum, 20000*quantum),
 		InCells(geo, bitmapidx.DecodeS2Key(cell)),
 	)
@@ -193,7 +192,7 @@ func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize 
 				}
 				entries := make([]bitmapidx.Entry, 0, len(ids))
 				for _, id := range ids {
-					entries = append(entries, bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("favorite")})
+					entries = append(entries, bitmapidx.Entry{ImageID: id, Value: bitmapidx.EnumStringValue("favorite")})
 				}
 				bitmapBatch := fixture.bitmap.NewBatch()
 				if err := bitmapBatch.Add(entries...); err != nil {
@@ -399,7 +398,7 @@ func BenchmarkExecutorStaleVsFreshPlan(b *testing.B) {
 		b.Fatal(err)
 	}
 	fresh, err := Compile(
-		AllValues(fixture.bitmap, bitmapidx.StringValue("favorite")),
+		AllValues(fixture.bitmap, bitmapidx.EnumStringValue("favorite")),
 		During(fixture.times, fixture.quantum, 20000*fixture.quantum),
 		InCells(fixture.geo, bitmapidx.DecodeS2Key(fixture.cell)),
 	)

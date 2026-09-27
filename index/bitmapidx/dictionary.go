@@ -193,7 +193,7 @@ func compareNamespaceHash(a, b NamespaceKey) int {
 // dictionaryWriter owns mutable dictionary state between publications.
 // Base and active slices are immutable once published; new values
 // accumulate in pending and seal into a fresh active slice. The writer is
-// confined to the NamespaceIndex writer lock and never read concurrently.
+// confined to the Index writer lock and never read concurrently.
 type dictionaryWriter struct {
 	chunks        [][]byte
 	base          []dictEntry
@@ -344,7 +344,7 @@ func (d *dictionaryWriter) resolvePending(base NamespaceKey, canonical []byte) (
 
 // abort discards entries staged by a batch that failed before
 // publication, so a later seal cannot publish values whose postings were
-// never written. The caller holds the NamespaceIndex writer lock.
+// never written. The caller holds the Index writer lock.
 func (d *dictionaryWriter) abort() {
 	d.pending = nil
 	d.pendingByHash = nil

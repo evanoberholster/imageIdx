@@ -2,8 +2,9 @@ package bitmapidx
 
 import (
 	"errors"
-	common "github.com/evanoberholster/imageIdx/common"
 	"sync/atomic"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 var (
@@ -21,7 +22,7 @@ var (
 // batch queued before it is WAL-appended and published.
 //
 // Ownership: staged entries borrow caller value bytes exactly like the
-// former BytesValue contract — callers must not mutate them until Apply
+// former EnumBytesValue contract — callers must not mutate them until Apply
 // returns. Apply copies each distinct canonical into committer-owned
 // storage before enqueueing, so once Apply returns the batch (and the
 // caller buffers) may be Reset and reused immediately, even though the
@@ -30,7 +31,7 @@ var (
 // reference. A Batch serves one caller at a time; Reset reuses its
 // buffers and Close invalidates it.
 type Batch struct {
-	index        *NamespaceIndex
+	index        *Index
 	add          []Entry
 	remove       []Entry
 	moves        []Move
@@ -42,7 +43,7 @@ type Batch struct {
 // NewBatch returns an empty batch bound to i. The batch is writer-owned:
 // stage operations from one goroutine, then Apply. A batch may be reused
 // with Reset after Apply returns.
-func (i *NamespaceIndex) NewBatch() *Batch {
+func (i *Index) NewBatch() *Batch {
 	return &Batch{index: i}
 }
 

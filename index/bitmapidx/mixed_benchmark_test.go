@@ -72,7 +72,7 @@ func benchmarkNamespaceIndexMixedRun(b *testing.B, duration time.Duration, write
 	dir := b.TempDir()
 	values := make([]Value, mixedValues)
 	for i := range values {
-		values[i] = StringValue(fmt.Sprintf("v-%d", i))
+		values[i] = EnumStringValue(fmt.Sprintf("v-%d", i))
 	}
 	heapBefore := bench.HeapBytes()
 	store, index := buildMixedStore(b, dir, mixedN, values)
@@ -97,9 +97,9 @@ func benchmarkNamespaceIndexMixedRun(b *testing.B, duration time.Duration, write
 // buildMixedStore creates the persistent enum store and seeds it with n
 // memberships spread over the supplied values, then checkpoints so readers
 // exercise the mmap-backed base rather than an in-memory delta.
-func buildMixedStore(tb testing.TB, dir string, n int, values []Value) (*Index, *NamespaceIndex) {
+func buildMixedStore(tb testing.TB, dir string, n int, values []Value) (*Store, *Index) {
 	tb.Helper()
-	store, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, DurabilityOS)
+	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		tb.Fatalf("NewIndex: %v", err)
 	}
@@ -119,7 +119,7 @@ func buildMixedStore(tb testing.TB, dir string, n int, values []Value) (*Index, 
 	assignment := bench.NewRNG(mixedSeed).Perm(n)
 	for id := 1; id <= n; id++ {
 		value := values[assignment[id-1]%len(values)]
-		entries = append(entries, Entry{ImageID: ImageID(id), Value: value})
+		entries = append(entries, Entry{ImageID: common.ImageID(id), Value: value})
 		if len(entries) == cap(entries) {
 			flush()
 		}
@@ -149,7 +149,7 @@ type mixedRunResult struct {
 // stay in plan order across lanes. deletePct == 0 pairs an eviction with
 // every insert so population stays bounded in a write-only mix; otherwise
 // deletes drain the inserted-ID pool.
-func runMixedWorkload(store *Index, index *NamespaceIndex, plan []bench.Op, reads []int, values []Value, duration time.Duration, writePct, deletePct int) (mixedRunResult, error) {
+func runMixedWorkload(store *Store, index *Index, plan []bench.Op, reads []int, values []Value, duration time.Duration, writePct, deletePct int) (mixedRunResult, error) {
 	var mutationCursor, nextID, readCount, writeCount, deleteCount atomic.Uint64
 	nextID.Store(mixedN)
 	pool := &mixedIDPool{}
@@ -192,7 +192,7 @@ func runMixedWorkload(store *Index, index *NamespaceIndex, plan []bench.Op, read
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			var buffer []ImageID
+			var buffer []common.ImageID
 			position := 0
 			result.readIssued[lane] = bench.OpenLoop(duration, readRatePerLane, 1, result.readRecorders[lane], func() {
 				readCount.Add(1)
@@ -222,7 +222,7 @@ func runMixedWorkload(store *Index, index *NamespaceIndex, plan []bench.Op, read
 				switch nextMutation(plan, &mutationCursor) {
 				case bench.Write:
 					writeCount.Add(1)
-					id := ImageID(nextID.Add(1))
+					id := common.ImageID(nextID.Add(1))
 					entry := Entry{ImageID: id, Value: values[id%uint64(len(values))]}
 					if err := batch.Reset(); err != nil {
 						fail(err)
@@ -313,7 +313,7 @@ func mixedMaintenanceInterval(duration time.Duration) time.Duration {
 // runMixedMaintenance checkpoints while the lanes run and vacuums every
 // fourth window. Checkpoint blocks writers, not readers, so any stall it
 // imposes shows up in the recorded write and subsequent request latencies.
-func runMixedMaintenance(ctx context.Context, store *Index, interval time.Duration, fail func(error)) {
+func runMixedMaintenance(ctx context.Context, store *Store, interval time.Duration, fail func(error)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	ticks := 0
@@ -368,7 +368,7 @@ func (p *mixedIDPool) pop() (Entry, bool) {
 	return entry, true
 }
 
-func mixedSortedUnique(ids []ImageID) bool {
+func mixedSortedUnique(ids []common.ImageID) bool {
 	if !slices.IsSorted(ids) {
 		return false
 	}

@@ -91,7 +91,7 @@ func principalKey(id uint64) [8]byte {
 }
 
 // Value returns the enum value for membership writes and presence checks:
-// the ID in fixed 8-byte little-endian form. Like bitmapidx.StringValue it
+// the ID in fixed 8-byte little-endian form. Like bitmapidx.EnumStringValue it
 // copies into a fresh slice.
 func (p principal[T]) Value() bitmapidx.Value {
 	key := principalKey(uint64(p.id))

@@ -11,7 +11,7 @@ import (
 
 func TestExecutorCountAndAppendIDs(t *testing.T) {
 	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
-	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
+	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)
 	}

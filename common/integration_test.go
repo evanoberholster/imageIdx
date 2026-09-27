@@ -31,12 +31,10 @@ func integrationDefs(t *testing.T) []common.NamespaceDef {
 
 	bitmapDef, err := bitmapidx.NamespaceSpec{
 		Namespace: common.NamespaceTag,
-		Name:      "tag",
 		Kind:      common.KindBitmapEnum,
-		Storage:   bitmapidx.StoragePerType,
-	}.SchemaDef()
+	}.NamespaceDef("tag")
 	if err != nil {
-		t.Fatalf("bitmap SchemaDef: %v", err)
+		t.Fatalf("bitmap NamespaceDef: %v", err)
 	}
 
 	vectorDef := vectoridx.Config{Namespace: vectorNamespace}.NamespaceDef()
@@ -111,7 +109,7 @@ func TestSchemaRegistersEveryIndexKind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NamespaceSpecFromSchemaDef: %v", err)
 	}
-	if spec.Namespace != common.NamespaceTag || spec.Kind != common.KindBitmapEnum || spec.Storage != bitmapidx.StoragePerType {
+	if spec.Namespace != common.NamespaceTag || spec.Kind != common.KindBitmapEnum {
 		t.Fatalf("restored bitmap spec = %+v", spec)
 	}
 }
@@ -123,13 +121,11 @@ func TestSchemaRegistersEveryIndexKind(t *testing.T) {
 func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 	tagSpec := bitmapidx.NamespaceSpec{
 		Namespace: common.NamespaceTag,
-		Name:      "tag",
 		Kind:      common.KindBitmapEnum,
-		Storage:   bitmapidx.StoragePerType,
 	}
-	tags, err := bitmapidx.NewNamespaceIndex(tagSpec, bitmapidx.NamespaceConfig{})
+	tags, err := bitmapidx.NewIndex(tagSpec, bitmapidx.NamespaceConfig{})
 	if err != nil {
-		t.Fatalf("NewNamespaceIndex: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	defer func() {
 		if err := tags.Close(); err != nil {

@@ -16,7 +16,7 @@ import (
 
 const namespaceManifestMagic uint32 = 0x424d464d
 
-// Index persists a fixed registry of namespaces with one serialized WAL
+// Store persists a fixed registry of namespaces with one serialized WAL
 // writer. Child Add/Apply/Move/ReplaceText calls automatically append to
 // that WAL. Each batch is atomic within one namespace; cross-namespace
 // transactions are not provided. Reads remain lock-free across writes and
@@ -28,12 +28,12 @@ const namespaceManifestMagic uint32 = 0x424d464d
 // maintenance, bound WAL growth, and monitor free space themselves; the
 // package benchmark suite probes the checkpoint write stall and restart
 // budgets.
-type Index struct {
+type Store struct {
 	dir        string
-	namespaces map[common.Namespace]*NamespaceIndex // immutable after construction
-	order      []*NamespaceIndex
+	namespaces map[common.Namespace]*Index // immutable after construction
+	order      []*Index
 	config     NamespaceConfig
-	durability Durability
+	durability common.Durability
 	storeID    [16]byte // binds manifest, snapshots, and WAL to one store
 	writeMu    sync.Mutex
 	closed     bool
@@ -55,12 +55,12 @@ func newStoreID() ([16]byte, error) {
 	return id, nil
 }
 
-// NewIndex creates a new mmap-backed namespace store. The
+// NewStore creates a new mmap-backed namespace store. The
 // directory must be empty (besides the lock file). NamespaceSpec definitions are
 // validated, persisted in the first checkpoint, and immutable after;
 // config is runtime-only policy. Handles become store-owned on success
 // and must be closed via the store.
-func NewIndex(dir string, namespaces []NamespaceSpec, config NamespaceConfig, durability Durability) (*Index, error) {
+func NewStore(dir string, namespaces []NamespaceSpec, config NamespaceConfig, durability common.Durability) (*Store, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -81,9 +81,9 @@ func NewIndex(dir string, namespaces []NamespaceSpec, config NamespaceConfig, du
 	if err != nil {
 		return nil, err
 	}
-	s := &Index{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, namespaces: make(map[common.Namespace]*NamespaceIndex)}
+	s := &Store{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, namespaces: make(map[common.Namespace]*Index)}
 	for _, spec := range specs {
-		index, err := NewNamespaceIndex(spec, config)
+		index, err := NewIndex(spec, config)
 		if err != nil {
 			s.Close()
 			return nil, err
@@ -101,11 +101,11 @@ func NewIndex(dir string, namespaces []NamespaceSpec, config NamespaceConfig, du
 	return s, nil
 }
 
-// OpenIndex opens a checkpoint, replays its WAL, and repairs
+// OpenStore opens a checkpoint, replays its WAL, and repairs
 // only an incomplete terminal frame before making namespace handles
 // available. Generation, namespace count, segment checksums, and WAL offsets
 // all validate; any other corruption fails the open for external recovery.
-func OpenIndex(dir string, config NamespaceConfig, durability Durability) (*Index, error) {
+func OpenStore(dir string, config NamespaceConfig, durability common.Durability) (*Store, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -117,7 +117,7 @@ func OpenIndex(dir string, config NamespaceConfig, durability Durability) (*Inde
 	if err != nil {
 		return nil, err
 	}
-	s := &Index{dir: dir, config: config, durability: durability, lock: lock}
+	s := &Store{dir: dir, config: config, durability: durability, lock: lock}
 	ok := false
 	defer func() {
 		if !ok {
@@ -146,7 +146,7 @@ func OpenIndex(dir string, config NamespaceConfig, durability Durability) (*Inde
 	if uint64(len(s.order)) != binary.LittleEndian.Uint64(data[16:24]) {
 		return nil, ErrCorruptManifest
 	}
-	s.namespaces = make(map[common.Namespace]*NamespaceIndex, len(s.order))
+	s.namespaces = make(map[common.Namespace]*Index, len(s.order))
 	for _, index := range s.order {
 		s.namespaces[index.spec().Namespace] = index
 	}
@@ -174,29 +174,29 @@ func OpenIndex(dir string, config NamespaceConfig, durability Durability) (*Inde
 
 // Lookup returns the store-owned namespace for t. All mutations append to the
 // store WAL. The handle must not be closed directly.
-func (s *Index) Lookup(t common.Namespace) (*NamespaceIndex, bool) {
+func (s *Store) Lookup(t common.Namespace) (*Index, bool) {
 	index, ok := s.namespaces[t]
 	return index, ok
 }
 
 // Len returns the number of namespaces in physical storage order.
-func (s *Index) Len() int { return len(s.order) }
+func (s *Store) Len() int { return len(s.order) }
 
 // Namespaces returns store-owned handles in physical storage order. The slice
 // is a copy; the handles are shared and must not be closed directly.
-func (s *Index) Namespaces() []*NamespaceIndex { return append([]*NamespaceIndex(nil), s.order...) }
+func (s *Store) Namespaces() []*Index { return append([]*Index(nil), s.order...) }
 
-func (s *Index) writable() error {
+func (s *Store) writable() error {
 	if s.closed {
 		return ErrClosed
 	}
 	return s.failed
 }
 
-func (s *Index) snapshotPath(gen uint64) string {
+func (s *Store) snapshotPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("namespaces-%020d.idx", gen))
 }
-func (s *Index) walPath(gen uint64) string {
+func (s *Store) walPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("namespaces-%020d.wal", gen))
 }
 
@@ -205,7 +205,7 @@ func (s *Index) walPath(gen uint64) string {
 // directory, then publishes the manifest. Afterwards it swaps namespace
 // roots, drains prior readers, and unmaps the old snapshot. A completed
 // checkpoint bounds subsequent replay to its WAL.
-func (s *Index) Checkpoint() error {
+func (s *Store) Checkpoint() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.checkpointLocked(false)
@@ -214,7 +214,7 @@ func (s *Index) Checkpoint() error {
 // Vacuum checkpoints with dead dictionary entries dropped, then removes
 // obsolete snapshot and WAL generations. Retirement serializes with
 // manifest publication; only the live generation's files remain.
-func (s *Index) Vacuum() error {
+func (s *Store) Vacuum() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := s.checkpointLocked(true); err != nil {
@@ -233,7 +233,7 @@ func (s *Index) Vacuum() error {
 // is safe to truncate while the lock is held. Dictionary generations are
 // preserved on plain checkpoints so compiled queries keep their fast
 // path; vacuum advances them because dead values may leave the set.
-func (s *Index) checkpointLocked(vacuum bool) error {
+func (s *Store) checkpointLocked(vacuum bool) error {
 	if err := s.writable(); err != nil {
 		return err
 	}
@@ -341,7 +341,7 @@ func (s *Index) checkpointLocked(vacuum bool) error {
 // directory lock. It is idempotent. Commit loops stop before the write
 // lock is taken: their final groups need it, and queued batches commit
 // before Close returns.
-func (s *Index) Close() error {
+func (s *Store) Close() error {
 	for _, index := range s.order {
 		index.commits.Stop()
 	}

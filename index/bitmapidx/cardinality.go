@@ -7,7 +7,7 @@ import common "github.com/evanoberholster/imageIdx/common"
 // excludes dictionary values whose last membership was removed, and returns
 // zero for a closed namespace. It reads one immutable namespace view without locking
 // writers or materializing any postings.
-func (i *NamespaceIndex) Cardinality() uint64 {
+func (i *Index) Cardinality() uint64 {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
 	view := i.view.Load()
@@ -66,7 +66,7 @@ func (i *NamespaceIndex) Cardinality() uint64 {
 // Cardinality returns the distinct live-value count for one registered
 // common.Namespace. ok is false when the type is not registered; a registered but
 // empty or closed namespace reports (0, true).
-func (s *Index) Cardinality(t common.Namespace) (count uint64, ok bool) {
+func (s *Store) Cardinality(t common.Namespace) (count uint64, ok bool) {
 	namespace, ok := s.Lookup(t)
 	if !ok {
 		return 0, false
@@ -77,7 +77,7 @@ func (s *Index) Cardinality(t common.Namespace) (count uint64, ok bool) {
 // Cardinalities returns the distinct live-value count for every registered
 // common.Namespace, including empty namespaces. Each namespace is sampled independently;
 // concurrent cross-namespace writes do not produce a store-wide snapshot.
-func (s *Index) Cardinalities() map[common.Namespace]uint64 {
+func (s *Store) Cardinalities() map[common.Namespace]uint64 {
 	counts := make(map[common.Namespace]uint64, len(s.order))
 	for _, namespace := range s.order {
 		counts[namespace.spec().Namespace] = namespace.Cardinality()

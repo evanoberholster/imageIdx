@@ -15,7 +15,7 @@ import (
 func TestPlanRankAndFilter(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
 	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 4})
-	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -128,7 +128,7 @@ type fakeANN struct {
 // search results in source order, dropping entries outside the plan.
 func TestFilterRankedANNResults(t *testing.T) {
 	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 4})
-	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestFilterRankedANNResults(t *testing.T) {
 
 func TestScorePrecision(t *testing.T) {
 	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
-	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestScorePrecision(t *testing.T) {
 func TestRankingCancellation(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
 	namespaceIndex := benchmarkEnumNamespace(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 4})
-	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")))
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}

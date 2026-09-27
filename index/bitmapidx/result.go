@@ -8,7 +8,7 @@ import "github.com/evanoberholster/imageIdx/roar"
 // intersections are heap-owned and are returned without copying. This keeps
 // the lifetime safety of the old unconditional clone while removing a full
 // posting copy from every query that materialized its own result.
-func (i *NamespaceIndex) detachOwned(result *roar.Bitmap, owned bool) {
+func (i *Index) detachOwned(result *roar.Bitmap, owned bool) {
 	if i.owner != nil && !owned {
 		*result = result.Clone()
 	}

@@ -32,7 +32,7 @@ const (
 )
 
 type namespaceClause struct {
-	index  *bitmapidx.NamespaceIndex
+	index  *bitmapidx.Index
 	kind   namespaceClauseKind
 	values []bitmapidx.Value
 	text   string
@@ -44,17 +44,17 @@ func (namespaceClause) searchClause() {}
 // AllValues requires every supplied value to be present in the namespace.
 // Compile rejects an empty value list. Canonical bytes are copied at Compile;
 // callers must not mutate Value.Bytes until compilation completes.
-func AllValues(index *bitmapidx.NamespaceIndex, values ...bitmapidx.Value) Clause {
+func AllValues(index *bitmapidx.Index, values ...bitmapidx.Value) Clause {
 	return namespaceClause{index: index, kind: namespaceValues, values: append([]bitmapidx.Value(nil), values...)}
 }
 
 // NamespaceText requires every analyzed token in text to be present.
-func NamespaceText(index *bitmapidx.NamespaceIndex, text string) Clause {
+func NamespaceText(index *bitmapidx.Index, text string) Clause {
 	return namespaceClause{index: index, kind: namespaceText, text: text}
 }
 
 // NamespaceRange restricts a continuous namespace to bounds.
-func NamespaceRange(index *bitmapidx.NamespaceIndex, bounds bitmapidx.NumericRange) Clause {
+func NamespaceRange(index *bitmapidx.Index, bounds bitmapidx.NumericRange) Clause {
 	return namespaceClause{index: index, kind: namespaceRange, bounds: bounds}
 }
 
@@ -113,7 +113,7 @@ func During(index *timeidx.Index, start, end uint64, options ...TimestampOption)
 }
 
 type geoClause struct {
-	index  *bitmapidx.NamespaceIndex
+	index  *bitmapidx.Index
 	ranges []bitmapidx.GeoRange
 	cells  []uint64
 }
@@ -122,6 +122,6 @@ func (geoClause) searchClause() {}
 
 // InCells restricts to the union of S2 cells. Like other constructors, it
 // defers validation/normalization to Compile and copies the input slice.
-func InCells(index *bitmapidx.NamespaceIndex, cellIDs ...uint64) Clause {
+func InCells(index *bitmapidx.Index, cellIDs ...uint64) Clause {
 	return geoClause{index: index, cells: append([]uint64(nil), cellIDs...)}
 }

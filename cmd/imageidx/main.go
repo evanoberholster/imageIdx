@@ -36,11 +36,11 @@ type searchResponse struct {
 }
 
 type demoService struct {
-	namespaces   *bitmapidx.Index
-	favorites    *bitmapidx.NamespaceIndex
+	namespaces   *bitmapidx.Store
+	favorites    *bitmapidx.Index
 	namespaceDir string
 	times        *timeidx.Index
-	geo          *bitmapidx.NamespaceIndex
+	geo          *bitmapidx.Index
 	canonical    map[common.ImageID]uint64
 	demoCell     uint64
 }
@@ -127,9 +127,9 @@ func newDemoService() (*demoService, error) {
 	if err != nil {
 		return nil, err
 	}
-	namespaces, err := bitmapidx.NewIndex(namespaceDir, []bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Name: "tag", Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType},
-		{Namespace: common.NamespaceLocation, Name: "location", Kind: common.KindBitmapGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
+	namespaces, err := bitmapidx.NewStore(namespaceDir, []bitmapidx.NamespaceSpec{
+		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
+		{Namespace: common.NamespaceLocation, Kind: common.KindBitmapGeo, Geo: bitmapidx.GeoCodec{Version: 1}},
 	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		_ = os.RemoveAll(namespaceDir)
@@ -143,9 +143,9 @@ func newDemoService() (*demoService, error) {
 	}
 	favoritesBatch := favorites.NewBatch()
 	if err := favoritesBatch.Add(
-		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("favorite")},
-		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("favorite")},
-		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.EnumStringValue("favorite")},
+		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.EnumStringValue("favorite")},
+		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.EnumStringValue("favorite")},
 	); err != nil {
 		_ = namespaces.Close()
 		_ = os.RemoveAll(namespaceDir)
@@ -244,7 +244,7 @@ func (service *demoService) Close() error {
 
 func (service *demoService) searchOnce(ctx context.Context, request searchRequest) ([]common.ImageID, error) {
 	return search.SearchOnce(ctx, nil,
-		search.AllValues(service.favorites, bitmapidx.StringValue("favorite")),
+		search.AllValues(service.favorites, bitmapidx.EnumStringValue("favorite")),
 		search.During(service.times, request.Start, request.End,
 			search.ExactTimestamp(func(id common.ImageID) (uint64, bool) {
 				value, ok := service.canonical[id]

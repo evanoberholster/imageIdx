@@ -13,17 +13,16 @@ import (
 	"github.com/golang/geo/s2"
 )
 
-func enumNamespaceForSearch(t *testing.T, typ common.Namespace, value string, ids []uint64) *bitmapidx.NamespaceIndex {
+func enumNamespaceForSearch(t *testing.T, typ common.Namespace, value string, ids []uint64) *bitmapidx.Index {
 	t.Helper()
-	index, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: typ, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType,
-	}, bitmapidx.NamespaceConfig{})
+	index, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+		Namespace: typ, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	entries := make([]bitmapidx.Entry, len(ids))
 	for n, id := range ids {
-		entries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue(value)}
+		entries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.EnumStringValue(value)}
 	}
 	batch := index.NewBatch()
 	if err := batch.Add(entries...); err != nil {
@@ -71,8 +70,8 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan, err := Compile(
-		AllValues(tags, bitmapidx.StringValue("favorite")),
-		AllValues(albums, bitmapidx.StringValue("holiday")),
+		AllValues(tags, bitmapidx.EnumStringValue("favorite")),
+		AllValues(albums, bitmapidx.EnumStringValue("holiday")),
 		During(timeIndex, 2*quantum, 5*quantum),
 		InCells(geo, bitmapidx.DecodeS2Key(key)),
 	)
@@ -140,7 +139,7 @@ func TestSearchRejectsEmptyAndNilNamespaceQueries(t *testing.T) {
 	if _, err := SearchOnce(context.Background(), nil); !errors.Is(err, ErrEmptyQuery) {
 		t.Fatalf("empty query error = %v", err)
 	}
-	if _, err := SearchOnce(context.Background(), nil, AllValues(nil, bitmapidx.StringValue("x"))); !errors.Is(err, ErrInvalidClause) {
+	if _, err := SearchOnce(context.Background(), nil, AllValues(nil, bitmapidx.EnumStringValue("x"))); !errors.Is(err, ErrInvalidClause) {
 		t.Fatalf("nil namespace error = %v", err)
 	}
 	if _, err := Compile(InCells(nil, uint64(s2.CellIDFromFace(0)))); !errors.Is(err, ErrInvalidClause) {
@@ -152,8 +151,8 @@ func TestNamespaceOnlyCountMatchesSearch(t *testing.T) {
 	first := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
 	second := enumNamespaceForSearch(t, common.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
 	plan, err := Compile(
-		AllValues(first, bitmapidx.StringValue("favorite")),
-		AllValues(second, bitmapidx.StringValue("holiday")),
+		AllValues(first, bitmapidx.EnumStringValue("favorite")),
+		AllValues(second, bitmapidx.EnumStringValue("holiday")),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -172,9 +171,8 @@ func TestNamespaceOnlyCountMatchesSearch(t *testing.T) {
 }
 
 func TestNamespaceTextAndRangeClauses(t *testing.T) {
-	text, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: common.Namespace(24), Kind: common.KindBitmapString, Storage: bitmapidx.StoragePerType,
-		Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
+	text, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+		Namespace: common.Namespace(24), Kind: common.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -187,9 +185,8 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 		)
 	})
 
-	continuous, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: common.Namespace(25), Kind: common.KindBitmapContinuous, Storage: bitmapidx.StoragePerType,
-		Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
+	continuous, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+		Namespace: common.Namespace(25), Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +211,7 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 }
 
 func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
-	newGeo := func(t *testing.T, typ common.Namespace, ids []uint64) (*bitmapidx.NamespaceIndex, bitmapidx.S2Key) {
+	newGeo := func(t *testing.T, typ common.Namespace, ids []uint64) (*bitmapidx.Index, bitmapidx.S2Key) {
 		t.Helper()
 		entries := make([]bitmapidx.GeoEntry, len(ids))
 		for i, id := range ids {
@@ -234,7 +231,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 
 	geo, key := newGeo(t, common.Namespace(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
 	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
-	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")), InCells(geo, bitmapidx.DecodeS2Key(key)))
+	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")), InCells(geo, bitmapidx.DecodeS2Key(key)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +272,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 		}
 	}
 	largeTags := enumNamespaceForSearch(t, common.NamespaceObject, "favorite", bitmapIDs)
-	fallback, err := Compile(AllValues(largeTags, bitmapidx.StringValue("favorite")), InCells(bigGeo, cellIDs...))
+	fallback, err := Compile(AllValues(largeTags, bitmapidx.EnumStringValue("favorite")), InCells(bigGeo, cellIDs...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +283,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 
 func TestAppendPage(t *testing.T) {
 	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
-	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
+	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +300,7 @@ func TestAppendPage(t *testing.T) {
 
 func TestVisit(t *testing.T) {
 	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
-	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
+	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)
 	}

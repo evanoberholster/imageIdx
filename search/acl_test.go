@@ -10,14 +10,14 @@ import (
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
-func aclStore(t *testing.T, includeGroups bool) *bitmapidx.Index {
+func aclStore(t *testing.T, includeGroups bool) *bitmapidx.Store {
 	t.Helper()
-	specs := []bitmapidx.NamespaceSpec{{Namespace: common.NamespaceUserACL, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType}}
+	specs := []bitmapidx.NamespaceSpec{{Namespace: common.NamespaceUserACL, Kind: common.KindBitmapEnum}}
 	if includeGroups {
-		specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceGroupACL, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType})
+		specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceGroupACL, Kind: common.KindBitmapEnum})
 	}
-	specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType})
-	store, err := bitmapidx.NewIndex(t.TempDir(), specs, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
+	specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum})
+	store, err := bitmapidx.NewStore(t.TempDir(), specs, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 	group9, _ := NewGroupACL(9)
 	otherGroup, _ := NewGroupACL(10)
 	for _, entry := range []struct {
-		index *bitmapidx.NamespaceIndex
+		index *bitmapidx.Index
 		id    uint64
 		value bitmapidx.Value
 	}{
@@ -51,16 +51,16 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 	}
 	for id := uint64(1); id <= 6; id++ {
 		commitBitmap(t, tags, func(b *bitmapidx.Batch) error {
-			return b.Add(bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("visible")})
+			return b.Add(bitmapidx.Entry{ImageID: id, Value: bitmapidx.EnumStringValue("visible")})
 		})
 	}
 	for _, id := range []uint64{2, 5} {
 		commitBitmap(t, tags, func(b *bitmapidx.Batch) error {
-			return b.Add(bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("select")})
+			return b.Add(bitmapidx.Entry{ImageID: id, Value: bitmapidx.EnumStringValue("select")})
 		})
 	}
 	plan, err := CompileWithStore(store,
-		AllValues(tags, bitmapidx.StringValue("visible")),
+		AllValues(tags, bitmapidx.EnumStringValue("visible")),
 		WithACL(42, 7, 9, 7), // repeated group must not duplicate images
 	)
 	if err != nil {
@@ -96,7 +96,7 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 		t.Fatal(got, err)
 	}
 	selective, err := CompileWithStore(store,
-		AllValues(tags, bitmapidx.StringValue("select")), WithACL(42, 7, 9),
+		AllValues(tags, bitmapidx.EnumStringValue("select")), WithACL(42, 7, 9),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 		return b.Add(bitmapidx.Entry{ImageID: 7, Value: group11.Value()})
 	})
 	commitBitmap(t, tags, func(b *bitmapidx.Batch) error {
-		return b.Add(bitmapidx.Entry{ImageID: 7, Value: bitmapidx.StringValue("visible")})
+		return b.Add(bitmapidx.Entry{ImageID: 7, Value: bitmapidx.EnumStringValue("visible")})
 	})
 	if got, err := withFuture.Search(ctx, nil, ws); err != nil || !slices.Equal(got, []ImageID{1, 3, 7}) {
 		t.Fatal(got, err)

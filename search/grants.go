@@ -18,7 +18,7 @@ type UserGrants = grantNamespace[common.UserID]
 
 // NewUserGrants binds the store's user ACL namespace. It rejects a nil index
 // and any namespace that is not the dedicated KindBitmapEnum user namespace.
-func NewUserGrants(index *bitmapidx.NamespaceIndex) (UserGrants, error) {
+func NewUserGrants(index *bitmapidx.Index) (UserGrants, error) {
 	return newGrantNamespace[common.UserID](index, common.NamespaceUserACL)
 }
 
@@ -30,7 +30,7 @@ type GroupGrants = grantNamespace[common.GroupID]
 
 // NewGroupGrants binds the store's group ACL namespace. It rejects a nil index
 // and any namespace that is not the dedicated KindBitmapEnum group namespace.
-func NewGroupGrants(index *bitmapidx.NamespaceIndex) (GroupGrants, error) {
+func NewGroupGrants(index *bitmapidx.Index) (GroupGrants, error) {
 	return newGrantNamespace[common.GroupID](index, common.NamespaceGroupACL)
 }
 
@@ -40,11 +40,11 @@ func NewGroupGrants(index *bitmapidx.NamespaceIndex) (GroupGrants, error) {
 // genuinely new dictionary values are copied under the writer lock — so
 // helpers add no allocations of their own beyond the batch itself.
 type grantNamespace[T ~uint64] struct {
-	index *bitmapidx.NamespaceIndex
+	index *bitmapidx.Index
 }
 
 // newGrantNamespace validates index against the dedicated ACL namespace.
-func newGrantNamespace[T ~uint64](index *bitmapidx.NamespaceIndex, namespace common.Namespace) (grantNamespace[T], error) {
+func newGrantNamespace[T ~uint64](index *bitmapidx.Index, namespace common.Namespace) (grantNamespace[T], error) {
 	if index == nil {
 		return grantNamespace[T]{}, ErrInvalidACLField
 	}
@@ -100,7 +100,7 @@ func (h grantNamespace[T]) Add(id T, imageIDs ...ImageID) error {
 
 // addLarge grants a batch that exceeds the stack inline capacity. The one
 // entries slice is inherent to batching: the equivalent hand-rolled
-// NamespaceIndex call allocates it too.
+// Index call allocates it too.
 func (h grantNamespace[T]) addLarge(id uint64, imageIDs []ImageID) error {
 	var key [8]byte
 	value := principalValue(id, &key)

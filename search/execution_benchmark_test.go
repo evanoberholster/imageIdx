@@ -22,7 +22,7 @@ func broadPlan(tb testing.TB, size int) Plan {
 	if err := b.Compact(); err != nil {
 		tb.Fatal(err)
 	}
-	p, err := Compile(AllValues(a, bitmapidx.StringValue("x")), AllValues(b, bitmapidx.StringValue("x")))
+	p, err := Compile(AllValues(a, bitmapidx.EnumStringValue("x")), AllValues(b, bitmapidx.EnumStringValue("x")))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -72,10 +72,10 @@ func BenchmarkExecution(b *testing.B) {
 
 func BenchmarkPersistentExecution(b *testing.B) {
 	specs := []bitmapidx.NamespaceSpec{
-		{Namespace: 100, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType},
-		{Namespace: 101, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType},
+		{Namespace: 100, Kind: common.KindBitmapEnum},
+		{Namespace: 101, Kind: common.KindBitmapEnum},
 	}
-	s, err := bitmapidx.NewIndex(b.TempDir(), specs, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
+	s, err := bitmapidx.NewStore(b.TempDir(), specs, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -86,11 +86,11 @@ func BenchmarkPersistentExecution(b *testing.B) {
 		for start := 1; start <= 100000; start += 4096 {
 			entries := make([]bitmapidx.Entry, 0, 4096)
 			for id := start; id < min(start+4096, 100001); id++ {
-				entries = append(entries, bitmapidx.Entry{ImageID: uint64(id), Value: bitmapidx.StringValue("x")})
+				entries = append(entries, bitmapidx.Entry{ImageID: uint64(id), Value: bitmapidx.EnumStringValue("x")})
 			}
 			commitBitmap(b, idx, func(bt *bitmapidx.Batch) error { return bt.Add(entries...) })
 		}
-		clauses = append(clauses, AllValues(idx, bitmapidx.StringValue("x")))
+		clauses = append(clauses, AllValues(idx, bitmapidx.EnumStringValue("x")))
 	}
 	if err := s.Checkpoint(); err != nil {
 		b.Fatal(err)

@@ -8,7 +8,7 @@ import (
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
-func grantHandles(t *testing.T) (users UserGrants, groups GroupGrants, userNamespace *bitmapidx.NamespaceIndex) {
+func grantHandles(t *testing.T) (users UserGrants, groups GroupGrants, userNamespace *bitmapidx.Index) {
 	t.Helper()
 	store := aclStore(t, true)
 	userNamespace, ok := store.Lookup(common.NamespaceUserACL)

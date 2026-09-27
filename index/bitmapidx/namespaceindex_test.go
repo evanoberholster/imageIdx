@@ -16,35 +16,32 @@ import (
 const testFocalLength common.Namespace = 100
 
 func enumNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapEnum, Storage: StoragePerType,
-		Normalizer: CodecSpec{Code: NormalizerIdentity, Version: 1}}
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapEnum, Normalizer: CodecSpec{Code: NormalizerIdentity, Version: 1}}
 }
 
 func boolNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapBool, Storage: StoragePerType}
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapBool}
 }
 
 func continuousNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapContinuous, Storage: StoragePerType,
-		Quant: Quantizer{Code: QuantIdentity, Version: 1, Scale: 1}}
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapContinuous, Quant: Quantizer{Code: QuantIdentity, Version: 1, Scale: 1}}
 }
 
 func textNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapString, Storage: StoragePerType,
-		Analyzer: CodecSpec{Code: textanalyzer.CodeLatin, Version: textanalyzer.Version}}
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapString, Analyzer: CodecSpec{Code: textanalyzer.CodeLatin, Version: textanalyzer.Version}}
 }
 
-func mustNamespace(t *testing.T, namespace NamespaceSpec, config NamespaceConfig) *NamespaceIndex {
+func mustNamespace(t *testing.T, namespace NamespaceSpec, config NamespaceConfig) *Index {
 	t.Helper()
-	index, err := NewNamespaceIndex(namespace, config)
+	index, err := NewIndex(namespace, config)
 	if err != nil {
-		t.Fatalf("NewNamespaceIndex: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	t.Cleanup(func() { _ = index.Close() })
 	return index
 }
 
-func appendIDs(t *testing.T, index *NamespaceIndex, value Value) []ImageID {
+func appendIDs(t *testing.T, index *Index, value Value) []common.ImageID {
 	t.Helper()
 	ids, err := index.ValueIDs(nil, value)
 	if err != nil {
@@ -53,7 +50,7 @@ func appendIDs(t *testing.T, index *NamespaceIndex, value Value) []ImageID {
 	return ids
 }
 
-func matchIDs(t *testing.T, index *NamespaceIndex, values ...Value) []ImageID {
+func matchIDs(t *testing.T, index *Index, values ...Value) []common.ImageID {
 	t.Helper()
 	match, err := index.MatchValues(values...)
 	if err != nil {
@@ -101,16 +98,15 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 	}
 
 	enum := enumNamespace(common.NamespaceTag)
-	enum.Name = "tag"
-	if !slices.Equal(encodeNamespaceSpecs([]NamespaceSpec{enum}), encodeNamespaceSpecs([]NamespaceSpec{enumNamespace(common.NamespaceTag)})) {
-		t.Fatal("Name must not be persisted in the namespace encoding")
-	}
-	def, err := enum.SchemaDef()
+	def, err := enum.NamespaceDef("tag")
 	if err != nil {
-		t.Fatalf("SchemaDef: %v", err)
+		t.Fatalf("NamespaceDef: %v", err)
 	}
 	if def.Namespace != common.NamespaceTag || def.Name != "tag" || def.Kind != common.KindBitmapEnum {
-		t.Fatalf("SchemaDef = %+v", def)
+		t.Fatalf("NamespaceDef = %+v", def)
+	}
+	if _, err := enum.NamespaceDef(""); !errors.Is(err, common.ErrNamespaceName) {
+		t.Fatalf("empty schema name error = %v, want ErrNamespaceName", err)
 	}
 	back, err := NamespaceSpecFromSchemaDef(def)
 	if err != nil {
@@ -164,33 +160,18 @@ func TestBitmapKindWireCodes(t *testing.T) {
 	}
 }
 
-func TestNewNamespaceSchemaRejectsDuplicates(t *testing.T) {
-	tag := enumNamespace(common.NamespaceTag)
-	tag.Name = "tag"
-	album := enumNamespace(common.NamespaceAlbum)
-	album.Name = "album"
-	schema, err := NewNamespaceSchema(tag, album)
-	if err != nil {
-		t.Fatalf("NewNamespaceSchema: %v", err)
+func TestLegacyStorageByteStillDecodes(t *testing.T) {
+	wire := appendNamespace(nil, enumNamespace(common.NamespaceTag))
+	if wire[3] != 2 {
+		t.Fatalf("storage byte = %d, want 2", wire[3])
 	}
-	if schema.Len() != 2 {
-		t.Fatalf("schema.Len() = %d, want 2", schema.Len())
+	wire[3] = 1
+	if _, _, err := decodeNamespace(wire, 0); err != nil {
+		t.Fatalf("decode old storage byte: %v", err)
 	}
-
-	sameNumber := enumNamespace(common.NamespaceTag)
-	sameNumber.Name = "tag-two"
-	if _, err := NewNamespaceSchema(tag, sameNumber); !errors.Is(err, common.ErrNamespaceDuplicate) {
-		t.Fatalf("duplicate namespace error = %v, want ErrNamespaceDuplicate", err)
-	}
-
-	sameName := enumNamespace(common.NamespaceAlbum)
-	sameName.Name = "tag"
-	if _, err := NewNamespaceSchema(tag, sameName); !errors.Is(err, common.ErrNamespaceName) {
-		t.Fatalf("duplicate name error = %v, want ErrNamespaceName", err)
-	}
-
-	if _, err := NewNamespaceSchema(enumNamespace(common.NamespaceAlbum)); !errors.Is(err, common.ErrNamespaceName) {
-		t.Fatalf("empty name error = %v, want ErrNamespaceName", err)
+	wire[3] = 3
+	if _, _, err := decodeNamespace(wire, 0); !errors.Is(err, ErrInvalidNamespace) {
+		t.Fatalf("invalid storage byte error = %v, want ErrInvalidNamespace", err)
 	}
 }
 
@@ -204,20 +185,20 @@ func TestHashCollisionSlots(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
-			Entry{ImageID: 1, Value: StringValue("alpha")},
-			Entry{ImageID: 2, Value: StringValue("beta")},
-			Entry{ImageID: 3, Value: StringValue("gamma")},
+			Entry{ImageID: 1, Value: EnumStringValue("alpha")},
+			Entry{ImageID: 2, Value: EnumStringValue("beta")},
+			Entry{ImageID: 3, Value: EnumStringValue("gamma")},
 		)
 	})
-	alphaKey, ok, err := index.KeyForValue(StringValue("alpha"))
+	alphaKey, ok, err := index.KeyForValue(EnumStringValue("alpha"))
 	if err != nil || !ok {
 		t.Fatalf("KeyForValue(alpha): ok=%v err=%v", ok, err)
 	}
-	betaKey, ok, err := index.KeyForValue(StringValue("beta"))
+	betaKey, ok, err := index.KeyForValue(EnumStringValue("beta"))
 	if err != nil || !ok {
 		t.Fatalf("KeyForValue(beta): ok=%v err=%v", ok, err)
 	}
-	gammaKey, ok, err := index.KeyForValue(StringValue("gamma"))
+	gammaKey, ok, err := index.KeyForValue(EnumStringValue("gamma"))
 	if err != nil || !ok {
 		t.Fatalf("KeyForValue(gamma): ok=%v err=%v", ok, err)
 	}
@@ -229,31 +210,31 @@ func TestHashCollisionSlots(t *testing.T) {
 	}
 	for _, check := range []struct {
 		value Value
-		want  []ImageID
+		want  []common.ImageID
 	}{
-		{StringValue("alpha"), []ImageID{1}},
-		{StringValue("beta"), []ImageID{2}},
-		{StringValue("gamma"), []ImageID{3}},
+		{EnumStringValue("alpha"), []common.ImageID{1}},
+		{EnumStringValue("beta"), []common.ImageID{2}},
+		{EnumStringValue("gamma"), []common.ImageID{3}},
 	} {
 		if got := appendIDs(t, index, check.value); !slices.Equal(got, check.want) {
 			t.Fatalf("%s = %v, want %v", check.value.Bytes, got, check.want)
 		}
 	}
-	if present, err := index.Contains(1, StringValue("beta")); err != nil || present {
+	if present, err := index.Contains(1, EnumStringValue("beta")); err != nil || present {
 		t.Fatalf("alpha matched beta: present=%v err=%v", present, err)
 	}
 
 	// Removing one colliding value must not disturb the others.
 	commit(t, index, func(b *Batch) error {
-		return b.Remove(Entry{ImageID: 2, Value: StringValue("beta")})
+		return b.Remove(Entry{ImageID: 2, Value: EnumStringValue("beta")})
 	})
-	if got := appendIDs(t, index, StringValue("alpha")); !slices.Equal(got, []ImageID{1}) {
+	if got := appendIDs(t, index, EnumStringValue("alpha")); !slices.Equal(got, []common.ImageID{1}) {
 		t.Fatalf("alpha after beta removal = %v", got)
 	}
-	if got := appendIDs(t, index, StringValue("gamma")); !slices.Equal(got, []ImageID{3}) {
+	if got := appendIDs(t, index, EnumStringValue("gamma")); !slices.Equal(got, []common.ImageID{3}) {
 		t.Fatalf("gamma after beta removal = %v", got)
 	}
-	if got := appendIDs(t, index, StringValue("beta")); len(got) != 0 {
+	if got := appendIDs(t, index, EnumStringValue("beta")); len(got) != 0 {
 		t.Fatalf("beta after removal = %v", got)
 	}
 	if value, ok := index.LookupValue(nil, gammaKey); !ok || string(value) != "gamma" {
@@ -264,19 +245,19 @@ func TestHashCollisionSlots(t *testing.T) {
 	if err := index.Vacuum(); err != nil {
 		t.Fatalf("Vacuum: %v", err)
 	}
-	if _, ok, err := index.KeyForValue(StringValue("beta")); err != nil || ok {
+	if _, ok, err := index.KeyForValue(EnumStringValue("beta")); err != nil || ok {
 		t.Fatalf("beta after vacuum: ok=%v err=%v", ok, err)
 	}
-	if got := appendIDs(t, index, StringValue("alpha")); !slices.Equal(got, []ImageID{1}) {
+	if got := appendIDs(t, index, EnumStringValue("alpha")); !slices.Equal(got, []common.ImageID{1}) {
 		t.Fatalf("alpha after vacuum = %v", got)
 	}
 	commit(t, index, func(b *Batch) error {
-		return b.Add(Entry{ImageID: 4, Value: StringValue("beta")})
+		return b.Add(Entry{ImageID: 4, Value: EnumStringValue("beta")})
 	})
-	if got := appendIDs(t, index, StringValue("beta")); !slices.Equal(got, []ImageID{4}) {
+	if got := appendIDs(t, index, EnumStringValue("beta")); !slices.Equal(got, []common.ImageID{4}) {
 		t.Fatalf("beta after re-add = %v", got)
 	}
-	if got := appendIDs(t, index, StringValue("gamma")); !slices.Equal(got, []ImageID{3}) {
+	if got := appendIDs(t, index, EnumStringValue("gamma")); !slices.Equal(got, []common.ImageID{3}) {
 		t.Fatalf("gamma after re-add = %v", got)
 	}
 	var values []string
@@ -297,48 +278,48 @@ func TestNamespaceIndexEnumLifecycle(t *testing.T) {
 	}
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
-			Entry{ImageID: 1, Value: StringValue("Paris")},
-			Entry{ImageID: 2, Value: StringValue("Paris")},
-			Entry{ImageID: 3, Value: StringValue("Rome")},
+			Entry{ImageID: 1, Value: EnumStringValue("Paris")},
+			Entry{ImageID: 2, Value: EnumStringValue("Paris")},
+			Entry{ImageID: 3, Value: EnumStringValue("Rome")},
 		)
 	})
-	if got := matchIDs(t, index, StringValue("Paris")); !slices.Equal(got, []ImageID{1, 2}) {
+	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []common.ImageID{1, 2}) {
 		t.Fatalf("Paris = %v", got)
 	}
-	if got := matchIDs(t, index, StringValue("Paris"), StringValue("Rome")); len(got) != 0 {
+	if got := matchIDs(t, index, EnumStringValue("Paris"), EnumStringValue("Rome")); len(got) != 0 {
 		t.Fatalf("Paris AND Rome = %v, want empty", got)
 	}
-	if present, err := index.Contains(1, StringValue("Paris")); err != nil || !present {
+	if present, err := index.Contains(1, EnumStringValue("Paris")); err != nil || !present {
 		t.Fatalf("Contains(1, Paris) = %v, %v", present, err)
 	}
-	if present, err := index.Contains(3, StringValue("Paris")); err != nil || present {
+	if present, err := index.Contains(3, EnumStringValue("Paris")); err != nil || present {
 		t.Fatalf("Contains(3, Paris) = %v, %v", present, err)
 	}
 
 	// Remove wins over Add within one batch.
 	commit(t, index, func(b *Batch) error {
-		if err := b.Add(Entry{ImageID: 4, Value: StringValue("Paris")}); err != nil {
+		if err := b.Add(Entry{ImageID: 4, Value: EnumStringValue("Paris")}); err != nil {
 			return err
 		}
-		return b.Remove(Entry{ImageID: 4, Value: StringValue("Paris")})
+		return b.Remove(Entry{ImageID: 4, Value: EnumStringValue("Paris")})
 	})
-	if got := matchIDs(t, index, StringValue("Paris")); !slices.Equal(got, []ImageID{1, 2}) {
+	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []common.ImageID{1, 2}) {
 		t.Fatalf("Paris after remove-wins = %v", got)
 	}
 
 	commit(t, index, func(b *Batch) error {
-		return b.Remove(Entry{ImageID: 1, Value: StringValue("Paris")})
+		return b.Remove(Entry{ImageID: 1, Value: EnumStringValue("Paris")})
 	})
-	if got := matchIDs(t, index, StringValue("Paris")); !slices.Equal(got, []ImageID{2}) {
+	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []common.ImageID{2}) {
 		t.Fatalf("Paris after remove = %v", got)
 	}
 
-	count, err := index.CountValues(StringValue("Paris"))
+	count, err := index.CountValues(EnumStringValue("Paris"))
 	if err != nil || count != 1 {
 		t.Fatalf("CountValues = %d, %v", count, err)
 	}
-	filtered, err := index.FilterValues(nil, []ImageID{1, 2, 3, 4}, StringValue("Paris"))
-	if err != nil || !slices.Equal(filtered, []ImageID{2}) {
+	filtered, err := index.FilterValues(nil, []common.ImageID{1, 2, 3, 4}, EnumStringValue("Paris"))
+	if err != nil || !slices.Equal(filtered, []common.ImageID{2}) {
 		t.Fatalf("FilterValues = %v, %v", filtered, err)
 	}
 }
@@ -358,11 +339,11 @@ func TestNamespaceIndexBoolExplicitFalse(t *testing.T) {
 		t.Fatal("absent image reported as false member")
 	}
 	falseIDs := appendIDs(t, index, BoolValue(false))
-	if !slices.Equal(falseIDs, []ImageID{1}) {
+	if !slices.Equal(falseIDs, []common.ImageID{1}) {
 		t.Fatalf("false IDs = %v", falseIDs)
 	}
 	trueIDs := appendIDs(t, index, BoolValue(true))
-	if !slices.Equal(trueIDs, []ImageID{2}) {
+	if !slices.Equal(trueIDs, []common.ImageID{2}) {
 		t.Fatalf("true IDs = %v", trueIDs)
 	}
 }
@@ -372,7 +353,7 @@ func TestNamespaceIndexContinuousRange(t *testing.T) {
 	values := []int64{math.MinInt64, -100, -1, 0, 1, 50, 64, 70, 100, math.MaxInt64}
 	for n, value := range values {
 		commit(t, index, func(b *Batch) error {
-			return b.Add(Entry{ImageID: ImageID(n + 1), Value: IntValue(value)})
+			return b.Add(Entry{ImageID: common.ImageID(n + 1), Value: IntValue(value)})
 		})
 	}
 	check := func(bounds NumericRange, want []int64) {
@@ -382,9 +363,9 @@ func TestNamespaceIndexContinuousRange(t *testing.T) {
 			t.Fatalf("Range: %v", err)
 		}
 		got := match.AppendTo(nil)
-		ids := make([]ImageID, 0, len(want))
+		ids := make([]common.ImageID, 0, len(want))
 		for _, value := range want {
-			ids = append(ids, ImageID(slices.Index(values, value)+1))
+			ids = append(ids, common.ImageID(slices.Index(values, value)+1))
 		}
 		if !slices.Equal(got, ids) {
 			t.Fatalf("Range %+v = %v, want %v", bounds, got, ids)
@@ -430,14 +411,14 @@ func TestNamespaceIndexMove(t *testing.T) {
 	if ids := appendIDs(t, index, IntValue(24)); len(ids) != 0 {
 		t.Fatalf("old value still present: %v", ids)
 	}
-	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []ImageID{1}) {
+	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{1}) {
 		t.Fatalf("new value = %v", ids)
 	}
 	// Same-value move is a no-op, not add/remove cancellation.
 	commit(t, index, func(b *Batch) error {
 		return b.Move(Move{ImageID: 1, From: 35, To: 35, HasFrom: true, HasTo: true})
 	})
-	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []ImageID{1}) {
+	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{1}) {
 		t.Fatalf("same-value move removed membership: %v", ids)
 	}
 	{
@@ -464,11 +445,11 @@ func TestNamespaceIndexTextReplace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchText: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1, 2}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 2}) {
 		t.Fatalf("golden gate = %v", got)
 	}
 	match, _ = index.MatchText("bridge")
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1}) {
 		t.Fatalf("bridge = %v", got)
 	}
 	commit(t, index, func(b *Batch) error {
@@ -480,7 +461,7 @@ func TestNamespaceIndexTextReplace(t *testing.T) {
 	}
 	// Token retained in both old and new text must not be removed.
 	match, _ = index.MatchText("golden")
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1, 2}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 2}) {
 		t.Fatalf("golden after overlapping replace = %v", got)
 	}
 	// Zero-token queries match nothing.
@@ -501,42 +482,42 @@ func TestNamespaceIndexDeltaRotationAndCompaction(t *testing.T) {
 	config := NamespaceConfig{ActiveTarget: 3, HardDeltaLimit: 8, MaxDeltaValues: 2}
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), config)
 	commit(t, index, func(b *Batch) error {
-		return b.Add(Entry{ImageID: 1, Value: StringValue("a")})
+		return b.Add(Entry{ImageID: 1, Value: EnumStringValue("a")})
 	})
 	// Cross ActiveTarget to rotate into Frozen and schedule compaction.
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
-			Entry{ImageID: 2, Value: StringValue("a")},
-			Entry{ImageID: 3, Value: StringValue("a")},
-			Entry{ImageID: 4, Value: StringValue("a")},
+			Entry{ImageID: 2, Value: EnumStringValue("a")},
+			Entry{ImageID: 3, Value: EnumStringValue("a")},
+			Entry{ImageID: 4, Value: EnumStringValue("a")},
 		)
 	})
 	if err := index.WaitIdle(context.Background()); err != nil {
 		t.Fatalf("WaitIdle: %v", err)
 	}
-	if got := matchIDs(t, index, StringValue("a")); !slices.Equal(got, []ImageID{1, 2, 3, 4}) {
+	if got := matchIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []common.ImageID{1, 2, 3, 4}) {
 		t.Fatalf("after rotation = %v", got)
 	}
 	// A batch above HardDeltaLimit folds the base directly.
 	large := make([]Entry, 0, 12)
-	for id := ImageID(10); id < 22; id++ {
-		large = append(large, Entry{ImageID: id, Value: StringValue("b")})
+	for id := common.ImageID(10); id < 22; id++ {
+		large = append(large, Entry{ImageID: id, Value: EnumStringValue("b")})
 	}
 	commit(t, index, func(b *Batch) error { return b.Add(large...) })
-	if got := matchIDs(t, index, StringValue("b")); len(got) != 12 {
+	if got := matchIDs(t, index, EnumStringValue("b")); len(got) != 12 {
 		t.Fatalf("large add = %v", got)
 	}
-	if got := matchIDs(t, index, StringValue("a")); !slices.Equal(got, []ImageID{1, 2, 3, 4}) {
+	if got := matchIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []common.ImageID{1, 2, 3, 4}) {
 		t.Fatalf("base preserved = %v", got)
 	}
 
 	// Delta beyond MaxDeltaValues folds too.
 	for value := 0; value < 4; value++ {
 		commit(t, index, func(b *Batch) error {
-			return b.Add(Entry{ImageID: ImageID(100 + value), Value: StringValue(string(rune('p' + value)))})
+			return b.Add(Entry{ImageID: common.ImageID(100 + value), Value: EnumStringValue(string(rune('p' + value)))})
 		})
 	}
-	if got := matchIDs(t, index, StringValue("p")); !slices.Equal(got, []ImageID{100}) {
+	if got := matchIDs(t, index, EnumStringValue("p")); !slices.Equal(got, []common.ImageID{100}) {
 		t.Fatalf("folded value = %v", got)
 	}
 }
@@ -545,23 +526,23 @@ func TestNamespaceIndexVacuumDropsDeadValues(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
-			Entry{ImageID: 1, Value: StringValue("dead")},
-			Entry{ImageID: 2, Value: StringValue("live")},
+			Entry{ImageID: 1, Value: EnumStringValue("dead")},
+			Entry{ImageID: 2, Value: EnumStringValue("live")},
 		)
 	})
 	commit(t, index, func(b *Batch) error {
-		return b.Remove(Entry{ImageID: 1, Value: StringValue("dead")})
+		return b.Remove(Entry{ImageID: 1, Value: EnumStringValue("dead")})
 	})
-	if _, ok, err := index.KeyForValue(StringValue("dead")); err != nil || !ok {
+	if _, ok, err := index.KeyForValue(EnumStringValue("dead")); err != nil || !ok {
 		t.Fatalf("dead before vacuum: ok=%v err=%v", ok, err)
 	}
 	if err := index.Vacuum(); err != nil {
 		t.Fatalf("Vacuum: %v", err)
 	}
-	if _, ok, err := index.KeyForValue(StringValue("dead")); err != nil || ok {
+	if _, ok, err := index.KeyForValue(EnumStringValue("dead")); err != nil || ok {
 		t.Fatalf("dead after vacuum: ok=%v err=%v", ok, err)
 	}
-	if got := matchIDs(t, index, StringValue("live")); !slices.Equal(got, []ImageID{2}) {
+	if got := matchIDs(t, index, EnumStringValue("live")); !slices.Equal(got, []common.ImageID{2}) {
 		t.Fatalf("live after vacuum = %v", got)
 	}
 	var visited []string
@@ -578,12 +559,12 @@ func TestNamespaceIndexPrefixAndLookup(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
-			Entry{ImageID: 1, Value: StringValue("Trekking")},
-			Entry{ImageID: 2, Value: StringValue("Travel")},
-			Entry{ImageID: 3, Value: StringValue("Family")},
+			Entry{ImageID: 1, Value: EnumStringValue("Trekking")},
+			Entry{ImageID: 2, Value: EnumStringValue("Travel")},
+			Entry{ImageID: 3, Value: EnumStringValue("Family")},
 		)
 	})
-	key, ok, err := index.KeyForValue(StringValue("Travel"))
+	key, ok, err := index.KeyForValue(EnumStringValue("Travel"))
 	if err != nil || !ok {
 		t.Fatalf("KeyForValue: ok=%v err=%v", ok, err)
 	}
@@ -600,22 +581,22 @@ func TestNamespaceIndexPrefixAndLookup(t *testing.T) {
 	}
 	// Removal-only batches never create dictionary entries.
 	commit(t, index, func(b *Batch) error {
-		return b.Remove(Entry{ImageID: 9, Value: StringValue("Ghost")})
+		return b.Remove(Entry{ImageID: 9, Value: EnumStringValue("Ghost")})
 	})
-	if _, ok, _ := index.KeyForValue(StringValue("Ghost")); ok {
+	if _, ok, _ := index.KeyForValue(EnumStringValue("Ghost")); ok {
 		t.Fatal("removal-only value was created")
 	}
 }
 
 func TestNamespaceIndexValidation(t *testing.T) {
-	if _, err := NewNamespaceIndex(NamespaceSpec{Namespace: 0, Kind: common.KindBitmapEnum, Storage: StoragePerType}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
+	if _, err := NewIndex(NamespaceSpec{Namespace: 0, Kind: common.KindBitmapEnum}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
 		t.Fatalf("zero type error = %v", err)
 	}
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	{
 		batch := index.NewBatch()
 		defer batch.Close()
-		if err := batch.Add(Entry{ImageID: 0, Value: StringValue("x")}); !errors.Is(err, ErrInvalidImageID) {
+		if err := batch.Add(Entry{ImageID: 0, Value: EnumStringValue("x")}); !errors.Is(err, ErrInvalidImageID) {
 			t.Fatalf("zero id error = %v", err)
 		}
 	}
@@ -642,17 +623,17 @@ func TestNamespaceIndexConcurrentReadersWriters(t *testing.T) {
 					return
 				default:
 				}
-				_, _ = index.MatchValues(StringValue("a"))
+				_, _ = index.MatchValues(EnumStringValue("a"))
 				_ = index.ContainsKey(1, hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("a")))
-				_, _, _ = index.KeyForValue(StringValue("a"))
+				_, _, _ = index.KeyForValue(EnumStringValue("a"))
 			}
 		}()
 	}
 	for batch := 0; batch < 200; batch++ {
-		id := ImageID(batch + 1)
-		commit(t, index, func(b *Batch) error { return b.Add(Entry{ImageID: id, Value: StringValue("a")}) })
+		id := common.ImageID(batch + 1)
+		commit(t, index, func(b *Batch) error { return b.Add(Entry{ImageID: id, Value: EnumStringValue("a")}) })
 		if batch%3 == 0 {
-			commit(t, index, func(b *Batch) error { return b.Remove(Entry{ImageID: id, Value: StringValue("a")}) })
+			commit(t, index, func(b *Batch) error { return b.Remove(Entry{ImageID: id, Value: EnumStringValue("a")}) })
 		}
 	}
 	close(stop)
@@ -668,7 +649,7 @@ func TestNamespaceIndexTextAnalyzerPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchText: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1}) {
 		t.Fatalf("accent-folded match = %v", got)
 	}
 }
@@ -702,15 +683,15 @@ func TestNamespaceIndexMoveToEmpty(t *testing.T) {
 	commit(t, index, func(b *Batch) error {
 		return b.Move(Move{ImageID: 2, HasTo: true, To: 35})
 	})
-	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []ImageID{2}) {
+	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{2}) {
 		t.Fatalf("insert-move = %v", ids)
 	}
 }
 
 func TestNamespaceIndexClose(t *testing.T) {
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		t.Fatalf("NewNamespaceIndex: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	if err := index.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -718,7 +699,7 @@ func TestNamespaceIndexClose(t *testing.T) {
 	{
 		batch := index.NewBatch()
 		defer batch.Close()
-		if err := batch.Add(Entry{ImageID: 1, Value: StringValue("x")}); err != nil {
+		if err := batch.Add(Entry{ImageID: 1, Value: EnumStringValue("x")}); err != nil {
 			t.Fatalf("Add stage after close = %v, want nil", err)
 		}
 		if err := batch.Apply(); !errors.Is(err, ErrClosed) {
@@ -737,22 +718,22 @@ func TestNamespaceIndexClose(t *testing.T) {
 		t.Fatalf("empty Apply after close = %v, want ErrClosed", err)
 	}
 	// Reads report empty results without errors.
-	if present, err := index.Contains(1, StringValue("x")); err != nil || present {
+	if present, err := index.Contains(1, EnumStringValue("x")); err != nil || present {
 		t.Fatalf("Contains after close = %v, %v; want false, nil", present, err)
 	}
-	if key, ok, err := index.KeyForValue(StringValue("x")); err != nil || ok || key != (NamespaceKey{}) {
+	if key, ok, err := index.KeyForValue(EnumStringValue("x")); err != nil || ok || key != (NamespaceKey{}) {
 		t.Fatalf("KeyForValue after close = %+v, %v, %v; want zero, false, nil", key, ok, err)
 	}
-	if ids, err := index.ValueIDs(nil, StringValue("x")); err != nil || len(ids) != 0 {
+	if ids, err := index.ValueIDs(nil, EnumStringValue("x")); err != nil || len(ids) != 0 {
 		t.Fatalf("ValueIDs after close = %v, %v; want empty, nil", ids, err)
 	}
-	if match, err := index.MatchValues(StringValue("x")); err != nil || !match.IsEmpty() {
+	if match, err := index.MatchValues(EnumStringValue("x")); err != nil || !match.IsEmpty() {
 		t.Fatalf("MatchValues after close = %v, %v; want empty, nil", match.AppendTo(nil), err)
 	}
 	if match, err := index.MatchValues(); err != nil || !match.IsEmpty() {
 		t.Fatalf("empty MatchValues after close = %v, %v; want empty, nil", match.AppendTo(nil), err)
 	}
-	if count, err := index.CountValues(StringValue("x")); err != nil || count != 0 {
+	if count, err := index.CountValues(EnumStringValue("x")); err != nil || count != 0 {
 		t.Fatalf("CountValues after close = %d, %v; want 0, nil", count, err)
 	}
 	if ids := index.AppendTo(nil); len(ids) != 0 {
@@ -776,7 +757,7 @@ func TestMatchValuesEmpty(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	defer func() { _ = index.Close() }()
 	commit(t, index, func(b *Batch) error {
-		return b.Add(Entry{ImageID: 1, Value: StringValue("x")})
+		return b.Add(Entry{ImageID: 1, Value: EnumStringValue("x")})
 	})
 	// An empty conjunction matches nothing rather than everything.
 	if match, err := index.MatchValues(); err != nil || !match.IsEmpty() {
@@ -785,7 +766,7 @@ func TestMatchValuesEmpty(t *testing.T) {
 	if count, err := index.CountValues(); err != nil || count != 0 {
 		t.Fatalf("empty CountValues = %d, %v; want 0, nil", count, err)
 	}
-	if got, err := index.FilterValues([]ImageID{9}, []ImageID{1, 2}); err != nil || !slices.Equal(got, []ImageID{9}) {
+	if got, err := index.FilterValues([]common.ImageID{9}, []common.ImageID{1, 2}); err != nil || !slices.Equal(got, []common.ImageID{9}) {
 		t.Fatalf("empty FilterValues = %v, %v; want [9], nil", got, err)
 	}
 }
@@ -797,7 +778,7 @@ func TestDictionaryCompaction(t *testing.T) {
 	adds := make([]Entry, 0, values)
 	for n := 0; n < values; n++ {
 		adds = append(adds, Entry{
-			ImageID: ImageID(n + 1),
+			ImageID: common.ImageID(n + 1),
 			Value:   Value{Kind: common.KindBitmapEnum, Bytes: []byte{byte(n), byte(n >> 8)}},
 		})
 	}
@@ -815,7 +796,7 @@ func TestDictionaryCompaction(t *testing.T) {
 	if _, ok, err := index.KeyForValue(first); err != nil || !ok {
 		t.Fatalf("KeyForValue ok = %v, %v; want true, nil", ok, err)
 	}
-	if ids, err := index.ValueIDs(nil, first); err != nil || !slices.Equal(ids, []ImageID{1}) {
+	if ids, err := index.ValueIDs(nil, first); err != nil || !slices.Equal(ids, []common.ImageID{1}) {
 		t.Fatalf("ValueIDs = %v, %v; want [1], nil", ids, err)
 	}
 	visited := 0
@@ -854,14 +835,14 @@ func TestReplaceTextRejectsDuplicateImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchText: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1}) {
 		t.Fatalf("alpha membership = %v, want [1]", got)
 	}
 }
 
 // closeWithin runs Close on a goroutine so a leaked reader token surfaces as
 // a timeout instead of hanging the test binary.
-func closeWithin(t *testing.T, index *NamespaceIndex, what string) {
+func closeWithin(t *testing.T, index *Index, what string) {
 	t.Helper()
 	closed := make(chan error, 1)
 	go func() { closed <- index.Close() }()
