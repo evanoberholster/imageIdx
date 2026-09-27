@@ -14,7 +14,7 @@ import (
 func geoNamespaceFor(t common.Namespace) NamespaceSpec {
 	return NamespaceSpec{
 		Namespace: t,
-		Kind:      KindGeo,
+		Kind:      common.KindBitmapGeo,
 		Storage:   StoragePerType,
 		Geo:       GeoCodec{Version: 1},
 	}
@@ -543,7 +543,7 @@ func TestGeoCoverAndNearest(t *testing.T) {
 // unmapped underneath it.
 func TestGeoReadersSurviveVacuum(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
@@ -603,7 +603,7 @@ func TestGeoNamespaceDefinitionValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeNamespaceSpecs: %v", err)
 	}
-	if len(restored) != 1 || restored[0].Geo != spec.Geo || restored[0].Kind != KindGeo {
+	if len(restored) != 1 || restored[0].Geo != spec.Geo || restored[0].Kind != common.KindBitmapGeo {
 		t.Fatalf("restored = %+v, want %+v", restored, spec)
 	}
 }

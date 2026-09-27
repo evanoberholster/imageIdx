@@ -3,6 +3,8 @@ package hashidx
 import (
 	"slices"
 	"sync"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // This file implements the staged correction layer for ExactIndex,
@@ -78,8 +80,8 @@ func overlayGroup(s []ExactEntry, hash Hash) []ExactEntry {
 
 // overlayContainsID reports whether id is present in group, which must
 // hold entries of one hash in ascending ImageID order.
-func overlayContainsID(group []ExactEntry, id ImageID) bool {
-	_, found := slices.BinarySearchFunc(group, id, func(e ExactEntry, id ImageID) int {
+func overlayContainsID(group []ExactEntry, id common.ImageID) bool {
+	_, found := slices.BinarySearchFunc(group, id, func(e ExactEntry, id common.ImageID) int {
 		switch {
 		case e.ImageID < id:
 			return -1

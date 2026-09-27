@@ -69,7 +69,7 @@ func TestStressMixedWorkload(t *testing.T) {
 	config := NamespaceConfig{ActiveTarget: 64, HardDeltaLimit: 256, MaxDeltaValues: 32}
 	store, err := NewIndex(dir, []NamespaceSpec{
 		enumNamespace(enumType), textNamespace(textType), continuousNamespace(continuousType), geoNamespaceFor(geoType),
-	}, config, DurabilityOS)
+	}, config, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestStressMixedWorkload(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := OpenIndex(dir, config, DurabilityOS)
+	reopened, err := OpenIndex(dir, config, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 		t.Skip("stress test")
 	}
 	dir := t.TempDir()
-	store, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, DurabilityOS)
+	store, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}

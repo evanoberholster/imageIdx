@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/hashIdx"
 )
 
@@ -22,12 +23,12 @@ func ExampleStore() {
 	store, err := hashidx.NewStore(dir, hashidx.StoreSpec{
 		Perceptual: hashidx.PerceptualSpec{Namespace: 1, Name: "perceptual"},
 		Exact:      hashidx.ExactSpec{Namespace: 2, Name: "exact", Algorithm: hashidx.AlgorithmSHA256},
-	}, hashidx.DurabilityOS)
+	}, common.DurabilityOS)
 	if err != nil {
 		panic(err)
 	}
 	for i, phash := range []uint64{0x0, 0x1, 0xFFFF} {
-		if err := store.Perceptual().Add(hashidx.Entry{ImageID: hashidx.ImageID(i + 1), PHash64: phash}); err != nil {
+		if err := store.Perceptual().Add(hashidx.Entry{ImageID: common.ImageID(i + 1), PHash64: phash}); err != nil {
 			panic(err)
 		}
 	}
@@ -54,7 +55,7 @@ func ExampleStore() {
 	if err := store.Close(); err != nil {
 		panic(err)
 	}
-	reopened, err := hashidx.OpenStore(dir, hashidx.DurabilityOS)
+	reopened, err := hashidx.OpenStore(dir, common.DurabilityOS)
 	if err != nil {
 		panic(err)
 	}

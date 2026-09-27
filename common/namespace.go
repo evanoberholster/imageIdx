@@ -34,30 +34,37 @@ const (
 	NamespaceGroupACL
 )
 
-// NamespaceKind identifies the index family that owns a namespace.
+// NamespaceKind identifies the index family and, for bitmap indexes, the
+// value shape of a namespace.
 type NamespaceKind uint8
 
 const (
-	// KindBitmap is a bitmapidx namespace: enum, bool, text, continuous, or
-	// geographic values over image IDs.
-	KindBitmap NamespaceKind = iota + 1
+	// Bitmap kinds use a separate range so existing schema kind numbers remain
+	// stable. Reserved values are not valid namespace kinds.
+	KindBitmapEnum       NamespaceKind = 0x11 // canonical discrete value
+	KindBitmapBool       NamespaceKind = 0x12 // explicit false/true value
+	KindBitmapString     NamespaceKind = 0x13 // analyzer tokens
+	KindBitmapContinuous NamespaceKind = 0x14 // int64 grid key
+	KindBitmapGeo        NamespaceKind = 0x15 // S2 cell key
+	KindBitmapBSI        NamespaceKind = 0x16 // Bit-Sliced Index (BSI) for int64 values, including floats
+	KindBitmapReserved1  NamespaceKind = 0x17 // reserved for future bitmap kinds
+	KindBitmapReserved2  NamespaceKind = 0x18
+
 	// KindTimestamp is a timeidx timestamp index.
-	KindTimestamp
+	KindTimestamp NamespaceKind = 2
 	// KindHashExact is a hashidx exact-content 256-bit digest index.
-	KindHashExact
+	KindHashExact NamespaceKind = 3
 	// KindHashPerceptual is a hashidx perceptual index (pHash64 and PDQ).
-	KindHashPerceptual
+	KindHashPerceptual NamespaceKind = 4
 	// KindVector is a vectoridx approximate-nearest-neighbor space.
-	KindVector
+	KindVector NamespaceKind = 5
 	// KindKV is a Pebble-backed key-value collection.
-	KindKV
+	KindKV NamespaceKind = 6
 )
 
 // String returns a stable human-readable kind name.
 func (k NamespaceKind) String() string {
 	switch k {
-	case KindBitmap:
-		return "bitmap"
 	case KindTimestamp:
 		return "timestamp"
 	case KindHashExact:
@@ -68,10 +75,30 @@ func (k NamespaceKind) String() string {
 		return "vector"
 	case KindKV:
 		return "kv"
+	case KindBitmapEnum:
+		return "bitmap-enum"
+	case KindBitmapBool:
+		return "bitmap-bool"
+	case KindBitmapString:
+		return "bitmap-string"
+	case KindBitmapContinuous:
+		return "bitmap-continuous"
+	case KindBitmapGeo:
+		return "bitmap-geo"
+	case KindBitmapBSI:
+		return "bitmap-bsi"
 	default:
 		return "unknown"
 	}
 }
 
 // Valid reports whether k is a recognized namespace kind.
-func (k NamespaceKind) Valid() bool { return k >= KindBitmap && k <= KindKV }
+func (k NamespaceKind) Valid() bool {
+	return k >= KindTimestamp && k <= KindKV ||
+		k >= KindBitmapEnum && k <= KindBitmapBSI
+}
+
+// IsBitmap reports whether k is a bitmap namespace kind.
+func (k NamespaceKind) IsBitmap() bool {
+	return k >= KindBitmapEnum && k <= KindBitmapBSI
+}

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
@@ -152,7 +153,7 @@ func TestFilterIDsDeltasAndRange(t *testing.T) {
 	if err != nil || !slices.Equal(got, []ImageID{4, 5, 1, 4}) {
 		t.Fatal(got, err)
 	}
-	numeric, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{Namespace: 102, Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}}, bitmapidx.NamespaceConfig{})
+	numeric, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{Namespace: 102, Kind: common.KindBitmapContinuous, Storage: bitmapidx.StoragePerType, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +181,7 @@ func TestFilterIDsDeltasAndRange(t *testing.T) {
 }
 
 func TestPersistentSourceDoesNotPinCallbacks(t *testing.T) {
-	s, err := bitmapidx.NewIndex(t.TempDir(), []bitmapidx.NamespaceSpec{{Namespace: 100, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType}}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
+	s, err := bitmapidx.NewIndex(t.TempDir(), []bitmapidx.NamespaceSpec{{Namespace: 100, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType}}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

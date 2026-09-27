@@ -2,6 +2,7 @@ package bitmapidx
 
 import (
 	"bytes"
+	common "github.com/evanoberholster/imageIdx/common"
 	"slices"
 	"time"
 
@@ -111,8 +112,8 @@ func (i *NamespaceIndex) prepare(namespace NamespaceSpec, mutation namespaceMuta
 // slotted key. Empty enum bytes normalize to an empty non-nil slice.
 func (i *NamespaceIndex) keyForValue(namespace NamespaceSpec, value Value) (NamespaceKey, []byte, error) {
 	switch namespace.Kind {
-	case KindEnum:
-		if value.Kind != KindEnum {
+	case common.KindBitmapEnum:
+		if value.Kind != common.KindBitmapEnum {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		canonical, err := normalizeEnum(namespace.Normalizer, value.Bytes)
@@ -125,31 +126,31 @@ func (i *NamespaceIndex) keyForValue(namespace NamespaceSpec, value Value) (Name
 		if canonical == nil {
 			canonical = []byte{}
 		}
-		return hashCanonical(namespace.Namespace, KindEnum, canonical), canonical, nil
-	case KindBool:
-		if value.Kind != KindBool {
+		return hashCanonical(namespace.Namespace, common.KindBitmapEnum, canonical), canonical, nil
+	case common.KindBitmapBool:
+		if value.Kind != common.KindBitmapBool {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		canonical := []byte{'0'}
 		if value.Bool {
 			canonical[0] = '1'
 		}
-		return hashCanonical(namespace.Namespace, KindBool, canonical), canonical, nil
-	case KindText:
-		if value.Kind != KindText {
+		return hashCanonical(namespace.Namespace, common.KindBitmapBool, canonical), canonical, nil
+	case common.KindBitmapString:
+		if value.Kind != common.KindBitmapString {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		if len(value.Bytes) > MaxValueBytes {
 			return NamespaceKey{}, nil, ErrValueTooLong
 		}
-		return hashCanonical(namespace.Namespace, KindText, value.Bytes), value.Bytes, nil
-	case KindContinuous:
-		if value.Kind != KindContinuous {
+		return hashCanonical(namespace.Namespace, common.KindBitmapString, value.Bytes), value.Bytes, nil
+	case common.KindBitmapContinuous:
+		if value.Kind != common.KindBitmapContinuous {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		return continuousKey(namespace.Namespace, value.Int), nil, nil
-	case KindGeo:
-		if value.Kind != KindGeo {
+	case common.KindBitmapGeo:
+		if value.Kind != common.KindBitmapGeo {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		if value.Int < 0 {

@@ -56,7 +56,7 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 	}
 
 	bitmap, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: common.NamespaceTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
+		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType,
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)

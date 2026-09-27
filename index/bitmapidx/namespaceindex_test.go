@@ -16,21 +16,21 @@ import (
 const testFocalLength common.Namespace = 100
 
 func enumNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: KindEnum, Storage: StoragePerType,
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapEnum, Storage: StoragePerType,
 		Normalizer: CodecSpec{Code: NormalizerIdentity, Version: 1}}
 }
 
 func boolNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: KindBool, Storage: StoragePerType}
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapBool, Storage: StoragePerType}
 }
 
 func continuousNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: KindContinuous, Storage: StoragePerType,
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapContinuous, Storage: StoragePerType,
 		Quant: Quantizer{Code: QuantIdentity, Version: 1, Scale: 1}}
 }
 
 func textNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: KindText, Storage: StoragePerType,
+	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapString, Storage: StoragePerType,
 		Analyzer: CodecSpec{Code: textanalyzer.CodeLatin, Version: textanalyzer.Version}}
 }
 
@@ -63,17 +63,17 @@ func matchIDs(t *testing.T, index *NamespaceIndex, values ...Value) []ImageID {
 }
 
 func TestHashDomainSeparation(t *testing.T) {
-	base := hashCanonical(common.NamespaceTag, KindEnum, []byte("x"))
-	if base != hashCanonical(common.NamespaceTag, KindEnum, []byte("x")) {
+	base := hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("x"))
+	if base != hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("x")) {
 		t.Fatal("hash is not deterministic")
 	}
-	if base == hashCanonical(common.NamespaceAlbum, KindEnum, []byte("x")) {
+	if base == hashCanonical(common.NamespaceAlbum, common.KindBitmapEnum, []byte("x")) {
 		t.Fatal("type is not domain-separated")
 	}
-	if base == hashCanonical(common.NamespaceTag, KindText, []byte("x")) {
+	if base == hashCanonical(common.NamespaceTag, common.KindBitmapString, []byte("x")) {
 		t.Fatal("kind is not domain-separated")
 	}
-	if base == hashCanonical(common.NamespaceTag, KindEnum, []byte("y")) {
+	if base == hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("y")) {
 		t.Fatal("value is not domain-separated")
 	}
 }
@@ -96,7 +96,7 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 			break
 		}
 	}
-	if !found || tag.Kind != KindEnum {
+	if !found || tag.Kind != common.KindBitmapEnum {
 		t.Fatalf("restored namespace = %+v, ok=%v", tag, found)
 	}
 
@@ -109,7 +109,7 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaDef: %v", err)
 	}
-	if def.Namespace != common.NamespaceTag || def.Name != "tag" || def.Kind != common.KindBitmap {
+	if def.Namespace != common.NamespaceTag || def.Name != "tag" || def.Kind != common.KindBitmapEnum {
 		t.Fatalf("SchemaDef = %+v", def)
 	}
 	back, err := NamespaceSpecFromSchemaDef(def)
@@ -120,6 +120,11 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 		back.Normalizer.Code != enum.Normalizer.Code || back.Normalizer.Version != enum.Normalizer.Version ||
 		!slices.Equal(back.Normalizer.Params, enum.Normalizer.Params) {
 		t.Fatalf("round trip = %+v, want %+v", back, enum)
+	}
+	mismatchedBitmapKind := def
+	mismatchedBitmapKind.Kind = common.KindBitmapBool
+	if _, err := NamespaceSpecFromSchemaDef(mismatchedBitmapKind); !errors.Is(err, ErrNamespaceMismatch) {
+		t.Fatalf("mismatched bitmap kind error = %v, want ErrNamespaceMismatch", err)
 	}
 	wrongKind := common.NamespaceDef{Namespace: common.NamespaceTag, Name: "tag", Kind: common.KindVector, Config: def.Config}
 	if _, err := NamespaceSpecFromSchemaDef(wrongKind); !errors.Is(err, ErrNamespaceMismatch) {
@@ -133,6 +138,29 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 	bad.Analyzer.Code = 99
 	if err := validateNamespaceSpecs([]NamespaceSpec{bad}); !errors.Is(err, ErrInvalidNamespace) {
 		t.Fatalf("bad codec error = %v, want ErrInvalidNamespace", err)
+	}
+}
+
+func TestBitmapKindWireCodes(t *testing.T) {
+	for _, tc := range []struct {
+		kind common.NamespaceKind
+		code byte
+	}{
+		{common.KindBitmapEnum, 1},
+		{common.KindBitmapBool, 2},
+		{common.KindBitmapString, 3},
+		{common.KindBitmapContinuous, 4},
+		{common.KindBitmapGeo, 5},
+	} {
+		if got := bitmapKindCode(tc.kind); got != tc.code {
+			t.Errorf("bitmapKindCode(%v) = %d, want %d", tc.kind, got, tc.code)
+		}
+		if got := bitmapKindFromCode(tc.code); got != tc.kind {
+			t.Errorf("bitmapKindFromCode(%d) = %v, want %v", tc.code, got, tc.kind)
+		}
+	}
+	if got := bitmapKindFromCode(0); got != 0 {
+		t.Fatalf("bitmapKindFromCode(0) = %v, want invalid kind", got)
 	}
 }
 
@@ -168,7 +196,7 @@ func TestNewNamespaceSchemaRejectsDuplicates(t *testing.T) {
 
 func TestHashCollisionSlots(t *testing.T) {
 	original := hashCanonical
-	hashCanonical = func(t common.Namespace, _ Kind, _ []byte) NamespaceKey {
+	hashCanonical = func(t common.Namespace, _ common.NamespaceKind, _ []byte) NamespaceKey {
 		return NamespaceKey{Namespace: t, Hash: 0xc0111ded}
 	}
 	t.Cleanup(func() { hashCanonical = original })
@@ -264,7 +292,7 @@ func TestHashCollisionSlots(t *testing.T) {
 
 func TestNamespaceIndexEnumLifecycle(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
-	if index.Spec().Kind != KindEnum {
+	if index.Spec().Kind != common.KindBitmapEnum {
 		t.Fatalf("kind = %v", index.Spec().Kind)
 	}
 	commit(t, index, func(b *Batch) error {
@@ -463,7 +491,7 @@ func TestNamespaceIndexTextReplace(t *testing.T) {
 	{
 		batch := index.NewBatch()
 		defer batch.Close()
-		if err := batch.Add(Entry{ImageID: 3, Value: Value{Kind: KindText, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
+		if err := batch.Add(Entry{ImageID: 3, Value: Value{Kind: common.KindBitmapString, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
 			t.Fatalf("text Add error = %v, want ErrUnsupportedOperation", err)
 		}
 	}
@@ -580,7 +608,7 @@ func TestNamespaceIndexPrefixAndLookup(t *testing.T) {
 }
 
 func TestNamespaceIndexValidation(t *testing.T) {
-	if _, err := NewNamespaceIndex(NamespaceSpec{Namespace: 0, Kind: KindEnum, Storage: StoragePerType}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
+	if _, err := NewNamespaceIndex(NamespaceSpec{Namespace: 0, Kind: common.KindBitmapEnum, Storage: StoragePerType}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
 		t.Fatalf("zero type error = %v", err)
 	}
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
@@ -615,7 +643,7 @@ func TestNamespaceIndexConcurrentReadersWriters(t *testing.T) {
 				default:
 				}
 				_, _ = index.MatchValues(StringValue("a"))
-				_ = index.ContainsKey(1, hashCanonical(common.NamespaceTag, KindEnum, []byte("a")))
+				_ = index.ContainsKey(1, hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("a")))
 				_, _, _ = index.KeyForValue(StringValue("a"))
 			}
 		}()
@@ -770,7 +798,7 @@ func TestDictionaryCompaction(t *testing.T) {
 	for n := 0; n < values; n++ {
 		adds = append(adds, Entry{
 			ImageID: ImageID(n + 1),
-			Value:   Value{Kind: KindEnum, Bytes: []byte{byte(n), byte(n >> 8)}},
+			Value:   Value{Kind: common.KindBitmapEnum, Bytes: []byte{byte(n), byte(n >> 8)}},
 		})
 	}
 	commit(t, index, func(b *Batch) error { return b.Add(adds...) })
@@ -783,7 +811,7 @@ func TestDictionaryCompaction(t *testing.T) {
 	if len(view.dict.base) != values {
 		t.Fatalf("base entries = %d, want %d", len(view.dict.base), values)
 	}
-	first := Value{Kind: KindEnum, Bytes: []byte{0, 0}}
+	first := Value{Kind: common.KindBitmapEnum, Bytes: []byte{0, 0}}
 	if _, ok, err := index.KeyForValue(first); err != nil || !ok {
 		t.Fatalf("KeyForValue ok = %v, %v; want true, nil", ok, err)
 	}

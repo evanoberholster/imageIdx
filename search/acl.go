@@ -20,7 +20,7 @@ func compileACL(store *bitmapidx.Index, clause aclClause) (stage, error) {
 		return stage{}, err
 	}
 	users, ok := store.Lookup(common.NamespaceUserACL)
-	if !ok || users.Spec().Kind != bitmapidx.KindEnum {
+	if !ok || users.Spec().Kind != common.KindBitmapEnum {
 		return stage{}, errACLStore
 	}
 	userQuery, err := users.Compile(user.Value())
@@ -31,7 +31,7 @@ func compileACL(store *bitmapidx.Index, clause aclClause) (stage, error) {
 	queries = append(queries, userQuery)
 	if len(clause.groupIDs) != 0 {
 		groups, ok := store.Lookup(common.NamespaceGroupACL)
-		if !ok || groups.Spec().Kind != bitmapidx.KindEnum {
+		if !ok || groups.Spec().Kind != common.KindBitmapEnum {
 			return stage{}, errACLStore
 		}
 		seen := make([]uint64, 0, len(clause.groupIDs))

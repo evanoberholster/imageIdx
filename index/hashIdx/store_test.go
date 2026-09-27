@@ -32,7 +32,7 @@ func testPerceptualSpec(cfg Config) PerceptualSpec {
 
 func mustNewStore(t *testing.T, dir string, spec StoreSpec) *Store {
 	t.Helper()
-	store, err := NewStore(dir, spec, DurabilityOS)
+	store, err := NewStore(dir, spec, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func mustNewStore(t *testing.T, dir string, spec StoreSpec) *Store {
 }
 
 func TestStoreRequiresDirectory(t *testing.T) {
-	if _, err := NewStore("", testStoreSpec(), DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewStore("", testStoreSpec(), common.DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("empty dir err = %v, want ErrInvalidConfig", err)
 	}
 }
@@ -62,7 +62,7 @@ func TestStoreRejectsInvalidNamespaceSchemas(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := testStoreSpec()
 			tc.mutate(&spec)
-			if _, err := NewStore(t.TempDir(), spec, DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
+			if _, err := NewStore(t.TempDir(), spec, common.DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
 				t.Fatalf("NewStore(%s) err = %v, want ErrInvalidConfig", tc.name, err)
 			}
 		})
@@ -76,7 +76,7 @@ func TestStorePersistentCheckpointReopenAndWAL(t *testing.T) {
 		Exact:       ExactSpec{Namespace: testExactNamespace, Name: "exact", Algorithm: AlgorithmBLAKE3, Entries: entriesForRange(0, 10, 1)},
 		ExactConfig: ExactConfig{BlockSize: 1024},
 	}
-	store, err := NewStore(dir, spec, DurabilityOS)
+	store, err := NewStore(dir, spec, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestStorePersistentCheckpointReopenAndWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenStore(dir, DurabilityOS)
+	reopened, err := OpenStore(dir, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,19 +150,19 @@ func TestStoreDirectoryOwnership(t *testing.T) {
 	dir := t.TempDir()
 	spec := testStoreSpec()
 	first := mustNewStore(t, dir, spec)
-	if _, err := NewStore(dir, spec, DurabilityOS); !errors.Is(err, ErrStoreBusy) {
+	if _, err := NewStore(dir, spec, common.DurabilityOS); !errors.Is(err, ErrStoreBusy) {
 		t.Fatalf("second NewStore err = %v, want ErrStoreBusy", err)
 	}
-	if _, err := OpenStore(dir, DurabilityOS); !errors.Is(err, ErrStoreBusy) {
+	if _, err := OpenStore(dir, common.DurabilityOS); !errors.Is(err, ErrStoreBusy) {
 		t.Fatalf("OpenStore while locked err = %v, want ErrStoreBusy", err)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewStore(dir, spec, DurabilityOS); !errors.Is(err, ErrStoreExists) {
+	if _, err := NewStore(dir, spec, common.DurabilityOS); !errors.Is(err, ErrStoreExists) {
 		t.Fatalf("NewStore over store err = %v, want ErrStoreExists", err)
 	}
-	if _, err := OpenStore(t.TempDir(), DurabilityOS); !errors.Is(err, ErrNotStore) {
+	if _, err := OpenStore(t.TempDir(), common.DurabilityOS); !errors.Is(err, ErrNotStore) {
 		t.Fatalf("OpenStore over plain dir err = %v, want ErrNotStore", err)
 	}
 }
@@ -252,10 +252,10 @@ func TestStoreCreationFailureCleansUp(t *testing.T) {
 	dir := t.TempDir()
 	bad := testStoreSpec()
 	bad.Exact.Algorithm = 0
-	if _, err := NewStore(dir, bad, DurabilityOS); !errors.Is(err, ErrInvalidAlgorithm) {
+	if _, err := NewStore(dir, bad, common.DurabilityOS); !errors.Is(err, ErrInvalidAlgorithm) {
 		t.Fatalf("bad algorithm err = %v, want ErrInvalidAlgorithm", err)
 	}
-	store, err := NewStore(dir, testStoreSpec(), DurabilityOS)
+	store, err := NewStore(dir, testStoreSpec(), common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("store not reusable after failed create: %v", err)
 	}

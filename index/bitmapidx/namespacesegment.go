@@ -58,7 +58,7 @@ func writeNamespaceSegment(path string, gen uint64, indexes []*NamespaceIndex, v
 		for _, key := range keys {
 			p, _ := table.get(key)
 			entry := namespaceSnapshotEntry{key: key, posting: p}
-			if view.namespace.Kind != KindContinuous && view.namespace.Kind != KindGeo {
+			if view.namespace.Kind != common.KindBitmapContinuous && view.namespace.Kind != common.KindBitmapGeo {
 				e, ok := view.dict.entry(key)
 				if !ok {
 					return ErrCorruptSegment
@@ -259,11 +259,11 @@ func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, store
 			return fail()
 		}
 		spec := index.spec()
-		if spec.Kind == KindContinuous || spec.Kind == KindGeo {
+		if spec.Kind == common.KindBitmapContinuous || spec.Kind == common.KindBitmapGeo {
 			if valueLen != 0 || key.Slot != 0 || card == 0 {
 				return fail()
 			}
-			if spec.Kind == KindGeo {
+			if spec.Kind == common.KindBitmapGeo {
 				if _, err := CellIDFromKey(key.Hash); err != nil {
 					return fail()
 				}

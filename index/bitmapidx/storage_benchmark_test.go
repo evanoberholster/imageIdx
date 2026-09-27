@@ -12,7 +12,7 @@ import (
 // memberships stay in the WAL until the caller checkpoints.
 func seedStore(b *testing.B, dir string, values, perValue int) *Index {
 	b.Helper()
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, DurabilitySync)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}

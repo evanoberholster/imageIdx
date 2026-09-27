@@ -63,7 +63,7 @@ func TestGrantsAddNoAllocations(t *testing.T) {
 	stackUserValue := func(id uint64) bitmapidx.Value {
 		var key [8]byte
 		binary.LittleEndian.PutUint64(key[:], id)
-		return bitmapidx.Value{Kind: bitmapidx.KindEnum, Bytes: key[:]}
+		return bitmapidx.Value{Kind: common.KindBitmapEnum, Bytes: key[:]}
 	}
 	manualContains := func() { _, _ = userNamespace.Contains(1, stackUserValue(42)) }
 	helperContains := func() { _, _ = users.Contains(42, 1) }

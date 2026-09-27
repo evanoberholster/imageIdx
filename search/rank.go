@@ -265,7 +265,7 @@ func FilterGeo(dst, candidates []ImageID, index *bitmapidx.NamespaceIndex, cellI
 	if index == nil || len(cellIDs) == 0 {
 		return dst, nil
 	}
-	if index.Spec().Kind != bitmapidx.KindGeo {
+	if index.Spec().Kind != common.KindBitmapGeo {
 		return dst, ErrInvalidClause
 	}
 	ranges, err := bitmapidx.RangesFromCellIDs(nil, cellIDs)

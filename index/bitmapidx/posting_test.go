@@ -26,7 +26,7 @@ func TestIntersectPostingsEmpty(t *testing.T) {
 }
 
 func TestTinyPostingTier(t *testing.T) {
-	rare := hashCanonical(common.NamespaceTag, KindEnum, []byte("rare"))
+	rare := hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("rare"))
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
@@ -176,7 +176,7 @@ func TestTinyPostingTierKinds(t *testing.T) {
 	if err := titles.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	token := hashCanonical(common.NamespaceTag, KindText, []byte("golden"))
+	token := hashCanonical(common.NamespaceTag, common.KindBitmapString, []byte("golden"))
 	if p := basePosting(t, titles, token); !p.isTiny() {
 		t.Fatal("text posting not tiny")
 	}

@@ -28,9 +28,9 @@ func main() {
 		log.Fatal(err)
 	}
 	namespaces, err := bitmapidx.NewIndex(namespaceDir, []bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Namespace: common.NamespaceLocation, Name: "location", Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
-	}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
+		{Namespace: common.NamespaceTag, Name: "tag", Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType},
+		{Namespace: common.NamespaceLocation, Name: "location", Kind: common.KindBitmapGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
+	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
 	}

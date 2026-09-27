@@ -11,7 +11,7 @@ import (
 // ErrInvalidPrincipal reports the reserved zero user or group ID.
 var ErrInvalidPrincipal = errors.New("search: invalid principal")
 
-// ACL principals come in two kinds, each with its own KindEnum namespace:
+// ACL principals come in two kinds, each with its own KindBitmapEnum namespace:
 // common.NamespaceUserACL holds user IDs, common.NamespaceGroupACL
 // holds group IDs. The namespace IS the stored key domain and the stored
 // key IS the uint64 ID in fixed 8-byte little-endian form — no prefixes,
@@ -25,7 +25,7 @@ var ErrInvalidPrincipal = errors.New("search: invalid principal")
 // Callers must authenticate group membership before supplying group IDs;
 // this package stores image grants, not user-to-group membership.
 // UserACL is one user principal for the common.NamespaceUserACL namespace:
-// a KindEnum namespace whose values are uint64 user IDs, each naming the
+// a KindBitmapEnum namespace whose values are uint64 user IDs, each naming the
 // images one user may see. The zero value is invalid; construct with
 // NewUserACL.
 //
@@ -95,7 +95,7 @@ func principalKey(id uint64) [8]byte {
 // copies into a fresh slice.
 func (p principal[T]) Value() bitmapidx.Value {
 	key := principalKey(uint64(p.id))
-	return bitmapidx.Value{Kind: bitmapidx.KindEnum, Bytes: key[:]}
+	return bitmapidx.Value{Kind: common.KindBitmapEnum, Bytes: key[:]}
 }
 
 // parsePrincipal recovers a principal from canonical dictionary bytes,

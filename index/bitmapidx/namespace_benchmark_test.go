@@ -56,7 +56,7 @@ func benchmarkEnumIntersectionNamespace(tb testing.TB) (*NamespaceIndex, []Value
 
 func BenchmarkNamespaceContainsKey(b *testing.B) {
 	index, _ := benchmarkEnumNamespace(b, 1, 100_000)
-	key := hashCanonical(common.NamespaceTag, KindEnum, []byte("value-0"))
+	key := hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("value-0"))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -225,7 +225,7 @@ func BenchmarkNamespaceHashValue(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		_ = hashCanonical(cameraModel, KindEnum, value)
+		_ = hashCanonical(cameraModel, common.KindBitmapEnum, value)
 	}
 }
 
@@ -413,7 +413,7 @@ func seededEnumNamespace(b *testing.B, count int) (*NamespaceIndex, NamespaceKey
 	if err := namespace.Compact(); err != nil {
 		b.Fatal(err)
 	}
-	return namespace, hashCanonical(common.NamespaceTag, KindEnum, []byte("v")), value
+	return namespace, hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("v")), value
 }
 
 func testDelta(key NamespaceKey, add, remove []ImageID) *namespaceDelta {

@@ -41,7 +41,7 @@ var geoBenchCities = []geoBenchCity{
 	{"Sydney", -33.8688, 151.2093},
 }
 
-// benchmarkGeoNamespace builds a KindGeo namespace with perCity images scattered
+// benchmarkGeoNamespace builds a KindBitmapGeo namespace with perCity images scattered
 // around each benchmark city and returns the namespace, one level-8 query cell per
 // city (the coarse cell used by "search Paris" style queries), and the
 // canonical coordinate lookup used by Nearest.

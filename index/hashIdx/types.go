@@ -11,18 +11,6 @@ import (
 	"github.com/zeebo/blake3"
 )
 
-// ImageID is the database-wide identifier shared by all index packages.
-type ImageID = common.ImageID
-
-// Durability controls when a write is acknowledged relative to filesystem
-// synchronization.
-type Durability = common.Durability
-
-const (
-	DurabilityOS   = common.DurabilityOS
-	DurabilitySync = common.DurabilitySync
-)
-
 var (
 	ErrInvalidConfig = errors.New("hashidx: invalid configuration")
 	ErrInvalidEntry  = errors.New("hashidx: invalid entry")
@@ -49,14 +37,14 @@ type PDQHash [4]uint64
 
 // Entry is one image's canonical perceptual-hash record.
 type Entry struct {
-	ImageID ImageID
+	ImageID common.ImageID
 	PHash64 uint64
 	PDQ     PDQHash
 }
 
 // Result is one search match.
 type Result struct {
-	ImageID  ImageID
+	ImageID  common.ImageID
 	Distance uint16
 }
 
@@ -65,7 +53,7 @@ type Result struct {
 // common.ImageID is an alias of uint64, a roar.Bitmap satisfies this
 // interface directly.
 type CandidateSet interface {
-	Contains(id ImageID) bool
+	Contains(id common.ImageID) bool
 }
 
 // DefaultRecordsPerPage is the default number of 48-byte records in one
@@ -181,7 +169,7 @@ type Hash [32]byte
 // ExactEntry is one logical (Hash, ImageID) pair.
 type ExactEntry struct {
 	Hash    Hash
-	ImageID ImageID
+	ImageID common.ImageID
 }
 
 // ExactSpec describes an index's stable identity, algorithm, and initial

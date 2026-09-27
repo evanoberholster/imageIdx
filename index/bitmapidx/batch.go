@@ -2,6 +2,7 @@ package bitmapidx
 
 import (
 	"errors"
+	common "github.com/evanoberholster/imageIdx/common"
 	"sync/atomic"
 )
 
@@ -52,7 +53,7 @@ func (b *Batch) Add(entries ...Entry) error {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind == KindText {
+	if namespace.Kind == common.KindBitmapString {
 		return ErrUnsupportedOperation
 	}
 	for _, entry := range entries {
@@ -75,7 +76,7 @@ func (b *Batch) Remove(entries ...Entry) error {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind == KindText {
+	if namespace.Kind == common.KindBitmapString {
 		return ErrUnsupportedOperation
 	}
 	for _, entry := range entries {
@@ -101,7 +102,7 @@ func (b *Batch) Move(moves ...Move) error {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind != KindContinuous && namespace.Kind != KindGeo {
+	if namespace.Kind != common.KindBitmapContinuous && namespace.Kind != common.KindBitmapGeo {
 		return ErrNamespaceMismatch
 	}
 	for _, move := range moves {
@@ -113,7 +114,7 @@ func (b *Batch) Move(moves ...Move) error {
 				return ErrInvalidMutation
 			}
 		}
-		if namespace.Kind == KindGeo {
+		if namespace.Kind == common.KindBitmapGeo {
 			if !move.HasFrom && move.From != 0 {
 				move.HasFrom = true
 			}
@@ -139,7 +140,7 @@ func (b *Batch) ReplaceText(changes ...TextReplacement) error {
 	if b.sealed.Load() {
 		return ErrBatchClosed
 	}
-	if b.index.spec().Kind != KindText {
+	if b.index.spec().Kind != common.KindBitmapString {
 		return ErrNamespaceMismatch
 	}
 	for _, change := range changes {
@@ -275,7 +276,7 @@ func (b *Batch) expand() (namespaceMutation, error) {
 	mutation := namespaceMutation{Add: b.add, Remove: b.remove}
 	namespace := b.index.spec()
 	value := func(v int64) Value {
-		if namespace.Kind == KindGeo {
+		if namespace.Kind == common.KindBitmapGeo {
 			return GeoValue(uint64(v))
 		}
 		return IntValue(v)
@@ -301,13 +302,13 @@ func (b *Batch) expand() (namespaceMutation, error) {
 			if _, ok := after[token]; ok {
 				continue
 			}
-			mutation.Remove = append(mutation.Remove, Entry{ImageID: change.ImageID, Value: Value{Kind: KindText, Bytes: []byte(token)}})
+			mutation.Remove = append(mutation.Remove, Entry{ImageID: change.ImageID, Value: Value{Kind: common.KindBitmapString, Bytes: []byte(token)}})
 		}
 		for token := range after {
 			if _, ok := before[token]; ok {
 				continue
 			}
-			mutation.Add = append(mutation.Add, Entry{ImageID: change.ImageID, Value: Value{Kind: KindText, Bytes: []byte(token)}})
+			mutation.Add = append(mutation.Add, Entry{ImageID: change.ImageID, Value: Value{Kind: common.KindBitmapString, Bytes: []byte(token)}})
 		}
 	}
 	return mutation, nil

@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
+
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -22,7 +24,7 @@ func benchEntries(count int) []Entry {
 	}
 	for k := range entries {
 		entries[k] = Entry{
-			ImageID: ImageID(k + 1),
+			ImageID: common.ImageID(k + 1),
 			PHash64: next(),
 			PDQ: PDQHash{
 				next(), next(), next(), next(),
@@ -35,7 +37,7 @@ func benchEntries(count int) []Entry {
 func buildBenchIndex(b *testing.B, count int, cfg Config) (*Index, []Entry) {
 	b.Helper()
 	entries := benchEntries(count)
-	idx, err := newIndex(b.TempDir(), testPerceptualSpec(cfg), DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(cfg), common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -47,7 +49,7 @@ func buildBenchIndex(b *testing.B, count int, cfg Config) (*Index, []Entry) {
 }
 
 func BenchmarkAppendSingle(b *testing.B) {
-	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -56,7 +58,7 @@ func BenchmarkAppendSingle(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		entry.ImageID = ImageID(i + 1)
+		entry.ImageID = common.ImageID(i + 1)
 		entry.PHash64 = uint64(i)
 		if err := idx.Add(entry); err != nil {
 			b.Fatal(err)
@@ -66,7 +68,7 @@ func BenchmarkAppendSingle(b *testing.B) {
 }
 
 func benchmarkApply(b *testing.B, batch int) {
-	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -77,7 +79,7 @@ func benchmarkApply(b *testing.B, batch int) {
 	for i := 0; i < b.N; i++ {
 		entries := benchEntries(batch)
 		for k := range entries {
-			entries[k].ImageID = ImageID(base + k + 1)
+			entries[k].ImageID = common.ImageID(base + k + 1)
 		}
 		base += batch
 		if err := idx.Apply(entries); err != nil {
@@ -237,7 +239,7 @@ func BenchmarkSearchPDQTop100(b *testing.B) {
 
 func BenchmarkCandidateDensity(b *testing.B) {
 	adds := benchEntries(100_000)
-	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -289,7 +291,7 @@ func BenchmarkRecordsPerPage(b *testing.B) {
 // entries/sec trend across commits.
 func BenchmarkCheckpoint(b *testing.B) {
 	dir := b.TempDir()
-	idx, err := newIndex(dir, testPerceptualSpec(Config{RecordsPerPage: 8192}), DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{RecordsPerPage: 8192}), common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -303,7 +305,7 @@ func BenchmarkCheckpoint(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		entries := benchEntries(1_000)
 		for k := range entries {
-			entries[k].ImageID = ImageID(base + k + 1)
+			entries[k].ImageID = common.ImageID(base + k + 1)
 		}
 		base += 1_000
 		if err := idx.Apply(entries); err != nil {
@@ -322,7 +324,7 @@ func BenchmarkCheckpoint(b *testing.B) {
 func BenchmarkVacuum(b *testing.B) {
 	dir := b.TempDir()
 	cfg := Config{RecordsPerPage: 8192}
-	idx, err := newIndex(dir, testPerceptualSpec(cfg), DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(cfg), common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -370,7 +372,7 @@ func buildExactBenchIndex(b *testing.B, count int, cfg ExactConfig, duplicates i
 	b.Helper()
 	entries := make([]ExactEntry, 0, count)
 	hashes := make([]Hash, 0, count)
-	id := ImageID(1)
+	id := common.ImageID(1)
 	for i := 0; i < count; {
 		h := benchHash(uint64(i))
 		hashes = append(hashes, h)
@@ -390,7 +392,7 @@ func buildExactBenchIndex(b *testing.B, count int, cfg ExactConfig, duplicates i
 		entries = append(entries, ExactEntry{Hash: h, ImageID: id})
 		id++
 	}
-	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, cfg, DurabilityOS)
+	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, cfg, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -404,7 +406,7 @@ func buildExactBenchIndex(b *testing.B, count int, cfg ExactConfig, duplicates i
 func BenchmarkLookupHit1(b *testing.B) {
 	idx, hashes := buildExactBenchIndex(b, 100_000, ExactConfig{}, 1)
 	h := hashes[len(hashes)/2]
-	dst := make([]ImageID, 0, 4)
+	dst := make([]common.ImageID, 0, 4)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -417,18 +419,18 @@ func BenchmarkLookupHit4(b *testing.B) {
 	_ = idx.Close()
 	h := benchHash(12345)
 	var entries []ExactEntry
-	for id := ImageID(1); id <= 4; id++ {
+	for id := common.ImageID(1); id <= 4; id++ {
 		entries = append(entries, ExactEntry{Hash: h, ImageID: id})
 	}
 	for i := 0; i < 20_000; i++ {
-		entries = append(entries, ExactEntry{Hash: benchHash(uint64(1_000_000 + i)), ImageID: ImageID(100 + i)})
+		entries = append(entries, ExactEntry{Hash: benchHash(uint64(1_000_000 + i)), ImageID: common.ImageID(100 + i)})
 	}
-	idx2, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{}, DurabilityOS)
+	idx2, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = idx2.Close() })
-	dst := make([]ImageID, 0, 8)
+	dst := make([]common.ImageID, 0, 8)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -439,18 +441,18 @@ func BenchmarkLookupHit4(b *testing.B) {
 func BenchmarkLookupHit16(b *testing.B) {
 	h := benchHash(999)
 	var entries []ExactEntry
-	for id := ImageID(1); id <= 16; id++ {
+	for id := common.ImageID(1); id <= 16; id++ {
 		entries = append(entries, ExactEntry{Hash: h, ImageID: id})
 	}
 	for i := 0; i < 20_000; i++ {
-		entries = append(entries, ExactEntry{Hash: benchHash(uint64(2_000_000 + i)), ImageID: ImageID(1000 + i)})
+		entries = append(entries, ExactEntry{Hash: benchHash(uint64(2_000_000 + i)), ImageID: common.ImageID(1000 + i)})
 	}
-	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = idx.Close() })
-	dst := make([]ImageID, 0, 16)
+	dst := make([]common.ImageID, 0, 16)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -461,18 +463,18 @@ func BenchmarkLookupHit16(b *testing.B) {
 func BenchmarkLookupDuplicateSpanning(b *testing.B) {
 	h := benchHash(7)
 	var entries []ExactEntry
-	for id := ImageID(1); id <= 40; id++ {
+	for id := common.ImageID(1); id <= 40; id++ {
 		entries = append(entries, ExactEntry{Hash: h, ImageID: id})
 	}
 	for i := 0; i < 5_000; i++ {
-		entries = append(entries, ExactEntry{Hash: benchHash(uint64(3_000_000 + i)), ImageID: ImageID(10_000 + i)})
+		entries = append(entries, ExactEntry{Hash: benchHash(uint64(3_000_000 + i)), ImageID: common.ImageID(10_000 + i)})
 	}
-	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 512}, DurabilityOS)
+	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = idx.Close() })
-	dst := make([]ImageID, 0, 40)
+	dst := make([]common.ImageID, 0, 40)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -483,7 +485,7 @@ func BenchmarkLookupDuplicateSpanning(b *testing.B) {
 func BenchmarkLookupMiss(b *testing.B) {
 	idx, _ := buildExactBenchIndex(b, 100_000, ExactConfig{}, 1)
 	miss := benchHash(1<<62 + 1)
-	dst := make([]ImageID, 0, 4)
+	dst := make([]common.ImageID, 0, 4)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -496,7 +498,7 @@ func BenchmarkLookupHotHit(b *testing.B) {
 	h := hashes[0]
 	// Warm the mapping/page cache.
 	_ = idx.Lookup(nil, h)
-	dst := make([]ImageID, 0, 4)
+	dst := make([]common.ImageID, 0, 4)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -507,7 +509,7 @@ func BenchmarkLookupHotHit(b *testing.B) {
 func BenchmarkLookupRandomHits(b *testing.B) {
 	idx, hashes := buildExactBenchIndex(b, 100_000, ExactConfig{}, 1)
 	rng := rand.New(rand.NewSource(1))
-	dst := make([]ImageID, 0, 4)
+	dst := make([]common.ImageID, 0, 4)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -543,7 +545,7 @@ func benchmarkBlockSize(b *testing.B, blockSize uint32) {
 	cfg := ExactConfig{BlockSize: blockSize}
 	idx, hashes := buildExactBenchIndex(b, 50_000, cfg, 1)
 	rng := rand.New(rand.NewSource(42))
-	dst := make([]ImageID, 0, 4)
+	dst := make([]common.ImageID, 0, 4)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -556,7 +558,7 @@ func BenchmarkBlockSize32KiB(b *testing.B) { benchmarkBlockSize(b, 32*1024) }
 func BenchmarkBlockSize64KiB(b *testing.B) { benchmarkBlockSize(b, 64*1024) }
 
 func BenchmarkWriteSingle(b *testing.B) {
-	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -564,13 +566,13 @@ func BenchmarkWriteSingle(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = idx.Add(benchHash(uint64(i)), ImageID(i+1))
+		_ = idx.Add(benchHash(uint64(i)), common.ImageID(i+1))
 	}
 }
 
 func benchmarkWriteBatch(b *testing.B, batch int) {
 	cfg := ExactConfig{MaxBatchEntries: uint32(batch)}
-	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256}, cfg, DurabilityOS)
+	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256}, cfg, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -582,7 +584,7 @@ func benchmarkWriteBatch(b *testing.B, batch int) {
 		m := Mutation{}
 		for k := 0; k < batch; k++ {
 			n := base + k
-			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(n)), ImageID: ImageID(n + 1)})
+			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(n)), ImageID: common.ImageID(n + 1)})
 		}
 		base += batch
 		if err := idx.Apply(m); err != nil {
@@ -599,7 +601,7 @@ func BenchmarkWriteBatch10000(b *testing.B) { benchmarkWriteBatch(b, 10000) }
 
 func BenchmarkWriteOneBlock(b *testing.B) {
 	// All entries share neighboring hashes so every batch hits one block.
-	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entriesForRange(0, 100, 1)}, ExactConfig{BlockSize: 4096}, DurabilityOS)
+	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entriesForRange(0, 100, 1)}, ExactConfig{BlockSize: 4096}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -612,7 +614,7 @@ func BenchmarkWriteOneBlock(b *testing.B) {
 		for k := 0; k < 100; k++ {
 			n := base + uint64(k)
 			// High hashes land in the last block.
-			m.Add = append(m.Add, ExactEntry{Hash: benchHash(1<<60 + n), ImageID: ImageID(n + 1)})
+			m.Add = append(m.Add, ExactEntry{Hash: benchHash(1<<60 + n), ImageID: common.ImageID(n + 1)})
 		}
 		base += 100
 		if err := idx.Apply(m); err != nil {
@@ -631,7 +633,7 @@ func BenchmarkWriteSpread(b *testing.B) {
 		m := Mutation{}
 		for k := 0; k < 100; k++ {
 			n := base*100 + k
-			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(9_000_000 + n)), ImageID: ImageID(50_000 + n)})
+			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(9_000_000 + n)), ImageID: common.ImageID(50_000 + n)})
 		}
 		base++
 		if err := idx.Apply(m); err != nil {
@@ -641,7 +643,7 @@ func BenchmarkWriteSpread(b *testing.B) {
 }
 
 func BenchmarkWriteSplitHeavy(b *testing.B) {
-	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512, TargetFillPct: 80}, DurabilityOS)
+	idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512, TargetFillPct: 80}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -653,7 +655,7 @@ func BenchmarkWriteSplitHeavy(b *testing.B) {
 		m := Mutation{}
 		for k := 0; k < 200; k++ {
 			n := base*200 + k
-			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(n)), ImageID: ImageID(n + 1)})
+			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(n)), ImageID: common.ImageID(n + 1)})
 		}
 		base++
 		if err := idx.Apply(m); err != nil {
@@ -671,14 +673,14 @@ func BenchmarkWriteDeleteHeavy(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		h := benchHash(uint64(rng.Intn(20_000)))
 		// Delete-then-add churn on nearby hashes.
-		_ = idx.Remove(h, ImageID(rng.Intn(20_000)+1))
-		_ = idx.Add(benchHash(uint64(50_000_000+i)), ImageID(100_000+i))
+		_ = idx.Remove(h, common.ImageID(rng.Intn(20_000)+1))
+		_ = idx.Add(benchHash(uint64(50_000_000+i)), common.ImageID(100_000+i))
 	}
 }
 
 func BenchmarkStorageAmplification(b *testing.B) {
 	dir := b.TempDir()
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 1024}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 1024}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -687,7 +689,7 @@ func BenchmarkStorageAmplification(b *testing.B) {
 		m := Mutation{}
 		for k := 0; k < 500; k++ {
 			n := round*500 + k
-			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(n)), ImageID: ImageID(n + 1)})
+			m.Add = append(m.Add, ExactEntry{Hash: benchHash(uint64(n)), ImageID: common.ImageID(n + 1)})
 		}
 		if err := idx.Apply(m); err != nil {
 			b.Fatal(err)
@@ -699,7 +701,7 @@ func BenchmarkStorageAmplification(b *testing.B) {
 	// Fragment with deletes.
 	m := Mutation{}
 	for k := 0; k < 5_000; k++ {
-		m.Remove = append(m.Remove, ExactEntry{Hash: benchHash(uint64(k * 2)), ImageID: ImageID(k*2 + 1)})
+		m.Remove = append(m.Remove, ExactEntry{Hash: benchHash(uint64(k * 2)), ImageID: common.ImageID(k*2 + 1)})
 	}
 	_ = idx.Apply(m)
 	before := idx.StorageAmplification()
@@ -760,10 +762,10 @@ func BenchmarkPublishScalingVsBlocks(b *testing.B) {
 		b.Run(fmt.Sprintf("entries=%d", total), func(b *testing.B) {
 			entries := make([]ExactEntry, 0, total)
 			for i := 0; i < total; i++ {
-				entries = append(entries, ExactEntry{Hash: benchHash(uint64(i)), ImageID: ImageID(i + 1)})
+				entries = append(entries, ExactEntry{Hash: benchHash(uint64(i)), ImageID: common.ImageID(i + 1)})
 			}
 			idx, err := newExact(b.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries},
-				ExactConfig{BlockSize: 512}, DurabilityOS)
+				ExactConfig{BlockSize: 512}, common.DurabilityOS)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -772,7 +774,7 @@ func BenchmarkPublishScalingVsBlocks(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				n := uint64(total + i)
-				e := ExactEntry{Hash: benchHash(n), ImageID: ImageID(n + 1)}
+				e := ExactEntry{Hash: benchHash(n), ImageID: common.ImageID(n + 1)}
 				if err := idx.Add(e.Hash, e.ImageID); err != nil {
 					b.Fatal(err)
 				}
@@ -802,7 +804,7 @@ func BenchmarkCompiledContains(b *testing.B) {
 	})
 	b.Run("staged", func(b *testing.B) {
 		for i := 0; i < 400; i++ {
-			if err := idx.Add(benchHash(uint64(50_000_000+i)), ImageID(200_000+i)); err != nil {
+			if err := idx.Add(benchHash(uint64(50_000_000+i)), common.ImageID(200_000+i)); err != nil {
 				b.Fatal(err)
 			}
 		}

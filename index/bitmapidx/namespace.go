@@ -12,20 +12,6 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// Kind is the value shape of a namespace. It selects hashing, storage and
-// query behavior. Missing membership is distinct from an explicit Bool
-// false. A namespace's kind is immutable for the life of its index and is part
-// of the persisted definition.
-type Kind uint8
-
-const (
-	KindEnum       Kind = iota + 1 // canonical discrete value, hashed
-	KindBool                       // explicit false/true value
-	KindText                       // analyzer tokens, each hashed
-	KindContinuous                 // int64 grid key, order preserving
-	KindGeo                        // S2 level-16 cell key, order preserving
-)
-
 // Storage is a reserved policy hint for a namespace. Both values are accepted
 // and behave identically today: they share one lookup path and one mmap
 // persistence layout. The distinction is persisted so a future cache policy
@@ -94,7 +80,7 @@ type Quantizer struct {
 	Offset  int64
 }
 
-// GeoCodec identifies the S2 cell level of a KindGeo namespace. Level zero
+// GeoCodec identifies the S2 cell level of a KindBitmapGeo namespace. Level zero
 // selects the default GeoS2Level. Any other explicit level but GeoS2Level
 // is rejected until smaller buckets are supported.
 type GeoCodec struct {
@@ -110,12 +96,12 @@ type GeoCodec struct {
 type NamespaceSpec struct {
 	Namespace  common.Namespace
 	Name       string
-	Kind       Kind
+	Kind       common.NamespaceKind
 	Storage    Storage
-	Quant      Quantizer // KindContinuous only
-	Geo        GeoCodec  // KindGeo only
-	Normalizer CodecSpec // KindEnum only
-	Analyzer   CodecSpec // KindText only
+	Quant      Quantizer // KindBitmapContinuous only
+	Geo        GeoCodec  // KindBitmapGeo only
+	Normalizer CodecSpec // KindBitmapEnum only
+	Analyzer   CodecSpec // KindBitmapString only
 	Flags      uint32    // supported feature bits; unknown bits are rejected
 }
 
@@ -180,23 +166,23 @@ func validateNamespace(f NamespaceSpec) error {
 		return ErrInvalidNamespace
 	}
 	switch f.Kind {
-	case KindEnum:
+	case common.KindBitmapEnum:
 		if _, err := normalizeEnum(f.Normalizer, nil); err != nil {
 			return err
 		}
-	case KindBool:
-	case KindText:
+	case common.KindBitmapBool:
+	case common.KindBitmapString:
 		if _, err := textanalyzer.New(f.Analyzer.Code, f.Analyzer.Version, f.Analyzer.Params); err != nil {
 			return errors.Join(ErrInvalidNamespace, err)
 		}
-	case KindContinuous:
+	case common.KindBitmapContinuous:
 		if f.Quant.Code == 0 || f.Quant.Version == 0 || f.Quant.Scale <= 0 {
 			return ErrInvalidNamespace
 		}
 		if f.Quant.Code == QuantIdentity && (f.Quant.Scale != 1 || f.Quant.Offset != 0) {
 			return ErrInvalidNamespace
 		}
-	case KindGeo:
+	case common.KindBitmapGeo:
 		if f.Geo.Version > 1 || (f.Geo.Level != 0 && f.Geo.Level != GeoS2Level) {
 			return ErrInvalidNamespace
 		}
@@ -269,10 +255,10 @@ func continuousKey(t common.Namespace, grid int64) NamespaceKey {
 // production code must never replace it.
 var hashCanonical = hashCanonicalValue
 
-func hashCanonicalValue(t common.Namespace, kind Kind, canonical []byte) NamespaceKey {
+func hashCanonicalValue(t common.Namespace, kind common.NamespaceKind, canonical []byte) NamespaceKey {
 	var header [8]byte
 	binary.LittleEndian.PutUint16(header[0:2], uint16(t))
-	header[2] = byte(kind)
+	header[2] = bitmapKindCode(kind)
 	binary.LittleEndian.PutUint32(header[4:8], uint32(len(canonical)))
 
 	var scratch [520]byte
@@ -295,7 +281,7 @@ func hashCanonicalValue(t common.Namespace, kind Kind, canonical []byte) Namespa
 // borrow caller memory through preparation and are copied under the writer
 // lock only for genuinely new dictionary values.
 type Value struct {
-	Kind  Kind
+	Kind  common.NamespaceKind
 	Bytes []byte
 	Int   int64
 	Bool  bool
@@ -304,7 +290,7 @@ type Value struct {
 // StringValue returns an enum value. The string is copied to a fresh byte
 // slice; the caller retains its string.
 func StringValue(value string) Value {
-	return Value{Kind: KindEnum, Bytes: []byte(value)}
+	return Value{Kind: common.KindBitmapEnum, Bytes: []byte(value)}
 }
 
 // BytesValue returns an enum value borrowing value. The slice is borrowed
@@ -312,21 +298,21 @@ func StringValue(value string) Value {
 // is new to the dictionary; callers must not mutate it until the write
 // returns.
 func BytesValue(value []byte) Value {
-	return Value{Kind: KindEnum, Bytes: value}
+	return Value{Kind: common.KindBitmapEnum, Bytes: value}
 }
 
 // BoolValue returns an explicit boolean value. False is distinct from
 // absent: an image with no bool membership is neither true nor false.
-func BoolValue(value bool) Value { return Value{Kind: KindBool, Bool: value} }
+func BoolValue(value bool) Value { return Value{Kind: common.KindBitmapBool, Bool: value} }
 
 // IntValue returns a continuous value already converted into the namespace's
 // int64 grid domain. No quantizer runs at write time.
-func IntValue(value int64) Value { return Value{Kind: KindContinuous, Int: value} }
+func IntValue(value int64) Value { return Value{Kind: common.KindBitmapContinuous, Int: value} }
 
-// GeoValue returns a KindGeo value carrying a level-16 S2 key. Keys fit in
+// GeoValue returns a KindBitmapGeo value carrying a level-16 S2 key. Keys fit in
 // int64; build them with KeyFromLatLng or KeyFromCellID and query them
 // with RangesFromCellIDs or CoverRegion.
-func GeoValue(key uint64) Value { return Value{Kind: KindGeo, Int: int64(key)} }
+func GeoValue(key uint64) Value { return Value{Kind: common.KindBitmapGeo, Int: int64(key)} }
 
 // Entry is one ImageID to value membership change. ImageID zero is
 // reserved and rejected with ErrInvalidImageID.
@@ -375,7 +361,7 @@ func (s NamespaceSpec) SchemaDef() (common.NamespaceDef, error) {
 	return common.NamespaceDef{
 		Namespace: s.Namespace,
 		Name:      s.Name,
-		Kind:      common.KindBitmap,
+		Kind:      s.Kind,
 		Config:    appendNamespace(nil, s),
 	}, nil
 }
@@ -383,14 +369,14 @@ func (s NamespaceSpec) SchemaDef() (common.NamespaceDef, error) {
 // NamespaceSpecFromSchemaDef is the inverse of SchemaDef. It rejects
 // definitions that do not describe a bitmap namespace with ErrNamespaceMismatch.
 func NamespaceSpecFromSchemaDef(def common.NamespaceDef) (NamespaceSpec, error) {
-	if def.Kind != common.KindBitmap {
+	if !def.Kind.IsBitmap() {
 		return NamespaceSpec{}, ErrNamespaceMismatch
 	}
 	spec, next, err := decodeNamespace(def.Config, 0)
 	if err != nil {
 		return NamespaceSpec{}, err
 	}
-	if next != len(def.Config) || spec.Namespace != def.Namespace {
+	if next != len(def.Config) || spec.Namespace != def.Namespace || def.Kind != spec.Kind {
 		return NamespaceSpec{}, ErrNamespaceMismatch
 	}
 	spec.Name = def.Name
@@ -488,9 +474,44 @@ func decodeNamespaceSpecs(data []byte) ([]NamespaceSpec, error) {
 	return specs, nil
 }
 
+// bitmapKindCode keeps the original bitmap wire and hash domain codes stable.
+func bitmapKindCode(kind common.NamespaceKind) byte {
+	switch kind {
+	case common.KindBitmapEnum:
+		return 1
+	case common.KindBitmapBool:
+		return 2
+	case common.KindBitmapString:
+		return 3
+	case common.KindBitmapContinuous:
+		return 4
+	case common.KindBitmapGeo:
+		return 5
+	default:
+		return 0
+	}
+}
+
+func bitmapKindFromCode(code byte) common.NamespaceKind {
+	switch code {
+	case 1:
+		return common.KindBitmapEnum
+	case 2:
+		return common.KindBitmapBool
+	case 3:
+		return common.KindBitmapString
+	case 4:
+		return common.KindBitmapContinuous
+	case 5:
+		return common.KindBitmapGeo
+	default:
+		return 0
+	}
+}
+
 func appendNamespace(out []byte, namespace NamespaceSpec) []byte {
 	out = binary.LittleEndian.AppendUint16(out, uint16(namespace.Namespace))
-	out = append(out, byte(namespace.Kind), byte(namespace.Storage))
+	out = append(out, bitmapKindCode(namespace.Kind), byte(namespace.Storage))
 	out = binary.LittleEndian.AppendUint32(out, namespace.Flags)
 	out = binary.LittleEndian.AppendUint16(out, namespace.Quant.Code)
 	out = binary.LittleEndian.AppendUint16(out, namespace.Quant.Version)
@@ -517,7 +538,7 @@ func decodeNamespace(data []byte, offset int) (NamespaceSpec, int, error) {
 	}
 	namespace := NamespaceSpec{
 		Namespace: common.Namespace(binary.LittleEndian.Uint16(data[offset : offset+2])),
-		Kind:      Kind(data[offset+2]),
+		Kind:      bitmapKindFromCode(data[offset+2]),
 		Storage:   Storage(data[offset+3]),
 		Flags:     binary.LittleEndian.Uint32(data[offset+4 : offset+8]),
 		Quant: Quantizer{

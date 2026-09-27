@@ -13,7 +13,7 @@ import (
 
 func benchmarkEnumNamespace(tb testing.TB, typ common.Namespace, value string, ids []uint64) *bitmapidx.NamespaceIndex {
 	tb.Helper()
-	index, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{Namespace: typ, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType}, bitmapidx.NamespaceConfig{})
+	index, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{Namespace: typ, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}

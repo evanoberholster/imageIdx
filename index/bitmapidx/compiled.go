@@ -1,6 +1,7 @@
 package bitmapidx
 
 import (
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -58,7 +59,7 @@ func (i *NamespaceIndex) Compile(values ...Value) (Query, error) {
 // tokens. A query producing no tokens compiles to a Query that matches
 // nothing.
 func (i *NamespaceIndex) CompileText(query string) (Query, error) {
-	if i.spec().Kind != KindText {
+	if i.spec().Kind != common.KindBitmapString {
 		return Query{}, ErrNamespaceMismatch
 	}
 	tokens, err := i.analyzer.TokenSet(query, nil)
@@ -70,7 +71,7 @@ func (i *NamespaceIndex) CompileText(query string) (Query, error) {
 	}
 	values := make([]Value, 0, len(tokens))
 	for _, text := range tokens {
-		values = append(values, Value{Kind: KindText, Bytes: []byte(text)})
+		values = append(values, Value{Kind: common.KindBitmapString, Bytes: []byte(text)})
 	}
 	return i.Compile(values...)
 }

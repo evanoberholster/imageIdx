@@ -24,9 +24,9 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 	store, err := bitmapidx.NewIndex(dir, []bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Namespace: common.NamespaceAlbum, Name: "album", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-	}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
+		{Namespace: common.NamespaceTag, Name: "tag", Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType},
+		{Namespace: common.NamespaceAlbum, Name: "album", Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType},
+	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
 	}

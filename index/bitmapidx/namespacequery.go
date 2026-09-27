@@ -2,6 +2,7 @@ package bitmapidx
 
 import (
 	"bytes"
+	common "github.com/evanoberholster/imageIdx/common"
 	"sort"
 
 	"github.com/evanoberholster/imageIdx/roar"
@@ -108,7 +109,7 @@ func (i *NamespaceIndex) MatchValues(values ...Value) (result roar.Bitmap, resul
 // nothing.
 func (i *NamespaceIndex) MatchText(query string) (roar.Bitmap, error) {
 	namespace := i.spec()
-	if namespace.Kind != KindText {
+	if namespace.Kind != common.KindBitmapString {
 		return roar.Bitmap{}, ErrNamespaceMismatch
 	}
 	tokens, err := i.analyzer.TokenSet(query, nil)
@@ -120,7 +121,7 @@ func (i *NamespaceIndex) MatchText(query string) (roar.Bitmap, error) {
 	}
 	values := make([]Value, 0, len(tokens))
 	for _, text := range tokens {
-		values = append(values, Value{Kind: KindText, Bytes: []byte(text)})
+		values = append(values, Value{Kind: common.KindBitmapString, Bytes: []byte(text)})
 	}
 	return i.MatchValues(values...)
 }
@@ -275,7 +276,7 @@ func (i *NamespaceIndex) ValueIDs(dst []ImageID, value Value) ([]ImageID, error)
 // their effective postings.
 func (i *NamespaceIndex) Range(bounds NumericRange) (result roar.Bitmap, resultErr error) {
 	namespace := i.spec()
-	if namespace.Kind != KindContinuous {
+	if namespace.Kind != common.KindBitmapContinuous {
 		return roar.Bitmap{}, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -319,7 +320,7 @@ func (i *NamespaceIndex) Range(bounds NumericRange) (result roar.Bitmap, resultE
 // additions minus removals. Multi-valued overlap makes it an upper bound.
 func (i *NamespaceIndex) EstimateRange(bounds NumericRange) (uint64, error) {
 	namespace := i.spec()
-	if namespace.Kind != KindContinuous {
+	if namespace.Kind != common.KindBitmapContinuous {
 		return 0, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -417,7 +418,7 @@ func (i *NamespaceIndex) CountValues(values ...Value) (uint64, error) {
 // per call.
 func (i *NamespaceIndex) CountRange(bounds NumericRange) (uint64, error) {
 	namespace := i.spec()
-	if namespace.Kind != KindContinuous {
+	if namespace.Kind != common.KindBitmapContinuous {
 		return 0, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -474,7 +475,7 @@ func (i *NamespaceIndex) FilterValues(dst, candidates []ImageID, values ...Value
 // FilterRange preserves order and duplicates; dst=candidates[:0] is safe.
 // It probes candidates or unions postings, according to the estimated work.
 func (i *NamespaceIndex) FilterRange(dst, candidates []ImageID, bounds NumericRange) ([]ImageID, error) {
-	if i.spec().Kind != KindContinuous {
+	if i.spec().Kind != common.KindBitmapContinuous {
 		return dst, ErrInvalidRange
 	}
 	if bounds.empty() || len(candidates) == 0 {

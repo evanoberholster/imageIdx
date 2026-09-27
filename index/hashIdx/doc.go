@@ -95,7 +95,7 @@
 //	store, err := NewStore(dir, StoreSpec{
 //		Perceptual: PerceptualSpec{Namespace: 1, Name: "perceptual"},
 //		Exact:      ExactSpec{Namespace: 2, Name: "exact", Algorithm: AlgorithmBLAKE3},
-//	}, DurabilityOS)
+//	}, common.DurabilityOS)
 //	ids := store.Exact().Lookup(dst, hash)
 //	found := store.Exact().Contains(hash)
 //

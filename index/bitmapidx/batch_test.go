@@ -65,7 +65,7 @@ func TestBatchValidation(t *testing.T) {
 	t.Cleanup(func() { _ = text.Close() })
 	textBatch := text.NewBatch()
 	defer textBatch.Close()
-	if err := textBatch.Add(Entry{ImageID: 1, Value: Value{Kind: KindText, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
+	if err := textBatch.Add(Entry{ImageID: 1, Value: Value{Kind: common.KindBitmapString, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
 		t.Fatalf("text Add err = %v", err)
 	}
 	if err := textBatch.ReplaceText(TextReplacement{ImageID: 1, After: []string{"x"}}, TextReplacement{ImageID: 1, After: []string{"y"}}); !errors.Is(err, ErrDuplicateImageID) {

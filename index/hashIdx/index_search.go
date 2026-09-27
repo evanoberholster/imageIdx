@@ -4,6 +4,8 @@ import (
 	"math/bits"
 	"slices"
 	"sync"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // Workspace holds reusable search scratch. A Workspace is not safe for
@@ -158,7 +160,7 @@ func (i *Index) CountPDQRadius(query PDQHash, maxDistance uint16, candidates Can
 func countPHashRadius(view *indexView, query uint64, maxDistance uint8, candidates CandidateSet) uint64 {
 	maxDist := int(maxDistance)
 	var n uint64
-	countPlane := func(ids []ImageID, hashes []uint64) {
+	countPlane := func(ids []common.ImageID, hashes []uint64) {
 		for k := range hashes {
 			if bits.OnesCount64(query^hashes[k]) > maxDist {
 				continue
@@ -185,7 +187,7 @@ func countPDQRadius(view *indexView, query PDQHash, maxDistance uint16, candidat
 	maxDist := int(maxDistance)
 	q0, q1, q2, q3 := query[0], query[1], query[2], query[3]
 	var n uint64
-	countPlane := func(ids []ImageID, pdq [4][]uint64) {
+	countPlane := func(ids []common.ImageID, pdq [4][]uint64) {
 		p0, p1, p2, p3 := pdq[0], pdq[1], pdq[2], pdq[3]
 		for k := range p0 {
 			distance := bits.OnesCount64(q0 ^ p0[k])
@@ -264,7 +266,7 @@ func searchPHashRadius(dst []Result, view *indexView, query uint64, maxDistance 
 	return dst
 }
 
-func phashRadiusPlane(dst []Result, ids []ImageID, hashes []uint64, query uint64, maxDist int, candidates CandidateSet) []Result {
+func phashRadiusPlane(dst []Result, ids []common.ImageID, hashes []uint64, query uint64, maxDist int, candidates CandidateSet) []Result {
 	for k := range hashes {
 		distance := bits.OnesCount64(query ^ hashes[k])
 		if distance > maxDist {
@@ -298,7 +300,7 @@ func searchPDQRadius(dst []Result, view *indexView, query PDQHash, maxDistance u
 	return dst
 }
 
-func pdqRadiusPlane(dst []Result, ids []ImageID, pdq [4][]uint64, query PDQHash, maxDist int, candidates CandidateSet) []Result {
+func pdqRadiusPlane(dst []Result, ids []common.ImageID, pdq [4][]uint64, query PDQHash, maxDist int, candidates CandidateSet) []Result {
 	q0, q1, q2, q3 := query[0], query[1], query[2], query[3]
 	p0, p1, p2, p3 := pdq[0], pdq[1], pdq[2], pdq[3]
 	for k := range p0 {
@@ -345,7 +347,7 @@ func searchPHashTopK(heap *[]Result, view *indexView, query uint64, k int, candi
 // wins for sparse candidate sets and loses for dense ones, the mirror of
 // the radius order; callers with dense sets and small k should prefer a
 // radius scan plus select.
-func phashTopKPlane(heap *[]Result, ids []ImageID, hashes []uint64, query uint64, k int, candidates CandidateSet) {
+func phashTopKPlane(heap *[]Result, ids []common.ImageID, hashes []uint64, query uint64, k int, candidates CandidateSet) {
 	for j := range hashes {
 		id := ids[j]
 		if candidates != nil && !candidates.Contains(id) {
@@ -382,7 +384,7 @@ func searchPDQTopK(heap *[]Result, view *indexView, query PDQHash, k int, candid
 // pdqTopKPlane probes one plane with candidates-first order, mirroring
 // phashTopKPlane: sparse candidate sets skip distance work per rejected
 // record, dense sets pay a lookup per record.
-func pdqTopKPlane(heap *[]Result, ids []ImageID, pdq [4][]uint64, query PDQHash, k int, candidates CandidateSet) {
+func pdqTopKPlane(heap *[]Result, ids []common.ImageID, pdq [4][]uint64, query PDQHash, k int, candidates CandidateSet) {
 	q0, q1, q2, q3 := query[0], query[1], query[2], query[3]
 	p0, p1, p2, p3 := pdq[0], pdq[1], pdq[2], pdq[3]
 	for j := range p0 {

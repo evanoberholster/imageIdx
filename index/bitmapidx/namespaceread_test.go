@@ -69,7 +69,7 @@ func TestCountValuesMatchesMaterialized(t *testing.T) {
 // unmap here.
 func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag), geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, DurabilityOS)
+	store, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag), geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}

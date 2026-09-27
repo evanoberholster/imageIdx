@@ -127,7 +127,7 @@ func BenchmarkWriteParallelBatch16(b *testing.B) {
 }
 
 func BenchmarkWriteStoreSyncBatch16(b *testing.B) {
-	s, err := NewIndex(b.TempDir(), []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, DurabilitySync)
+	s, err := NewIndex(b.TempDir(), []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func BenchmarkWriteStoreSyncBatch16(b *testing.B) {
 }
 
 func BenchmarkWriteStoreSyncParallelBatch16(b *testing.B) {
-	s, err := NewIndex(b.TempDir(), []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, DurabilitySync)
+	s, err := NewIndex(b.TempDir(), []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}

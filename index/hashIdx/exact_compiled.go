@@ -1,6 +1,10 @@
 package hashidx
 
-import "sync"
+import (
+	"sync"
+
+	common "github.com/evanoberholster/imageIdx/common"
+)
 
 // This file implements generation-gated compiled point lookups,
 // the ExactIndex analog of bitmapidx's compiled Query with its dictGen
@@ -18,7 +22,7 @@ type CompiledLookup struct {
 	hash  Hash
 	mu    sync.Mutex
 	gen   uint64
-	ids   []ImageID
+	ids   []common.ImageID
 	ok    bool
 }
 
@@ -86,7 +90,7 @@ func (c *CompiledLookup) Count() uint64 {
 
 // Lookup appends the sorted unique ImageIDs for the compiled hash to dst.
 // The cached copy is never aliased: results append out of it.
-func (c *CompiledLookup) Lookup(dst []ImageID) []ImageID {
+func (c *CompiledLookup) Lookup(dst []common.ImageID) []common.ImageID {
 	if c == nil || c.index == nil {
 		return dst
 	}

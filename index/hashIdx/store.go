@@ -138,7 +138,7 @@ func (s *Store) publishJointManifest() error {
 }
 
 // NewStore creates and locks a store in dir and checkpoints both indexes.
-func NewStore(dir string, spec StoreSpec, durability Durability) (*Store, error) {
+func NewStore(dir string, spec StoreSpec, durability common.Durability) (*Store, error) {
 	if dir == "" {
 		return nil, ErrInvalidConfig
 	}
@@ -182,7 +182,7 @@ func NewStore(dir string, spec StoreSpec, durability Durability) (*Store, error)
 
 // OpenStore opens an existing persistent store and replays both WAL tails.
 // The store's persisted sizing and algorithm are adopted.
-func OpenStore(dir string, durability Durability) (*Store, error) {
+func OpenStore(dir string, durability common.Durability) (*Store, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}

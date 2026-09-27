@@ -22,7 +22,7 @@ func TestNamespaceCrashWriter(t *testing.T) {
 	if dir == "" {
 		return
 	}
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilitySync)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestNamespaceRecoveryAfterProcessExit(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child: %s: %v", out, err)
 	}
-	s, err := OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+	s, err := OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestNamespaceRecoveryAfterProcessExit(t *testing.T) {
 
 func TestNamespaceManifestFailureRequiresRecovery(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilitySync)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestNamespaceManifestFailureRequiresRecovery(t *testing.T) {
 	if err := os.Remove(temporary); err != nil {
 		t.Fatal(err)
 	}
-	s, err = OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+	s, err = OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,10 +97,12 @@ func TestNamespaceManifestFailureRequiresRecovery(t *testing.T) {
 
 func TestNamespacePersistentCollisions(t *testing.T) {
 	previous := hashCanonical
-	hashCanonical = func(t common.Namespace, _ Kind, _ []byte) NamespaceKey { return NamespaceKey{Namespace: t, Hash: 99} }
+	hashCanonical = func(t common.Namespace, _ common.NamespaceKind, _ []byte) NamespaceKey {
+		return NamespaceKey{Namespace: t, Hash: 99}
+	}
 	defer func() { hashCanonical = previous }()
 	dir := t.TempDir()
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +119,7 @@ func TestNamespacePersistentCollisions(t *testing.T) {
 	}
 	commit(t, index, func(bt *Batch) error { return bt.Add(Entry{ImageID: 3, Value: StringValue("c")}) })
 	s.Close()
-	s, err = OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+	s, err = OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +138,7 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 	for _, checkpoint := range []bool{false, true} {
 		t.Run(fmt.Sprint(checkpoint), func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := NewIndex(dir, namespaces, NamespaceConfig{}, DurabilitySync)
+			s, err := NewIndex(dir, namespaces, NamespaceConfig{}, common.DurabilitySync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -177,7 +179,7 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 			if err := s.Close(); err != nil {
 				t.Fatal(err)
 			}
-			s, err = OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+			s, err = OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -236,7 +238,7 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 	for _, corrupt := range []bool{false, true} {
 		t.Run(fmt.Sprint(corrupt), func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilitySync)
+			s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -259,7 +261,7 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				t.Fatal(err)
 			}
-			s, err = OpenIndex(dir, NamespaceConfig{}, DurabilitySync)
+			s, err = OpenIndex(dir, NamespaceConfig{}, common.DurabilitySync)
 			if corrupt {
 				if !errors.Is(err, ErrCorruptWAL) {
 					if s != nil {
@@ -275,7 +277,7 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 			index, _ = s.Lookup(100)
 			commit(t, index, func(bt *Batch) error { return bt.Add(Entry{ImageID: 2, Value: StringValue("b")}) })
 			s.Close()
-			s, err = OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+			s, err = OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -290,7 +292,7 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 
 func TestIndexBoundsAndFailedWrites(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +354,7 @@ func TestIndexBoundsAndFailedWrites(t *testing.T) {
 func TestNamespaceConcurrentCheckpointAndReaders(t *testing.T) {
 	dir := t.TempDir()
 	config := NamespaceConfig{ActiveTarget: 2, HardDeltaLimit: 8, CompactDelay: time.Millisecond}
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, config, DurabilityOS)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, config, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +404,7 @@ func TestNamespaceConcurrentCheckpointAndReaders(t *testing.T) {
 	close(done)
 	wg.Wait()
 	s.Close()
-	s, err = OpenIndex(dir, config, DurabilityOS)
+	s, err = OpenIndex(dir, config, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,11 +422,11 @@ func TestNamespaceConcurrentCheckpointAndReaders(t *testing.T) {
 
 func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other, err := OpenIndex(dir, NamespaceConfig{}, DurabilityOS); !errors.Is(err, ErrStoreBusy) {
+	if other, err := OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS); !errors.Is(err, ErrStoreBusy) {
 		if other != nil {
 			other.Close()
 		}
@@ -436,7 +438,7 @@ func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 	}
 	path := s.snapshotPath(s.generation)
 	s.Close()
-	if other, err := NewIndex(dir, nil, NamespaceConfig{}, DurabilityOS); !errors.Is(err, ErrStoreExists) {
+	if other, err := NewIndex(dir, nil, NamespaceConfig{}, common.DurabilityOS); !errors.Is(err, ErrStoreExists) {
 		if other != nil {
 			other.Close()
 		}
@@ -450,7 +452,7 @@ func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if other, err := OpenIndex(dir, NamespaceConfig{}, DurabilityOS); !errors.Is(err, ErrCorruptSegment) {
+	if other, err := OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS); !errors.Is(err, ErrCorruptSegment) {
 		if other != nil {
 			other.Close()
 		}
@@ -464,7 +466,7 @@ func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 func TestIndexRejectsForeignFiles(t *testing.T) {
 	build := func(t *testing.T, dir string, id ImageID) (snapshot, wal string) {
 		t.Helper()
-		s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilitySync)
+		s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -492,7 +494,7 @@ func TestIndexRejectsForeignFiles(t *testing.T) {
 		_, walA := build(t, dirA, 1)
 		_, walB := build(t, dirB, 2)
 		copyFile(t, walB, walA)
-		s, err := OpenIndex(dirA, NamespaceConfig{}, DurabilityOS)
+		s, err := OpenIndex(dirA, NamespaceConfig{}, common.DurabilityOS)
 		if s != nil {
 			s.Close()
 		}
@@ -505,7 +507,7 @@ func TestIndexRejectsForeignFiles(t *testing.T) {
 		snapC, _ := build(t, dirC, 1)
 		snapD, _ := build(t, dirD, 2)
 		copyFile(t, snapD, snapC)
-		s, err := OpenIndex(dirC, NamespaceConfig{}, DurabilityOS)
+		s, err := OpenIndex(dirC, NamespaceConfig{}, common.DurabilityOS)
 		if s != nil {
 			s.Close()
 		}
@@ -521,7 +523,7 @@ func TestIndexRejectsForeignFiles(t *testing.T) {
 func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 	t.Run("unpublished successor files ignored", func(t *testing.T) {
 		dir := t.TempDir()
-		s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilitySync)
+		s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -542,7 +544,7 @@ func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		s, err = OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+		s, err = OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS)
 		if err != nil {
 			t.Fatalf("open with unpublished successor: %v", err)
 		}
@@ -561,7 +563,7 @@ func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 
 	t.Run("segment write failure recoverable", func(t *testing.T) {
 		dir := t.TempDir()
-		s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, DurabilitySync)
+		s, err := NewIndex(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -587,7 +589,7 @@ func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		s, err = OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+		s, err = OpenIndex(dir, NamespaceConfig{}, common.DurabilityOS)
 		if err != nil {
 			t.Fatal(err)
 		}

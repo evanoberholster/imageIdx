@@ -3,6 +3,8 @@ package bitmapidx
 import (
 	"errors"
 	"slices"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // commitQueueCapacity bounds queued commit requests. Apply blocks when the
@@ -150,7 +152,7 @@ func (i *NamespaceIndex) commitGroup(group []commitReq) {
 				return
 			}
 		}
-		if i.owner.durability == DurabilitySync {
+		if i.owner.durability == common.DurabilitySync {
 			if err := i.owner.wal.Sync(); err != nil {
 				i.owner.failed = errors.Join(ErrRecoveryRequired, err)
 				i.dict = groupStart

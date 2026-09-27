@@ -12,12 +12,12 @@ import (
 
 func aclStore(t *testing.T, includeGroups bool) *bitmapidx.Index {
 	t.Helper()
-	specs := []bitmapidx.NamespaceSpec{{Namespace: common.NamespaceUserACL, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType}}
+	specs := []bitmapidx.NamespaceSpec{{Namespace: common.NamespaceUserACL, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType}}
 	if includeGroups {
-		specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceGroupACL, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType})
+		specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceGroupACL, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType})
 	}
-	specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType})
-	store, err := bitmapidx.NewIndex(t.TempDir(), specs, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
+	specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType})
+	store, err := bitmapidx.NewIndex(t.TempDir(), specs, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

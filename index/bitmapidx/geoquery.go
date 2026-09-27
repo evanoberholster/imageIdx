@@ -2,6 +2,7 @@ package bitmapidx
 
 import (
 	"cmp"
+	common "github.com/evanoberholster/imageIdx/common"
 	"math"
 	"slices"
 	"sort"
@@ -72,7 +73,7 @@ func geoBaseRangeIn(entries []NamespaceKey, keyRange GeoRange) (int, int) {
 // path references base postings directly; the delta path unions effective
 // postings for occupied keys.
 func (i *NamespaceIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr error) {
-	if i.spec().Kind != KindGeo {
+	if i.spec().Kind != common.KindBitmapGeo {
 		return roar.Bitmap{}, ErrNamespaceMismatch
 	}
 	if len(ranges) == 0 {
@@ -120,7 +121,7 @@ func (i *NamespaceIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resul
 // counts. Prefer CollectGeoRanges plus bitmap probes when buckets are many or
 // the match will be reused; see CountGeoCells for the planning probe.
 func (i *NamespaceIndex) FilterGeoRanges(dst, candidates []ImageID, ranges []GeoRange) ([]ImageID, error) {
-	if i.spec().Kind != KindGeo {
+	if i.spec().Kind != common.KindBitmapGeo {
 		return dst, ErrNamespaceMismatch
 	}
 	token := i.readers.Acquire()
@@ -220,7 +221,7 @@ func (v *namespaceView) geoProbeContains(p *geoProbe, id ImageID) bool {
 // buckets inside ranges without materializing. Multi-valued overlap
 // makes it an upper bound; it is a planning hint, not an exact count.
 func (i *NamespaceIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
-	if i.spec().Kind != KindGeo {
+	if i.spec().Kind != common.KindBitmapGeo {
 		return 0, ErrNamespaceMismatch
 	}
 	token := i.readers.Acquire()
@@ -246,7 +247,7 @@ func (i *NamespaceIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
 // unioning bitmaps and counting, without appending IDs. The no-delta
 // path pre-sizes scratch once from the occupied bucket count.
 func (i *NamespaceIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
-	if i.spec().Kind != KindGeo {
+	if i.spec().Kind != common.KindBitmapGeo {
 		return 0, ErrNamespaceMismatch
 	}
 	token := i.readers.Acquire()
@@ -281,7 +282,7 @@ func (i *NamespaceIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
 // The caller resets m first and materializes once with AppendTo. The
 // delta path uses deduplicated keys so each posting folds once.
 func (i *NamespaceIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) {
-	if m == nil || len(ranges) == 0 || i.spec().Kind != KindGeo {
+	if m == nil || len(ranges) == 0 || i.spec().Kind != common.KindBitmapGeo {
 		return
 	}
 	token := i.readers.Acquire()
@@ -311,7 +312,7 @@ func (i *NamespaceIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRan
 // favor CollectGeoRanges materialization. Delta keys present in multiple
 // layers count twice, so it is an upper bound.
 func (i *NamespaceIndex) CountGeoCells(ranges []GeoRange) int {
-	if len(ranges) == 0 || i.spec().Kind != KindGeo {
+	if len(ranges) == 0 || i.spec().Kind != common.KindBitmapGeo {
 		return 0
 	}
 	token := i.readers.Acquire()
@@ -441,7 +442,7 @@ func (i *NamespaceIndex) AppendTo(dst []ImageID) []ImageID {
 // Move); only same-key duplicates and in-batch double-adds are rejected
 // here.
 func validateGeoChanges(view *namespaceView, changes []stagedChange) error {
-	if view.namespace.Kind != KindGeo {
+	if view.namespace.Kind != common.KindBitmapGeo {
 		return nil
 	}
 	for _, change := range changes {
@@ -482,7 +483,7 @@ type NearestResult struct {
 // Invalid origins, non-positive k, nil lookups, and wrong kinds append
 // nothing.
 func (i *NamespaceIndex) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup GeoCoordinateLookup) []NearestResult {
-	if i.spec().Kind != KindGeo || k <= 0 || lookup == nil {
+	if i.spec().Kind != common.KindBitmapGeo || k <= 0 || lookup == nil {
 		return dst
 	}
 	if _, err := KeyFromLatLng(latitude, longitude); err != nil {

@@ -16,7 +16,7 @@ import (
 func enumNamespaceForSearch(t *testing.T, typ common.Namespace, value string, ids []uint64) *bitmapidx.NamespaceIndex {
 	t.Helper()
 	index, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: typ, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
+		Namespace: typ, Kind: common.KindBitmapEnum, Storage: bitmapidx.StoragePerType,
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +173,7 @@ func TestNamespaceOnlyCountMatchesSearch(t *testing.T) {
 
 func TestNamespaceTextAndRangeClauses(t *testing.T) {
 	text, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: common.Namespace(24), Kind: bitmapidx.KindText, Storage: bitmapidx.StoragePerType,
+		Namespace: common.Namespace(24), Kind: common.KindBitmapString, Storage: bitmapidx.StoragePerType,
 		Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
@@ -188,7 +188,7 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 	})
 
 	continuous, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
-		Namespace: common.Namespace(25), Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType,
+		Namespace: common.Namespace(25), Kind: common.KindBitmapContinuous, Storage: bitmapidx.StoragePerType,
 		Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {

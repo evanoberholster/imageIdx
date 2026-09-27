@@ -3,6 +3,7 @@ package bitmapidx
 import (
 	"context"
 	"errors"
+	common "github.com/evanoberholster/imageIdx/common"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -130,7 +131,7 @@ func NewNamespaceIndex(namespace NamespaceSpec, config NamespaceConfig) (*Namesp
 		readers: &storage.ReaderTracker{},
 	}
 	index.commits = commitqueue.New(commitQueueCapacity, index.commitGroup)
-	if namespace.Kind == KindText {
+	if namespace.Kind == common.KindBitmapString {
 		index.analyzer, err = textanalyzer.New(namespace.Analyzer.Code, namespace.Analyzer.Version, namespace.Analyzer.Params)
 		if err != nil {
 			return nil, err
