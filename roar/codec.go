@@ -6,7 +6,7 @@ import (
 	"math/bits"
 	"unsafe"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // MarshalBinary returns an owned copy of the serialized representation. The
@@ -100,7 +100,7 @@ func Validate(data []byte) error {
 	if binary.LittleEndian.Uint16(data[0:2]) != Version {
 		return ErrUnsupportedVersion
 	}
-	if !indexutil.HostIsLittleEndian() {
+	if !storage.HostIsLittleEndian() {
 		return ErrUnsupportedEndian
 	}
 	flags := binary.LittleEndian.Uint16(data[2:4])
@@ -109,7 +109,7 @@ func Validate(data []byte) error {
 		return ErrInvalidBitmap
 	}
 	const tableStart = uint64(HeaderSize)
-	tableEnd, ok := indexutil.CheckedEnd(tableStart, uint64(keyCount), KeyEntrySize, uint64(len(data)))
+	tableEnd, ok := storage.CheckedEnd(tableStart, uint64(keyCount), KeyEntrySize, uint64(len(data)))
 	if !ok {
 		return ErrInvalidBitmap
 	}
@@ -130,7 +130,7 @@ func Validate(data []byte) error {
 		if offset < tableEnd || offset%Alignment != 0 {
 			return ErrInvalidBitmap
 		}
-		if _, ok := indexutil.CheckedEnd(offset, 1, ContainerHeaderSize, uint64(len(data))); !ok {
+		if _, ok := storage.CheckedEnd(offset, 1, ContainerHeaderSize, uint64(len(data))); !ok {
 			return ErrInvalidBitmap
 		}
 		if err := validateContainer(data[offset:], key); err != nil {

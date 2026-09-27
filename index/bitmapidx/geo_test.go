@@ -6,16 +6,17 @@ import (
 	"sync"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 )
 
-func geoFieldFor(t IndexType) Field {
-	return Field{
-		Type:    t,
-		Kind:    KindGeo,
-		Storage: StoragePerType,
-		Geo:     GeoCodec{Version: 1},
+func geoNamespaceFor(t common.Namespace) NamespaceSpec {
+	return NamespaceSpec{
+		Namespace: t,
+		Kind:      KindGeo,
+		Storage:   StoragePerType,
+		Geo:       GeoCodec{Version: 1},
 	}
 }
 
@@ -185,17 +186,17 @@ func TestGeoRangeNormalizationExact(t *testing.T) {
 // every image a gap-filled range would: the seam key between Hilbert-adjacent
 // expansions is even and can never be stored, so splitting loses nothing.
 func TestGeoSplitRangesMatchMerged(t *testing.T) {
-	index := mustField(t, geoFieldFor(IndexTypeLocation), FieldConfig{})
+	index := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), NamespaceConfig{})
 	cell := s2.CellIDFromLatLng(s2.LatLngFromDegrees(37.7749, -122.4194)).Parent(10)
 	north := cell.Next()
 	keyA := uint64(cell.ChildBeginAtLevel(GeoS2Level)) >> geoKeyShift
 	keyB := uint64(north.ChildBeginAtLevel(GeoS2Level)) >> geoKeyShift
-	if err := index.Move(
-		Move{ImageID: 1, To: int64(keyA)},
-		Move{ImageID: 2, To: int64(keyB)},
-	); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Move(
+			Move{ImageID: 1, To: int64(keyA)},
+			Move{ImageID: 2, To: int64(keyB)},
+		)
+	})
 	ranges, err := RangesFromCellIDs(nil, []uint64{uint64(cell), uint64(north)})
 	if err != nil {
 		t.Fatalf("RangesFromCellIDs: %v", err)
@@ -242,39 +243,39 @@ func TestGeoCoarseLevelQuery(t *testing.T) {
 		latitude, longitude := center(point.cell)
 		entries = append(entries, GeoEntry{ImageID: point.id, Latitude: latitude, Longitude: longitude})
 	}
-	field, err := NewGeoField(IndexTypeLocation, entries, FieldConfig{})
+	namespace, err := NewGeoNamespace(common.NamespaceLocation, entries, NamespaceConfig{})
 	if err != nil {
-		t.Fatalf("NewGeoField: %v", err)
+		t.Fatalf("NewGeoNamespace: %v", err)
 	}
-	defer field.Close()
+	defer namespace.Close()
 
 	ranges, err := RangesFromCellIDs(nil, []uint64{uint64(coarse)})
 	if err != nil {
 		t.Fatalf("RangesFromCellIDs: %v", err)
 	}
-	match, err := field.GeoRanges(ranges)
+	match, err := namespace.GeoRanges(ranges)
 	if err != nil {
 		t.Fatalf("GeoRanges: %v", err)
 	}
 	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1, 2, 3, 4}) {
 		t.Fatalf("level-10 query = %v, want [1 2 3 4]", got)
 	}
-	count, err := field.CountGeoRanges(ranges)
+	count, err := namespace.CountGeoRanges(ranges)
 	if err != nil || count != 4 {
 		t.Fatalf("CountGeoRanges = %d, %v", count, err)
 	}
-	filtered, err := field.FilterGeoRanges(nil, []ImageID{1, 2, 3, 4, 5, 6}, ranges)
+	filtered, err := namespace.FilterGeoRanges(nil, []ImageID{1, 2, 3, 4, 5, 6}, ranges)
 	if err != nil || !slices.Equal(filtered, []ImageID{1, 2, 3, 4}) {
 		t.Fatalf("FilterGeoRanges = %v, %v", filtered, err)
 	}
-	if err := field.Compact(); err != nil {
+	if err := namespace.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	estimate, err := field.EstimateGeoRanges(ranges)
+	estimate, err := namespace.EstimateGeoRanges(ranges)
 	if err != nil || estimate != 4 {
 		t.Fatalf("EstimateGeoRanges = %d, %v", estimate, err)
 	}
-	if cells := field.CountGeoCells(ranges); cells != 3 {
+	if cells := namespace.CountGeoCells(ranges); cells != 3 {
 		t.Fatalf("CountGeoCells = %d, want 3 occupied buckets", cells)
 	}
 
@@ -295,7 +296,7 @@ func TestGeoCoarseLevelQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s ranges: %v", check.name, err)
 		}
-		match, err := field.GeoRanges(exact)
+		match, err := namespace.GeoRanges(exact)
 		if err != nil {
 			t.Fatalf("%s query: %v", check.name, err)
 		}
@@ -305,8 +306,8 @@ func TestGeoCoarseLevelQuery(t *testing.T) {
 	}
 }
 
-func TestGeoFieldMoveAndValidation(t *testing.T) {
-	index := mustField(t, geoFieldFor(IndexTypeLocation), FieldConfig{})
+func TestGeoNamespaceMoveAndValidation(t *testing.T) {
+	index := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), NamespaceConfig{})
 	sanFrancisco := sfKey(t)
 	losAngeles, err := KeyFromLatLng(34.0522, -118.2437)
 	if err != nil {
@@ -314,82 +315,93 @@ func TestGeoFieldMoveAndValidation(t *testing.T) {
 	}
 
 	// Geo presence flags may be omitted: a level-16 key is never zero.
-	if err := index.Move(Move{ImageID: 1, To: int64(sanFrancisco)}); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, To: int64(sanFrancisco)})
+	})
 	// Re-inserting the same cell is rejected; a cross-cell insert without a
-	// From is caller discipline because no reverse index is stored.
-	if err := index.Add(Entry{ImageID: 1, Value: GeoValue(sanFrancisco)}); err != ErrDuplicateImageID {
+	// From is caller discipline because no reverse index is stored. Geo
+	// validation runs at commit, so the error surfaces at the barrier.
+	if err := commitBarrier(t, index, func(b *Batch) error {
+		return b.Add(Entry{ImageID: 1, Value: GeoValue(sanFrancisco)})
+	}); err != ErrDuplicateImageID {
 		t.Fatalf("duplicate insert error = %v, want ErrDuplicateImageID", err)
 	}
 	// Explicit flags still work and report stale transitions.
-	if err := index.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco), HasFrom: true, HasTo: true}); err != ErrInvalidMutation {
+	if err := commitBarrier(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco), HasFrom: true, HasTo: true})
+	}); err != ErrInvalidMutation {
 		t.Fatalf("stale From error = %v, want ErrInvalidMutation", err)
 	}
-	if err := index.Move(Move{ImageID: 1, From: int64(sanFrancisco), To: int64(losAngeles)}); err != nil {
-		t.Fatalf("move: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, From: int64(sanFrancisco), To: int64(losAngeles)})
+	})
 	// Batched double-add is rejected before publication.
-	if err := index.Add(
-		Entry{ImageID: 2, Value: GeoValue(sanFrancisco)},
-		Entry{ImageID: 2, Value: GeoValue(losAngeles)},
-	); err != ErrDuplicateImageID {
+	if err := commitBarrier(t, index, func(b *Batch) error {
+		return b.Add(
+			Entry{ImageID: 2, Value: GeoValue(sanFrancisco)},
+			Entry{ImageID: 2, Value: GeoValue(losAngeles)},
+		)
+	}); err != ErrDuplicateImageID {
 		t.Fatalf("batched double-add error = %v, want ErrDuplicateImageID", err)
 	}
-	if err := index.Move(Move{ImageID: 1, From: int64(sanFrancisco)}); err != ErrInvalidMutation {
+	if err := commitBarrier(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, From: int64(sanFrancisco)})
+	}); err != ErrInvalidMutation {
 		t.Fatalf("remove from wrong cell error = %v, want ErrInvalidMutation", err)
 	}
-	if err := index.Move(Move{ImageID: 1, From: int64(losAngeles)}); err != nil {
-		t.Fatalf("remove: %v", err)
-	}
-	if err := index.Move(Move{ImageID: 1, To: 0}); err != nil {
-		t.Fatalf("zero-target no-op: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, From: int64(losAngeles)})
+	})
+	commit(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, To: 0})
+	})
 	if ids := appendIDs(t, index, GeoValue(losAngeles)); len(ids) != 0 {
 		t.Fatalf("removed image still present: %v", ids)
 	}
-	// Continuous fields keep explicit flags because zero is a valid value.
-	focals := mustField(t, continuousField(testFocalLength), FieldConfig{})
-	if err := focals.Move(Move{ImageID: 1, To: 0}); err != nil {
-		t.Fatalf("continuous no-op: %v", err)
-	}
+	// Continuous namespaces keep explicit flags because zero is a valid value.
+	focals := mustNamespace(t, continuousNamespace(testFocalLength), NamespaceConfig{})
+	commit(t, focals, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, To: 0})
+	})
 	if present, err := focals.Contains(1, IntValue(0)); err != nil || present {
 		t.Fatalf("continuous zero inserted without a flag: present=%v err=%v", present, err)
 	}
 }
 
 func TestFailedBatchDiscardsStagedDictionary(t *testing.T) {
-	index := mustField(t, geoFieldFor(IndexTypeLocation), FieldConfig{})
+	index := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), NamespaceConfig{})
 	sanFrancisco := sfKey(t)
-	if err := index.Move(Move{ImageID: 1, To: int64(sanFrancisco)}); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, To: int64(sanFrancisco)})
+	})
 	// Simulate a value staged by a batch that then fails validation: without
 	// an abort the next successful write would seal it into the dictionary
 	// even though its postings were never published.
-	phantom := FieldKey{Hash: 0x12345678, Type: IndexTypeLocation}
+	phantom := NamespaceKey{Hash: 0x12345678, Namespace: common.NamespaceLocation}
 	index.dict.stage(phantom, []byte("phantom"))
 	losAngeles, err := KeyFromLatLng(34.0522, -118.2437)
 	if err != nil {
 		t.Fatalf("KeyFromLatLng: %v", err)
 	}
-	if err := index.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco), HasFrom: true, HasTo: true}); err != ErrInvalidMutation {
+	if err := commitBarrier(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco), HasFrom: true, HasTo: true})
+	}); err != ErrInvalidMutation {
 		t.Fatalf("stale From error = %v, want ErrInvalidMutation", err)
 	}
 	if len(index.dict.pending) != 0 {
 		t.Fatalf("failed batch left %d staged entries", len(index.dict.pending))
 	}
-	if err := index.Move(Move{ImageID: 1, From: int64(sanFrancisco), To: int64(losAngeles)}); err != nil {
-		t.Fatalf("move: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 1, From: int64(sanFrancisco), To: int64(losAngeles)})
+	})
 	if _, ok := index.view.Load().dict.resolve(phantom, []byte("phantom")); ok {
 		t.Fatal("failed batch value survived in the dictionary")
 	}
 }
 
-func TestGeoFieldRangesCountsAndDeltas(t *testing.T) {
-	config := FieldConfig{ActiveTarget: 2, HardDeltaLimit: 4, MaxDeltaValues: 2}
-	index := mustField(t, geoFieldFor(IndexTypeLocation), config)
+func TestGeoNamespaceRangesCountsAndDeltas(t *testing.T) {
+	config := NamespaceConfig{ActiveTarget: 2, HardDeltaLimit: 4, MaxDeltaValues: 2}
+	index := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), config)
 	type city struct {
 		id   ImageID
 		lat  float64
@@ -407,14 +419,14 @@ func TestGeoFieldRangesCountsAndDeltas(t *testing.T) {
 		if err != nil {
 			t.Fatalf("KeyFromLatLng(%s): %v", c.name, err)
 		}
-		if err := index.Move(Move{ImageID: c.id, To: int64(key)}); err != nil {
-			t.Fatalf("insert %s: %v", c.name, err)
-		}
+		commit(t, index, func(b *Batch) error {
+			return b.Move(Move{ImageID: c.id, To: int64(key)})
+		})
 	}
 	// Force delta rotation and compaction with the remaining moves.
-	if err := index.Move(Move{ImageID: 5, To: int64(sfKey(t))}); err != nil {
-		t.Fatalf("insert 5: %v", err)
-	}
+	commit(t, index, func(b *Batch) error {
+		return b.Move(Move{ImageID: 5, To: int64(sfKey(t))})
+	})
 	if err := index.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -461,7 +473,7 @@ func TestGeoFieldRangesCountsAndDeltas(t *testing.T) {
 }
 
 func TestGeoCoverAndNearest(t *testing.T) {
-	index := mustField(t, geoFieldFor(IndexTypeLocation), FieldConfig{})
+	index := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), NamespaceConfig{})
 	keys := make(map[ImageID]uint64)
 	for id, coordinate := range map[ImageID][2]float64{
 		1: {37.7749, -122.4194}, // San Francisco
@@ -473,9 +485,9 @@ func TestGeoCoverAndNearest(t *testing.T) {
 			t.Fatalf("KeyFromLatLng: %v", err)
 		}
 		keys[id] = key
-		if err := index.Move(Move{ImageID: id, To: int64(key)}); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
+		commit(t, index, func(b *Batch) error {
+			return b.Move(Move{ImageID: id, To: int64(key)})
+		})
 	}
 
 	bayArea := s2.RectFromLatLng(s2.LatLngFromDegrees(37.5, -122.6)).AddPoint(s2.LatLngFromDegrees(38.1, -122.0))
@@ -531,16 +543,16 @@ func TestGeoCoverAndNearest(t *testing.T) {
 // unmapped underneath it.
 func TestGeoReadersSurviveVacuum(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewIndex(dir, []Field{geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
+	s, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
-	index, _ := s.Lookup(IndexTypeLocation)
+	index, _ := s.Lookup(common.NamespaceLocation)
 	key := sfKey(t)
 	for id := 1; id <= 64; id++ {
-		if err := index.Move(Move{ImageID: ImageID(id), To: int64(key)}); err != nil {
-			t.Fatalf("Move: %v", err)
-		}
+		commit(t, index, func(b *Batch) error {
+			return b.Move(Move{ImageID: ImageID(id), To: int64(key)})
+		})
 	}
 	if err := s.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
@@ -577,30 +589,21 @@ func TestGeoReadersSurviveVacuum(t *testing.T) {
 	}
 }
 
-func TestGeoFieldDefinitionValidation(t *testing.T) {
-	field := geoFieldFor(IndexTypeLocation)
-	if err := validateField(field); err != nil {
-		t.Fatalf("valid geo field rejected: %v", err)
+func TestGeoNamespaceDefinitionValidation(t *testing.T) {
+	namespace := geoNamespaceFor(common.NamespaceLocation)
+	if err := validateNamespace(namespace); err != nil {
+		t.Fatalf("valid geo namespace rejected: %v", err)
 	}
-	field.Geo.Level = 10
-	if err := validateField(field); err != ErrInvalidField {
-		t.Fatalf("wrong level error = %v, want ErrInvalidField", err)
+	namespace.Geo.Level = 10
+	if err := validateNamespace(namespace); err != ErrInvalidNamespace {
+		t.Fatalf("wrong level error = %v, want ErrInvalidNamespace", err)
 	}
-	field = geoFieldFor(IndexTypeLocation)
-	registry := NewRegistry()
-	if err := registry.Register(field); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	data, err := registry.MarshalBinary()
+	spec := geoNamespaceFor(common.NamespaceLocation)
+	restored, err := decodeNamespaceSpecs(encodeNamespaceSpecs([]NamespaceSpec{spec}))
 	if err != nil {
-		t.Fatalf("MarshalBinary: %v", err)
+		t.Fatalf("decodeNamespaceSpecs: %v", err)
 	}
-	restored := NewRegistry()
-	if err := restored.UnmarshalBinary(data); err != nil {
-		t.Fatalf("UnmarshalBinary: %v", err)
-	}
-	restoredField, ok := restored.Field(IndexTypeLocation)
-	if !ok || restoredField.Geo != field.Geo || restoredField.Kind != KindGeo {
-		t.Fatalf("restored = %+v, ok=%v", restoredField, ok)
+	if len(restored) != 1 || restored[0].Geo != spec.Geo || restored[0].Kind != KindGeo {
+		t.Fatalf("restored = %+v, want %+v", restored, spec)
 	}
 }

@@ -3,6 +3,7 @@ package timeidx
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +12,7 @@ import (
 func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
 	const offset = uint64(1_000)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{IndexID: 9, Flags: 3, Offset: offset, Entries: []Entry{
+	index, err := NewPersistent(directory, Spec{Namespace: testNamespace, Flags: 3, Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 		{Timestamp: offset + 2*testQuantum, ImageID: 2},
 		{Timestamp: offset + 3*testQuantum, ImageID: 3},
@@ -53,7 +54,7 @@ func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
 	if reopened.Metadata().Generation != generation {
 		t.Fatalf("generation = %d, want %d", reopened.Metadata().Generation, generation)
 	}
-	if reopened.Metadata().IndexID != 9 || reopened.Metadata().Flags != 3 {
+	if reopened.Metadata().Namespace != testNamespace || reopened.Metadata().Flags != 3 {
 		t.Fatalf("metadata = %+v", reopened.Metadata())
 	}
 	if len(reopened.persistence.mappings) != 2 {
@@ -298,6 +299,14 @@ func TestVacuumRotatesWALAndRetainsLiveGeneration(t *testing.T) {
 	matches, _ := filepath.Glob(filepath.Join(directory, walGlob))
 	if len(matches) != 1 {
 		t.Fatalf("WAL files after second vacuum = %v, want 1", matches)
+	}
+}
+
+func TestDecodeManifestRejectsOversizedNamespace(t *testing.T) {
+	data := validManifestBytes()
+	binary.LittleEndian.PutUint64(data[16:24], uint64(math.MaxUint16)+1)
+	if _, err := decodeManifest(data); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("decode oversized namespace = %v, want ErrCorruptManifest", err)
 	}
 }
 

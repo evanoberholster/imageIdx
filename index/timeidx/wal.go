@@ -5,7 +5,7 @@ import (
 	"errors"
 	"hash/crc32"
 
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 const (
@@ -16,7 +16,7 @@ const (
 )
 
 type timestampWAL struct {
-	*persist.WAL
+	*storage.WAL
 }
 
 var ErrCorruptWAL = errors.New("timeidx: corrupt write-ahead log")
@@ -25,14 +25,17 @@ func openTimestampWAL(path string, batchCapacity int) (*timestampWAL, error) {
 	if batchCapacity < 256 {
 		batchCapacity = 256
 	}
-	wal, err := persist.OpenWAL(path, walHeaderSize+batchCapacity*walWriteSize)
+	wal, err := storage.OpenWAL(path, walHeaderSize+batchCapacity*walWriteSize)
 	if err != nil {
 		return nil, err
 	}
 	return &timestampWAL{WAL: wal}, nil
 }
 
-func (w *timestampWAL) appendBatch(writes []write, durability Durability) error {
+// appendBatch frames one mutation batch. Group commits append every frame
+// unsynced and fsync once for the whole group, so sync only requests the
+// fsync; the frame always appends.
+func (w *timestampWAL) appendBatch(writes []write, sync bool) error {
 	if len(writes) == 0 {
 		return nil
 	}
@@ -54,7 +57,7 @@ func (w *timestampWAL) appendBatch(writes []write, durability Durability) error 
 		clear(record[offset+17 : offset+walWriteSize])
 	}
 	binary.LittleEndian.PutUint32(record[12:16], crc32.ChecksumIEEE(record[walHeaderSize:]))
-	return w.WriteRecord(record, durability == DurabilitySync)
+	return w.WriteRecord(record, sync)
 }
 
 // validateWALFrame resolves one frame header to its payload size. Count
@@ -77,7 +80,7 @@ func validateWALFrame(header []byte) (uint64, error) {
 // replayWALEnd is replayWAL plus the exclusive end of the last complete
 // frame, used by Vacuum to carry only complete frames into a fresh epoch.
 func replayWALEnd(path string, offset int64) (int64, error) {
-	return persist.ReplayEnd(path, offset, persist.FrameSpec{
+	return storage.ReplayEnd(path, offset, storage.FrameSpec{
 		HeaderSize: walHeaderSize,
 		Magic:      walMagic,
 		Version:    walVersion,
@@ -92,7 +95,7 @@ func replayWALEnd(path string, offset int64) (int64, error) {
 
 func replayWAL(path string, offset int64) ([]write, error) {
 	var writes []write
-	err := persist.Replay(path, offset, persist.FrameSpec{
+	err := storage.Replay(path, offset, storage.FrameSpec{
 		HeaderSize: walHeaderSize,
 		Magic:      walMagic,
 		Version:    walVersion,

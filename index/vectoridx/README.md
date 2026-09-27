@@ -11,11 +11,11 @@ scalar kernels here are their correctness reference.
 
 ## Concepts
 
-- **Direct identity.** `SpaceID` packs the index type (`IndexTypeImage`, `IndexTypeFace`,
-  `IndexTypeCustom`) in its high byte and the space number in its low byte. `NodeID`
-  (`uint32`) is the stored identifier; HNSW edges store NodeIDs, never
-  pointers or ordinals. Results widen the stored NodeID to
-  `imageidx.ImageID` (`Result{ImageID, Score}`).
+- **Direct identity.** `Namespace` (`common.Namespace`, registered as
+  `common.KindVector`) is the shared schema identity of one vector space.
+  `NodeID` (`uint32`) is the stored identifier; HNSW edges store NodeIDs,
+  never pointers or ordinals. Results widen the stored NodeID to
+  `common.ImageID` (`Result{ImageID, Score}`).
 - **Dense physical data.** Vectors pack contiguously in insertion-ordinal
   order even when NodeIDs are sparse. A dense O(1) table serves dense ID
   ranges with atomic fills; the sorted `NodeID → ordinal` locator covers
@@ -48,7 +48,7 @@ scalar kernels here are their correctness reference.
 
 ```go
 idx, err := vectoridx.Create(path, vectoridx.Config{
-    SpaceID:     vectoridx.NewSpaceID(vectoridx.IndexTypeImage, 1),
+    Namespace:   1, // common.Namespace registered as common.KindVector
     Dimensions:  vectoridx.Dim512,
     ElementType: vectoridx.ElementFloat32,
 }, vectoridx.DurabilitySync)
@@ -78,7 +78,7 @@ Filter with any bitmap representation:
 
 ```go
 filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
-    return bitmap.Contains(imageidx.ImageID(id))
+    return bitmap.Contains(common.ImageID(id))
 })
 ```
 
@@ -144,7 +144,7 @@ generation.
 ## API rules worth knowing
 
 - `Dimensions` is closed {512, 768, 1024} and element type is fixed for the
-  index lifetime; an invalid `SpaceID` or `Dimensions` returns
+  index lifetime; an invalid (zero) `Namespace` or `Dimensions` returns
   `ErrInvalidConfig`. Mismatched vectors/queries return `ErrInvalidVector`.
 - Duplicate `Add` of a live NodeID returns `ErrDuplicateNodeID`. Adding a
   tombstoned NodeID replaces its vector and reconnects it, so `Delete`
@@ -191,7 +191,7 @@ that degrade the graph fail loudly.
 | File | Contents |
 |---|---|
 | `doc.go` | Package overview, V1 scope and simplifications |
-| `types.go` | IndexType/SpaceID/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
+| `types.go` | Namespace/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
 | `distance.go` | Scalar L2/cosine/dot kernels, dispatch, `EncodeScore` |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
 | `hnsw.go` | Locator, greedy descent, layer search, assembly, exact oracle |

@@ -6,21 +6,21 @@ import (
 	"io"
 	"math/bits"
 
-	imageidx "github.com/evanoberholster/imageIdx"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/zeebo/blake3"
 )
 
 // ImageID is the database-wide identifier shared by all index packages.
-type ImageID = imageidx.ImageID
+type ImageID = common.ImageID
 
 // Durability controls when a write is acknowledged relative to filesystem
 // synchronization.
-type Durability = imageidx.Durability
+type Durability = common.Durability
 
 const (
-	DurabilityOS   = imageidx.DurabilityOS
-	DurabilitySync = imageidx.DurabilitySync
+	DurabilityOS   = common.DurabilityOS
+	DurabilitySync = common.DurabilitySync
 )
 
 var (
@@ -32,10 +32,10 @@ var (
 	ErrUnsupported   = errors.New("hashidx: unsupported format")
 	// ErrRecoveryRequired reports a WAL failure that latched the index:
 	// every later write and maintenance call fails with it until the
-	// index is closed and reopened. It aliases persist.ErrWALFailed.
+	// index is closed and reopened. It aliases storage.ErrWALFailed.
 	// Recovery is close plus reopen: replay restores the last durable
 	// prefix and reports a torn tail as a clean stop or ErrCorruptWAL.
-	ErrRecoveryRequired = persist.ErrWALFailed
+	ErrRecoveryRequired = storage.ErrWALFailed
 )
 
 // Ordinal is an internal physical position in the shared SoA space. Ordinals
@@ -62,7 +62,7 @@ type Result struct {
 
 // CandidateSet admits records at search time. Implementations commonly wrap a
 // live/candidate bitmap. A nil CandidateSet means "no filtering". Because
-// imageidx.ImageID is an alias of uint64, a roar.Bitmap satisfies this
+// common.ImageID is an alias of uint64, a roar.Bitmap satisfies this
 // interface directly.
 type CandidateSet interface {
 	Contains(id ImageID) bool
@@ -100,9 +100,12 @@ type Config struct {
 	MaxBatchEntries uint32
 }
 
-// Metadata is a copied summary of the current published view. PageCount
-// counts sealed pages plus an in-progress final page when one is active.
+// Metadata is a copied summary of the current published view. Namespace is
+// the perceptual index's schema namespace and is zero for an index constructed
+// directly without a Store. PageCount counts sealed pages plus an in-progress
+// final page when one is active.
 type Metadata struct {
+	Namespace      common.Namespace
 	Generation     uint64
 	RecordCount    uint64
 	PageCount      uint64
@@ -181,21 +184,34 @@ type ExactEntry struct {
 	ImageID ImageID
 }
 
-// ExactSpec describes an index's stable identity, algorithm, and initial entries.
+// ExactSpec describes an index's stable identity, algorithm, and initial
+// entries. Namespace is the shared schema identity of the exact-content index
+// and may be zero for an index constructed directly in tests; Store creation
+// requires non-zero, distinct namespaces. Name is the schema name and is never
+// persisted.
 type ExactSpec struct {
-	IndexID   uint64
+	Namespace common.Namespace
+	Name      string
 	Flags     uint32
 	Algorithm Algorithm
 	Entries   []ExactEntry
 }
 
-// ExactMetadata is a copied summary of the current generation. BaseCount
-// counts base block records and deliberately excludes staged overlay
-// corrections; OverlayCount counts staged entries not yet folded. The
-// effective live count is BaseCount plus staged adds minus staged
-// removes (see LiveCount).
+// NamespaceDef returns the common.Schema definition for this spec. The
+// exact-content index records no kind-specific schema configuration, so
+// Config is nil.
+func (s ExactSpec) NamespaceDef() common.NamespaceDef {
+	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindHashExact}
+}
+
+// ExactMetadata is a copied summary of the current generation. Namespace is
+// the exact-content index's schema namespace and is zero for an index
+// constructed directly without a Store. BaseCount counts base block records
+// and deliberately excludes staged overlay corrections; OverlayCount counts
+// staged entries not yet folded. The effective live count is BaseCount plus
+// staged adds minus staged removes (see LiveCount).
 type ExactMetadata struct {
-	IndexID      uint64
+	Namespace    common.Namespace
 	Flags        uint32
 	Algorithm    Algorithm
 	Generation   uint64

@@ -129,7 +129,14 @@ func (v *VectorIdx) rotateWALLocked() error {
 	}
 	if v.wal != nil {
 		if v.durability == DurabilitySync {
-			_ = v.wal.Sync()
+			// The old segment must be durable before it stops being the
+			// active handle: a writer that appended to it may be about to
+			// fsync the successor instead.
+			if err := v.wal.Sync(); err != nil {
+				_ = f.Close()
+				return err
+			}
+			v.walSyncs.Add(1)
 		}
 		_ = v.wal.Close()
 	}
@@ -216,19 +223,16 @@ func (v *VectorIdx) appendWALRecord(rtype uint8, id NodeID, raw []byte) error {
 	v.walSize += walHeaderSize + int64(vecLen) + walCRCSize
 	v.walRecords.Add(1)
 	v.walBytes.Add(uint64(walHeaderSize + vecLen + walCRCSize))
-	// DurabilitySync fsyncs each acknowledged mutation; DurabilityOS leaves
-	// the record in the OS page cache and only marks it dirty for periodic
-	// group commit.
-	if v.durability == DurabilitySync {
-		if err := v.wal.Sync(); err != nil {
-			return err
-		}
-		v.walSyncs.Add(1)
-		v.walDirty.Store(false)
-		return nil
-	}
-	if v.syncInterval > 0 {
+	// The record is written but never fsynced here. A DurabilitySync
+	// writer calls syncWALAfterWrite once it releases writeMu, so the
+	// fsync overlaps the next writer's graph insertion instead of holding
+	// the write lock. DurabilityOS leaves the record in the OS page cache
+	// and only marks it dirty for periodic group commit.
+	if v.syncInterval > 0 && v.durability == DurabilityOS {
 		v.walDirty.Store(true)
+	}
+	if v.durability == DurabilitySync {
+		v.pendingSync = v.wal
 	}
 	return nil
 }

@@ -20,7 +20,8 @@ func ExampleStore() {
 	defer os.RemoveAll(dir)
 
 	store, err := hashidx.NewStore(dir, hashidx.StoreSpec{
-		Exact: hashidx.ExactSpec{Algorithm: hashidx.AlgorithmSHA256},
+		Perceptual: hashidx.PerceptualSpec{Namespace: 1, Name: "perceptual"},
+		Exact:      hashidx.ExactSpec{Namespace: 2, Name: "exact", Algorithm: hashidx.AlgorithmSHA256},
 	}, hashidx.DurabilityOS)
 	if err != nil {
 		panic(err)

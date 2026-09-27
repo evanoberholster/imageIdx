@@ -3,61 +3,61 @@ package search
 import (
 	"errors"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
-// ErrInvalidACLField reports a nil field or one that is not the dedicated
-// KindEnum ACL field the handle requires.
-var ErrInvalidACLField = errors.New("search: invalid ACL field")
+// ErrInvalidACLField reports a nil namespace or one that is not the dedicated
+// KindEnum ACL namespace the handle requires.
+var ErrInvalidACLField = errors.New("search: invalid ACL namespace")
 
-// UserGrants manages direct image grants for the IndexTypeUserACL field:
+// UserGrants manages direct image grants for the NamespaceUserACL namespace:
 // one posting per user holding the ImageIDs that user may see. Construct
 // with NewUserGrants; the zero value is unusable.
-type UserGrants = grantField[imageidx.UserID]
+type UserGrants = grantNamespace[common.UserID]
 
-// NewUserGrants binds the store's user ACL field. It rejects a nil index
-// and any field that is not the dedicated KindEnum user field.
-func NewUserGrants(index *bitmapidx.FieldIndex) (UserGrants, error) {
-	return newGrantField[imageidx.UserID](index, bitmapidx.IndexTypeUserACL)
+// NewUserGrants binds the store's user ACL namespace. It rejects a nil index
+// and any namespace that is not the dedicated KindEnum user namespace.
+func NewUserGrants(index *bitmapidx.NamespaceIndex) (UserGrants, error) {
+	return newGrantNamespace[common.UserID](index, common.NamespaceUserACL)
 }
 
-// GroupGrants manages image grants for the IndexTypeGroupACL field: one
+// GroupGrants manages image grants for the NamespaceGroupACL namespace: one
 // posting per group holding the ImageIDs visible to its members. It also
-// serves grant audits via the underlying field's ValueIDs. Construct with
+// serves grant audits via the underlying namespace's ValueIDs. Construct with
 // NewGroupGrants; the zero value is unusable.
-type GroupGrants = grantField[imageidx.GroupID]
+type GroupGrants = grantNamespace[common.GroupID]
 
-// NewGroupGrants binds the store's group ACL field. It rejects a nil index
-// and any field that is not the dedicated KindEnum group field.
-func NewGroupGrants(index *bitmapidx.FieldIndex) (GroupGrants, error) {
-	return newGrantField[imageidx.GroupID](index, bitmapidx.IndexTypeGroupACL)
+// NewGroupGrants binds the store's group ACL namespace. It rejects a nil index
+// and any namespace that is not the dedicated KindEnum group namespace.
+func NewGroupGrants(index *bitmapidx.NamespaceIndex) (GroupGrants, error) {
+	return newGrantNamespace[common.GroupID](index, common.NamespaceGroupACL)
 }
 
-// grantField is the shared implementation behind UserGrants and
+// grantNamespace is the shared implementation behind UserGrants and
 // GroupGrants. One 8-byte stack key serves the whole call: batch entries
-// share it, and Value bytes are only borrowed through preparation —
+// share it, and Value bytes are only borrowed through Apply —
 // genuinely new dictionary values are copied under the writer lock — so
-// helpers add no allocations of their own.
-type grantField[T ~uint64] struct {
-	index *bitmapidx.FieldIndex
+// helpers add no allocations of their own beyond the batch itself.
+type grantNamespace[T ~uint64] struct {
+	index *bitmapidx.NamespaceIndex
 }
 
-// newGrantField validates index against the dedicated ACL field type.
-func newGrantField[T ~uint64](index *bitmapidx.FieldIndex, field bitmapidx.IndexType) (grantField[T], error) {
+// newGrantNamespace validates index against the dedicated ACL namespace.
+func newGrantNamespace[T ~uint64](index *bitmapidx.NamespaceIndex, namespace common.Namespace) (grantNamespace[T], error) {
 	if index == nil {
-		return grantField[T]{}, ErrInvalidACLField
+		return grantNamespace[T]{}, ErrInvalidACLField
 	}
-	def := index.Field()
-	if def.Type != field || def.Kind != bitmapidx.KindEnum {
-		return grantField[T]{}, ErrInvalidACLField
+	def := index.Spec()
+	if def.Namespace != namespace || def.Kind != bitmapidx.KindEnum {
+		return grantNamespace[T]{}, ErrInvalidACLField
 	}
-	return grantField[T]{index: index}, nil
+	return grantNamespace[T]{index: index}, nil
 }
 
 // value encodes id into a caller-owned key. The returned Value borrows key:
-// callers must not mutate key until the index call returns, which holds
-// for every helper below since each completes its call synchronously.
+// callers must not mutate key until Apply returns, which holds for every
+// helper below since staging and Apply complete synchronously in the call.
 func principalValue(id uint64, key *[8]byte) bitmapidx.Value {
 	*key = principalKey(id)
 	return bitmapidx.Value{Kind: bitmapidx.KindEnum, Bytes: key[:]}
@@ -66,7 +66,7 @@ func principalValue(id uint64, key *[8]byte) bitmapidx.Value {
 // Add grants each image to id in one atomic batch. Unknown images are
 // created by granting; already-present memberships are no-ops. An empty
 // image list is a no-op. Only the reserved zero id is rejected.
-func (h grantField[T]) Add(id T, imageIDs ...ImageID) error {
+func (h grantNamespace[T]) Add(id T, imageIDs ...ImageID) error {
 	if id == 0 {
 		return ErrInvalidPrincipal
 	}
@@ -87,25 +87,41 @@ func (h grantField[T]) Add(id T, imageIDs ...ImageID) error {
 	for n, image := range imageIDs {
 		entries[n] = bitmapidx.Entry{ImageID: image, Value: value}
 	}
-	return h.index.Add(entries...)
+	batch := h.index.NewBatch()
+	defer batch.Close()
+	if err := batch.Add(entries...); err != nil {
+		return err
+	}
+	if err := batch.Apply(); err != nil {
+		return err
+	}
+	return h.index.Barrier()
 }
 
 // addLarge grants a batch that exceeds the stack inline capacity. The one
 // entries slice is inherent to batching: the equivalent hand-rolled
-// FieldIndex call allocates it too.
-func (h grantField[T]) addLarge(id uint64, imageIDs []ImageID) error {
+// NamespaceIndex call allocates it too.
+func (h grantNamespace[T]) addLarge(id uint64, imageIDs []ImageID) error {
 	var key [8]byte
 	value := principalValue(id, &key)
 	entries := make([]bitmapidx.Entry, len(imageIDs))
 	for n, image := range imageIDs {
 		entries[n] = bitmapidx.Entry{ImageID: image, Value: value}
 	}
-	return h.index.Add(entries...)
+	batch := h.index.NewBatch()
+	defer batch.Close()
+	if err := batch.Add(entries...); err != nil {
+		return err
+	}
+	if err := batch.Apply(); err != nil {
+		return err
+	}
+	return h.index.Barrier()
 }
 
 // Contains reports whether image holds id's grant. Unknown ids report
 // false with no error; only the reserved zero id is rejected.
-func (h grantField[T]) Contains(id T, image ImageID) (bool, error) {
+func (h grantNamespace[T]) Contains(id T, image ImageID) (bool, error) {
 	if id == 0 {
 		return false, ErrInvalidPrincipal
 	}
@@ -116,7 +132,7 @@ func (h grantField[T]) Contains(id T, image ImageID) (bool, error) {
 // Remove revokes each image from id in one atomic batch. Unknown revokes
 // are no-ops and never create dictionary entries. An empty image list is
 // a no-op. Only the reserved zero id is rejected.
-func (h grantField[T]) Remove(id T, imageIDs ...ImageID) error {
+func (h grantNamespace[T]) Remove(id T, imageIDs ...ImageID) error {
 	if id == 0 {
 		return ErrInvalidPrincipal
 	}
@@ -133,17 +149,33 @@ func (h grantField[T]) Remove(id T, imageIDs ...ImageID) error {
 	for n, image := range imageIDs {
 		entries[n] = bitmapidx.Entry{ImageID: image, Value: value}
 	}
-	return h.index.Remove(entries...)
+	batch := h.index.NewBatch()
+	defer batch.Close()
+	if err := batch.Remove(entries...); err != nil {
+		return err
+	}
+	if err := batch.Apply(); err != nil {
+		return err
+	}
+	return h.index.Barrier()
 }
 
 // removeLarge revokes a batch that exceeds the stack inline capacity; see
 // addLarge for the allocation note.
-func (h grantField[T]) removeLarge(id uint64, imageIDs []ImageID) error {
+func (h grantNamespace[T]) removeLarge(id uint64, imageIDs []ImageID) error {
 	var key [8]byte
 	value := principalValue(id, &key)
 	entries := make([]bitmapidx.Entry, len(imageIDs))
 	for n, image := range imageIDs {
 		entries[n] = bitmapidx.Entry{ImageID: image, Value: value}
 	}
-	return h.index.Remove(entries...)
+	batch := h.index.NewBatch()
+	defer batch.Close()
+	if err := batch.Remove(entries...); err != nil {
+		return err
+	}
+	if err := batch.Apply(); err != nil {
+		return err
+	}
+	return h.index.Barrier()
 }

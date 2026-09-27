@@ -13,8 +13,8 @@ func broadPlan(tb testing.TB, size int) Plan {
 	for i := range ids {
 		ids[i] = uint64(i + 1)
 	}
-	a := benchmarkEnumField(tb, 100, "x", ids)
-	b := benchmarkEnumField(tb, 101, "x", ids)
+	a := benchmarkEnumNamespace(tb, 100, "x", ids)
+	b := benchmarkEnumNamespace(tb, 101, "x", ids)
 	if err := a.Compact(); err != nil {
 		tb.Fatal(err)
 	}
@@ -70,26 +70,24 @@ func BenchmarkExecution(b *testing.B) {
 }
 
 func BenchmarkPersistentExecution(b *testing.B) {
-	fields := []bitmapidx.Field{
-		{Type: 100, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Type: 101, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+	specs := []bitmapidx.NamespaceSpec{
+		{Namespace: 100, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+		{Namespace: 101, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
 	}
-	s, err := bitmapidx.NewIndex(b.TempDir(), fields, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	s, err := bitmapidx.NewIndex(b.TempDir(), specs, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { s.Close() })
 	var clauses []Clause
-	for _, f := range fields {
-		idx, _ := s.Lookup(f.Type)
+	for _, spec := range specs {
+		idx, _ := s.Lookup(spec.Namespace)
 		for start := 1; start <= 100000; start += 4096 {
 			entries := make([]bitmapidx.Entry, 0, 4096)
 			for id := start; id < min(start+4096, 100001); id++ {
 				entries = append(entries, bitmapidx.Entry{ImageID: uint64(id), Value: bitmapidx.StringValue("x")})
 			}
-			if err := idx.Add(entries...); err != nil {
-				b.Fatal(err)
-			}
+			commitBitmap(b, idx, func(bt *bitmapidx.Batch) error { return bt.Add(entries...) })
 		}
 		clauses = append(clauses, AllValues(idx, bitmapidx.StringValue("x")))
 	}

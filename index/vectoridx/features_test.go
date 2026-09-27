@@ -9,7 +9,7 @@ import (
 
 func testConfigCosine512() Config {
 	return Config{
-		SpaceID:     NewSpaceID(IndexTypeImage, 11),
+		Namespace:   testNamespace,
 		Dimensions:  Dim512,
 		ElementType: ElementFloat32,
 		Metric:      MetricCosine,
@@ -18,7 +18,7 @@ func testConfigCosine512() Config {
 
 func testConfigDot512() Config {
 	return Config{
-		SpaceID:     NewSpaceID(IndexTypeImage, 12),
+		Namespace:   testNamespace,
 		Dimensions:  Dim512,
 		ElementType: ElementFloat32,
 		Metric:      MetricDot,

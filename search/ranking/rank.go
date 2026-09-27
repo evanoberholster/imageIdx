@@ -1,12 +1,12 @@
 package ranking
 
 import (
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // ImageID reuses the repository-wide identifier. It is an alias so existing
 // uint64 storage remains zero-conversion.
-type ImageID = imageidx.ImageID
+type ImageID = common.ImageID
 
 // Rank is one fused or unfused ranking signal. Higher is better. Zero is
 // reserved for missing/unranked and sorts after every ordinary value.

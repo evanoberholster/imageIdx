@@ -4,31 +4,32 @@ import (
 	"errors"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
-func grantHandles(t *testing.T) (users UserGrants, groups GroupGrants, userField *bitmapidx.FieldIndex) {
+func grantHandles(t *testing.T) (users UserGrants, groups GroupGrants, userNamespace *bitmapidx.NamespaceIndex) {
 	t.Helper()
 	store := aclStore(t, true)
-	userField, ok := store.Lookup(bitmapidx.IndexTypeUserACL)
+	userNamespace, ok := store.Lookup(common.NamespaceUserACL)
 	if !ok {
-		t.Fatal("missing user ACL field")
+		t.Fatal("missing user ACL namespace")
 	}
-	groupField, ok := store.Lookup(bitmapidx.IndexTypeGroupACL)
+	groupNamespace, ok := store.Lookup(common.NamespaceGroupACL)
 	if !ok {
-		t.Fatal("missing group ACL field")
+		t.Fatal("missing group ACL namespace")
 	}
 	var err error
-	if users, err = NewUserGrants(userField); err != nil {
+	if users, err = NewUserGrants(userNamespace); err != nil {
 		t.Fatal(err)
 	}
-	if groups, err = NewGroupGrants(groupField); err != nil {
+	if groups, err = NewGroupGrants(groupNamespace); err != nil {
 		t.Fatal(err)
 	}
-	return users, groups, userField
+	return users, groups, userNamespace
 }
 
-func TestGrantFieldValidation(t *testing.T) {
+func TestGrantNamespaceValidation(t *testing.T) {
 	if _, err := NewUserGrants(nil); !errors.Is(err, ErrInvalidACLField) {
 		t.Fatalf("NewUserGrants(nil) err = %v, want ErrInvalidACLField", err)
 	}
@@ -36,21 +37,21 @@ func TestGrantFieldValidation(t *testing.T) {
 		t.Fatalf("NewGroupGrants(nil) err = %v, want ErrInvalidACLField", err)
 	}
 	store := aclStore(t, true)
-	tags, _ := store.Lookup(bitmapidx.IndexTypeTag)
+	tags, _ := store.Lookup(common.NamespaceTag)
 	if _, err := NewUserGrants(tags); !errors.Is(err, ErrInvalidACLField) {
-		t.Fatalf("NewUserGrants(tag field) err = %v, want ErrInvalidACLField", err)
+		t.Fatalf("NewUserGrants(tag namespace) err = %v, want ErrInvalidACLField", err)
 	}
 }
 
-func TestGrantFieldCrossWiring(t *testing.T) {
+func TestGrantNamespaceCrossWiring(t *testing.T) {
 	store := aclStore(t, true)
-	userField, _ := store.Lookup(bitmapidx.IndexTypeUserACL)
-	groupField, _ := store.Lookup(bitmapidx.IndexTypeGroupACL)
-	if _, err := NewUserGrants(groupField); !errors.Is(err, ErrInvalidACLField) {
-		t.Fatalf("NewUserGrants(group field) err = %v, want ErrInvalidACLField", err)
+	userNamespace, _ := store.Lookup(common.NamespaceUserACL)
+	groupNamespace, _ := store.Lookup(common.NamespaceGroupACL)
+	if _, err := NewUserGrants(groupNamespace); !errors.Is(err, ErrInvalidACLField) {
+		t.Fatalf("NewUserGrants(group namespace) err = %v, want ErrInvalidACLField", err)
 	}
-	if _, err := NewGroupGrants(userField); !errors.Is(err, ErrInvalidACLField) {
-		t.Fatalf("NewGroupGrants(user field) err = %v, want ErrInvalidACLField", err)
+	if _, err := NewGroupGrants(userNamespace); !errors.Is(err, ErrInvalidACLField) {
+		t.Fatalf("NewGroupGrants(user namespace) err = %v, want ErrInvalidACLField", err)
 	}
 }
 

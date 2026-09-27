@@ -27,16 +27,16 @@ func (plan Plan) Count(ctx context.Context, workspace *Workspace) (uint64, error
 	if plan.IsEmpty() {
 		return 0, nil
 	}
-	// Single-field plans can count directly without materializing IDs.
-	if len(plan.stages) == 1 && plan.stages[0].kind == StageField {
+	// Single-namespace plans can count directly without materializing IDs.
+	if len(plan.stages) == 1 && plan.stages[0].kind == StageNamespace {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
 		stage := &plan.stages[0]
-		if stage.fieldKind == fieldRange {
-			return stage.fieldIndex.CountRange(stage.fieldRange)
+		if stage.namespaceKind == namespaceRange {
+			return stage.namespaceIndex.CountRange(stage.namespaceRange)
 		}
-		return stage.fieldQuery.Count()
+		return stage.namespaceQuery.Count()
 	}
 	bitmapOnly := true
 	for _, st := range plan.stages {
@@ -112,7 +112,7 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 		return dst, nil
 	}
 
-	// Filter-first: apply all in-place filters (field, exact-timestamp)
+	// Filter-first: apply all in-place filters (namespace, exact-timestamp)
 	// before any collect+intersect stage (lossy timestamp, geo).
 	for index := 1; index < len(plan.stages); index++ {
 		if err := ctx.Err(); err != nil {
@@ -179,7 +179,7 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 	return dst, nil
 }
 
-// collectStage appends one stage's candidates to dst. Bitmap-backed field and
+// collectStage appends one stage's candidates to dst. Bitmap-backed namespace and
 // geo collects are already ascending and unique, so only timestamp scans need
 // sorting. Geo stages accumulate covered cells into the workspace-owned
 // MutableBitmap and materialize once.

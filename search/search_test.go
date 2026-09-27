@@ -7,16 +7,17 @@ import (
 	"slices"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/golang/geo/s2"
 )
 
-func enumFieldForSearch(t *testing.T, typ bitmapidx.IndexType, value string, ids []uint64) *bitmapidx.FieldIndex {
+func enumNamespaceForSearch(t *testing.T, typ common.Namespace, value string, ids []uint64) *bitmapidx.NamespaceIndex {
 	t.Helper()
-	index, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
-		Type: typ, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
-	}, bitmapidx.FieldConfig{})
+	index, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
+		Namespace: typ, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
+	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +25,17 @@ func enumFieldForSearch(t *testing.T, typ bitmapidx.IndexType, value string, ids
 	for n, id := range ids {
 		entries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue(value)}
 	}
-	if err := index.Add(entries...); err != nil {
+	batch := index.NewBatch()
+	if err := batch.Add(entries...); err != nil {
+		_ = index.Close()
+		t.Fatal(err)
+	}
+	if err := batch.Apply(); err != nil {
+		_ = index.Close()
+		t.Fatal(err)
+	}
+	batch.Close()
+	if err := index.Barrier(); err != nil {
 		_ = index.Close()
 		t.Fatal(err)
 	}
@@ -34,8 +45,8 @@ func enumFieldForSearch(t *testing.T, typ bitmapidx.IndexType, value string, ids
 
 func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
-	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3, 5})
-	albums := enumFieldForSearch(t, bitmapidx.IndexTypeAlbum, "holiday", []uint64{2, 3, 4})
+	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
+	albums := enumNamespaceForSearch(t, common.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
 
 	timeIndex, err := timeidx.New(timeidx.Spec{Entries: []timeidx.Entry{
 		{Timestamp: quantum, ImageID: 1}, {Timestamp: 2 * quantum, ImageID: 2},
@@ -47,10 +58,10 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	}
 	defer timeIndex.Close()
 
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(20), []bitmapidx.GeoEntry{
+	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(20), []bitmapidx.GeoEntry{
 		{ImageID: 1, Latitude: 37, Longitude: -122}, {ImageID: 2, Latitude: 37, Longitude: -122},
 		{ImageID: 3, Latitude: 37, Longitude: -122}, {ImageID: 4, Latitude: 37, Longitude: -122},
-	}, bitmapidx.FieldConfig{})
+	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +80,7 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	stages := plan.Stages()
-	if len(stages) != 4 || stages[0].Kind != StageField || stages[0].Estimate != 3 {
+	if len(stages) != 4 || stages[0].Kind != StageNamespace || stages[0].Estimate != 3 {
 		t.Fatalf("stages = %+v", stages)
 	}
 	workspace := NewWorkspace(8)
@@ -83,10 +94,10 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 }
 
 func TestInCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(21), []bitmapidx.GeoEntry{
+	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(21), []bitmapidx.GeoEntry{
 		{ImageID: 1, Latitude: 37.7749, Longitude: -122.4194},
 		{ImageID: 2, Latitude: 34.0522, Longitude: -118.2437},
-	}, bitmapidx.FieldConfig{})
+	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,21 +136,21 @@ func TestSearchUsesExactTimestampLookup(t *testing.T) {
 	}
 }
 
-func TestSearchRejectsEmptyAndNilFieldQueries(t *testing.T) {
+func TestSearchRejectsEmptyAndNilNamespaceQueries(t *testing.T) {
 	if _, err := SearchOnce(context.Background(), nil); !errors.Is(err, ErrEmptyQuery) {
 		t.Fatalf("empty query error = %v", err)
 	}
 	if _, err := SearchOnce(context.Background(), nil, AllValues(nil, bitmapidx.StringValue("x"))); !errors.Is(err, ErrInvalidClause) {
-		t.Fatalf("nil field error = %v", err)
+		t.Fatalf("nil namespace error = %v", err)
 	}
 	if _, err := Compile(InCells(nil, uint64(s2.CellIDFromFace(0)))); !errors.Is(err, ErrInvalidClause) {
 		t.Fatalf("nil geo index error = %v", err)
 	}
 }
 
-func TestFieldOnlyCountMatchesSearch(t *testing.T) {
-	first := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3, 5})
-	second := enumFieldForSearch(t, bitmapidx.IndexTypeAlbum, "holiday", []uint64{2, 3, 4})
+func TestNamespaceOnlyCountMatchesSearch(t *testing.T) {
+	first := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
+	second := enumNamespaceForSearch(t, common.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
 	plan, err := Compile(
 		AllValues(first, bitmapidx.StringValue("favorite")),
 		AllValues(second, bitmapidx.StringValue("holiday")),
@@ -160,56 +171,56 @@ func TestFieldOnlyCountMatchesSearch(t *testing.T) {
 	}
 }
 
-func TestFieldTextAndRangeClauses(t *testing.T) {
-	text, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
-		Type: bitmapidx.IndexType(24), Kind: bitmapidx.KindText, Storage: bitmapidx.StoragePerType,
+func TestNamespaceTextAndRangeClauses(t *testing.T) {
+	text, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
+		Namespace: common.Namespace(24), Kind: bitmapidx.KindText, Storage: bitmapidx.StoragePerType,
 		Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
-	}, bitmapidx.FieldConfig{})
+	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer text.Close()
-	if err := text.ReplaceText(
-		bitmapidx.TextReplacement{ImageID: 1, After: []string{"Golden Gate Bridge"}},
-		bitmapidx.TextReplacement{ImageID: 2, After: []string{"Golden Gate Park"}},
-	); err != nil {
-		t.Fatal(err)
-	}
+	commitBitmap(t, text, func(b *bitmapidx.Batch) error {
+		return b.ReplaceText(
+			bitmapidx.TextReplacement{ImageID: 1, After: []string{"Golden Gate Bridge"}},
+			bitmapidx.TextReplacement{ImageID: 2, After: []string{"Golden Gate Park"}},
+		)
+	})
 
-	continuous, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
-		Type: bitmapidx.IndexType(25), Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType,
+	continuous, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
+		Namespace: common.Namespace(25), Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType,
 		Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
-	}, bitmapidx.FieldConfig{})
+	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer continuous.Close()
-	if err := continuous.Move(
-		bitmapidx.Move{ImageID: 1, To: 10, HasTo: true},
-		bitmapidx.Move{ImageID: 2, To: 20, HasTo: true},
-	); err != nil {
-		t.Fatal(err)
-	}
+	commitBitmap(t, continuous, func(b *bitmapidx.Batch) error {
+		return b.Move(
+			bitmapidx.Move{ImageID: 1, To: 10, HasTo: true},
+			bitmapidx.Move{ImageID: 2, To: 20, HasTo: true},
+		)
+	})
 	plan, err := Compile(
-		FieldText(text, "golden bridge"),
-		FieldRange(continuous, bitmapidx.Between(0, math.MaxInt64)),
+		NamespaceText(text, "golden bridge"),
+		NamespaceRange(continuous, bitmapidx.Between(0, math.MaxInt64)),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := plan.AppendIDs(context.Background(), nil, NewWorkspace(4)); err != nil || !slices.Equal(got, []ImageID{1}) {
-		t.Fatalf("field text/range search = %v", got)
+		t.Fatalf("namespace text/range search = %v", got)
 	}
 }
 
 func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
-	newGeo := func(t *testing.T, typ bitmapidx.IndexType, ids []uint64) (*bitmapidx.FieldIndex, bitmapidx.S2Key) {
+	newGeo := func(t *testing.T, typ common.Namespace, ids []uint64) (*bitmapidx.NamespaceIndex, bitmapidx.S2Key) {
 		t.Helper()
 		entries := make([]bitmapidx.GeoEntry, len(ids))
 		for i, id := range ids {
 			entries[i] = bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122}
 		}
-		index, err := bitmapidx.NewGeoField(typ, entries, bitmapidx.FieldConfig{})
+		index, err := bitmapidx.NewGeoNamespace(typ, entries, bitmapidx.NamespaceConfig{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -221,8 +232,8 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 		return index, key
 	}
 
-	geo, key := newGeo(t, bitmapidx.IndexType(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
-	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
+	geo, key := newGeo(t, common.Namespace(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")), InCells(geo, bitmapidx.DecodeS2Key(key)))
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +260,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 			geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37 + float64(cell)/100, Longitude: -122})
 		}
 	}
-	bigGeo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(23), geoEntries, bitmapidx.FieldConfig{})
+	bigGeo, err := bitmapidx.NewGeoNamespace(common.Namespace(23), geoEntries, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +274,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 			bitmapIDs = append(bitmapIDs, id)
 		}
 	}
-	largeTags := enumFieldForSearch(t, bitmapidx.IndexTypeObject, "favorite", bitmapIDs)
+	largeTags := enumNamespaceForSearch(t, common.NamespaceObject, "favorite", bitmapIDs)
 	fallback, err := Compile(AllValues(largeTags, bitmapidx.StringValue("favorite")), InCells(bigGeo, cellIDs...))
 	if err != nil {
 		t.Fatal(err)
@@ -274,7 +285,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 }
 
 func TestAppendPage(t *testing.T) {
-	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
+	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)
@@ -291,7 +302,7 @@ func TestAppendPage(t *testing.T) {
 }
 
 func TestVisit(t *testing.T) {
-	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
+	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)

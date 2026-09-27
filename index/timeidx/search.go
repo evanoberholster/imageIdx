@@ -1,6 +1,6 @@
 package timeidx
 
-import "github.com/evanoberholster/imageIdx/internal/indexutil"
+import "github.com/evanoberholster/imageIdx/internal/storage"
 
 type ExactTimestampFunc func(ImageID) (uint64, bool)
 
@@ -78,7 +78,7 @@ func (i *Index) EstimateRange(start, end uint64) uint64 {
 		if entry.startMarker >= hi {
 			break
 		}
-		estimate = indexutil.SaturatingAdd(estimate, estimateBlock(entry.block.view.Load(), lo, hi))
+		estimate = storage.SaturatingAdd(estimate, estimateBlock(entry.block.view.Load(), lo, hi))
 	}
 	i.readers.Release(token)
 	return estimate
@@ -91,9 +91,9 @@ func estimateBlock(view *blockView, lo, hi uint64) uint64 {
 		baseStart, baseEnd := view.base.rangeIndexes(lo, hi)
 		estimate := uint64(baseEnd - baseStart)
 		if view.frozen != nil {
-			estimate = indexutil.SaturatingAdd(estimate, estimateDelta(view.frozen, lo, hi))
+			estimate = storage.SaturatingAdd(estimate, estimateDelta(view.frozen, lo, hi))
 		}
-		estimate = indexutil.SaturatingAdd(estimate, estimateDelta(active, lo, hi))
+		estimate = storage.SaturatingAdd(estimate, estimateDelta(active, lo, hi))
 		if active.version.Load() == version {
 			return estimate
 		}

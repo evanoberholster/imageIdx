@@ -9,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 type indexedRecord struct {
@@ -22,7 +22,7 @@ type indexedRecord struct {
 // Index is one compressed timestamp candidate index. Readers search immutable
 // block views without locks; a single writer owns delta publication.
 type Index struct {
-	indexID    uint64
+	namespace  common.Namespace
 	flags      uint32
 	offset     uint64
 	startTime  uint64
@@ -31,7 +31,7 @@ type Index struct {
 	baseCount  atomic.Uint64
 	config     Config
 	directory  atomic.Pointer[blockDirectory]
-	readers    indexutil.ReaderTracker
+	readers    storage.ReaderTracker
 
 	writes        chan *Batch
 	barriers      chan chan barrierResult
@@ -52,6 +52,10 @@ type Index struct {
 	// Writer-loop owned and reused across batches.
 	writerMarks  []uint64
 	writerBlocks []int
+	// writeGroup and writeResults buffer one coalesced writer-loop group.
+	// Writer-loop owned and reused across groups.
+	writeGroup   []*Batch
+	writeResults []error
 
 	// failMu guards failed, the latched first WAL error. While set,
 	// writes fail fast and maintenance refuses, until close and reopen.
@@ -115,7 +119,7 @@ func New(spec Spec, config Config) (*Index, error) {
 
 	directory := buildDirectory(prepared, spec.Offset, config)
 	index := &Index{
-		indexID:       spec.IndexID,
+		namespace:     spec.Namespace,
 		flags:         spec.Flags,
 		offset:        spec.Offset,
 		config:        config,
@@ -225,7 +229,7 @@ func buildDirectory(records []indexedRecord, offset uint64, config Config) *bloc
 // Metadata returns a copied summary of the current base generation.
 func (i *Index) Metadata() Metadata {
 	return Metadata{
-		IndexID: i.indexID, Flags: i.flags, Generation: i.generation.Load(),
+		Namespace: i.namespace, Flags: i.flags, Generation: i.generation.Load(),
 		Offset: i.offset, BaseCount: i.baseCount.Load(), BlockCount: uint32(len(i.directory.Load().entries)),
 	}
 }
@@ -235,7 +239,7 @@ func (i *Index) PendingCompactions() int64 { return i.pending.Load() }
 
 // WaitIdle waits until background compactions drain or ctx is cancelled.
 func (i *Index) WaitIdle(ctx context.Context) error {
-	return indexutil.WaitForCondition(ctx, func() bool { return i.pending.Load() == 0 })
+	return storage.WaitForCondition(ctx, func() bool { return i.pending.Load() == 0 })
 }
 
 // Close stops background workers, closes the WAL, and releases mmap regions.
@@ -258,14 +262,14 @@ func (i *Index) Close() error {
 		}
 		if i.persistence != nil {
 			for _, mapping := range i.persistence.mappings {
-				if err := persist.Unmap(mapping); err != nil && closeErr == nil {
+				if err := storage.Unmap(mapping); err != nil && closeErr == nil {
 					closeErr = err
 				}
 			}
 		}
 		// Last: releasing the directory lock admits the next opener.
 		// A nil lock (in-memory index) is a no-op.
-		if err := indexutil.ReleaseLock(i.lock); err != nil && closeErr == nil {
+		if err := storage.ReleaseLock(i.lock); err != nil && closeErr == nil {
 			closeErr = err
 		}
 	})

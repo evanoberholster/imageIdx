@@ -5,11 +5,12 @@ import (
 	"slices"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
 func TestExecutorCountAndAppendIDs(t *testing.T) {
-	tags := enumFieldForSearch(t, bitmapidx.IndexTypeTag, "favorite", []uint64{1, 2, 3})
+	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.StringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)

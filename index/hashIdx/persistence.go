@@ -2,11 +2,12 @@ package hashidx
 
 import (
 	"errors"
+	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // persistedState is the on-disk state both index kinds share: directory,
@@ -16,7 +17,7 @@ type persistedState struct {
 	mu           sync.Mutex
 	dir          string
 	durability   Durability
-	wal          *persist.WAL
+	wal          *storage.WAL
 	walEpoch     uint64
 	mappings     [][]byte
 	persistedGen uint64
@@ -37,7 +38,7 @@ func (s *persistedState) close() error {
 		s.wal = nil
 	}
 	for _, mapping := range s.mappings {
-		err = errors.Join(err, persist.Unmap(mapping))
+		err = errors.Join(err, storage.Unmap(mapping))
 	}
 	s.mappings = nil
 	return err
@@ -45,34 +46,21 @@ func (s *persistedState) close() error {
 
 // chooseReaders returns the first non-nil tracker or a fresh private one.
 // Store passes its tracker so both indexes share one reader lifetime domain.
-func chooseReaders(readers []*indexutil.ReaderTracker) *indexutil.ReaderTracker {
+func chooseReaders(readers []*storage.ReaderTracker) *storage.ReaderTracker {
 	for _, tracker := range readers {
 		if tracker != nil {
 			return tracker
 		}
 	}
-	return &indexutil.ReaderTracker{}
+	return &storage.ReaderTracker{}
 }
 
-// writeAtomicFile writes path+".tmp" through write, fsyncs it, and renames it
-// over path. Index data is owner-only (0o600), matching WAL and segment
-// files everywhere else in the package.
-func writeAtomicFile(path string, write func(file *os.File) error) error {
-	tmpPath := path + ".tmp"
-	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	if err = write(file); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
+// writeAtomicFile streams path through write, fsyncs it, and renames it
+// over path. Generation files are owner-only (0o600), matching WAL and
+// segment files everywhere else in the package.
+func writeAtomicFile(path string, write func(io.Writer) error) error {
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	return storage.WriteFileAtomicFunc(dir, base+".tmp", base, 0o600, write)
 }
 
 // storageAmplification returns physical/live, or 1 for an empty live set.

@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 
 	"github.com/evanoberholster/imageIdx/index/timeidx"
@@ -32,17 +32,17 @@ type searchRequest struct {
 }
 
 type searchResponse struct {
-	ImageIDs []imageidx.ImageID `json:"image_ids"`
+	ImageIDs []common.ImageID `json:"image_ids"`
 }
 
 type demoService struct {
-	fields    *bitmapidx.Index
-	favorites *bitmapidx.FieldIndex
-	fieldDir  string
-	times     *timeidx.Index
-	geo       *bitmapidx.FieldIndex
-	canonical map[imageidx.ImageID]uint64
-	demoCell  uint64
+	namespaces   *bitmapidx.Index
+	favorites    *bitmapidx.NamespaceIndex
+	namespaceDir string
+	times        *timeidx.Index
+	geo          *bitmapidx.NamespaceIndex
+	canonical    map[common.ImageID]uint64
+	demoCell     uint64
 }
 
 func main() {
@@ -123,41 +123,53 @@ func runServer(ctx context.Context, address string) error {
 }
 
 func newDemoService() (*demoService, error) {
-	fieldDir, err := os.MkdirTemp("", "imageidx-fields-")
+	namespaceDir, err := os.MkdirTemp("", "imageidx-namespaces-")
 	if err != nil {
 		return nil, err
 	}
-	fields, err := bitmapidx.NewIndex(fieldDir, []bitmapidx.Field{
-		{Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Type: bitmapidx.IndexTypeLocation, Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
-	}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	namespaces, err := bitmapidx.NewIndex(namespaceDir, []bitmapidx.NamespaceSpec{
+		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
+		{Namespace: common.NamespaceLocation, Name: "location", Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
+	}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
 	if err != nil {
-		_ = os.RemoveAll(fieldDir)
+		_ = os.RemoveAll(namespaceDir)
 		return nil, err
 	}
-	favorites, ok := fields.Lookup(bitmapidx.IndexTypeTag)
+	favorites, ok := namespaces.Lookup(common.NamespaceTag)
 	if !ok {
-		_ = fields.Close()
-		_ = os.RemoveAll(fieldDir)
-		return nil, bitmapidx.ErrInvalidField
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
+		return nil, bitmapidx.ErrInvalidNamespace
 	}
-	if err := favorites.Add(
+	favoritesBatch := favorites.NewBatch()
+	if err := favoritesBatch.Add(
 		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("favorite")},
 	); err != nil {
-		_ = fields.Close()
-		_ = os.RemoveAll(fieldDir)
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
 		return nil, err
 	}
-	geo, ok := fields.Lookup(bitmapidx.IndexTypeLocation)
+	if err := favoritesBatch.Apply(); err != nil {
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
+		return nil, err
+	}
+	favoritesBatch.Close()
+	if err := favorites.Barrier(); err != nil {
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
+		return nil, err
+	}
+	geo, ok := namespaces.Lookup(common.NamespaceLocation)
 	if !ok {
-		_ = fields.Close()
-		_ = os.RemoveAll(fieldDir)
-		return nil, bitmapidx.ErrInvalidField
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
+		return nil, bitmapidx.ErrInvalidNamespace
 	}
 	for _, entry := range []struct {
-		id  imageidx.ImageID
+		id  common.ImageID
 		lat float64
 		lng float64
 	}{
@@ -166,25 +178,38 @@ func newDemoService() (*demoService, error) {
 	} {
 		key, err := bitmapidx.KeyFromLatLng(entry.lat, entry.lng)
 		if err != nil {
-			_ = fields.Close()
-			_ = os.RemoveAll(fieldDir)
+			_ = namespaces.Close()
+			_ = os.RemoveAll(namespaceDir)
 			return nil, err
 		}
-		if err := geo.Move(bitmapidx.Move{ImageID: entry.id, To: int64(key)}); err != nil {
-			_ = fields.Close()
-			_ = os.RemoveAll(fieldDir)
+		geoBatch := geo.NewBatch()
+		if err := geoBatch.Move(bitmapidx.Move{ImageID: entry.id, To: int64(key)}); err != nil {
+			_ = namespaces.Close()
+			_ = os.RemoveAll(namespaceDir)
+			return nil, err
+		}
+		if err := geoBatch.Apply(); err != nil {
+			_ = namespaces.Close()
+			_ = os.RemoveAll(namespaceDir)
+			return nil, err
+		}
+		geoBatch.Close()
+		if err := geo.Barrier(); err != nil {
+			_ = namespaces.Close()
+			_ = os.RemoveAll(namespaceDir)
 			return nil, err
 		}
 	}
 
-	canonical := map[imageidx.ImageID]uint64{
+	canonical := map[common.ImageID]uint64{
 		100: demoQuantum,
 		200: 2 * demoQuantum,
 		300: 3 * demoQuantum,
 		400: 4 * demoQuantum,
 	}
 	times, err := timeidx.New(timeidx.Spec{
-		IndexID: 2,
+		Namespace: common.Namespace(100),
+		Name:      "timestamp",
 		Entries: []timeidx.Entry{
 			{ImageID: 100, Timestamp: canonical[100]},
 			{ImageID: 200, Timestamp: canonical[200]},
@@ -193,35 +218,35 @@ func newDemoService() (*demoService, error) {
 		},
 	}, timeidx.Config{})
 	if err != nil {
-		_ = fields.Close()
-		_ = os.RemoveAll(fieldDir)
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
 		return nil, err
 	}
 
 	return &demoService{
-		fields: fields, favorites: favorites, fieldDir: fieldDir, times: times, geo: geo,
+		namespaces: namespaces, favorites: favorites, namespaceDir: namespaceDir, times: times, geo: geo,
 		canonical: canonical, demoCell: bitmapidx.CellIDFromLatLng(37.7749, -122.4194),
 	}, nil
 }
 
 func (service *demoService) Close() error {
 	var first error
-	for _, closeIndex := range []func() error{service.geo.Close, service.times.Close, service.fields.Close} {
+	for _, closeIndex := range []func() error{service.geo.Close, service.times.Close, service.namespaces.Close} {
 		if err := closeIndex(); err != nil && first == nil {
 			first = err
 		}
 	}
-	if err := os.RemoveAll(service.fieldDir); err != nil && first == nil {
+	if err := os.RemoveAll(service.namespaceDir); err != nil && first == nil {
 		first = err
 	}
 	return first
 }
 
-func (service *demoService) searchOnce(ctx context.Context, request searchRequest) ([]imageidx.ImageID, error) {
+func (service *demoService) searchOnce(ctx context.Context, request searchRequest) ([]common.ImageID, error) {
 	return search.SearchOnce(ctx, nil,
 		search.AllValues(service.favorites, bitmapidx.StringValue("favorite")),
 		search.During(service.times, request.Start, request.End,
-			search.ExactTimestamp(func(id imageidx.ImageID) (uint64, bool) {
+			search.ExactTimestamp(func(id common.ImageID) (uint64, bool) {
 				value, ok := service.canonical[id]
 				return value, ok
 			})),

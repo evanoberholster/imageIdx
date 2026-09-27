@@ -23,39 +23,39 @@ type Clause interface {
 	searchClause()
 }
 
-type fieldClauseKind uint8
+type namespaceClauseKind uint8
 
 const (
-	fieldValues fieldClauseKind = iota + 1
-	fieldText
-	fieldRange
+	namespaceValues namespaceClauseKind = iota + 1
+	namespaceText
+	namespaceRange
 )
 
-type fieldClause struct {
-	index  *bitmapidx.FieldIndex
-	kind   fieldClauseKind
+type namespaceClause struct {
+	index  *bitmapidx.NamespaceIndex
+	kind   namespaceClauseKind
 	values []bitmapidx.Value
 	text   string
 	bounds bitmapidx.NumericRange
 }
 
-func (fieldClause) searchClause() {}
+func (namespaceClause) searchClause() {}
 
-// AllValues requires every supplied value to be present in the field.
+// AllValues requires every supplied value to be present in the namespace.
 // Compile rejects an empty value list. Canonical bytes are copied at Compile;
 // callers must not mutate Value.Bytes until compilation completes.
-func AllValues(index *bitmapidx.FieldIndex, values ...bitmapidx.Value) Clause {
-	return fieldClause{index: index, kind: fieldValues, values: append([]bitmapidx.Value(nil), values...)}
+func AllValues(index *bitmapidx.NamespaceIndex, values ...bitmapidx.Value) Clause {
+	return namespaceClause{index: index, kind: namespaceValues, values: append([]bitmapidx.Value(nil), values...)}
 }
 
-// FieldText requires every analyzed token in text to be present.
-func FieldText(index *bitmapidx.FieldIndex, text string) Clause {
-	return fieldClause{index: index, kind: fieldText, text: text}
+// NamespaceText requires every analyzed token in text to be present.
+func NamespaceText(index *bitmapidx.NamespaceIndex, text string) Clause {
+	return namespaceClause{index: index, kind: namespaceText, text: text}
 }
 
-// FieldRange restricts a continuous field to bounds.
-func FieldRange(index *bitmapidx.FieldIndex, bounds bitmapidx.NumericRange) Clause {
-	return fieldClause{index: index, kind: fieldRange, bounds: bounds}
+// NamespaceRange restricts a continuous namespace to bounds.
+func NamespaceRange(index *bitmapidx.NamespaceIndex, bounds bitmapidx.NumericRange) Clause {
+	return namespaceClause{index: index, kind: namespaceRange, bounds: bounds}
 }
 
 type aclClause struct {
@@ -67,7 +67,7 @@ func (aclClause) searchClause() {}
 
 // WithACL restricts results to images granted to userID or any supplied
 // group ID. Group membership must be authenticated by the caller. Compile
-// this clause with CompileWithStore so it can resolve the dedicated ACL fields.
+// this clause with CompileWithStore so it can resolve the dedicated ACL namespaces.
 func WithACL(userID uint64, groupIDs ...uint64) Clause {
 	return aclClause{userID: userID, groupIDs: append([]uint64(nil), groupIDs...)}
 }
@@ -113,7 +113,7 @@ func During(index *timeidx.Index, start, end uint64, options ...TimestampOption)
 }
 
 type geoClause struct {
-	index  *bitmapidx.FieldIndex
+	index  *bitmapidx.NamespaceIndex
 	ranges []bitmapidx.GeoRange
 	cells  []uint64
 }
@@ -122,6 +122,6 @@ func (geoClause) searchClause() {}
 
 // InCells restricts to the union of S2 cells. Like other constructors, it
 // defers validation/normalization to Compile and copies the input slice.
-func InCells(index *bitmapidx.FieldIndex, cellIDs ...uint64) Clause {
+func InCells(index *bitmapidx.NamespaceIndex, cellIDs ...uint64) Clause {
 	return geoClause{index: index, cells: append([]uint64(nil), cellIDs...)}
 }

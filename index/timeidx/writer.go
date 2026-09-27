@@ -215,9 +215,7 @@ func (i *Index) writerLoop() {
 				batch.done <- ErrClosed
 				continue
 			}
-			rotations, err := i.applyBatch(batch.writes)
-			outstanding += rotations
-			batch.done <- err
+			outstanding += i.applyGroup(i.collectWrites(batch))
 		case response := <-i.barriers:
 			var result barrierResult
 			if i.persistence != nil && i.persistence.wal != nil {
@@ -238,6 +236,57 @@ func (i *Index) writerLoop() {
 	}
 }
 
+// collectWrites gathers the leader batch plus every batch already queued
+// behind it. Bursts commit as one group sharing one WAL sync; an idle index
+// commits a group of one with no added latency.
+func (i *Index) collectWrites(first *Batch) []*Batch {
+	i.writeGroup = append(i.writeGroup[:0], first)
+	for {
+		select {
+		case batch := <-i.writes:
+			i.writeGroup = append(i.writeGroup, batch)
+		default:
+			return i.writeGroup
+		}
+	}
+}
+
+// applyGroup commits one coalesced writer-loop group. Each batch keeps its
+// own validation, rotation, and result, exactly as when applied alone; the
+// group shares one WAL sync under DurabilitySync, so N queued batches pay
+// one fsync instead of N. A sync failure converts the group's successful
+// results into the latched recovery error.
+func (i *Index) applyGroup(group []*Batch) int {
+	i.writeResults = i.writeResults[:0]
+	rotations := 0
+	wrote := false
+	for _, batch := range group {
+		rotated, err := i.applyBatch(batch.writes)
+		rotations += rotated
+		i.writeResults = append(i.writeResults, err)
+		if err == nil && len(batch.writes) != 0 {
+			wrote = true
+		}
+	}
+	if wrote && i.persistence != nil && i.persistence.wal != nil && i.persistence.durability == DurabilitySync {
+		if err := i.persistence.wal.Sync(); err != nil {
+			syncErr := i.fail(err)
+			for n := range i.writeResults {
+				if i.writeResults[n] == nil {
+					i.writeResults[n] = syncErr
+				}
+			}
+		}
+	}
+	for n, batch := range group {
+		batch.done <- i.writeResults[n]
+	}
+	return rotations
+}
+
+// applyBatch validates and applies one batch's writes. It never fsyncs:
+// the writer loop coalesces a group and syncs once at the end, so a batch
+// applied alone is durable only after applyGroup's sync.
 func (i *Index) applyBatch(writes []write) (int, error) {
 	if len(writes) == 0 {
 		return 0, nil
@@ -279,7 +328,7 @@ func (i *Index) applyBatch(writes []write) (int, error) {
 		}
 	}
 	if i.persistence != nil && i.persistence.wal != nil {
-		if err := i.persistence.wal.appendBatch(writes, i.persistence.durability); err != nil {
+		if err := i.persistence.wal.appendBatch(writes, false); err != nil {
 			i.clearWriterNeeds()
 			return 0, i.fail(err)
 		}

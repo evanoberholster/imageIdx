@@ -3,10 +3,14 @@ package vectoridx
 import (
 	"math/rand"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
+const testNamespace common.Namespace = 1
+
 func testConfigFloat512() Config {
-	return Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: Dim512, ElementType: ElementFloat32}
+	return Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32}
 }
 
 func randFloatVec(rng *rand.Rand, dims Dimensions) []float32 {

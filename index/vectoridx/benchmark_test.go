@@ -34,7 +34,7 @@ func BenchmarkDistanceUint16_1024(b *testing.B) {
 func benchDistance(b *testing.B, elem ElementType, dims Dimensions) {
 	b.Helper()
 	rng := rand.New(rand.NewSource(77))
-	cfg := Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: dims, ElementType: elem}
+	cfg := Config{Namespace: testNamespace, Dimensions: dims, ElementType: elem}
 	validated, err := cfg.withDefaults()
 	if err != nil {
 		b.Fatal(err)
@@ -60,7 +60,7 @@ func benchDistance(b *testing.B, elem ElementType, dims Dimensions) {
 func buildBenchIndex(b *testing.B, n int) (*VectorIdx, [][]float32) {
 	b.Helper()
 	idx, err := New(Config{
-		SpaceID:        NewSpaceID(IndexTypeImage, 1),
+		Namespace:      testNamespace,
 		Dimensions:     Dim512,
 		ElementType:    ElementFloat32,
 		M:              DefaultM,
@@ -128,7 +128,7 @@ func TestSearchSteadyStateAllocs(t *testing.T) {
 	if raceEnabled {
 		t.Skip("allocation counts are calibrated for non-race builds; the race detector adds bookkeeping allocs")
 	}
-	idx, err := New(Config{SpaceID: NewSpaceID(IndexTypeImage, 1), Dimensions: Dim512, ElementType: ElementFloat32})
+	idx, err := New(Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32})
 	if err != nil {
 		t.Fatal(err)
 	}

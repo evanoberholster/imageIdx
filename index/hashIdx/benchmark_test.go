@@ -35,7 +35,7 @@ func benchEntries(count int) []Entry {
 func buildBenchIndex(b *testing.B, count int, cfg Config) (*Index, []Entry) {
 	b.Helper()
 	entries := benchEntries(count)
-	idx, err := newIndex(b.TempDir(), cfg, DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(cfg), DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func buildBenchIndex(b *testing.B, count int, cfg Config) (*Index, []Entry) {
 }
 
 func BenchmarkAppendSingle(b *testing.B) {
-	idx, err := newIndex(b.TempDir(), Config{}, DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func BenchmarkAppendSingle(b *testing.B) {
 }
 
 func benchmarkApply(b *testing.B, batch int) {
-	idx, err := newIndex(b.TempDir(), Config{}, DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func BenchmarkSearchPDQTop100(b *testing.B) {
 
 func BenchmarkCandidateDensity(b *testing.B) {
 	adds := benchEntries(100_000)
-	idx, err := newIndex(b.TempDir(), Config{}, DurabilityOS)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func BenchmarkRecordsPerPage(b *testing.B) {
 // entries/sec trend across commits.
 func BenchmarkCheckpoint(b *testing.B) {
 	dir := b.TempDir()
-	idx, err := newIndex(dir, Config{RecordsPerPage: 8192}, DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{RecordsPerPage: 8192}), DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -322,7 +322,7 @@ func BenchmarkCheckpoint(b *testing.B) {
 func BenchmarkVacuum(b *testing.B) {
 	dir := b.TempDir()
 	cfg := Config{RecordsPerPage: 8192}
-	idx, err := newIndex(dir, cfg, DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(cfg), DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}

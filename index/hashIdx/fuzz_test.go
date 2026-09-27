@@ -49,7 +49,7 @@ func FuzzDecodeBlockHeader(f *testing.F) {
 
 func validExactManifest() []byte {
 	return encodeManifest(exactManifest{
-		generation: 3, indexID: 7, liveCount: 11, blockCount: 2,
+		generation: 3, namespace: 7, liveCount: 11, blockCount: 2,
 		walOffset: 128, flags: 0, blockSize: DefaultBlockSize,
 		algorithm: AlgorithmSHA256, targetFillPct: DefaultTargetFillPct,
 		walEpoch: 1,

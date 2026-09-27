@@ -3,7 +3,11 @@ package timeidx
 import (
 	"math"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
+
+const testNamespace common.Namespace = 9
 
 func TestTimemarkerEncoding(t *testing.T) {
 	const offset = uint64(1_700_000_000_000_000_000)
@@ -47,10 +51,17 @@ func TestMarkerRangeUsesConservativeBoundaries(t *testing.T) {
 
 func TestMetadataCopiesStableIdentity(t *testing.T) {
 	index := mustNewIndex(t, nil, 42, Config{})
-	index.indexID = 7
+	index.namespace = testNamespace
 	index.flags = 3
 	metadata := index.Metadata()
-	if metadata.IndexID != 7 || metadata.Flags != 3 || metadata.Offset != 42 || metadata.Generation != 1 {
+	if metadata.Namespace != testNamespace || metadata.Flags != 3 || metadata.Offset != 42 || metadata.Generation != 1 {
 		t.Fatalf("metadata = %+v", metadata)
+	}
+}
+
+func TestSpecNamespaceDef(t *testing.T) {
+	def := Spec{Namespace: testNamespace, Name: "capture-time"}.NamespaceDef()
+	if def.Namespace != testNamespace || def.Name != "capture-time" || def.Kind != common.KindTimestamp {
+		t.Fatalf("NamespaceDef() = %+v", def)
 	}
 }

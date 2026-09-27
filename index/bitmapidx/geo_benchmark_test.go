@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s2"
 )
@@ -40,11 +41,11 @@ var geoBenchCities = []geoBenchCity{
 	{"Sydney", -33.8688, 151.2093},
 }
 
-// benchmarkGeoField builds a KindGeo field with perCity images scattered
-// around each benchmark city and returns the field, one level-8 query cell per
+// benchmarkGeoNamespace builds a KindGeo namespace with perCity images scattered
+// around each benchmark city and returns the namespace, one level-8 query cell per
 // city (the coarse cell used by "search Paris" style queries), and the
 // canonical coordinate lookup used by Nearest.
-func benchmarkGeoField(b *testing.B, perCity int) (*FieldIndex, []uint64, GeoCoordinateLookup) {
+func benchmarkGeoNamespace(b *testing.B, perCity int) (*NamespaceIndex, []uint64, GeoCoordinateLookup) {
 	b.Helper()
 	rng := rand.New(rand.NewSource(42))
 	total := perCity * len(geoBenchCities)
@@ -60,11 +61,11 @@ func benchmarkGeoField(b *testing.B, perCity int) (*FieldIndex, []uint64, GeoCoo
 			id++
 		}
 	}
-	field, err := NewGeoField(IndexTypeLocation, entries, FieldConfig{})
+	namespace, err := NewGeoNamespace(common.NamespaceLocation, entries, NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { _ = field.Close() })
+	b.Cleanup(func() { _ = namespace.Close() })
 
 	cells := make([]uint64, len(geoBenchCities))
 	for index, city := range geoBenchCities {
@@ -74,7 +75,7 @@ func benchmarkGeoField(b *testing.B, perCity int) (*FieldIndex, []uint64, GeoCoo
 		coordinate, ok := coordinates[id]
 		return coordinate[0], coordinate[1], ok
 	}
-	return field, cells, lookup
+	return namespace, cells, lookup
 }
 
 // BenchmarkGeoCitySearch measures city queries over a 24-city distribution.
@@ -82,13 +83,13 @@ func benchmarkGeoField(b *testing.B, perCity int) (*FieldIndex, []uint64, GeoCoo
 // buckets inside it.
 func BenchmarkGeoCitySearch(b *testing.B) {
 	const perCity = 5_000
-	field, cells, _ := benchmarkGeoField(b, perCity)
+	namespace, cells, _ := benchmarkGeoNamespace(b, perCity)
 	for index, city := range geoBenchCities[:4] {
 		ranges, err := RangesFromCellIDs(nil, cells[index:index+1])
 		if err != nil {
 			b.Fatal(err)
 		}
-		match, err := field.GeoRanges(ranges)
+		match, err := namespace.GeoRanges(ranges)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -103,7 +104,7 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 		b.Run(city.name+"/ranges", func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
-				_, _ = field.GeoRanges(ranges)
+				_, _ = namespace.GeoRanges(ranges)
 			}
 		})
 		b.Run(city.name+"/append", func(b *testing.B) {
@@ -111,7 +112,7 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				result, _ := field.GeoRanges(ranges)
+				result, _ := namespace.GeoRanges(ranges)
 				dst = result.AppendTo(dst[:0])
 			}
 			_ = dst
@@ -128,7 +129,7 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				dst, _ = field.FilterGeoRanges(dst[:0], candidates, neighborhood)
+				dst, _ = namespace.FilterGeoRanges(dst[:0], candidates, neighborhood)
 			}
 			_ = dst
 		})
@@ -139,7 +140,7 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 			b.ResetTimer()
 			for range b.N {
 				m.Reset()
-				field.CollectGeoRanges(m, ranges)
+				namespace.CollectGeoRanges(m, ranges)
 				dst = m.AppendTo(dst[:0])
 			}
 			_ = dst
@@ -151,14 +152,14 @@ func BenchmarkGeoCitySearch(b *testing.B) {
 // Nearest scans the immutable view, so allocation reflects the full ID
 // materialization.
 func BenchmarkGeoCityNearest(b *testing.B) {
-	field, _, lookup := benchmarkGeoField(b, 500)
+	namespace, _, lookup := benchmarkGeoNamespace(b, 500)
 	for _, city := range geoBenchCities[:4] {
 		b.Run(city.name, func(b *testing.B) {
 			dst := make([]NearestResult, 0, 16)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				dst = field.Nearest(dst[:0], city.lat, city.lng, 10, lookup)
+				dst = namespace.Nearest(dst[:0], city.lat, city.lng, 10, lookup)
 			}
 			if len(dst) != 10 {
 				b.Fatalf("Nearest returned %d results", len(dst))

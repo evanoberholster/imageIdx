@@ -12,16 +12,16 @@ import (
 // geoKeys returns the occupied keys inside ranges from base plus deltas,
 // sorted and deduplicated with one allocation. Prefer forEachGeoKey when
 // callers can tolerate duplicate keys and want no allocation.
-func (v *fieldView) geoKeys(ranges []GeoRange) []FieldKey {
-	var keys []FieldKey
-	collect := func(entries []FieldKey) {
+func (v *namespaceView) geoKeys(ranges []GeoRange) []NamespaceKey {
+	var keys []NamespaceKey
+	collect := func(entries []NamespaceKey) {
 		for _, keyRange := range ranges {
 			start, end := geoBaseRangeIn(entries, keyRange)
 			keys = append(keys, entries[start:end]...)
 		}
 	}
 	collect(v.base.keys)
-	for _, delta := range []*fieldDelta{v.frozen, v.active} {
+	for _, delta := range []*namespaceDelta{v.frozen, v.active} {
 		if delta == nil {
 			continue
 		}
@@ -30,16 +30,16 @@ func (v *fieldView) geoKeys(ranges []GeoRange) []FieldKey {
 	if len(keys) < 2 {
 		return keys
 	}
-	slices.SortFunc(keys, compareFieldKey)
+	slices.SortFunc(keys, compareNamespaceKey)
 	return slices.Compact(keys)
 }
 
-// allKeys returns one copy of every occupied key in the field, sorted
+// allKeys returns one copy of every occupied key in the namespace, sorted
 // and deduplicated. Used by full scans such as AppendTo with deltas.
-func (v *fieldView) allKeys() []FieldKey {
-	var keys []FieldKey
+func (v *namespaceView) allKeys() []NamespaceKey {
+	var keys []NamespaceKey
 	keys = append(keys, v.base.keys...)
-	for _, delta := range []*fieldDelta{v.frozen, v.active} {
+	for _, delta := range []*namespaceDelta{v.frozen, v.active} {
 		if delta == nil {
 			continue
 		}
@@ -48,14 +48,14 @@ func (v *fieldView) allKeys() []FieldKey {
 	if len(keys) < 2 {
 		return keys
 	}
-	slices.SortFunc(keys, compareFieldKey)
+	slices.SortFunc(keys, compareNamespaceKey)
 	return slices.Compact(keys)
 }
 
 // geoBaseRangeIn returns the index span of entries sorted by Hash inside
 // an inclusive key range, via two binary searches. Inverted ranges select
 // nothing.
-func geoBaseRangeIn(entries []FieldKey, keyRange GeoRange) (int, int) {
+func geoBaseRangeIn(entries []NamespaceKey, keyRange GeoRange) (int, int) {
 	if keyRange.End < keyRange.Start {
 		return 0, 0
 	}
@@ -71,9 +71,9 @@ func geoBaseRangeIn(entries []FieldKey, keyRange GeoRange) (int, int) {
 // and unique. Ranges may be unnormalized and overlapping. The no-delta
 // path references base postings directly; the delta path unions effective
 // postings for occupied keys.
-func (i *FieldIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr error) {
-	if i.field().Kind != KindGeo {
-		return roar.Bitmap{}, ErrFieldMismatch
+func (i *NamespaceIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr error) {
+	if i.spec().Kind != KindGeo {
+		return roar.Bitmap{}, ErrNamespaceMismatch
 	}
 	if len(ranges) == 0 {
 		return roar.Bitmap{}, nil
@@ -119,15 +119,15 @@ func (i *FieldIndex) GeoRanges(ranges []GeoRange) (result roar.Bitmap, resultErr
 // candidates' order and allocates nothing beyond dst growth for typical range
 // counts. Prefer CollectGeoRanges plus bitmap probes when buckets are many or
 // the match will be reused; see CountGeoCells for the planning probe.
-func (i *FieldIndex) FilterGeoRanges(dst, candidates []ImageID, ranges []GeoRange) ([]ImageID, error) {
-	if i.field().Kind != KindGeo {
-		return dst, ErrFieldMismatch
+func (i *NamespaceIndex) FilterGeoRanges(dst, candidates []ImageID, ranges []GeoRange) ([]ImageID, error) {
+	if i.spec().Kind != KindGeo {
+		return dst, ErrNamespaceMismatch
 	}
 	token := i.readers.Acquire()
 	view := i.view.Load()
 	if !i.closed.Load() && len(ranges) != 0 {
 		var spanBuf [8]geoBaseSpan
-		var keyBuf [16]FieldKey
+		var keyBuf [16]NamespaceKey
 		probe := view.prepareGeoProbe(ranges, spanBuf[:0], keyBuf[:0])
 		for _, id := range candidates {
 			if view.geoProbeContains(&probe, id) {
@@ -149,12 +149,12 @@ type geoBaseSpan struct {
 // resolved once so candidate probes avoid per-candidate binary searches.
 type geoProbe struct {
 	spans     []geoBaseSpan
-	deltaKeys []FieldKey
+	deltaKeys []NamespaceKey
 }
 
 // prepareGeoProbe resolves ranges against the view once. spanBuf and keyBuf are
 // caller-owned scratch; unusually large range sets fall back to allocation.
-func (v *fieldView) prepareGeoProbe(ranges []GeoRange, spanBuf []geoBaseSpan, keyBuf []FieldKey) geoProbe {
+func (v *namespaceView) prepareGeoProbe(ranges []GeoRange, spanBuf []geoBaseSpan, keyBuf []NamespaceKey) geoProbe {
 	spans := spanBuf
 	for _, keyRange := range ranges {
 		if keyRange.End < keyRange.Start {
@@ -167,7 +167,7 @@ func (v *fieldView) prepareGeoProbe(ranges []GeoRange, spanBuf []geoBaseSpan, ke
 		return geoProbe{spans: spans}
 	}
 	keys := keyBuf
-	for _, delta := range []*fieldDelta{v.frozen, v.active} {
+	for _, delta := range []*namespaceDelta{v.frozen, v.active} {
 		if delta == nil {
 			continue
 		}
@@ -189,7 +189,7 @@ func (v *fieldView) prepareGeoProbe(ranges []GeoRange, spanBuf []geoBaseSpan, ke
 // geoProbeContains reports whether id holds any bucket inside the prepared
 // spans, walking base postings directly when no deltas are visible and the
 // full active/frozen/base precedence otherwise.
-func (v *fieldView) geoProbeContains(p *geoProbe, id ImageID) bool {
+func (v *namespaceView) geoProbeContains(p *geoProbe, id ImageID) bool {
 	if p.deltaKeys == nil {
 		for _, span := range p.spans {
 			postings := v.base.postings[span.start:span.end]
@@ -219,9 +219,9 @@ func (v *fieldView) geoProbeContains(p *geoProbe, id ImageID) bool {
 // EstimateGeoRanges returns the effective candidate count for occupied
 // buckets inside ranges without materializing. Multi-valued overlap
 // makes it an upper bound; it is a planning hint, not an exact count.
-func (i *FieldIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
-	if i.field().Kind != KindGeo {
-		return 0, ErrFieldMismatch
+func (i *NamespaceIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
+	if i.spec().Kind != KindGeo {
+		return 0, ErrNamespaceMismatch
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
@@ -245,9 +245,9 @@ func (i *FieldIndex) EstimateGeoRanges(ranges []GeoRange) (uint64, error) {
 // CountGeoRanges returns the number of images inside any key range by
 // unioning bitmaps and counting, without appending IDs. The no-delta
 // path pre-sizes scratch once from the occupied bucket count.
-func (i *FieldIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
-	if i.field().Kind != KindGeo {
-		return 0, ErrFieldMismatch
+func (i *NamespaceIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
+	if i.spec().Kind != KindGeo {
+		return 0, ErrNamespaceMismatch
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
@@ -280,8 +280,8 @@ func (i *FieldIndex) CountGeoRanges(ranges []GeoRange) (uint64, error) {
 // CollectGeoRanges folds every effective posting inside ranges into m.
 // The caller resets m first and materializes once with AppendTo. The
 // delta path uses deduplicated keys so each posting folds once.
-func (i *FieldIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) {
-	if m == nil || len(ranges) == 0 || i.field().Kind != KindGeo {
+func (i *NamespaceIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) {
+	if m == nil || len(ranges) == 0 || i.spec().Kind != KindGeo {
 		return
 	}
 	token := i.readers.Acquire()
@@ -295,7 +295,7 @@ func (i *FieldIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) 
 				}
 			}
 		} else {
-			view.forEachGeoKey(ranges, func(key FieldKey) {
+			view.forEachGeoKey(ranges, func(key NamespaceKey) {
 				if p, ok := view.effective(key); ok {
 					p.addTo(m)
 				}
@@ -310,8 +310,8 @@ func (i *FieldIndex) CollectGeoRanges(m *roar.MutableBitmap, ranges []GeoRange) 
 // planning probe: small counts favor FilterGeoRanges probes, large counts
 // favor CollectGeoRanges materialization. Delta keys present in multiple
 // layers count twice, so it is an upper bound.
-func (i *FieldIndex) CountGeoCells(ranges []GeoRange) int {
-	if len(ranges) == 0 || i.field().Kind != KindGeo {
+func (i *NamespaceIndex) CountGeoCells(ranges []GeoRange) int {
+	if len(ranges) == 0 || i.spec().Kind != KindGeo {
 		return 0
 	}
 	token := i.readers.Acquire()
@@ -329,7 +329,7 @@ func (i *FieldIndex) CountGeoCells(ranges []GeoRange) int {
 // idempotent (re-Oring into a mutable bitmap, counting at most once per
 // layer is caller's choice). Prefer geoKeys when duplicates cost more
 // than one allocation.
-func (v *fieldView) forEachGeoKey(ranges []GeoRange, fn func(FieldKey)) {
+func (v *namespaceView) forEachGeoKey(ranges []GeoRange, fn func(NamespaceKey)) {
 	for _, keyRange := range ranges {
 		if keyRange.End < keyRange.Start {
 			continue
@@ -339,7 +339,7 @@ func (v *fieldView) forEachGeoKey(ranges []GeoRange, fn func(FieldKey)) {
 			fn(key)
 		}
 	}
-	for _, delta := range []*fieldDelta{v.frozen, v.active} {
+	for _, delta := range []*namespaceDelta{v.frozen, v.active} {
 		if delta == nil {
 			continue
 		}
@@ -359,7 +359,7 @@ func (v *fieldView) forEachGeoKey(ranges []GeoRange, fn func(FieldKey)) {
 
 // countGeoKeys counts occupied keys inside ranges without allocating.
 // Delta keys present in multiple layers count twice; see CountGeoCells.
-func (v *fieldView) countGeoKeys(ranges []GeoRange) int {
+func (v *namespaceView) countGeoKeys(ranges []GeoRange) int {
 	count := 0
 	for _, keyRange := range ranges {
 		if keyRange.End < keyRange.Start {
@@ -368,7 +368,7 @@ func (v *fieldView) countGeoKeys(ranges []GeoRange) int {
 		start, end := geoBaseRangeIn(v.base.keys, keyRange)
 		count += end - start
 	}
-	for _, delta := range []*fieldDelta{v.frozen, v.active} {
+	for _, delta := range []*namespaceDelta{v.frozen, v.active} {
 		if delta == nil {
 			continue
 		}
@@ -387,24 +387,12 @@ func (v *fieldView) countGeoKeys(ranges []GeoRange) int {
 	return count
 }
 
-// geoContains reports whether id holds any bucket inside ranges, walking
-// base spans and delta keys without materializing postings. Each key
-// resolves through the full active/frozen/base precedence. It is retained for
-// callers that probe a single id; bulk filtering uses geoProbeContains, which
-// resolves the spans once.
-func (v *fieldView) geoContains(ranges []GeoRange, id ImageID) bool {
-	var spanBuf [8]geoBaseSpan
-	var keyBuf [16]FieldKey
-	probe := v.prepareGeoProbe(ranges, spanBuf[:0], keyBuf[:0])
-	return v.geoProbeContains(&probe, id)
-}
-
 // AppendTo appends every indexed image ID in ascending order, preserving
 // dst's prefix. Capacity is reserved once from the cardinality estimate
 // so per-key appends do not regrow. Postings append per key, then the
-// tail sorts and compacts once; disjoint single-valued fields could merge
+// tail sorts and compacts once; disjoint single-valued namespaces could merge
 // without a global sort, but one sort keeps the path simple and uniform.
-func (i *FieldIndex) AppendTo(dst []ImageID) []ImageID {
+func (i *NamespaceIndex) AppendTo(dst []ImageID) []ImageID {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
 	view := i.view.Load()
@@ -452,8 +440,8 @@ func (i *FieldIndex) AppendTo(dst []ImageID) []ImageID {
 // successive Adds of different cells for one image are caller error (use
 // Move); only same-key duplicates and in-batch double-adds are rejected
 // here.
-func validateGeoChanges(view *fieldView, changes []stagedChange) error {
-	if view.field.Kind != KindGeo {
+func validateGeoChanges(view *namespaceView, changes []stagedChange) error {
+	if view.namespace.Kind != KindGeo {
 		return nil
 	}
 	for _, change := range changes {
@@ -490,11 +478,11 @@ type NearestResult struct {
 
 // Nearest returns the exact top K among indexed images with coordinates.
 // It scans the whole effective set and sorts every candidate: O(N log N)
-// in field size. It suits modest fields, not full-catalog nearest search.
+// in namespace size. It suits modest namespaces, not full-catalog nearest search.
 // Invalid origins, non-positive k, nil lookups, and wrong kinds append
 // nothing.
-func (i *FieldIndex) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup GeoCoordinateLookup) []NearestResult {
-	if i.field().Kind != KindGeo || k <= 0 || lookup == nil {
+func (i *NamespaceIndex) Nearest(dst []NearestResult, latitude, longitude float64, k int, lookup GeoCoordinateLookup) []NearestResult {
+	if i.spec().Kind != KindGeo || k <= 0 || lookup == nil {
 		return dst
 	}
 	if _, err := KeyFromLatLng(latitude, longitude); err != nil {

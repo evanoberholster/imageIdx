@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 
 	"github.com/evanoberholster/imageIdx/index/timeidx"
@@ -31,9 +32,9 @@ type stressFixture struct {
 	plan     Plan
 	executor *Executor
 	batches  sync.Pool
-	bitmap   *bitmapidx.FieldIndex
+	bitmap   *bitmapidx.NamespaceIndex
 	times    *timeidx.Index
-	geo      *bitmapidx.FieldIndex
+	geo      *bitmapidx.NamespaceIndex
 	cell     bitmapidx.S2Key
 	quantum  uint64
 }
@@ -54,9 +55,9 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 		geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122})
 	}
 
-	bitmap, err := bitmapidx.NewFieldIndex(bitmapidx.Field{
-		Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
-	}, bitmapidx.FieldConfig{})
+	bitmap, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{
+		Namespace: common.NamespaceTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
+	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -64,18 +65,16 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 	for n, id := range bitmapIDs {
 		initialEntries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("favorite")}
 	}
-	if err := bitmap.Add(initialEntries...); err != nil {
-		tb.Fatal(err)
-	}
+	commitBitmap(tb, bitmap, func(bt *bitmapidx.Batch) error { return bt.Add(initialEntries...) })
 	tb.Cleanup(func() { _ = bitmap.Close() })
 
-	timeIndex, err := timeidx.New(timeidx.Spec{IndexID: 2, Entries: records}, timeidx.Config{})
+	timeIndex, err := timeidx.New(timeidx.Spec{Namespace: 2, Entries: records}, timeidx.Config{})
 	if err != nil {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { _ = timeIndex.Close() })
 
-	geo, err := bitmapidx.NewGeoField(bitmapidx.IndexType(3), geoEntries, bitmapidx.FieldConfig{})
+	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(3), geoEntries, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -196,10 +195,16 @@ func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize 
 				for _, id := range ids {
 					entries = append(entries, bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue("favorite")})
 				}
-				if err := fixture.bitmap.Add(entries...); err != nil {
+				bitmapBatch := fixture.bitmap.NewBatch()
+				if err := bitmapBatch.Add(entries...); err != nil {
 					errs <- err
 					return
 				}
+				if err := bitmapBatch.Apply(); err != nil {
+					errs <- err
+					return
+				}
+				bitmapBatch.Close()
 				batch := runner.acquireBatch()
 				for k, id := range ids {
 					if !batch.Append(timeidx.Insert(ImageID(id), fixture.quantum*uint64(7000+round*batchSize+k))) {
@@ -218,10 +223,24 @@ func runLoad(fixture *stressFixture, readers, writers, iters, rounds, batchSize 
 				for _, id := range ids {
 					moves = append(moves, bitmapidx.Move{ImageID: id, To: int64(fixture.cell)})
 				}
-				if err := fixture.geo.Move(moves...); err != nil {
+				geoBatch := fixture.geo.NewBatch()
+				if err := geoBatch.Move(moves...); err != nil {
 					errs <- err
 					return
 				}
+				if err := geoBatch.Apply(); err != nil {
+					errs <- err
+					return
+				}
+				geoBatch.Close()
+			}
+			if err := fixture.bitmap.Barrier(); err != nil {
+				errs <- err
+				return
+			}
+			if err := fixture.geo.Barrier(); err != nil {
+				errs <- err
+				return
 			}
 		}(w)
 	}

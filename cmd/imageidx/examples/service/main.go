@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/search"
@@ -20,31 +21,40 @@ import (
 const quantum = uint64(1) << timeidx.TimestampShift
 
 func main() {
-	fieldDir, err := os.MkdirTemp("", "imageidx-fields-")
+	namespaceDir, err := os.MkdirTemp("", "imageidx-namespaces-")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fields, err := bitmapidx.NewIndex(fieldDir, []bitmapidx.Field{{
-		Type: bitmapidx.IndexTypeTag, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
-	}}, bitmapidx.FieldConfig{}, bitmapidx.DurabilityOS)
+	namespaces, err := bitmapidx.NewIndex(namespaceDir, []bitmapidx.NamespaceSpec{{
+		Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
+	}}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = fields.Close(); _ = os.RemoveAll(fieldDir) }()
-	favorites, ok := fields.Lookup(bitmapidx.IndexTypeTag)
+	defer func() { _ = namespaces.Close(); _ = os.RemoveAll(namespaceDir) }()
+	favorites, ok := namespaces.Lookup(common.NamespaceTag)
 	if !ok {
-		log.Fatal("tag field missing")
+		log.Fatal("tag namespace missing")
 	}
-	if err := favorites.Add(
+	favoritesBatch := favorites.NewBatch()
+	if err := favoritesBatch.Add(
 		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("favorite")},
 		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("favorite")},
 	); err != nil {
 		log.Fatal(err)
 	}
+	if err := favoritesBatch.Apply(); err != nil {
+		log.Fatal(err)
+	}
+	favoritesBatch.Close()
+	if err := favorites.Barrier(); err != nil {
+		log.Fatal(err)
+	}
 
 	times, err := timeidx.New(timeidx.Spec{
-		IndexID: 2,
+		Namespace: common.Namespace(100),
+		Name:      "timestamp",
 		Entries: []timeidx.Entry{
 			{ImageID: 100, Timestamp: quantum},
 			{ImageID: 200, Timestamp: 2 * quantum},

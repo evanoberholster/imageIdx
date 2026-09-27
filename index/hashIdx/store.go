@@ -3,13 +3,14 @@ package hashidx
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 const (
@@ -31,27 +32,54 @@ const (
 
 var (
 	// ErrStoreExists reports creating a store in a non-empty directory.
-	// It aliases indexutil.ErrExists; see internal/indexutil.
-	ErrStoreExists = indexutil.ErrExists
+	// It aliases storage.ErrExists; see internal/storage.
+	ErrStoreExists = storage.ErrExists
 	// ErrStoreBusy reports another process holding the store lock. It
-	// aliases indexutil.ErrBusy; see internal/indexutil.
-	ErrStoreBusy   = indexutil.ErrBusy
+	// aliases storage.ErrBusy; see internal/storage.
+	ErrStoreBusy   = storage.ErrBusy
 	ErrNotStore    = errors.New("hashidx: directory is not a hashidx store")
 	ErrChannelFull = errors.New("hashidx: buffered writer channel full")
 )
 
+// PerceptualSpec describes the perceptual index's identity and configuration.
+// Namespace and Name are required by NewStore (non-zero and unique within the
+// store); Config's zero value selects defaults.
+type PerceptualSpec struct {
+	Namespace common.Namespace
+	Name      string
+	Config    Config
+}
+
+// NamespaceDef returns the common.Schema definition for this spec. The
+// perceptual index records no kind-specific schema configuration, so Config
+// is nil.
+func (s PerceptualSpec) NamespaceDef() common.NamespaceDef {
+	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindHashPerceptual}
+}
+
 // StoreSpec describes the two indexes a new Store contains: one perceptual
 // Index and one exact-content ExactIndex.
 type StoreSpec struct {
-	// Perceptual configures the perceptual index. The zero value selects
-	// defaults.
-	Perceptual Config
+	// Perceptual describes the perceptual index's identity and configuration.
+	Perceptual PerceptualSpec
 	// Exact describes the exact-content index's stable identity, algorithm,
 	// and optional initial entries. Algorithm must be set.
 	Exact ExactSpec
 	// ExactConfig configures exact block sizing and write batching. The zero
 	// value selects defaults.
 	ExactConfig ExactConfig
+}
+
+// schema builds the store's two-namespace schema and validates it: both
+// namespaces must be non-zero with distinct numbers, and both names must be
+// non-empty and distinct. A violation reports ErrInvalidConfig wrapping the
+// underlying common schema error.
+func (s StoreSpec) schema() (*common.Schema, error) {
+	schema := common.NewSchema()
+	if err := schema.RegisterAll(s.Perceptual.NamespaceDef(), s.Exact.NamespaceDef()); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	return schema, nil
 }
 
 // Store is the single controller for a hashidx directory. It owns exactly one
@@ -75,11 +103,11 @@ type Store struct {
 // dir/manifest. It is advisory: backups and operators read it, opens
 // ignore it.
 func writeStoreManifest(dir string, perceptualGen, exactGen uint64) error {
-	data := persist.BuildManifest(storeManifestSize, storeManifestMagic, storeManifestVersion, 28, 28, func(data []byte) {
+	data := storage.BuildManifest(storeManifestSize, storeManifestMagic, storeManifestVersion, 28, 28, func(data []byte) {
 		binary.LittleEndian.PutUint64(data[8:16], perceptualGen)
 		binary.LittleEndian.PutUint64(data[16:24], exactGen)
 	})
-	return persist.WriteManifest(dir, data)
+	return storage.WriteManifest(dir, data)
 }
 
 // ReadStoreManifest returns the last jointly checkpointed generation pair
@@ -93,10 +121,10 @@ func ReadStoreManifest(dir string) (perceptualGen, exactGen uint64, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	if magic, version, ok := persist.PeekHeader(data); ok && magic == storeManifestMagic && version != storeManifestVersion {
+	if magic, version, ok := storage.PeekHeader(data); ok && magic == storeManifestMagic && version != storeManifestVersion {
 		return 0, 0, ErrUnsupported
 	}
-	if err := persist.VerifyManifest(data, storeManifestSize, storeManifestMagic, storeManifestVersion, 28, 28); err != nil {
+	if err := storage.VerifyManifest(data, storeManifestSize, storeManifestMagic, storeManifestVersion, 28, 28); err != nil {
 		return 0, 0, ErrCorrupt
 	}
 	return binary.LittleEndian.Uint64(data[8:16]), binary.LittleEndian.Uint64(data[16:24]), nil
@@ -117,17 +145,20 @@ func NewStore(dir string, spec StoreSpec, durability Durability) (*Store, error)
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := indexutil.AcquireLock(dir, storeLockName, true)
+	if _, err := spec.schema(); err != nil {
+		return nil, err
+	}
+	lock, err := storage.AcquireLock(dir, storeLockName, true)
 	if err != nil {
 		return nil, err
 	}
-	readers := &indexutil.ReaderTracker{}
+	readers := &storage.ReaderTracker{}
 	perceptualDir := filepath.Join(dir, perceptualDirName)
 	exactDir := filepath.Join(dir, exactDirName)
 	perceptual, err := newIndex(perceptualDir, spec.Perceptual, durability, readers)
 	if err != nil {
 		_ = os.RemoveAll(perceptualDir)
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	exact, err := newExact(exactDir, spec.Exact, spec.ExactConfig, durability, readers)
@@ -135,7 +166,7 @@ func NewStore(dir string, spec StoreSpec, durability Durability) (*Store, error)
 		_ = perceptual.Close()
 		_ = os.RemoveAll(perceptualDir)
 		_ = os.RemoveAll(exactDir)
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	s := &Store{dir: dir, perceptual: perceptual, exact: exact, lock: lock}
@@ -155,27 +186,27 @@ func OpenStore(dir string, durability Durability) (*Store, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := indexutil.AcquireLock(dir, storeLockName, false)
+	lock, err := storage.AcquireLock(dir, storeLockName, false)
 	if err != nil {
 		return nil, err
 	}
 	for _, name := range []string{perceptualDirName, exactDirName} {
 		info, statErr := os.Stat(filepath.Join(dir, name))
 		if statErr != nil || !info.IsDir() {
-			_ = indexutil.ReleaseLock(lock)
+			_ = storage.ReleaseLock(lock)
 			return nil, ErrNotStore
 		}
 	}
-	readers := &indexutil.ReaderTracker{}
+	readers := &storage.ReaderTracker{}
 	perceptual, err := openIndex(filepath.Join(dir, perceptualDirName), Config{}, durability, readers)
 	if err != nil {
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	exact, err := openExact(filepath.Join(dir, exactDirName), ExactConfig{}, durability, readers)
 	if err != nil {
 		_ = perceptual.Close()
-		_ = indexutil.ReleaseLock(lock)
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	// The joint anchor is advisory only: a missing file means a pre-V1
@@ -269,11 +300,11 @@ func verifyPerceptualDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	mapping, err := persist.MapFile(generationPath(dir, manifest.generation), ErrCorrupt)
+	mapping, err := storage.MapFile(generationPath(dir, manifest.generation), ErrCorrupt)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = persist.Unmap(mapping) }()
+	defer func() { _ = storage.Unmap(mapping) }()
 	view, header, err := decodeGeneration(mapping, Config{RecordsPerPage: manifest.recordsPerPage})
 	if err != nil {
 		return err
@@ -295,16 +326,16 @@ func verifyExactDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	mapping, err := persist.MapFile(exactGenerationPath(dir, manifest.generation), ErrCorrupt)
+	mapping, err := storage.MapFile(exactGenerationPath(dir, manifest.generation), ErrCorrupt)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = persist.Unmap(mapping) }()
+	defer func() { _ = storage.Unmap(mapping) }()
 	view, header, err := decodeExactGeneration(mapping)
 	if err != nil {
 		return err
 	}
-	if header.generation != manifest.generation || header.indexID != manifest.indexID ||
+	if header.generation != manifest.generation || header.namespace != manifest.namespace ||
 		header.liveCount != manifest.liveCount || header.blockCount != manifest.blockCount ||
 		header.algorithm != manifest.algorithm {
 		return ErrCorrupt
@@ -334,11 +365,11 @@ func (s *Store) Close() error {
 		result = errors.Join(result, s.exact.Close())
 	}
 	if s.lock != nil {
-		result = errors.Join(result, indexutil.ReleaseLock(s.lock))
+		result = errors.Join(result, storage.ReleaseLock(s.lock))
 	}
 	return result
 }
 
-// Directory locking lives in internal/indexutil (flock on Unix, LockFileEx
+// Directory locking lives in internal/storage (flock on Unix, LockFileEx
 // on Windows, explicit unsupported error elsewhere), selected by build
 // tags. See the filelock files there for the per-platform contracts.

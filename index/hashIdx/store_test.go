@@ -6,7 +6,29 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
+
+const (
+	testPerceptualNamespace common.Namespace = 1
+	testExactNamespace      common.Namespace = 2
+)
+
+// testStoreSpec returns a valid two-namespace store spec with the default
+// SHA-256 exact index and no initial entries.
+func testStoreSpec() StoreSpec {
+	return StoreSpec{
+		Perceptual: PerceptualSpec{Namespace: testPerceptualNamespace, Name: "perceptual"},
+		Exact:      ExactSpec{Namespace: testExactNamespace, Name: "exact", Algorithm: AlgorithmSHA256},
+	}
+}
+
+// testPerceptualSpec wraps cfg with the shared test namespace for direct
+// newIndex construction (Store construction uses testStoreSpec).
+func testPerceptualSpec(cfg Config) PerceptualSpec {
+	return PerceptualSpec{Namespace: testPerceptualNamespace, Name: "perceptual", Config: cfg}
+}
 
 func mustNewStore(t *testing.T, dir string, spec StoreSpec) *Store {
 	t.Helper()
@@ -19,16 +41,39 @@ func mustNewStore(t *testing.T, dir string, spec StoreSpec) *Store {
 }
 
 func TestStoreRequiresDirectory(t *testing.T) {
-	if _, err := NewStore("", StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}}, DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewStore("", testStoreSpec(), DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("empty dir err = %v, want ErrInvalidConfig", err)
+	}
+}
+
+func TestStoreRejectsInvalidNamespaceSchemas(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*StoreSpec)
+	}{
+		{"zero perceptual namespace", func(s *StoreSpec) { s.Perceptual.Namespace = 0 }},
+		{"zero exact namespace", func(s *StoreSpec) { s.Exact.Namespace = 0 }},
+		{"duplicate namespace", func(s *StoreSpec) { s.Exact.Namespace = s.Perceptual.Namespace }},
+		{"empty perceptual name", func(s *StoreSpec) { s.Perceptual.Name = "" }},
+		{"empty exact name", func(s *StoreSpec) { s.Exact.Name = "" }},
+		{"duplicate name", func(s *StoreSpec) { s.Exact.Name = s.Perceptual.Name }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := testStoreSpec()
+			tc.mutate(&spec)
+			if _, err := NewStore(t.TempDir(), spec, DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("NewStore(%s) err = %v, want ErrInvalidConfig", tc.name, err)
+			}
+		})
 	}
 }
 
 func TestStorePersistentCheckpointReopenAndWAL(t *testing.T) {
 	dir := t.TempDir()
 	spec := StoreSpec{
-		Perceptual:  Config{RecordsPerPage: 64},
-		Exact:       ExactSpec{IndexID: 7, Algorithm: AlgorithmBLAKE3, Entries: entriesForRange(0, 10, 1)},
+		Perceptual:  PerceptualSpec{Namespace: testPerceptualNamespace, Name: "perceptual", Config: Config{RecordsPerPage: 64}},
+		Exact:       ExactSpec{Namespace: testExactNamespace, Name: "exact", Algorithm: AlgorithmBLAKE3, Entries: entriesForRange(0, 10, 1)},
 		ExactConfig: ExactConfig{BlockSize: 1024},
 	}
 	store, err := NewStore(dir, spec, DurabilityOS)
@@ -64,8 +109,11 @@ func TestStorePersistentCheckpointReopenAndWAL(t *testing.T) {
 	if reopened.Perceptual().readers != reopened.Exact().readers {
 		t.Fatal("reopened store indexes do not share a reader tracker")
 	}
-	if md := reopened.Exact().Metadata(); md.IndexID != 7 || md.Algorithm != AlgorithmBLAKE3 {
+	if md := reopened.Exact().Metadata(); md.Namespace != testExactNamespace || md.Algorithm != AlgorithmBLAKE3 {
 		t.Fatalf("exact metadata = %+v", md)
+	}
+	if got := reopened.Perceptual().Metadata().Namespace; got != testPerceptualNamespace {
+		t.Fatalf("perceptual namespace = %d, want %d", got, testPerceptualNamespace)
 	}
 	if got := reopened.Perceptual().Metadata().RecordsPerPage; got != 64 {
 		t.Fatalf("perceptual page size = %d, want 64", got)
@@ -100,7 +148,7 @@ func TestStorePersistentCheckpointReopenAndWAL(t *testing.T) {
 
 func TestStoreDirectoryOwnership(t *testing.T) {
 	dir := t.TempDir()
-	spec := StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}}
+	spec := testStoreSpec()
 	first := mustNewStore(t, dir, spec)
 	if _, err := NewStore(dir, spec, DurabilityOS); !errors.Is(err, ErrStoreBusy) {
 		t.Fatalf("second NewStore err = %v, want ErrStoreBusy", err)
@@ -132,8 +180,8 @@ func TestStoreCheckpointConvergenceAfterExactFailure(t *testing.T) {
 	}
 	dir := t.TempDir()
 	spec := StoreSpec{
-		Perceptual: Config{RecordsPerPage: 64},
-		Exact:      ExactSpec{Algorithm: AlgorithmSHA256},
+		Perceptual: PerceptualSpec{Namespace: testPerceptualNamespace, Name: "perceptual", Config: Config{RecordsPerPage: 64}},
+		Exact:      ExactSpec{Namespace: testExactNamespace, Name: "exact", Algorithm: AlgorithmSHA256},
 	}
 	store := mustNewStore(t, dir, spec)
 	if err := store.Perceptual().Apply(seedEntries(4)); err != nil {
@@ -202,10 +250,12 @@ func TestStoreCheckpointConvergenceAfterExactFailure(t *testing.T) {
 
 func TestStoreCreationFailureCleansUp(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := NewStore(dir, StoreSpec{Exact: ExactSpec{Algorithm: 0}}, DurabilityOS); !errors.Is(err, ErrInvalidAlgorithm) {
+	bad := testStoreSpec()
+	bad.Exact.Algorithm = 0
+	if _, err := NewStore(dir, bad, DurabilityOS); !errors.Is(err, ErrInvalidAlgorithm) {
 		t.Fatalf("bad algorithm err = %v, want ErrInvalidAlgorithm", err)
 	}
-	store, err := NewStore(dir, StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}}, DurabilityOS)
+	store, err := NewStore(dir, testStoreSpec(), DurabilityOS)
 	if err != nil {
 		t.Fatalf("store not reusable after failed create: %v", err)
 	}

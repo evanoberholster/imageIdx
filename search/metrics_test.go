@@ -12,8 +12,8 @@ import (
 )
 
 func TestSearchWithMetricsCountsAndReuse(t *testing.T) {
-	first := benchmarkEnumField(t, 130, "x", []uint64{1, 2, 3, 4, 5})
-	second := benchmarkEnumField(t, 131, "x", []uint64{2, 4, 6})
+	first := benchmarkEnumNamespace(t, 130, "x", []uint64{1, 2, 3, 4, 5})
+	second := benchmarkEnumNamespace(t, 131, "x", []uint64{2, 4, 6})
 	plan, err := Compile(AllValues(first, bitmapidx.StringValue("x")), AllValues(second, bitmapidx.StringValue("x")))
 	if err != nil {
 		t.Fatal(err)
@@ -51,8 +51,8 @@ func TestSearchWithMetricsCountsAndReuse(t *testing.T) {
 }
 
 func TestMeasuredFilteringAndRanking(t *testing.T) {
-	first := benchmarkEnumField(t, 132, "x", []uint64{1, 2, 3, 4, 5})
-	second := benchmarkEnumField(t, 133, "x", []uint64{2, 4, 6})
+	first := benchmarkEnumNamespace(t, 132, "x", []uint64{1, 2, 3, 4, 5})
+	second := benchmarkEnumNamespace(t, 133, "x", []uint64{2, 4, 6})
 	plan, err := Compile(AllValues(first, bitmapidx.StringValue("x")), AllValues(second, bitmapidx.StringValue("x")))
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestSearchWithMetricsCancellationAndNil(t *testing.T) {
 
 func TestSearchWithMetricsBufferedTimestampAndEmptyFilter(t *testing.T) {
 	const quantum = uint64(1) << timeidx.TimestampShift
-	field := benchmarkEnumField(t, 134, "x", []uint64{1})
+	namespaceIndex := benchmarkEnumNamespace(t, 134, "x", []uint64{1})
 	timestamps, err := timeidx.New(timeidx.Spec{Entries: []timeidx.Entry{
 		{ImageID: 1, Timestamp: quantum},
 		{ImageID: 3, Timestamp: 2 * quantum},
@@ -129,16 +129,16 @@ func TestSearchWithMetricsBufferedTimestampAndEmptyFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = timestamps.Close() })
-	plan, err := Compile(AllValues(field, bitmapidx.StringValue("x")), During(timestamps, quantum, 3*quantum))
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("x")), During(timestamps, quantum, 3*quantum))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := field.Add(
-		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("x")},
-		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("x")},
-	); err != nil {
-		t.Fatal(err)
-	}
+	commitBitmap(t, namespaceIndex, func(bt *bitmapidx.Batch) error {
+		return bt.Add(
+			bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("x")},
+			bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("x")},
+		)
+	})
 	metrics := NewSearchMetrics(plan)
 	ctx := context.Background()
 	got, err := plan.SearchWithMetrics(ctx, nil, nil, metrics)

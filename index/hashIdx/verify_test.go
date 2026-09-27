@@ -9,7 +9,7 @@ import (
 
 func mustVerifyStore(t *testing.T, dir string) {
 	t.Helper()
-	store, err := NewStore(dir, StoreSpec{Exact: ExactSpec{Algorithm: AlgorithmSHA256}}, DurabilityOS)
+	store, err := NewStore(dir, testStoreSpec(), DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

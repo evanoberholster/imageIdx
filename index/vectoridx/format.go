@@ -8,7 +8,8 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 var _ = atomic.LoadInt32
@@ -21,6 +22,11 @@ var _ = atomic.LoadInt32
 // 32-byte entries; region payloads follow packed and 8-byte aligned.
 //
 // Region kinds: 1=NodeMeta, 2=Vectors, 3=Graph, 4=Tombstones.
+//
+// The 16-bit identity field at header offset 24 is a plain common.Namespace.
+// The format is byte-identical to the era when it held a packed SpaceID: the
+// field was always one validated uint16, so no version bump is needed and old
+// files reopen with their old packed value read as a namespace.
 
 const (
 	vectorMagic0 = 'V'
@@ -51,7 +57,7 @@ var vectorMagic = [8]byte{
 
 type fileHeader struct {
 	generation     uint64
-	spaceID        SpaceID
+	namespace      common.Namespace
 	elem           ElementType
 	metric         uint8
 	dims           uint16
@@ -80,7 +86,7 @@ func encodeHeader(dst []byte, h fileHeader) {
 	binary.LittleEndian.PutUint32(dst[8:12], vectorFormatVersion)
 	binary.LittleEndian.PutUint32(dst[12:16], vectorHeaderSize)
 	binary.LittleEndian.PutUint64(dst[16:24], h.generation)
-	binary.LittleEndian.PutUint16(dst[24:26], uint16(h.spaceID))
+	binary.LittleEndian.PutUint16(dst[24:26], uint16(h.namespace))
 	dst[26] = byte(h.elem)
 	dst[27] = h.metric
 	binary.LittleEndian.PutUint16(dst[28:30], h.dims)
@@ -126,7 +132,7 @@ func decodeHeader(data []byte) (fileHeader, error) {
 		return h, ErrCorruptStorage
 	}
 	h.generation = binary.LittleEndian.Uint64(data[16:24])
-	h.spaceID = SpaceID(binary.LittleEndian.Uint16(data[24:26]))
+	h.namespace = common.Namespace(binary.LittleEndian.Uint16(data[24:26]))
 	h.elem = ElementType(data[26])
 	h.metric = data[27]
 	h.dims = binary.LittleEndian.Uint16(data[28:30])
@@ -189,7 +195,7 @@ func decodeFile(data []byte) (fileHeader, [][]byte, error) {
 	}
 	dirOff := uint64(vectorHeaderSize)
 	dirLen := uint64(4 * regionEntrySize)
-	dirEnd, ok := indexutil.CheckedEnd(dirOff, 1, dirLen, uint64(len(data)))
+	dirEnd, ok := storage.CheckedEnd(dirOff, 1, dirLen, uint64(len(data)))
 	if !ok || dirEnd > uint64(len(data)) {
 		return h, nil, ErrCorruptStorage
 	}
@@ -201,7 +207,7 @@ func decodeFile(data []byte) (fileHeader, [][]byte, error) {
 			return h, nil, ErrCorruptStorage
 		}
 		seen[entry.kind] = true
-		end, ok := indexutil.CheckedEnd(entry.offset, 1, entry.length, uint64(len(data)))
+		end, ok := storage.CheckedEnd(entry.offset, 1, entry.length, uint64(len(data)))
 		if !ok || end > uint64(len(data)) {
 			return h, nil, ErrCorruptStorage
 		}
@@ -412,7 +418,7 @@ func (v *VectorIdx) writeBaseLocked() error {
 	v.checkpointLSNPub.Store(v.checkpointLSN)
 	h := fileHeader{
 		generation:     v.gen.Load(),
-		spaceID:        snap.cfg.SpaceID,
+		namespace:      snap.cfg.Namespace,
 		elem:           snap.cfg.ElementType,
 		metric:         snap.cfg.Metric,
 		dims:           uint16(snap.cfg.Dimensions),
@@ -433,7 +439,7 @@ func (v *VectorIdx) writeBaseLocked() error {
 	total := dirOff + uint64(4*regionEntrySize)
 	offsets := make([]uint64, 4)
 	for i, p := range payloads {
-		total = indexutil.Align(total, 8)
+		total = storage.Align(total, 8)
 		offsets[i] = total
 		total += uint64(len(p))
 	}
@@ -451,7 +457,7 @@ func (v *VectorIdx) writeBaseLocked() error {
 	}
 	dir := filepath.Dir(v.path)
 	base := filepath.Base(v.path)
-	if err := indexutil.WriteFileAtomic(dir, base+".tmp", base, file, 0o644); err != nil {
+	if err := storage.WriteFileAtomic(dir, base+".tmp", base, file, 0o644); err != nil {
 		return err
 	}
 	return nil

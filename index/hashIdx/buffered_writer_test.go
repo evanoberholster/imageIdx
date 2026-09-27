@@ -8,7 +8,7 @@ import (
 
 func testWriterIndex(t *testing.T, dir string) *Index {
 	t.Helper()
-	idx, err := newIndex(dir, Config{}, DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{}), DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

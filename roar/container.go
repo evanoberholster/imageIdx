@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/evanoberholster/imageIdx/internal/indexutil"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar/internal/bitmapkernel"
 )
 
@@ -333,7 +333,7 @@ func putUint16s(dst []byte, values []uint16) {
 	if len(values) == 0 {
 		return
 	}
-	if indexutil.HostIsLittleEndian() {
+	if storage.HostIsLittleEndian() {
 		copy(dst, unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(values))), len(values)*2))
 		return
 	}

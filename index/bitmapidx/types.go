@@ -1,11 +1,11 @@
-// Package bitmapidx implements immutable, copy-on-write field indexes over
-// database-wide image identifiers (imageidx.ImageID).
+// Package bitmapidx implements immutable, copy-on-write namespace indexes over
+// database-wide image identifiers (common.ImageID).
 //
-// A FieldIndex owns all postings for one typed field. Values are
-// canonicalized according to the persisted field definition and may be enum,
+// A NamespaceIndex owns all postings for one typed namespace. Values are
+// canonicalized according to the persisted namespace definition and may be enum,
 // bool, text, continuous, or geographic values. The dictionary maps hashed
 // values to collision slots; postings map each value to the images holding
-// it. A fieldView is one atomically published snapshot of base postings,
+// it. A namespaceView is one atomically published snapshot of base postings,
 // frozen/active deltas, and the dictionary.
 //
 // Concurrency: readers load one published view and take no locks; writers
@@ -22,45 +22,20 @@ package bitmapidx
 import (
 	"errors"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // ImageID is the database-wide identifier type shared by all index packages.
-type ImageID = imageidx.ImageID
+type ImageID = common.ImageID
 
 // UserID is the database-wide user principal type shared by all index
 // packages.
-type UserID = imageidx.UserID
+type UserID = common.UserID
 
 // GroupID is the database-wide group principal type shared by all index
 // packages.
-type GroupID = imageidx.GroupID
-
-// IndexType identifies a database field (location, person, album, and so
-// on). The concrete registry is database-defined. Zero is reserved and
-// never a valid field.
-type IndexType uint16
-
-const (
-	IndexTypeLocation IndexType = iota + 1
-	IndexTypePerson
-	IndexTypeAlbum
-	IndexTypeTag
-	IndexTypeObject
-	IndexTypeEvent
-
-	// v3 additions
-	IndexTypeRating
-	IndexTypeColorLabel
-	IndexTypeFlag
-
-	// Reserved field IDs for access-control postings: one KindEnum field
-	// per principal kind, so the stored key IS the uint64 user or group ID
-	// in fixed 8-byte form. Principal encoding and policy live in search
-	// (search.UserACL/search.GroupACL); this package stores opaque values.
-	IndexTypeUserACL
-	IndexTypeGroupACL
-)
+type GroupID = common.GroupID
 
 var (
 	// ErrClosed reports a write or maintenance operation on a closed index
@@ -83,9 +58,26 @@ var (
 // Durability controls persistent WAL synchronization. DurabilityOS returns
 // once the frame is visible to the OS; DurabilitySync fsyncs before
 // returning. It is a store-wide policy, not part of the persisted format.
-type Durability = imageidx.Durability
+type Durability = common.Durability
 
 const (
-	DurabilityOS   = imageidx.DurabilityOS
-	DurabilitySync = imageidx.DurabilitySync
+	DurabilityOS   = common.DurabilityOS
+	DurabilitySync = common.DurabilitySync
+)
+
+// storeLockName is the never-unlinked lock file inside a store directory;
+// every opener must lock the same inode.
+const storeLockName = ".bitmapidx.lock"
+
+var (
+	// ErrStoreExists reports creating a store in a non-empty directory.
+	ErrStoreExists = storage.ErrExists
+	// ErrStoreBusy reports another process holding the store lock.
+	ErrStoreBusy = storage.ErrBusy
+	// ErrOwnedIndex reports Close on a store-owned NamespaceIndex. Close the
+	// owning Index instead; it owns all child and mmap lifetimes.
+	ErrOwnedIndex = errors.New("bitmapidx: close the owning store instead")
+	// ErrRecoveryRequired reports a WAL failure that leaves the store
+	// failed until recovery. It aliases storage.ErrWALFailed.
+	ErrRecoveryRequired = storage.ErrWALFailed
 )

@@ -1,7 +1,7 @@
 # Search execution benchmarks
 
 Measured on Apple M4 Pro (`darwin/arm64`) with Go's benchmark harness. The
-in-memory fixture has 100,000 IDs present in two compacted enum fields. Each
+in-memory fixture has 100,000 IDs present in two compacted enum namespaces. Each
 operation uses a reused workspace and destination slice. The persistent fixture
 has the same memberships, written with OS durability and checkpointed before
 measurement. Results are the range of three isolated runs at 250 ms per run.
@@ -44,7 +44,7 @@ pages are not represented by these timings.
 
 ## Opt-in search metrics
 
-`BenchmarkSearchMetrics` runs the same two-enum-field plan through `Search`
+`BenchmarkSearchMetrics` runs the same two-enum-namespace plan through `Search`
 and `SearchWithMetrics`, reusing the workspace, result buffer and metrics
 report. Apple M4 Pro, five isolated 250 ms runs, `darwin/arm64`:
 

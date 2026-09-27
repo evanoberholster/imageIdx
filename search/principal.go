@@ -4,61 +4,62 @@ import (
 	"encoding/binary"
 	"errors"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
 // ErrInvalidPrincipal reports the reserved zero user or group ID.
 var ErrInvalidPrincipal = errors.New("search: invalid principal")
 
-// ACL principals come in two kinds, each with its own KindEnum field:
-// bitmapidx.IndexTypeUserACL holds user IDs, bitmapidx.IndexTypeGroupACL
-// holds group IDs. The field IS the namespace and the stored key IS the
-// uint64 ID in fixed 8-byte little-endian form — no prefixes, no
-// separators, no variable lengths. Hash domain separation over the field
-// type keeps equal IDs in different fields (or in ordinary enum fields)
-// fully distinct.
+// ACL principals come in two kinds, each with its own KindEnum namespace:
+// common.NamespaceUserACL holds user IDs, common.NamespaceGroupACL
+// holds group IDs. The namespace IS the stored key domain and the stored
+// key IS the uint64 ID in fixed 8-byte little-endian form — no prefixes,
+// no separators, no variable lengths. Hash domain separation over the
+// namespace keeps equal IDs in different namespaces (or in ordinary enum
+// namespaces) fully distinct.
 //
 // A search-time ACL check unions one user's posting with the postings for
 // the user's authenticated groups. Each value's posting — the bitmap named
 // by one principal — holds exactly the ImageIDs granted to that principal.
 // Callers must authenticate group membership before supplying group IDs;
 // this package stores image grants, not user-to-group membership.
-// UserACL is one user principal for the bitmapidx.IndexTypeUserACL field:
-// a KindEnum field whose values are uint64 user IDs, each naming the images
-// one user may see. The zero value is invalid; construct with NewUserACL.
+// UserACL is one user principal for the common.NamespaceUserACL namespace:
+// a KindEnum namespace whose values are uint64 user IDs, each naming the
+// images one user may see. The zero value is invalid; construct with
+// NewUserACL.
 //
-// Direct user grants live in this field. Group grants live separately in
+// Direct user grants live in this namespace. Group grants live separately in
 // GroupACL and are unioned at search time using authenticated group IDs.
-type UserACL = principal[imageidx.UserID]
+type UserACL = principal[common.UserID]
 
 // NewUserACL validates id and returns its principal. Only the reserved
 // zero ID is rejected, mirroring the reserved ImageID zero.
-func NewUserACL(id imageidx.UserID) (UserACL, error) { return newPrincipal(id) }
+func NewUserACL(id common.UserID) (UserACL, error) { return newPrincipal(id) }
 
-// GroupACL is one group principal for the bitmapidx.IndexTypeGroupACL
-// field. Its posting records images granted to the group; search unions it
-// with the direct user posting for authenticated groups. It also supports
-// grant audits via ValueIDs. The zero value is invalid; construct with
-// NewGroupACL.
-type GroupACL = principal[imageidx.GroupID]
+// GroupACL is one group principal for the common.NamespaceGroupACL
+// namespace. Its posting records images granted to the group; search unions
+// it with the direct user posting for authenticated groups. It also
+// supports grant audits via ValueIDs. The zero value is invalid; construct
+// with NewGroupACL.
+type GroupACL = principal[common.GroupID]
 
 // NewGroupACL validates id and returns its principal, under the same rule
 // as NewUserACL.
-func NewGroupACL(id imageidx.GroupID) (GroupACL, error) { return newPrincipal(id) }
+func NewGroupACL(id common.GroupID) (GroupACL, error) { return newPrincipal(id) }
 
 // ParseUserACL recovers the principal from canonical dictionary bytes, as
 // returned by LookupValue or Iterate. Anything but exactly 8 bytes
-// reports false; within a dedicated user field every surviving value is
-// a principal by construction.
+// reports false; within a dedicated user namespace every surviving value
+// is a principal by construction.
 func ParseUserACL(canonical []byte) (UserACL, bool) {
-	return parsePrincipal[imageidx.UserID](canonical)
+	return parsePrincipal[common.UserID](canonical)
 }
 
 // ParseGroupACL recovers the principal from canonical dictionary bytes,
 // mirroring ParseUserACL.
 func ParseGroupACL(canonical []byte) (GroupACL, bool) {
-	return parsePrincipal[imageidx.GroupID](canonical)
+	return parsePrincipal[common.GroupID](canonical)
 }
 
 // principal is the shared implementation behind UserACL and GroupACL. The

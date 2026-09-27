@@ -8,7 +8,7 @@ import (
 	"slices"
 	"time"
 
-	imageidx "github.com/evanoberholster/imageIdx"
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
@@ -16,7 +16,7 @@ import (
 // RankedResult preserves the ranker's native score precision. Lower scores
 // sort first; equal scores break ties by ascending ImageID.
 type RankedResult[S uint64 | float64] struct {
-	ImageID imageidx.ImageID
+	ImageID common.ImageID
 	Score   S
 }
 
@@ -261,11 +261,11 @@ func FilterTime(dst, candidates []ImageID, lookup timeidx.ExactTimestampFunc, st
 // appends nothing; invalid cells join ErrInvalidClause. Like FilterTime it
 // has no Context form: cell expansion is the only index-independent work
 // and the probe itself is bounded by the candidate list.
-func FilterGeo(dst, candidates []ImageID, index *bitmapidx.FieldIndex, cellIDs ...uint64) ([]ImageID, error) {
+func FilterGeo(dst, candidates []ImageID, index *bitmapidx.NamespaceIndex, cellIDs ...uint64) ([]ImageID, error) {
 	if index == nil || len(cellIDs) == 0 {
 		return dst, nil
 	}
-	if index.Field().Kind != bitmapidx.KindGeo {
+	if index.Spec().Kind != bitmapidx.KindGeo {
 		return dst, ErrInvalidClause
 	}
 	ranges, err := bitmapidx.RangesFromCellIDs(nil, cellIDs)
@@ -284,7 +284,7 @@ func FilterGeo(dst, candidates []ImageID, index *bitmapidx.FieldIndex, cellIDs .
 // Because the plan is applied
 // after ranking, a selective plan can under-fill; over-fetch from the ranked
 // source, or filter during ANN traversal with a CandidateFilter instead.
-func (plan Plan) FilterRanked[T any](ctx context.Context, dst []Result, workspace *Workspace, ranked []T, imageID func(T) (imageidx.ImageID, bool), score func(T) uint64) ([]Result, error) {
+func (plan Plan) FilterRanked[T any](ctx context.Context, dst []Result, workspace *Workspace, ranked []T, imageID func(T) (common.ImageID, bool), score func(T) uint64) ([]Result, error) {
 	if len(ranked) == 0 || plan.IsEmpty() {
 		return dst, ctx.Err()
 	}

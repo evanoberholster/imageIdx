@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // stressInt reads an environment override for a stress parameter, falling
@@ -33,7 +35,7 @@ func idsSortedUnique(ids []ImageID) bool {
 }
 
 // TestStressMixedWorkload drives disjoint writers across enum, text,
-// continuous, and geo fields while readers query and a maintainer
+// continuous, and geo namespaces while readers query and a maintainer
 // checkpoints, vacuums, and compacts the persistent store. After the writers
 // stop it folds the deltas, reopens the store from disk, and verifies every
 // membership against the writers' reference model.
@@ -46,10 +48,10 @@ func TestStressMixedWorkload(t *testing.T) {
 	rounds := stressInt("BITMAPIDX_STRESS_ROUNDS", 24)
 	const idsPerWriter = 192
 	const (
-		enumType       = IndexType(100)
-		textType       = IndexType(101)
-		continuousType = IndexType(102)
-		geoType        = IndexType(103)
+		enumType       = common.Namespace(100)
+		textType       = common.Namespace(101)
+		continuousType = common.Namespace(102)
+		geoType        = common.Namespace(103)
 	)
 
 	keys := make([]uint64, 0, 32)
@@ -64,9 +66,9 @@ func TestStressMixedWorkload(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	config := FieldConfig{ActiveTarget: 64, HardDeltaLimit: 256, MaxDeltaValues: 32}
-	store, err := NewIndex(dir, []Field{
-		enumField(enumType), textField(textType), continuousField(continuousType), geoFieldFor(geoType),
+	config := NamespaceConfig{ActiveTarget: 64, HardDeltaLimit: 256, MaxDeltaValues: 32}
+	store, err := NewIndex(dir, []NamespaceSpec{
+		enumNamespace(enumType), textNamespace(textType), continuousNamespace(continuousType), geoNamespaceFor(geoType),
 	}, config, DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
@@ -107,6 +109,29 @@ func TestStressMixedWorkload(t *testing.T) {
 			curGeo := make([]uint64, idsPerWriter)
 			prevText := make([][]string, idsPerWriter)
 			prevCont := make([]int64, idsPerWriter)
+			tagBatch := tag.NewBatch()
+			defer tagBatch.Close()
+			titleBatch := title.NewBatch()
+			defer titleBatch.Close()
+			isoBatch := iso.NewBatch()
+			defer isoBatch.Close()
+			locBatch := loc.NewBatch()
+			defer locBatch.Close()
+			apply := func(batch *Batch, stage func(*Batch) error) bool {
+				if err := batch.Reset(); err != nil {
+					fail(err)
+					return false
+				}
+				if err := stage(batch); err != nil {
+					fail(err)
+					return false
+				}
+				if err := batch.Apply(); err != nil {
+					fail(err)
+					return false
+				}
+				return true
+			}
 			for round := 0; round < rounds; round++ {
 				enumAdds := make([]Entry, 0, idsPerWriter)
 				textChanges := make([]TextReplacement, 0, idsPerWriter)
@@ -141,21 +166,23 @@ func TestStressMixedWorkload(t *testing.T) {
 
 					exp[i] = expect{enumValue: enumValue, cont: toCont, geo: toGeo}
 				}
-				if err := tag.Apply(FieldMutation{Add: enumAdds}); err != nil {
-					fail(err)
+				if !apply(tagBatch, func(b *Batch) error { return b.Add(enumAdds...) }) {
 					return
 				}
-				if err := title.ReplaceText(textChanges...); err != nil {
-					fail(err)
+				if !apply(titleBatch, func(b *Batch) error { return b.ReplaceText(textChanges...) }) {
 					return
 				}
-				if err := iso.Move(contMoves...); err != nil {
-					fail(err)
+				if !apply(isoBatch, func(b *Batch) error { return b.Move(contMoves...) }) {
 					return
 				}
-				if err := loc.Move(geoMoves...); err != nil {
-					fail(err)
+				if !apply(locBatch, func(b *Batch) error { return b.Move(geoMoves...) }) {
 					return
+				}
+				for _, index := range []*NamespaceIndex{tag, title, iso, loc} {
+					if err := index.Barrier(); err != nil {
+						fail(err)
+						return
+					}
 				}
 			}
 			reference[w] = exp
@@ -163,7 +190,7 @@ func TestStressMixedWorkload(t *testing.T) {
 	}
 
 	// Maintenance: alternate checkpoint and vacuum, with an occasional
-	// field-level compact to exercise rotation and dictionary sealing.
+	// namespace-level compact to exercise rotation and dictionary sealing.
 	workersWG.Add(1)
 	go func() {
 		defer workersWG.Done()
@@ -242,7 +269,7 @@ func TestStressMixedWorkload(t *testing.T) {
 				}
 				loc.EstimateGeoRanges([]GeoRange{{Start: 0, End: ^uint64(0)}})
 				loc.AppendTo(nil)
-				title.Prefix([]byte("shared"), func(FieldKey, []byte) bool { return true })
+				title.Prefix([]byte("shared"), func(NamespaceKey, []byte) bool { return true })
 				if ids := tag.AppendTo(nil); !idsSortedUnique(ids) {
 					fail(errors.New("AppendTo not sorted unique"))
 					return
@@ -259,7 +286,7 @@ func TestStressMixedWorkload(t *testing.T) {
 		store.Close()
 		t.Fatalf("stress workload error: %v", firstErr)
 	}
-	for _, index := range store.Fields() {
+	for _, index := range store.Namespaces() {
 		if err := index.WaitIdle(context.Background()); err != nil {
 			t.Fatalf("WaitIdle: %v", err)
 		}
@@ -332,16 +359,24 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 		t.Skip("stress test")
 	}
 	dir := t.TempDir()
-	store, err := NewIndex(dir, []Field{geoFieldFor(IndexTypeLocation)}, FieldConfig{}, DurabilityOS)
+	store, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
-	loc, _ := store.Lookup(IndexTypeLocation)
+	loc, _ := store.Lookup(common.NamespaceLocation)
 	key := sfKey(t)
+	seed := loc.NewBatch()
 	for id := 1; id <= 512; id++ {
-		if err := loc.Move(Move{ImageID: ImageID(id), To: int64(key)}); err != nil {
+		if err := seed.Move(Move{ImageID: ImageID(id), To: int64(key)}); err != nil {
 			t.Fatalf("Move: %v", err)
 		}
+	}
+	if err := seed.Apply(); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	seed.Close()
+	if err := loc.Barrier(); err != nil {
+		t.Fatalf("Barrier: %v", err)
 	}
 	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint: %v", err)

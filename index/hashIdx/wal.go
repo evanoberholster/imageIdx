@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 
-	"github.com/evanoberholster/imageIdx/internal/persist"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 const (
@@ -28,12 +28,14 @@ const (
 //	8:12 record count
 //	12:16 payload length (count * 48)
 //	24:28 CRC32/IEEE of payload
-func openHashWAL(path string) (*persist.WAL, error) {
-	return persist.OpenWAL(path, walHeaderSize+4096*walEntrySize)
+func openHashWAL(path string) (*storage.WAL, error) {
+	return storage.OpenWAL(path, walHeaderSize+4096*walEntrySize)
 }
 
 // appendHashWAL frames one Apply batch so it is atomically replayable.
-func appendHashWAL(w *persist.WAL, entries []Entry, durability Durability) error {
+// Group commits append every frame unsynced and fsync once for the whole
+// group, so sync only requests the fsync; the frame always appends.
+func appendHashWAL(w *storage.WAL, entries []Entry, sync bool) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -57,7 +59,7 @@ func appendHashWAL(w *persist.WAL, entries []Entry, durability Durability) error
 		offset += walEntrySize
 	}
 	binary.LittleEndian.PutUint32(record[24:28], crc32.ChecksumIEEE(record[walHeaderSize:]))
-	return w.WriteRecord(record, durability == DurabilitySync)
+	return w.WriteRecord(record, sync)
 }
 
 // replayHashWAL returns every complete valid batch after offset, flattened in
@@ -65,7 +67,7 @@ func appendHashWAL(w *persist.WAL, entries []Entry, durability Durability) error
 // structural corruption returns ErrCorruptWAL.
 func replayHashWAL(path string, offset int64) ([]Entry, error) {
 	var entries []Entry
-	err := persist.Replay(path, offset, persist.FrameSpec{
+	err := storage.Replay(path, offset, storage.FrameSpec{
 		HeaderSize: walHeaderSize,
 		Magic:      walMagic,
 		Version:    walVersion,
@@ -119,15 +121,15 @@ type walRecord struct {
 	op      uint8
 }
 
-func openExactWAL(path string, maxBatch int) (*persist.WAL, error) {
+func openExactWAL(path string, maxBatch int) (*storage.WAL, error) {
 	if maxBatch < 1 {
 		maxBatch = 1
 	}
-	return persist.OpenWAL(path, exactWALHeaderSize+maxBatch*exactWALOpSize)
+	return storage.OpenWAL(path, exactWALHeaderSize+maxBatch*exactWALOpSize)
 }
 
 // appendExactWAL frames one add/remove batch with its sequence number.
-func appendExactWAL(w *persist.WAL, adds, removes []ExactEntry, durability Durability, seq uint64) error {
+func appendExactWAL(w *storage.WAL, adds, removes []ExactEntry, durability Durability, seq uint64) error {
 	count := len(adds) + len(removes)
 	if count == 0 {
 		return nil
@@ -166,7 +168,7 @@ func appendExactWAL(w *persist.WAL, adds, removes []ExactEntry, durability Durab
 func replayExactWAL(path string, offset int64) ([][]walRecord, uint64, error) {
 	var batches [][]walRecord
 	var maxSeq uint64
-	err := persist.Replay(path, offset, persist.FrameSpec{
+	err := storage.Replay(path, offset, storage.FrameSpec{
 		HeaderSize: exactWALHeaderSize, Magic: exactWALMagic, Version: exactWALVersion, Corrupt: ErrCorruptWAL,
 	}, func(header []byte) (uint64, error) {
 		count := int(binary.LittleEndian.Uint32(header[8:12]))
