@@ -3,28 +3,31 @@ package search
 import (
 	"context"
 	"time"
+
+	searchmetrics "github.com/evanoberholster/imageIdx/search/metrics"
 )
 
-// SearchOperation identifies the execution measured by SearchMetrics.
-type SearchOperation uint8
+// SearchOperation identifies the execution measured by SearchMetrics. It is
+// an alias for the shared search/metrics vocabulary; see search/metrics.
+type SearchOperation = searchmetrics.SearchOperation
 
 const (
-	OperationSearch SearchOperation = iota + 1
-	OperationFilterIDs
-	OperationRankTime
-	OperationRankGeo
+	OperationSearch    = searchmetrics.OperationSearch
+	OperationFilterIDs = searchmetrics.OperationFilterIDs
+	OperationRankTime  = searchmetrics.OperationRankTime
+	OperationRankGeo   = searchmetrics.OperationRankGeo
 )
 
-// StageMode describes how a stage ran. A stage not reached because an earlier
-// stage emptied the candidates has StageModeSkipped.
-type StageMode uint8
+// StageMode describes how a stage ran. It is an alias for the shared
+// search/metrics vocabulary; see search/metrics.
+type StageMode = searchmetrics.StageMode
 
 const (
-	StageModeSkipped StageMode = iota
-	StageModeSource
-	StageModeFilter
-	StageModeCollectIntersect
-	StageModeBufferedFilter
+	StageModeSkipped          = searchmetrics.StageModeSkipped
+	StageModeSource           = searchmetrics.StageModeSource
+	StageModeFilter           = searchmetrics.StageModeFilter
+	StageModeCollectIntersect = searchmetrics.StageModeCollectIntersect
+	StageModeBufferedFilter   = searchmetrics.StageModeBufferedFilter
 )
 
 // StageMetrics describes one plan stage in the order returned by Plan.Stages.
@@ -52,17 +55,17 @@ func (s StageMetrics) Rejected() uint64 {
 	return s.Input - s.Passed
 }
 
-// RankMetrics describes score work after plan filtering. ScoreDuration includes
-// canonical lookup, scoring, and top-k heap maintenance, measured per batch;
-// SortDuration covers the final result sort. Neither includes filter stages.
-type RankMetrics struct {
-	K             int
-	Candidates    uint64
-	Scored        uint64
-	Skipped       uint64
-	ScoreDuration time.Duration
-	SortDuration  time.Duration
-}
+// RankMetrics describes score work after plan filtering. It is an alias for
+// the shared search/metrics report so search and search/ranking fill the
+// same fields with the same meanings; see search/metrics for the contract.
+type RankMetrics = searchmetrics.RankMetrics
+
+// Compile-time proof that the aliases track the shared types.
+var (
+	_ searchmetrics.RankMetrics     = RankMetrics{}
+	_ searchmetrics.SearchOperation = SearchOperation(0)
+	_ searchmetrics.StageMode       = StageMode(0)
+)
 
 // SearchMetrics is one caller-owned execution report. Reuse it sequentially;
 // never share one instance between concurrent searches. Counts describe work
