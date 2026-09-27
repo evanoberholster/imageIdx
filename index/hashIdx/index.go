@@ -95,7 +95,7 @@ func (i *Index) Add(entry Entry) error { return i.Apply([]Entry{entry}) }
 // Config.MaxBatchEntries fail with ErrBatchTooLarge before any WAL or view
 // work. Batches queued while the commit loop is busy are coalesced into one
 // WAL sync and one view publication, so N concurrent writers pay one fsync
-// per group under DurabilitySync. A WAL failure latches
+// per group under common.DurabilitySync. A WAL failure latches
 // ErrRecoveryRequired: the view is untouched, and later writes fail fast
 // with it until close and reopen.
 func (i *Index) Apply(entries []Entry) error {
@@ -128,7 +128,7 @@ func (i *Index) Apply(entries []Entry) error {
 // commitGroup is the commit.Queue callback. It holds writerMu for the whole
 // group, so it serializes with Checkpoint, Vacuum, and Close. It appends
 // one WAL frame per request, syncs once for the group under
-// DurabilitySync, merges the group into a single page append, and then
+// common.DurabilitySync, merges the group into a single page append, and then
 // completes every waiter. Readers never interact with it: publication
 // stays one atomic view store, so reads keep their zero-lock guarantee.
 //
@@ -154,7 +154,7 @@ func (i *Index) commitGroup(group []*applyRequest) {
 			break
 		}
 	}
-	if walErr == nil && i.persistence.durability == DurabilitySync {
+	if walErr == nil && i.persistence.durability == common.DurabilitySync {
 		walErr = i.persistence.wal.Sync()
 	}
 	i.persistence.mu.Unlock()
@@ -297,7 +297,7 @@ func (i *Index) Close() error {
 // pageView is one immutable sealed page. Each plane has exactly count()
 // elements; the planes are never mutated after publication.
 type pageView struct {
-	imageIDs []ImageID
+	imageIDs []common.ImageID
 	phash64  []uint64
 	pdq      [4][]uint64
 }
@@ -311,7 +311,7 @@ func (p *pageView) count() int { return len(p.imageIDs) }
 // The writer never rewrites a published slot, which is what keeps readers
 // lock-free without copying the active page on every publish.
 type activePage struct {
-	imageIDs []ImageID
+	imageIDs []common.ImageID
 	phash64  []uint64
 	pdq      [4][]uint64
 }
@@ -330,7 +330,7 @@ func newActivePage(recordsPerPage int) *activePage {
 		off += recordsPerPage
 	}
 	return &activePage{
-		imageIDs: make([]ImageID, recordsPerPage),
+		imageIDs: make([]common.ImageID, recordsPerPage),
 		phash64:  phash,
 		pdq:      pdq,
 	}

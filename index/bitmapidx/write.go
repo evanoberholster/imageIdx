@@ -5,6 +5,7 @@ import (
 	"slices"
 	"time"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/textanalyzer"
 	"github.com/evanoberholster/imageIdx/roar"
 )
@@ -16,7 +17,7 @@ import (
 // genuinely new dictionary values. Owner pre-checks are conservative:
 // entry counts scale by batchFanoutBound and byte budgets cap source
 // bytes; the WAL encoder enforces exact membership limits later.
-func (i *NamespaceIndex) prepare(namespace NamespaceSpec, mutation namespaceMutation) ([]stagedChange, error) {
+func (i *Index) prepare(namespace NamespaceSpec, mutation namespaceMutation) ([]stagedChange, error) {
 	if len(mutation.Add) == 0 && len(mutation.Remove) == 0 {
 		return nil, nil
 	}
@@ -109,10 +110,10 @@ func (i *NamespaceIndex) prepare(namespace NamespaceSpec, mutation namespaceMuta
 // canonical is nil for continuous and geo values, which have no
 // dictionary entry; every other kind returns bytes that must resolve to a
 // slotted key. Empty enum bytes normalize to an empty non-nil slice.
-func (i *NamespaceIndex) keyForValue(namespace NamespaceSpec, value Value) (NamespaceKey, []byte, error) {
+func (i *Index) keyForValue(namespace NamespaceSpec, value Value) (NamespaceKey, []byte, error) {
 	switch namespace.Kind {
-	case KindEnum:
-		if value.Kind != KindEnum {
+	case common.KindBitmapEnum:
+		if value.Kind != common.KindBitmapEnum {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		canonical, err := normalizeEnum(namespace.Normalizer, value.Bytes)
@@ -125,31 +126,31 @@ func (i *NamespaceIndex) keyForValue(namespace NamespaceSpec, value Value) (Name
 		if canonical == nil {
 			canonical = []byte{}
 		}
-		return hashCanonical(namespace.Namespace, KindEnum, canonical), canonical, nil
-	case KindBool:
-		if value.Kind != KindBool {
+		return hashCanonical(namespace.Namespace, common.KindBitmapEnum, canonical), canonical, nil
+	case common.KindBitmapBool:
+		if value.Kind != common.KindBitmapBool {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		canonical := []byte{'0'}
 		if value.Bool {
 			canonical[0] = '1'
 		}
-		return hashCanonical(namespace.Namespace, KindBool, canonical), canonical, nil
-	case KindText:
-		if value.Kind != KindText {
+		return hashCanonical(namespace.Namespace, common.KindBitmapBool, canonical), canonical, nil
+	case common.KindBitmapString:
+		if value.Kind != common.KindBitmapString {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		if len(value.Bytes) > MaxValueBytes {
 			return NamespaceKey{}, nil, ErrValueTooLong
 		}
-		return hashCanonical(namespace.Namespace, KindText, value.Bytes), value.Bytes, nil
-	case KindContinuous:
-		if value.Kind != KindContinuous {
+		return hashCanonical(namespace.Namespace, common.KindBitmapString, value.Bytes), value.Bytes, nil
+	case common.KindBitmapContinuous:
+		if value.Kind != common.KindBitmapContinuous {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		return continuousKey(namespace.Namespace, value.Int), nil, nil
-	case KindGeo:
-		if value.Kind != KindGeo {
+	case common.KindBitmapGeo:
+		if value.Kind != common.KindBitmapGeo {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		if value.Int < 0 {
@@ -176,7 +177,7 @@ func (i *NamespaceIndex) keyForValue(namespace NamespaceSpec, value Value) (Name
 // no phantom value survives. Rotation policy: hard limits fold into Base
 // synchronously, ActiveTarget rotates Active to Frozen and schedules
 // background compaction.
-func (i *NamespaceIndex) applyChangesReplay(changes []stagedChange) error {
+func (i *Index) applyChangesReplay(changes []stagedChange) error {
 	i.writerMu.Lock()
 	defer i.writerMu.Unlock()
 	if i.closed.Load() {
@@ -215,7 +216,7 @@ func (i *NamespaceIndex) applyChangesReplay(changes []stagedChange) error {
 // freezes its WAL frame for store-owned indexes. It performs every fallible
 // step before the caller appends to the WAL; a failure rolls the dictionary
 // writer back through the caller's deferred restore.
-func (i *NamespaceIndex) resolveBatch(current *namespaceView, changes []stagedChange, replay bool) (resolved []stagedChange, walPayload []byte, walUpdates uint32, err error) {
+func (i *Index) resolveBatch(current *namespaceView, changes []stagedChange, replay bool) (resolved []stagedChange, walPayload []byte, walUpdates uint32, err error) {
 	resolved, err = i.resolveChanges(current, changes)
 	if err != nil {
 		return nil, nil, 0, err
@@ -240,7 +241,7 @@ func (i *NamespaceIndex) resolveBatch(current *namespaceView, changes []stagedCh
 // Frozen, and Active layers for the next view. Hard limits fold Frozen and
 // Active into a replacement Base synchronously; otherwise a full Active
 // rotates to Frozen and the caller schedules background compaction.
-func (i *NamespaceIndex) planRotation(current *namespaceView, active *namespaceDelta) (base postingTable, frozen, next *namespaceDelta, rotate bool) {
+func (i *Index) planRotation(current *namespaceView, active *namespaceDelta) (base postingTable, frozen, next *namespaceDelta, rotate bool) {
 	switch {
 	case active != nil && (active.ids >= i.config.HardDeltaLimit || len(active.values) > i.config.MaxDeltaValues):
 		return current.effectiveTable(current.frozen, active), nil, nil, false
@@ -260,7 +261,7 @@ func (i *NamespaceIndex) planRotation(current *namespaceView, active *namespaceD
 // cursor because at most one output is produced per input, and each read
 // happens before the corresponding write, so reusing changes' backing is
 // safe and allocation-free. The returned slice aliases changes' storage.
-func (i *NamespaceIndex) resolveChanges(view *namespaceView, changes []stagedChange) ([]stagedChange, error) {
+func (i *Index) resolveChanges(view *namespaceView, changes []stagedChange) ([]stagedChange, error) {
 	out := changes[:0]
 	for read := range changes {
 		change := changes[read]
@@ -317,7 +318,7 @@ func composeNamespaceDelta(view *namespaceView, changes []stagedChange) *namespa
 		adds = subtractSortedIDs(adds, rems) // remove wins within the batch
 
 		old, _ := view.active.delta(change.key)
-		var oldAdds, oldRems []ImageID
+		var oldAdds, oldRems []common.ImageID
 		oldLen := 0
 		if old != nil {
 			if !old.additions.IsEmpty() {
@@ -333,7 +334,7 @@ func composeNamespaceDelta(view *namespaceView, changes []stagedChange) *namespa
 		// underlying layers: removals carry through, additions carry through.
 		stayingAdds := subtractSortedIDs(oldAdds, rems)
 		stayingRems := subtractSortedIDs(oldRems, adds)
-		var newAdds, newRems []ImageID
+		var newAdds, newRems []common.ImageID
 		for _, id := range adds {
 			// Already added: underlying lacks the ID. Covered by stayingAdds.
 			if containsSortedID(oldAdds, id) {
@@ -393,20 +394,20 @@ func composeNamespaceDelta(view *namespaceView, changes []stagedChange) *namespa
 // dedupeSortedIDs sorts ids in place and returns the unique prefix. The
 // input must be caller-owned; encode and compose both rely on sorted,
 // deduplicated columns.
-func dedupeSortedIDs(ids []ImageID) []ImageID {
+func dedupeSortedIDs(ids []common.ImageID) []common.ImageID {
 	slices.Sort(ids)
 	return slices.Compact(ids)
 }
 
 // containsSortedID binary-searches an ascending slice.
-func containsSortedID(ids []ImageID, id ImageID) bool {
+func containsSortedID(ids []common.ImageID, id common.ImageID) bool {
 	_, ok := slices.BinarySearch(ids, id)
 	return ok
 }
 
 // subtractSortedIDs returns values minus minus, both ascending and
 // unique. It reuses values backing when possible; callers must own values.
-func subtractSortedIDs(values, minus []ImageID) []ImageID {
+func subtractSortedIDs(values, minus []common.ImageID) []common.ImageID {
 	if len(values) == 0 || len(minus) == 0 {
 		return values
 	}
@@ -429,14 +430,14 @@ func subtractSortedIDs(values, minus []ImageID) []ImageID {
 
 // mergeSortedIDs returns the ascending union of two ascending, unique
 // slices. Empty inputs are returned without allocating.
-func mergeSortedIDs(first, second []ImageID) []ImageID {
+func mergeSortedIDs(first, second []common.ImageID) []common.ImageID {
 	if len(first) == 0 {
 		return second
 	}
 	if len(second) == 0 {
 		return first
 	}
-	out := make([]ImageID, 0, len(first)+len(second))
+	out := make([]common.ImageID, 0, len(first)+len(second))
 	left, right := 0, 0
 	for left < len(first) && right < len(second) {
 		switch {
@@ -457,13 +458,13 @@ func mergeSortedIDs(first, second []ImageID) []ImageID {
 }
 
 // publishLocked publishes a replacement view. The caller holds writerMu.
-func (i *NamespaceIndex) publishLocked(old *namespaceView, base postingTable, frozen, active *namespaceDelta) *namespaceView {
+func (i *Index) publishLocked(old *namespaceView, base postingTable, frozen, active *namespaceDelta) *namespaceView {
 	next := i.nextView(old, base, frozen, active)
 	i.view.Store(next)
 	return next
 }
 
-func (i *NamespaceIndex) nextView(old *namespaceView, base postingTable, frozen, active *namespaceDelta) *namespaceView {
+func (i *Index) nextView(old *namespaceView, base postingTable, frozen, active *namespaceDelta) *namespaceView {
 	return &namespaceView{
 		namespace:  old.namespace,
 		base:       base,
@@ -478,7 +479,7 @@ func (i *NamespaceIndex) nextView(old *namespaceView, base postingTable, frozen,
 // scheduleCompaction folds a rotated Frozen into Base in the background.
 // It captures the frozen pointer and publishes only if it is still
 // current, so superseded rotations are skipped safely.
-func (i *NamespaceIndex) scheduleCompaction(frozen *namespaceDelta) {
+func (i *Index) scheduleCompaction(frozen *namespaceDelta) {
 	i.workers.Add(1)
 	i.pending.Add(1)
 	go func() {
@@ -509,7 +510,7 @@ func (i *NamespaceIndex) scheduleCompaction(frozen *namespaceDelta) {
 // still have a posting in base. The caller holds writerMu. The local
 // rebuild stages, seals, and compacts, then swaps into the live writer
 // with one generation bump; the local seal's generation is discarded.
-func (i *NamespaceIndex) rebuildDictionary(view *namespaceView, base postingTable) {
+func (i *Index) rebuildDictionary(view *namespaceView, base postingTable) {
 	live := make(map[NamespaceKey]struct{}, len(base.keys))
 	for _, key := range base.keys {
 		live[key] = struct{}{}

@@ -2,6 +2,7 @@ package hashidx
 
 import (
 	"errors"
+	common "github.com/evanoberholster/imageIdx/common"
 	"testing"
 )
 
@@ -17,7 +18,7 @@ func breakWAL(t *testing.T, close func() error) {
 
 func TestPerceptualFailedWALRequiresRecovery(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := newIndex(dir, testPerceptualSpec(Config{}), DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{}), common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +31,7 @@ func TestPerceptualFailedWALRequiresRecovery(t *testing.T) {
 	breakWAL(t, idx.persistence.wal.Close)
 	failed := benchEntries(16)
 	for k := range failed {
-		failed[k].ImageID = ImageID(10_000 + k + 1)
+		failed[k].ImageID = common.ImageID(10_000 + k + 1)
 	}
 	err = idx.Apply(failed)
 	if !errors.Is(err, ErrRecoveryRequired) {
@@ -60,7 +61,7 @@ func TestPerceptualFailedWALRequiresRecovery(t *testing.T) {
 	// Recovery is close plus reopen: the failed append never touched the
 	// file (it failed seeking before writing), so the tail replays clean
 	// and the failed batch is absent.
-	reopened, err := openIndex(dir, Config{}, DurabilityOS)
+	reopened, err := openIndex(dir, Config{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +73,7 @@ func TestPerceptualFailedWALRequiresRecovery(t *testing.T) {
 
 func TestExactFailedWALRequiresRecovery(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestExactFailedWALRequiresRecovery(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,15 +11,15 @@ import (
 	"github.com/golang/geo/s2"
 )
 
-func benchmarkEnumNamespace(tb testing.TB, typ common.Namespace, value string, ids []uint64) *bitmapidx.NamespaceIndex {
+func benchmarkEnumNamespace(tb testing.TB, typ common.Namespace, value string, ids []uint64) *bitmapidx.Index {
 	tb.Helper()
-	index, err := bitmapidx.NewNamespaceIndex(bitmapidx.NamespaceSpec{Namespace: typ, Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType}, bitmapidx.NamespaceConfig{})
+	index, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{Namespace: typ, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
 	entries := make([]bitmapidx.Entry, len(ids))
 	for n, id := range ids {
-		entries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.StringValue(value)}
+		entries[n] = bitmapidx.Entry{ImageID: id, Value: bitmapidx.EnumStringValue(value)}
 	}
 	commitBitmap(tb, index, func(b *bitmapidx.Batch) error { return b.Add(entries...) })
 	tb.Cleanup(func() { _ = index.Close() })
@@ -29,7 +29,7 @@ func benchmarkEnumNamespace(tb testing.TB, typ common.Namespace, value string, i
 // commitBitmap stages fill into a one-shot bitmapidx batch, applies it,
 // and barriers until visible: the test equivalent of the old synchronous
 // write.
-func commitBitmap(tb testing.TB, index *bitmapidx.NamespaceIndex, fill func(*bitmapidx.Batch) error) {
+func commitBitmap(tb testing.TB, index *bitmapidx.Index, fill func(*bitmapidx.Batch) error) {
 	tb.Helper()
 	batch := index.NewBatch()
 	defer batch.Close()
@@ -74,7 +74,7 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	}
 	b.Cleanup(func() { _ = geo.Close() })
 	plan, err := Compile(
-		AllValues(namespaceIndex, bitmapidx.StringValue("favorite")),
+		AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")),
 		During(timeIndex, 4_000*quantum, 6_000*quantum),
 		InCells(geo, bitmapidx.DecodeS2Key(key)),
 	)
@@ -113,7 +113,7 @@ func BenchmarkGeoCollectSearch(b *testing.B) {
 	}
 	b.Cleanup(func() { _ = geo.Close() })
 	cover := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(30, -120)).Parent(0))
-	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")), InCells(geo, cover))
+	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")), InCells(geo, cover))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func BenchmarkGeoCityPlan(b *testing.B) {
 	b.Cleanup(func() { _ = geo.Close() })
 	for _, city := range cities {
 		cityCell := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(city.lat, city.lng)).Parent(8))
-		plan, err := Compile(AllValues(namespaceIndex, bitmapidx.StringValue("favorite")), InCells(geo, cityCell))
+		plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")), InCells(geo, cityCell))
 		if err != nil {
 			b.Fatal(err)
 		}

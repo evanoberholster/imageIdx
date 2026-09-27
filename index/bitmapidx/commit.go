@@ -3,6 +3,8 @@ package bitmapidx
 import (
 	"errors"
 	"slices"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // commitQueueCapacity bounds queued commit requests. Apply blocks when the
@@ -27,7 +29,7 @@ type commitReq struct {
 // Call Barrier before Close when queued batches must survive: Close
 // commits what is queued, but Apply concurrent with Close may report
 // ErrClosed.
-func (i *NamespaceIndex) Barrier() error {
+func (i *Index) Barrier() error {
 	if !i.commits.Started() {
 		if i.closed.Load() {
 			return ErrClosed
@@ -64,7 +66,7 @@ func (i *NamespaceIndex) Barrier() error {
 // batches queued before them. A failed batch records its error for the
 // next barrier and the group continues with the latest good view, so one
 // bad batch never poisons its neighbors.
-func (i *NamespaceIndex) commitGroup(group []commitReq) {
+func (i *Index) commitGroup(group []commitReq) {
 	if i.owner != nil {
 		i.owner.writeMu.Lock()
 		defer i.owner.writeMu.Unlock()
@@ -150,7 +152,7 @@ func (i *NamespaceIndex) commitGroup(group []commitReq) {
 				return
 			}
 		}
-		if i.owner.durability == DurabilitySync {
+		if i.owner.durability == common.DurabilitySync {
 			if err := i.owner.wal.Sync(); err != nil {
 				i.owner.failed = errors.Join(ErrRecoveryRequired, err)
 				i.dict = groupStart
@@ -174,7 +176,7 @@ func (i *NamespaceIndex) commitGroup(group []commitReq) {
 
 // failGroup reports err to every request in group: barriers observe it
 // directly, batches latch it for the next barrier.
-func (i *NamespaceIndex) failGroup(group []commitReq, err error) {
+func (i *Index) failGroup(group []commitReq, err error) {
 	for _, req := range group {
 		if req.barrier != nil {
 			req.barrier <- err

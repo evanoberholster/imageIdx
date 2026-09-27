@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -87,7 +88,7 @@ func replayHashWAL(path string, offset int64) ([]Entry, error) {
 		for k := 0; k < count; k++ {
 			offset := k * walEntrySize
 			var entry Entry
-			entry.ImageID = ImageID(binary.LittleEndian.Uint64(payload[offset : offset+8]))
+			entry.ImageID = common.ImageID(binary.LittleEndian.Uint64(payload[offset : offset+8]))
 			entry.PHash64 = binary.LittleEndian.Uint64(payload[offset+8 : offset+16])
 			for word := 0; word < 4; word++ {
 				entry.PDQ[word] = binary.LittleEndian.Uint64(payload[offset+16+word*8 : offset+24+word*8])
@@ -117,7 +118,7 @@ const (
 
 type walRecord struct {
 	hash    Hash
-	imageID ImageID
+	imageID common.ImageID
 	op      uint8
 }
 
@@ -129,7 +130,7 @@ func openExactWAL(path string, maxBatch int) (*storage.WAL, error) {
 }
 
 // appendExactWAL frames one add/remove batch with its sequence number.
-func appendExactWAL(w *storage.WAL, adds, removes []ExactEntry, durability Durability, seq uint64) error {
+func appendExactWAL(w *storage.WAL, adds, removes []ExactEntry, durability common.Durability, seq uint64) error {
 	count := len(adds) + len(removes)
 	if count == 0 {
 		return nil
@@ -159,7 +160,7 @@ func appendExactWAL(w *storage.WAL, adds, removes []ExactEntry, durability Durab
 		off += exactWALOpSize
 	}
 	binary.LittleEndian.PutUint32(record[24:28], crc32.ChecksumIEEE(record[exactWALHeaderSize:]))
-	return w.WriteRecord(record, durability == DurabilitySync)
+	return w.WriteRecord(record, durability == common.DurabilitySync)
 }
 
 // replayExactWAL replays batches from offset, returning per-batch records and
@@ -191,7 +192,7 @@ func replayExactWAL(path string, offset int64) ([][]walRecord, uint64, error) {
 			pos := i * exactWALOpSize
 			var rec walRecord
 			copy(rec.hash[:], payload[pos:pos+32])
-			rec.imageID = ImageID(binary.LittleEndian.Uint64(payload[pos+32 : pos+40]))
+			rec.imageID = common.ImageID(binary.LittleEndian.Uint64(payload[pos+32 : pos+40]))
 			rec.op = payload[pos+40]
 			if rec.op != exactWALOpAdd && rec.op != exactWALOpRemove {
 				return ErrCorruptWAL

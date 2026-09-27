@@ -11,10 +11,10 @@ import (
 // cardinality across rotations, folds, and compaction.
 func TestCountValuesMatchesMaterialized(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
-	value := StringValue("v")
-	other := StringValue("other")
+	value := EnumStringValue("v")
+	other := EnumStringValue("other")
 	for step := 0; step < 600; step++ {
-		id := ImageID((step*7)%64 + 1)
+		id := common.ImageID((step*7)%64 + 1)
 		switch {
 		case step%3 == 0:
 			commit(t, index, func(b *Batch) error {
@@ -42,7 +42,7 @@ func TestCountValuesMatchesMaterialized(t *testing.T) {
 		}
 	}
 	for n := 0; n < 40; n++ {
-		id := ImageID(n%32 + 1)
+		id := common.ImageID(n%32 + 1)
 		if n%2 == 0 {
 			commit(t, index, func(b *Batch) error {
 				return b.Add(Entry{ImageID: id, Value: value})
@@ -69,7 +69,7 @@ func TestCountValuesMatchesMaterialized(t *testing.T) {
 // unmap here.
 func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewIndex(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag), geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, DurabilityOS)
+	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag), geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
@@ -83,10 +83,10 @@ func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	}
 	for id := 1; id <= 128; id++ {
 		commit(t, tag, func(b *Batch) error {
-			return b.Add(Entry{ImageID: ImageID(id), Value: StringValue("shared")})
+			return b.Add(Entry{ImageID: common.ImageID(id), Value: EnumStringValue("shared")})
 		})
 		commit(t, loc, func(b *Batch) error {
-			return b.Move(Move{ImageID: ImageID(id), To: int64(key)})
+			return b.Move(Move{ImageID: common.ImageID(id), To: int64(key)})
 		})
 	}
 	if err := store.Checkpoint(); err != nil {
@@ -94,7 +94,7 @@ func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	}
 
 	// Base-only results alias the mapped segment and must be detached.
-	baseMatch, err := tag.MatchValues(StringValue("shared"))
+	baseMatch, err := tag.MatchValues(EnumStringValue("shared"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,12 +105,12 @@ func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 
 	// Mutate so the next results take the corrected, heap-owned path.
 	commit(t, tag, func(b *Batch) error {
-		return b.Add(Entry{ImageID: 500, Value: StringValue("shared")})
+		return b.Add(Entry{ImageID: 500, Value: EnumStringValue("shared")})
 	})
 	commit(t, loc, func(b *Batch) error {
 		return b.Move(Move{ImageID: 500, To: int64(key)})
 	})
-	deltaMatch, err := tag.MatchValues(StringValue("shared"))
+	deltaMatch, err := tag.MatchValues(EnumStringValue("shared"))
 	if err != nil {
 		t.Fatal(err)
 	}

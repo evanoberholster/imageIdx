@@ -39,9 +39,9 @@ func TestHeavyStress(t *testing.T) {
 	valuesN := heavyInt("HEAVY_VALUES_PER_NAMESPACE", 64)
 	checkpointEvery := heavyInt("HEAVY_CHECKPOINT_EVERY", 2_000_000)
 	batchSize := heavyInt("HEAVY_BATCH", 64)
-	durability := DurabilityOS
+	durability := common.DurabilityOS
 	if os.Getenv("HEAVY_DURABILITY") == "sync" {
-		durability = DurabilitySync
+		durability = common.DurabilitySync
 	}
 	if namespacesN < 1 || items < 1 || perItem < 1 || valuesN < 1 || writers < 0 || readers < 0 || batchSize < 1 {
 		t.Fatal("invalid heavy parameters")
@@ -60,15 +60,15 @@ func TestHeavyStress(t *testing.T) {
 	// Bulk load is always written with OS durability; a sync-mode run reopens
 	// the checkpointed store so the measured phase pays per-write fsync.
 	loadDurability := durability
-	if durability == DurabilitySync {
-		loadDurability = DurabilityOS
+	if durability == common.DurabilitySync {
+		loadDurability = common.DurabilityOS
 	}
-	store, err := NewIndex(dir, namespaces, config, loadDurability)
+	store, err := NewStore(dir, namespaces, config, loadDurability)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	indexes := make([]*NamespaceIndex, namespacesN)
+	indexes := make([]*Index, namespacesN)
 	for f := 0; f < namespacesN; f++ {
 		index, ok := store.Lookup(firstType + common.Namespace(f))
 		if !ok {
@@ -155,7 +155,7 @@ func TestHeavyStress(t *testing.T) {
 			chosen[n] = f
 			n++
 			v := valueFor(item)
-			batches[f] = append(batches[f], Entry{ImageID: ImageID(item), Value: BytesValue(values[f][v])})
+			batches[f] = append(batches[f], Entry{ImageID: common.ImageID(item), Value: EnumBytesValue(values[f][v])})
 			if len(batches[f]) == cap(batches[f]) {
 				if err := flush(f); err != nil {
 					t.Fatalf("load flush: %v", err)
@@ -183,7 +183,7 @@ func TestHeavyStress(t *testing.T) {
 		if err := store.Close(); err != nil {
 			t.Fatalf("close after load: %v", err)
 		}
-		store, err = OpenIndex(dir, config, durability)
+		store, err = OpenStore(dir, config, durability)
 		if err != nil {
 			t.Fatalf("reopen for sync durability: %v", err)
 		}
@@ -237,9 +237,9 @@ func TestHeavyStress(t *testing.T) {
 				f := (lo + src.Intn(perWriter)) % namespacesN
 				entries = entries[:0]
 				for n := 0; n < batchSize; n++ {
-					id := ImageID(src.Intn(items) + 1)
+					id := common.ImageID(src.Intn(items) + 1)
 					v := src.Intn(valuesN)
-					entries = append(entries, Entry{ImageID: id, Value: BytesValue(values[f][v])})
+					entries = append(entries, Entry{ImageID: id, Value: EnumBytesValue(values[f][v])})
 				}
 				wb := indexes[f].NewBatch()
 				var err error
@@ -274,7 +274,7 @@ func TestHeavyStress(t *testing.T) {
 				}
 				f := src.Intn(namespacesN)
 				v := src.Intn(valuesN)
-				value := BytesValue(values[f][v])
+				value := EnumBytesValue(values[f][v])
 				if _, err := indexes[f].CountValues(value); err != nil {
 					fail(err)
 					return
@@ -283,7 +283,7 @@ func TestHeavyStress(t *testing.T) {
 					fail(err)
 					return
 				}
-				id := ImageID(src.Intn(items) + 1)
+				id := common.ImageID(src.Intn(items) + 1)
 				if _, err := indexes[f].Contains(id, value); err != nil {
 					fail(err)
 					return
@@ -360,7 +360,7 @@ func TestHeavyStress(t *testing.T) {
 	t.Logf("heap: start=%dMiB peak=%dMiB end=%dMiB goroutines=%d GOMAXPROCS=%d",
 		memBefore.HeapAlloc>>20, peakHeap>>20, memAfter.HeapAlloc>>20, runtime.NumGoroutine(), runtime.GOMAXPROCS(0))
 
-	reopened, err := OpenIndex(dir, config, DurabilityOS)
+	reopened, err := OpenStore(dir, config, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestHeavyStress(t *testing.T) {
 		f := namespaceFor(item, 0)
 		v := valueFor(item)
 		idx, _ := reopened.Lookup(firstType + common.Namespace(f))
-		ok, err := idx.Contains(ImageID(item), BytesValue(values[f][v]))
+		ok, err := idx.Contains(common.ImageID(item), EnumBytesValue(values[f][v]))
 		if err != nil || !ok {
 			t.Fatalf("reopen spot-check item=%d namespace=%d ok=%v err=%v", item, f, ok, err)
 		}

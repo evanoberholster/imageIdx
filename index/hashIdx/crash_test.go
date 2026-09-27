@@ -1,6 +1,7 @@
 package hashidx
 
 import (
+	common "github.com/evanoberholster/imageIdx/common"
 	"os"
 	"path/filepath"
 	"testing"
@@ -50,7 +51,7 @@ func TestStrayTmpFilesIgnored(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(dir, DurabilityOS)
+	reopened, err := OpenStore(dir, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("open with stray tmp files: %v", err)
 	}

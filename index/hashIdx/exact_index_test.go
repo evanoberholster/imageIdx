@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	common "github.com/evanoberholster/imageIdx/common"
 	"sync"
 	"testing"
 )
@@ -26,7 +27,7 @@ func mustNewExactIndex(t *testing.T, entries []ExactEntry, cfg ExactConfig) *Exa
 	if cfg.BlockSize == 0 && cfg.TargetFillPct == 0 && cfg.MaxBatchEntries == 0 {
 		// leave zero to exercise defaults unless caller overrides
 	}
-	idx, err := newExact(t.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, cfg, DurabilityOS)
+	idx, err := newExact(t.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, cfg, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,15 +35,15 @@ func mustNewExactIndex(t *testing.T, entries []ExactEntry, cfg ExactConfig) *Exa
 	return idx
 }
 
-func entriesForRange(start, count uint64, idBase ImageID) []ExactEntry {
+func entriesForRange(start, count uint64, idBase common.ImageID) []ExactEntry {
 	out := make([]ExactEntry, 0, count)
 	for i := uint64(0); i < count; i++ {
-		out = append(out, ExactEntry{Hash: makeHash(start + i), ImageID: idBase + ImageID(i)})
+		out = append(out, ExactEntry{Hash: makeHash(start + i), ImageID: idBase + common.ImageID(i)})
 	}
 	return out
 }
 
-func checkAscendingUnique(t *testing.T, ids []ImageID) {
+func checkAscendingUnique(t *testing.T, ids []common.ImageID) {
 	t.Helper()
 	for i := 1; i < len(ids); i++ {
 		if ids[i] <= ids[i-1] {
@@ -75,7 +76,7 @@ func TestSingleBlockLookup(t *testing.T) {
 	// first / middle / last
 	for _, tc := range []struct {
 		hash Hash
-		want ImageID
+		want common.ImageID
 	}{
 		{makeHash(10), 100},
 		{makeHash(19), 109},
@@ -114,7 +115,7 @@ func TestMultiBlockLookup(t *testing.T) {
 	for i := uint64(0); i < 50; i++ {
 		h := makeHash(i)
 		got := idx.Lookup(nil, h)
-		if len(got) != 1 || got[0] != ImageID(i+1) {
+		if len(got) != 1 || got[0] != common.ImageID(i+1) {
 			t.Fatalf("hash %d lookup = %v", i, got)
 		}
 	}
@@ -141,7 +142,7 @@ func TestOneHashMultipleIDs(t *testing.T) {
 func TestDuplicateRunSpanningBlocks(t *testing.T) {
 	h := makeHash(7)
 	var entries []ExactEntry
-	for id := ImageID(1); id <= 20; id++ {
+	for id := common.ImageID(1); id <= 20; id++ {
 		entries = append(entries, ExactEntry{Hash: h, ImageID: id})
 	}
 	// Prepend and append neighboring hashes to force boundary conditions.
@@ -157,7 +158,7 @@ func TestDuplicateRunSpanningBlocks(t *testing.T) {
 	}
 	checkAscendingUnique(t, got)
 	for i, id := range got {
-		if id != ImageID(i+1) {
+		if id != common.ImageID(i+1) {
 			t.Fatalf("spanning ids[%d] = %d", i, id)
 		}
 	}
@@ -188,7 +189,7 @@ func TestInsertPositions(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		h    Hash
-		want ImageID
+		want common.ImageID
 	}{
 		{makeHash(1), 100}, {makeHash(25), 101}, {makeHash(99), 102},
 	} {
@@ -206,7 +207,7 @@ func TestBatchIntoOneBlockRewritesOnce(t *testing.T) {
 	for i := uint64(100); i < 110; i++ {
 		// Hashes routing to the same neighborhood (all greater than existing
 		// to land in the last block).
-		adds = append(adds, ExactEntry{Hash: makeHash(1000 + i), ImageID: ImageID(i)})
+		adds = append(adds, ExactEntry{Hash: makeHash(1000 + i), ImageID: common.ImageID(i)})
 	}
 	if err := idx.Apply(Mutation{Add: adds}); err != nil {
 		t.Fatal(err)
@@ -228,7 +229,7 @@ func TestBatchTouchingManyBlocks(t *testing.T) {
 	idx := mustNewExactIndex(t, entries, ExactConfig{BlockSize: 512})
 	var adds []ExactEntry
 	for i := uint64(0); i < 100; i += 10 {
-		adds = append(adds, ExactEntry{Hash: makeHash(i), ImageID: 1000 + ImageID(i)})
+		adds = append(adds, ExactEntry{Hash: makeHash(i), ImageID: 1000 + common.ImageID(i)})
 	}
 	if err := idx.Apply(Mutation{Add: adds}); err != nil {
 		t.Fatal(err)
@@ -247,14 +248,14 @@ func TestSplitAroundDuplicates(t *testing.T) {
 	// when a clean boundary exists.
 	var entries []ExactEntry
 	for i := uint64(0); i < 10; i++ {
-		entries = append(entries, ExactEntry{Hash: makeHash(i), ImageID: ImageID(i + 1)})
+		entries = append(entries, ExactEntry{Hash: makeHash(i), ImageID: common.ImageID(i + 1)})
 	}
 	idx := mustNewExactIndex(t, entries, ExactConfig{BlockSize: 256, TargetFillPct: 80})
 	// Add several IDs under one existing hash plus neighboring hashes to
 	// force a split decision.
 	h := makeHash(5)
 	var adds []ExactEntry
-	for id := ImageID(100); id < 110; id++ {
+	for id := common.ImageID(100); id < 110; id++ {
 		adds = append(adds, ExactEntry{Hash: h, ImageID: id})
 	}
 	if err := idx.Apply(Mutation{Add: adds}); err != nil {
@@ -317,14 +318,14 @@ func TestNoDuplicateAfterRepeatedAdd(t *testing.T) {
 
 func TestRejectsDuplicateSpecAndBadEntries(t *testing.T) {
 	dup := []ExactEntry{{Hash: makeHash(1), ImageID: 1}, {Hash: makeHash(1), ImageID: 1}}
-	if _, err := newExact(t.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: dup}, ExactConfig{}, DurabilityOS); err == nil {
+	if _, err := newExact(t.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: dup}, ExactConfig{}, common.DurabilityOS); err == nil {
 		t.Fatal("expected duplicate entry error")
 	}
 	bad := []ExactEntry{{Hash: makeHash(1), ImageID: 0}}
-	if _, err := newExact(t.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: bad}, ExactConfig{}, DurabilityOS); err == nil {
+	if _, err := newExact(t.TempDir(), ExactSpec{Algorithm: AlgorithmSHA256, Entries: bad}, ExactConfig{}, common.DurabilityOS); err == nil {
 		t.Fatal("expected invalid entry error for ImageID 0")
 	}
-	if _, err := newExact(t.TempDir(), ExactSpec{Algorithm: 0}, ExactConfig{}, DurabilityOS); err == nil {
+	if _, err := newExact(t.TempDir(), ExactSpec{Algorithm: 0}, ExactConfig{}, common.DurabilityOS); err == nil {
 		t.Fatal("expected invalid algorithm error")
 	}
 	if err := mustNewExactIndex(t, nil, ExactConfig{}).Apply(Mutation{Add: []ExactEntry{{Hash: makeHash(1), ImageID: 0}}}); err == nil {
@@ -336,7 +337,7 @@ func TestBatchTooLarge(t *testing.T) {
 	idx := mustNewExactIndex(t, nil, ExactConfig{MaxBatchEntries: 4})
 	var adds []ExactEntry
 	for i := 0; i < 5; i++ {
-		adds = append(adds, ExactEntry{Hash: makeHash(uint64(i)), ImageID: ImageID(i + 1)})
+		adds = append(adds, ExactEntry{Hash: makeHash(uint64(i)), ImageID: common.ImageID(i + 1)})
 	}
 	if err := idx.Apply(Mutation{Add: adds}); err == nil {
 		t.Fatal("expected batch-too-large error")
@@ -352,7 +353,7 @@ func TestExactConcurrentReadersAndWriter(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var dst []ImageID
+			var dst []common.ImageID
 			for {
 				select {
 				case <-stop:
@@ -369,7 +370,7 @@ func TestExactConcurrentReadersAndWriter(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 100; i++ {
-		_ = idx.Add(makeHash(uint64(1000+i)), ImageID(10000+i))
+		_ = idx.Add(makeHash(uint64(1000+i)), common.ImageID(10000+i))
 	}
 	close(stop)
 	wg.Wait()
@@ -400,7 +401,7 @@ func TestSteadyStateLookupAllocs(t *testing.T) {
 	entries := entriesForRange(0, 1024, 1)
 	idx := mustNewExactIndex(t, entries, ExactConfig{})
 	h := makeHash(512)
-	dst := make([]ImageID, 0, 8)
+	dst := make([]common.ImageID, 0, 8)
 	if allocs := testing.AllocsPerRun(1000, func() {
 		dst = idx.Lookup(dst[:0], h)
 	}); allocs != 0 {
@@ -423,10 +424,10 @@ func TestInvariantsAfterRandomMutations(t *testing.T) {
 	for round := 0; round < 20; round++ {
 		var adds, removes []ExactEntry
 		for k := 0; k < 10; k++ {
-			adds = append(adds, ExactEntry{Hash: makeHash(uint64((round*37 + k*11) % 80)), ImageID: ImageID(round*100 + k + 1)})
+			adds = append(adds, ExactEntry{Hash: makeHash(uint64((round*37 + k*11) % 80)), ImageID: common.ImageID(round*100 + k + 1)})
 		}
 		if round%3 == 0 {
-			removes = append(removes, ExactEntry{Hash: makeHash(uint64(round % 50)), ImageID: ImageID(round%50 + 1)})
+			removes = append(removes, ExactEntry{Hash: makeHash(uint64(round % 50)), ImageID: common.ImageID(round%50 + 1)})
 		}
 		if err := idx.Apply(Mutation{Add: adds, Remove: removes}); err != nil {
 			t.Fatal(err)
@@ -568,7 +569,7 @@ func TestConcurrentAppliesStayLinearizable(t *testing.T) {
 			defer wg.Done()
 			for k := 0; k < perWriter; k++ {
 				n := uint64(w*perWriter + k + 1)
-				if err := idx.Apply(Mutation{Add: []ExactEntry{{Hash: makeHash(n), ImageID: ImageID(n)}}}); err != nil {
+				if err := idx.Apply(Mutation{Add: []ExactEntry{{Hash: makeHash(n), ImageID: common.ImageID(n)}}}); err != nil {
 					t.Errorf("apply %d: %v", n, err)
 					return
 				}
@@ -577,7 +578,7 @@ func TestConcurrentAppliesStayLinearizable(t *testing.T) {
 	}
 	wg.Wait()
 	for n := uint64(1); n <= writers*perWriter; n++ {
-		if got := idx.Lookup(nil, makeHash(n)); len(got) != 1 || got[0] != ImageID(n) {
+		if got := idx.Lookup(nil, makeHash(n)); len(got) != 1 || got[0] != common.ImageID(n) {
 			t.Fatalf("lookup %d = %v, want [%d]", n, got, n)
 		}
 	}
@@ -601,11 +602,11 @@ func TestAlgorithmsBehaveEquivalently(t *testing.T) {
 		if algo == AlgorithmBLAKE3 {
 			sum = SumBLAKE3
 		}
-		idx, err := newExact(t.TempDir(), ExactSpec{Algorithm: algo}, ExactConfig{BlockSize: 512}, DurabilityOS)
+		idx, err := newExact(t.TempDir(), ExactSpec{Algorithm: algo}, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 		if err != nil {
 			t.Fatal(err)
 		}
-		id := ImageID(1)
+		id := common.ImageID(1)
 		for _, p := range payloads {
 			h := sum([]byte(p))
 			if err := idx.Add(h, id); err != nil {

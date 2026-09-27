@@ -98,7 +98,7 @@ func validRecordsPerPage(value uint32) bool {
 // checkpoint and manifest. spec.Namespace is persisted zero-extended and may
 // be zero for tests; NewStore validates non-zero and uniqueness. An optional
 // reader tracker lets Store share one tracker across its indexes.
-func newIndex(dir string, spec PerceptualSpec, durability Durability, readers ...*storage.ReaderTracker) (*Index, error) {
+func newIndex(dir string, spec PerceptualSpec, durability common.Durability, readers ...*storage.ReaderTracker) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -128,7 +128,7 @@ func newIndex(dir string, spec PerceptualSpec, durability Durability, readers ..
 // cfg.RecordsPerPage must match the persisted page size; a zero value adopts
 // the persisted size. An optional reader tracker lets Store share one tracker
 // across its indexes.
-func openIndex(dir string, cfg Config, durability Durability, readers ...*storage.ReaderTracker) (*Index, error) {
+func openIndex(dir string, cfg Config, durability common.Durability, readers ...*storage.ReaderTracker) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -433,7 +433,7 @@ func writePageRef(dst []byte, offset uint64, count uint32) {
 // writePage encodes one page: a 64-byte header followed by the six planes.
 // Planes are written with explicit little-endian encoding; the CRC covers the
 // concatenated payload.
-func writePage(out io.Writer, buffer []byte, imageIDs []ImageID, phash64 []uint64, pdq [4][]uint64) error {
+func writePage(out io.Writer, buffer []byte, imageIDs []common.ImageID, phash64 []uint64, pdq [4][]uint64) error {
 	crc := crc32.ChecksumIEEE(nil)
 	crc = crcPlane(crc, buffer, imageIDs)
 	crc = crcPlane(crc, buffer, phash64)
@@ -629,7 +629,7 @@ func decodeGeneration(mapping []byte, cfg Config) (*indexView, genHeader, error)
 		}
 		planeWidth := uint64(count) * 8
 		planeOffset := offset + pageHeaderSize
-		imageIDs, err := storage.View[ImageID](mapping, planeOffset, uint64(count), ErrCorrupt, ErrUnsupported)
+		imageIDs, err := storage.View[common.ImageID](mapping, planeOffset, uint64(count), ErrCorrupt, ErrUnsupported)
 		if err != nil {
 			return nil, genHeader{}, err
 		}
@@ -900,7 +900,7 @@ func exactWALPath(dir string, epoch uint64) string {
 // newExact creates a persistent index in dir and publishes its initial
 // checkpoint. An optional reader tracker lets Store share one tracker across
 // its indexes.
-func newExact(dir string, spec ExactSpec, cfg ExactConfig, durability Durability, readers ...*storage.ReaderTracker) (*ExactIndex, error) {
+func newExact(dir string, spec ExactSpec, cfg ExactConfig, durability common.Durability, readers ...*storage.ReaderTracker) (*ExactIndex, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -929,7 +929,7 @@ func newExact(dir string, spec ExactSpec, cfg ExactConfig, durability Durability
 // BlockSize and TargetFillPct values adopt the persisted generation's sizing
 // so reopening a store keeps its write policy. An optional reader tracker lets
 // Store share one tracker across its indexes.
-func openExact(dir string, cfg ExactConfig, durability Durability, readers ...*storage.ReaderTracker) (*ExactIndex, error) {
+func openExact(dir string, cfg ExactConfig, durability common.Durability, readers ...*storage.ReaderTracker) (*ExactIndex, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}

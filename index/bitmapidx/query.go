@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"sort"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -81,7 +82,7 @@ type queryKey struct {
 // MatchValues returns the images holding every supplied value (logical
 // AND), sorted and unique. An empty value list matches nothing.
 // Store-owned results are detached from mmap state.
-func (i *NamespaceIndex) MatchValues(values ...Value) (result roar.Bitmap, resultErr error) {
+func (i *Index) MatchValues(values ...Value) (result roar.Bitmap, resultErr error) {
 	if len(values) == 0 {
 		return roar.Bitmap{}, nil
 	}
@@ -106,9 +107,9 @@ func (i *NamespaceIndex) MatchValues(values ...Value) (result roar.Bitmap, resul
 // MatchText analyzes query text and returns the images holding every
 // resulting token (logical AND). A query producing no tokens matches
 // nothing.
-func (i *NamespaceIndex) MatchText(query string) (roar.Bitmap, error) {
+func (i *Index) MatchText(query string) (roar.Bitmap, error) {
 	namespace := i.spec()
-	if namespace.Kind != KindText {
+	if namespace.Kind != common.KindBitmapString {
 		return roar.Bitmap{}, ErrNamespaceMismatch
 	}
 	tokens, err := i.analyzer.TokenSet(query, nil)
@@ -120,7 +121,7 @@ func (i *NamespaceIndex) MatchText(query string) (roar.Bitmap, error) {
 	}
 	values := make([]Value, 0, len(tokens))
 	for _, text := range tokens {
-		values = append(values, Value{Kind: KindText, Bytes: []byte(text)})
+		values = append(values, Value{Kind: common.KindBitmapString, Bytes: []byte(text)})
 	}
 	return i.MatchValues(values...)
 }
@@ -139,7 +140,7 @@ type canonicalizedValue struct {
 // re-resolve later (compiled queries); otherwise they may alias caller input
 // and are valid only for the call. Deduplication is a linear scan for tiny
 // inputs and a map for larger ones.
-func (i *NamespaceIndex) canonicalizeValues(namespace NamespaceSpec, values []Value, retain bool) ([]canonicalizedValue, error) {
+func (i *Index) canonicalizeValues(namespace NamespaceSpec, values []Value, retain bool) ([]canonicalizedValue, error) {
 	out := make([]canonicalizedValue, 0, len(values))
 	const linearDedupBound = 8
 	useLinear := len(values) <= linearDedupBound
@@ -202,7 +203,7 @@ func resolveKeysPartial(view *namespaceView, items []canonicalizedValue) (keys [
 
 // resolveQueryKeys maps query values to dictionary keys with slots. ok is
 // false when a hashed value is absent, which empties the conjunction.
-func (i *NamespaceIndex) resolveQueryKeys(view *namespaceView, values []Value) ([]NamespaceKey, bool, error) {
+func (i *Index) resolveQueryKeys(view *namespaceView, values []Value) ([]NamespaceKey, bool, error) {
 	items, err := i.canonicalizeValues(i.spec(), values, false)
 	if err != nil {
 		return nil, false, err
@@ -241,7 +242,7 @@ func (v *namespaceView) matchResolved(keys []NamespaceKey) (result roar.Bitmap, 
 
 // ValueIDs appends every image holding value to dst in ascending order.
 // Unknown values append nothing. It materializes only the one posting.
-func (i *NamespaceIndex) ValueIDs(dst []ImageID, value Value) ([]ImageID, error) {
+func (i *Index) ValueIDs(dst []common.ImageID, value Value) ([]common.ImageID, error) {
 	namespace := i.spec()
 	base, canonical, err := i.keyForValue(namespace, value)
 	if err != nil {
@@ -273,9 +274,9 @@ func (i *NamespaceIndex) ValueIDs(dst []ImageID, value Value) ([]ImageID, error)
 // sorted and unique. The no-delta path references base postings directly;
 // the delta path collects occupied keys across all layers, then unions
 // their effective postings.
-func (i *NamespaceIndex) Range(bounds NumericRange) (result roar.Bitmap, resultErr error) {
+func (i *Index) Range(bounds NumericRange) (result roar.Bitmap, resultErr error) {
 	namespace := i.spec()
-	if namespace.Kind != KindContinuous {
+	if namespace.Kind != common.KindBitmapContinuous {
 		return roar.Bitmap{}, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -317,9 +318,9 @@ func (i *NamespaceIndex) Range(bounds NumericRange) (result roar.Bitmap, resultE
 // EstimateRange returns a planning hint for the occupied grid keys
 // inside bounds without materializing: base cardinality plus delta
 // additions minus removals. Multi-valued overlap makes it an upper bound.
-func (i *NamespaceIndex) EstimateRange(bounds NumericRange) (uint64, error) {
+func (i *Index) EstimateRange(bounds NumericRange) (uint64, error) {
 	namespace := i.spec()
-	if namespace.Kind != KindContinuous {
+	if namespace.Kind != common.KindBitmapContinuous {
 		return 0, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -375,7 +376,7 @@ func (v *namespaceView) estimateKeys(keys []NamespaceKey) uint64 {
 // CountValues returns the number of images holding every supplied value
 // without materializing the intersection when possible. No values count
 // zero.
-func (i *NamespaceIndex) CountValues(values ...Value) (uint64, error) {
+func (i *Index) CountValues(values ...Value) (uint64, error) {
 	if len(values) == 0 {
 		return 0, nil
 	}
@@ -415,9 +416,9 @@ func (i *NamespaceIndex) CountValues(values ...Value) (uint64, error) {
 // CountRange returns the number of images inside bounds by unioning
 // bitmaps and counting, without appending IDs. Scratch is pre-sized once
 // per call.
-func (i *NamespaceIndex) CountRange(bounds NumericRange) (uint64, error) {
+func (i *Index) CountRange(bounds NumericRange) (uint64, error) {
 	namespace := i.spec()
-	if namespace.Kind != KindContinuous {
+	if namespace.Kind != common.KindBitmapContinuous {
 		return 0, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -451,7 +452,7 @@ func (i *NamespaceIndex) CountRange(bounds NumericRange) (uint64, error) {
 
 // FilterValues appends the candidates holding every supplied value to
 // dst. No values append nothing: an empty conjunction matches nothing.
-func (i *NamespaceIndex) FilterValues(dst, candidates []ImageID, values ...Value) ([]ImageID, error) {
+func (i *Index) FilterValues(dst, candidates []common.ImageID, values ...Value) ([]common.ImageID, error) {
 	if len(values) == 0 {
 		return dst, nil
 	}
@@ -473,8 +474,8 @@ func (i *NamespaceIndex) FilterValues(dst, candidates []ImageID, values ...Value
 
 // FilterRange preserves order and duplicates; dst=candidates[:0] is safe.
 // It probes candidates or unions postings, according to the estimated work.
-func (i *NamespaceIndex) FilterRange(dst, candidates []ImageID, bounds NumericRange) ([]ImageID, error) {
-	if i.spec().Kind != KindContinuous {
+func (i *Index) FilterRange(dst, candidates []common.ImageID, bounds NumericRange) ([]common.ImageID, error) {
+	if i.spec().Kind != common.KindBitmapContinuous {
 		return dst, ErrInvalidRange
 	}
 	if bounds.empty() || len(candidates) == 0 {
@@ -515,7 +516,7 @@ func (i *NamespaceIndex) FilterRange(dst, candidates []ImageID, bounds NumericRa
 
 // filterBitmap appends the candidates present in bit, tolerating unsorted
 // input. It probes with a cursor and allocates nothing beyond dst growth.
-func filterBitmap(dst, candidates []ImageID, bit roar.Bitmap) []ImageID {
+func filterBitmap(dst, candidates []common.ImageID, bit roar.Bitmap) []common.ImageID {
 	if bit.IsEmpty() {
 		return dst
 	}
@@ -600,4 +601,16 @@ func rangeKeyIndexes(keys []NamespaceKey, bounds NumericRange) (int, int) {
 		return end, end
 	}
 	return start, end
+}
+
+// detachOwned clones a query result when it could alias store-owned mmap
+// state. Only a result whose bytes live in the mapped segment is not
+// heap-owned; corrected postings, tiny postings, and fresh unions and
+// intersections are heap-owned and are returned without copying. This keeps
+// the lifetime safety of the old unconditional clone while removing a full
+// posting copy from every query that materialized its own result.
+func (i *Index) detachOwned(result *roar.Bitmap, owned bool) {
+	if i.owner != nil && !owned {
+		*result = result.Clone()
+	}
 }

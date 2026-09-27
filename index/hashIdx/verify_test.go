@@ -2,6 +2,7 @@ package hashidx
 
 import (
 	"errors"
+	common "github.com/evanoberholster/imageIdx/common"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,7 +10,7 @@ import (
 
 func mustVerifyStore(t *testing.T, dir string) {
 	t.Helper()
-	store, err := NewStore(dir, testStoreSpec(), DurabilityOS)
+	store, err := NewStore(dir, testStoreSpec(), common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +36,7 @@ func TestVerifyStoreHealthy(t *testing.T) {
 		t.Fatalf("VerifyStore = %v, want nil", err)
 	}
 	// Verification is read-only: the store still opens with data intact.
-	reopened, err := OpenStore(dir, DurabilityOS)
+	reopened, err := OpenStore(dir, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

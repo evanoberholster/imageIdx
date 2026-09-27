@@ -11,7 +11,7 @@ import (
 func TestFilterValuesPreservesCandidateOrderWithDeltas(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	defer index.Close()
-	value := StringValue("review-filter")
+	value := EnumStringValue("review-filter")
 	commit(t, index, func(batch *Batch) error {
 		return batch.Add(Entry{ImageID: 1, Value: value}, Entry{ImageID: 3, Value: value})
 	})
@@ -21,9 +21,9 @@ func TestFilterValuesPreservesCandidateOrderWithDeltas(t *testing.T) {
 	commit(t, index, func(batch *Batch) error {
 		return batch.Add(Entry{ImageID: 4, Value: value})
 	})
-	candidates := []ImageID{3, 2, 4, 1, 3}
+	candidates := []common.ImageID{3, 2, 4, 1, 3}
 	got, err := index.FilterValues(candidates[:0], candidates, value)
-	if err != nil || !slices.Equal(got, []ImageID{3, 4, 1, 3}) {
+	if err != nil || !slices.Equal(got, []common.ImageID{3, 4, 1, 3}) {
 		t.Fatalf("FilterValues = %v, %v", got, err)
 	}
 }
@@ -41,18 +41,18 @@ func TestEffectiveTableMergesLayeredChanges(t *testing.T) {
 	frozen := &namespaceDelta{
 		keys: []NamespaceKey{key(1), key(2), key(3)},
 		values: map[NamespaceKey]*bitmapDelta{
-			key(1): newBitmapDelta(nil, []ImageID{1}),
-			key(2): newBitmapDelta([]ImageID{2}, nil),
-			key(3): newBitmapDelta([]ImageID{30}, nil),
+			key(1): newBitmapDelta(nil, []common.ImageID{1}),
+			key(2): newBitmapDelta([]common.ImageID{2}, nil),
+			key(3): newBitmapDelta([]common.ImageID{30}, nil),
 		},
 	}
 	active := &namespaceDelta{
 		keys: []NamespaceKey{key(1), key(2), key(3), key(4)},
 		values: map[NamespaceKey]*bitmapDelta{
-			key(1): newBitmapDelta([]ImageID{1}, nil),
-			key(2): newBitmapDelta(nil, []ImageID{2}),
-			key(3): newBitmapDelta(nil, []ImageID{3}),
-			key(4): newBitmapDelta([]ImageID{4}, nil),
+			key(1): newBitmapDelta([]common.ImageID{1}, nil),
+			key(2): newBitmapDelta(nil, []common.ImageID{2}),
+			key(3): newBitmapDelta(nil, []common.ImageID{3}),
+			key(4): newBitmapDelta([]common.ImageID{4}, nil),
 		},
 	}
 	view := &namespaceView{base: base}
@@ -61,12 +61,12 @@ func TestEffectiveTableMergesLayeredChanges(t *testing.T) {
 	if !slices.Equal(got.keys, wantKeys) {
 		t.Fatalf("keys = %v, want %v", got.keys, wantKeys)
 	}
-	for n, wantID := range []ImageID{1, 30, 4, 5} {
-		if ids := got.postings[n].appendTo(nil); !slices.Equal(ids, []ImageID{wantID}) {
+	for n, wantID := range []common.ImageID{1, 30, 4, 5} {
+		if ids := got.postings[n].appendTo(nil); !slices.Equal(ids, []common.ImageID{wantID}) {
 			t.Fatalf("posting %d = %v, want %d", n, ids, wantID)
 		}
 	}
-	if ids := base.postings[0].appendTo(nil); !slices.Equal(ids, []ImageID{1}) {
+	if ids := base.postings[0].appendTo(nil); !slices.Equal(ids, []common.ImageID{1}) {
 		t.Fatalf("source base mutated: %v", ids)
 	}
 }
@@ -115,7 +115,7 @@ func BenchmarkEffectiveTableWideDelta(b *testing.B) {
 	for n := range delta.keys {
 		k := key(int64(n*2 + 1))
 		delta.keys[n] = k
-		delta.values[k] = newBitmapDelta([]ImageID{ImageID(baseCount + n + 1)}, nil)
+		delta.values[k] = newBitmapDelta([]common.ImageID{common.ImageID(baseCount + n + 1)}, nil)
 	}
 	view := &namespaceView{base: base}
 	b.ReportAllocs()

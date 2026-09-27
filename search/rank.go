@@ -261,11 +261,11 @@ func FilterTime(dst, candidates []ImageID, lookup timeidx.ExactTimestampFunc, st
 // appends nothing; invalid cells join ErrInvalidClause. Like FilterTime it
 // has no Context form: cell expansion is the only index-independent work
 // and the probe itself is bounded by the candidate list.
-func FilterGeo(dst, candidates []ImageID, index *bitmapidx.NamespaceIndex, cellIDs ...uint64) ([]ImageID, error) {
+func FilterGeo(dst, candidates []ImageID, index *bitmapidx.Index, cellIDs ...uint64) ([]ImageID, error) {
 	if index == nil || len(cellIDs) == 0 {
 		return dst, nil
 	}
-	if index.Spec().Kind != bitmapidx.KindGeo {
+	if index.Spec().Kind != common.KindBitmapGeo {
 		return dst, ErrInvalidClause
 	}
 	ranges, err := bitmapidx.RangesFromCellIDs(nil, cellIDs)

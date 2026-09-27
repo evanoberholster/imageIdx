@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	common "github.com/evanoberholster/imageIdx/common"
-	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
 func TestPrincipalValidation(t *testing.T) {
@@ -34,8 +33,8 @@ func TestPrincipalValidation(t *testing.T) {
 func TestPrincipalValueRoundTrip(t *testing.T) {
 	user, _ := NewUserACL(42)
 	value := user.Value()
-	if value.Kind != bitmapidx.KindEnum {
-		t.Fatalf("user Value kind = %v, want KindEnum", value.Kind)
+	if value.Kind != common.KindBitmapEnum {
+		t.Fatalf("user Value kind = %v, want KindBitmapEnum", value.Kind)
 	}
 	// Fixed 8-byte little-endian key.
 	if len(value.Bytes) != 8 {

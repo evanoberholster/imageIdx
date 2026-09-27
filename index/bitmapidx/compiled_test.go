@@ -39,7 +39,7 @@ func TestCompiledQueryParity(t *testing.T) {
 	if gotCount != directCount {
 		t.Fatalf("compiled Count = %d, want %d", gotCount, directCount)
 	}
-	candidates := []ImageID{1, 2, 3, 4, 5, 999_999}
+	candidates := []common.ImageID{1, 2, 3, 4, 5, 999_999}
 	directFiltered, err := index.FilterValues(nil, candidates, names...)
 	if err != nil {
 		t.Fatalf("FilterValues: %v", err)
@@ -56,9 +56,9 @@ func TestCompiledQueryParity(t *testing.T) {
 func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
-		return b.Add(Entry{ImageID: 1, Value: StringValue("a")})
+		return b.Add(Entry{ImageID: 1, Value: EnumStringValue("a")})
 	})
-	compiled, err := index.Compile(StringValue("b"))
+	compiled, err := index.Compile(EnumStringValue("b"))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -71,24 +71,24 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	}
 	// A value added after compiling is visible without recompiling.
 	commit(t, index, func(b *Batch) error {
-		return b.Add(Entry{ImageID: 2, Value: StringValue("b")})
+		return b.Add(Entry{ImageID: 2, Value: EnumStringValue("b")})
 	})
 	got, err := compiled.Match()
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
-	if !slices.Equal(got.AppendTo(nil), []ImageID{2}) {
+	if !slices.Equal(got.AppendTo(nil), []common.ImageID{2}) {
 		t.Fatalf("compiled Match = %v, want [2]", got.AppendTo(nil))
 	}
 
 	// Multi-value conjunctions see later writes too: image 3 holds both.
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
-			Entry{ImageID: 3, Value: StringValue("a")},
-			Entry{ImageID: 3, Value: StringValue("b")},
+			Entry{ImageID: 3, Value: EnumStringValue("a")},
+			Entry{ImageID: 3, Value: EnumStringValue("b")},
 		)
 	})
-	both, err := index.Compile(StringValue("a"), StringValue("b"))
+	both, err := index.Compile(EnumStringValue("a"), EnumStringValue("b"))
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
-	if !slices.Equal(got.AppendTo(nil), []ImageID{3}) {
+	if !slices.Equal(got.AppendTo(nil), []common.ImageID{3}) {
 		t.Fatalf("compiled Match = %v, want [3]", got.AppendTo(nil))
 	}
 	count, err := both.Count()
@@ -107,8 +107,8 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	// A value vacuumed away empties the conjunction.
 	commit(t, index, func(b *Batch) error {
 		return b.Remove(
-			Entry{ImageID: 2, Value: StringValue("b")},
-			Entry{ImageID: 3, Value: StringValue("b")},
+			Entry{ImageID: 2, Value: EnumStringValue("b")},
+			Entry{ImageID: 3, Value: EnumStringValue("b")},
 		)
 	})
 	if err := index.Vacuum(); err != nil {
@@ -162,21 +162,21 @@ func TestCompiledQueryValidation(t *testing.T) {
 		t.Fatal("compiled text differs from MatchText")
 	}
 
-	closed, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	closed, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := closed.Close(); err != nil {
 		t.Fatal(err)
 	}
-	closedQuery, err := closed.Compile(StringValue("a"))
+	closedQuery, err := closed.Compile(EnumStringValue("a"))
 	if err != nil {
 		t.Fatalf("Compile on closed index error = %v", err)
 	}
 	if got, err := closedQuery.Match(); err != nil || !got.IsEmpty() {
 		t.Fatalf("closed Compile match = %v, %v; want empty, nil", got.AppendTo(nil), err)
 	}
-	stale, err := index.Compile(StringValue("a"))
+	stale, err := index.Compile(EnumStringValue("a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestZeroQueryMatchesNothing(t *testing.T) {
 	if count, err := q.Count(); err != nil || count != 0 {
 		t.Fatalf("zero Query Count = %d, %v; want 0, nil", count, err)
 	}
-	if got, err := q.Filter([]ImageID{9}, []ImageID{1}); err != nil || !slices.Equal(got, []ImageID{9}) {
+	if got, err := q.Filter([]common.ImageID{9}, []common.ImageID{1}); err != nil || !slices.Equal(got, []common.ImageID{9}) {
 		t.Fatalf("zero Query Filter = %v, %v; want [9], nil", got, err)
 	}
 }
@@ -211,7 +211,7 @@ func TestCompiledQueryReResolveDoesNotAllocate(t *testing.T) {
 	// resolve through the re-resolution path rather than the compiled-key
 	// fast path.
 	commit(t, index, func(b *Batch) error {
-		return b.Add(Entry{ImageID: 1_000_000, Value: StringValue("unrelated-value")})
+		return b.Add(Entry{ImageID: 1_000_000, Value: EnumStringValue("unrelated-value")})
 	})
 	view := index.view.Load()
 	if view.dictGen == query.dictGen {
@@ -254,7 +254,7 @@ func TestCompiledQueryConcurrent(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if _, err := compiled.Filter(nil, []ImageID{1, 2, 3}); err != nil {
+				if _, err := compiled.Filter(nil, []common.ImageID{1, 2, 3}); err != nil {
 					t.Error(err)
 					return
 				}

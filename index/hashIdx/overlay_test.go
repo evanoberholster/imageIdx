@@ -1,6 +1,7 @@
 package hashidx
 
 import (
+	common "github.com/evanoberholster/imageIdx/common"
 	"math/rand"
 	"slices"
 	"sync"
@@ -155,7 +156,7 @@ func TestOverlayRemoveOfBaseThenReAdd(t *testing.T) {
 func TestOverlayFoldThreshold(t *testing.T) {
 	idx := mustNewExactIndex(t, nil, ExactConfig{BlockSize: 512, OverlayMaxEntries: 8})
 	for i := 0; i < 20; i++ {
-		if err := idx.Add(makeHash(uint64(5_000_000+i)), ImageID(70_000+i)); err != nil {
+		if err := idx.Add(makeHash(uint64(5_000_000+i)), common.ImageID(70_000+i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -188,7 +189,7 @@ func TestOverlayFoldEquivalenceRandom(t *testing.T) {
 		model[e] = true
 		present = append(present, e)
 	}
-	var nextID ImageID = 10_000
+	var nextID common.ImageID = 10_000
 	rng := rand.New(rand.NewSource(11))
 	removeFromPresent := func(e ExactEntry) {
 		for k, p := range present {
@@ -257,13 +258,13 @@ func TestOverlayFoldEquivalenceRandom(t *testing.T) {
 
 func TestOverlayCheckpointReopen(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var want []ExactEntry
 	for i := 0; i < 40; i++ {
-		e := ExactEntry{Hash: makeHash(uint64(6_000_000 + i)), ImageID: ImageID(80_000 + i)}
+		e := ExactEntry{Hash: makeHash(uint64(6_000_000 + i)), ImageID: common.ImageID(80_000 + i)}
 		want = append(want, e)
 	}
 	if err := idx.Apply(Mutation{Add: want}); err != nil {
@@ -283,7 +284,7 @@ func TestOverlayCheckpointReopen(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,13 +307,13 @@ func TestOverlayCheckpointReopen(t *testing.T) {
 
 func TestOverlayWALReplay(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var want []ExactEntry
 	for i := 0; i < 25; i++ {
-		e := ExactEntry{Hash: makeHash(uint64(7_000_000 + i)), ImageID: ImageID(90_000 + i)}
+		e := ExactEntry{Hash: makeHash(uint64(7_000_000 + i)), ImageID: common.ImageID(90_000 + i)}
 		want = append(want, e)
 	}
 	if err := idx.Apply(Mutation{Add: want[:20]}); err != nil {
@@ -326,7 +327,7 @@ func TestOverlayWALReplay(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +413,7 @@ func TestOverlayConcurrentStress(t *testing.T) {
 			for k := 0; k < perWriter; k++ {
 				e := ExactEntry{
 					Hash:    makeHash(uint64(100_000_000 + w*10_000 + k)),
-					ImageID: ImageID(200_000 + w*10_000 + k),
+					ImageID: common.ImageID(200_000 + w*10_000 + k),
 				}
 				if err := idx.Add(e.Hash, e.ImageID); err != nil {
 					errs <- err

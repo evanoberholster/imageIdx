@@ -8,20 +8,20 @@ import (
 	common "github.com/evanoberholster/imageIdx/common"
 )
 
-func benchmarkEnumNamespace(tb testing.TB, values int, perValue int) (*NamespaceIndex, []Value) {
+func benchmarkEnumNamespace(tb testing.TB, values int, perValue int) (*Index, []Value) {
 	tb.Helper()
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		tb.Fatalf("NewNamespaceIndex: %v", err)
+		tb.Fatalf("NewIndex: %v", err)
 	}
 	tb.Cleanup(func() { _ = index.Close() })
 	entries := make([]Entry, 0, values*perValue)
 	names := make([]Value, values)
 	for value := 0; value < values; value++ {
 		name := fmt.Sprintf("value-%d", value)
-		names[value] = StringValue(name)
+		names[value] = EnumStringValue(name)
 		for n := 0; n < perValue; n++ {
-			entries = append(entries, Entry{ImageID: ImageID(value*perValue + n + 1), Value: names[value]})
+			entries = append(entries, Entry{ImageID: common.ImageID(value*perValue + n + 1), Value: names[value]})
 		}
 	}
 	commit(tb, index, func(bt *Batch) error { return bt.Add(entries...) })
@@ -30,24 +30,24 @@ func benchmarkEnumNamespace(tb testing.TB, values int, perValue int) (*Namespace
 
 // benchmarkEnumIntersectionNamespace mirrors the legacy And4 fixture: each value
 // has its own arithmetic ID set, and one image may carry all four values.
-func benchmarkEnumIntersectionNamespace(tb testing.TB) (*NamespaceIndex, []Value) {
+func benchmarkEnumIntersectionNamespace(tb testing.TB) (*Index, []Value) {
 	tb.Helper()
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		tb.Fatalf("NewNamespaceIndex: %v", err)
+		tb.Fatalf("NewIndex: %v", err)
 	}
 	tb.Cleanup(func() { _ = index.Close() })
 	const values, perValue = 4, 20_000
 	names := make([]Value, values)
 	entries := make([]Entry, 0, values*perValue)
 	for value := 0; value < values; value++ {
-		names[value] = StringValue(fmt.Sprintf("value-%d", value))
+		names[value] = EnumStringValue(fmt.Sprintf("value-%d", value))
 		for n := 0; n < perValue; n++ {
 			id := n*(value+1) + value
 			if id == 0 { // ImageID zero is reserved by the namespace API.
 				continue
 			}
-			entries = append(entries, Entry{ImageID: ImageID(id), Value: names[value]})
+			entries = append(entries, Entry{ImageID: common.ImageID(id), Value: names[value]})
 		}
 	}
 	commit(tb, index, func(bt *Batch) error { return bt.Add(entries...) })
@@ -56,7 +56,7 @@ func benchmarkEnumIntersectionNamespace(tb testing.TB) (*NamespaceIndex, []Value
 
 func BenchmarkNamespaceContainsKey(b *testing.B) {
 	index, _ := benchmarkEnumNamespace(b, 1, 100_000)
-	key := hashCanonical(common.NamespaceTag, KindEnum, []byte("value-0"))
+	key := hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("value-0"))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -66,7 +66,7 @@ func BenchmarkNamespaceContainsKey(b *testing.B) {
 
 func BenchmarkNamespaceContainsValue(b *testing.B) {
 	index, _ := benchmarkEnumNamespace(b, 1, 100_000)
-	value := BytesValue([]byte("value-0"))
+	value := EnumBytesValue([]byte("value-0"))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -88,12 +88,12 @@ func BenchmarkNamespaceMatch4(b *testing.B) {
 func BenchmarkNamespaceApplyDistinct1000(b *testing.B) {
 	entries := make([]Entry, 1_000)
 	for n := range entries {
-		entries[n] = Entry{ImageID: ImageID(n + 1), Value: StringValue("value-" + strconv.Itoa(n))}
+		entries[n] = Entry{ImageID: common.ImageID(n + 1), Value: EnumStringValue("value-" + strconv.Itoa(n))}
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -115,12 +115,12 @@ func BenchmarkNamespaceApplyDistinct1000(b *testing.B) {
 func BenchmarkNamespaceApplyBatch1000(b *testing.B) {
 	entries := make([]Entry, 1_000)
 	for n := range entries {
-		entries[n] = Entry{ImageID: ImageID(n + 1), Value: StringValue("batch")}
+		entries[n] = Entry{ImageID: common.ImageID(n + 1), Value: EnumStringValue("batch")}
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -141,8 +141,8 @@ func BenchmarkNamespaceApplyBatch1000(b *testing.B) {
 
 func BenchmarkNamespaceValueIDs(b *testing.B) {
 	index, _ := benchmarkEnumNamespace(b, 1, 100_000)
-	value := StringValue("value-0")
-	buffer := make([]ImageID, 0, 100_000)
+	value := EnumStringValue("value-0")
+	buffer := make([]common.ImageID, 0, 100_000)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -155,7 +155,7 @@ func BenchmarkNamespaceValueIDs(b *testing.B) {
 }
 
 func BenchmarkNamespaceRange(b *testing.B) {
-	index, err := NewNamespaceIndex(continuousNamespace(testFocalLength), NamespaceConfig{})
+	index, err := NewIndex(continuousNamespace(testFocalLength), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func BenchmarkNamespaceRange(b *testing.B) {
 	entries := make([]Entry, 0, 100_000)
 	for value := -5_000; value < 5_000; value++ {
 		for n := 0; n < 10; n++ {
-			id := ImageID((value+5_000)*10 + n + 1)
+			id := common.ImageID((value+5_000)*10 + n + 1)
 			entries = append(entries, Entry{ImageID: id, Value: IntValue(int64(value))})
 		}
 	}
@@ -180,11 +180,11 @@ func BenchmarkNamespaceRange(b *testing.B) {
 
 func BenchmarkNamespaceFilter(b *testing.B) {
 	index, names := benchmarkEnumIntersectionNamespace(b)
-	candidates := make([]ImageID, 10_000)
+	candidates := make([]common.ImageID, 10_000)
 	for n := range candidates {
-		candidates[n] = ImageID(n*7 + 1)
+		candidates[n] = common.ImageID(n*7 + 1)
 	}
-	buffer := make([]ImageID, 0, 10_000)
+	buffer := make([]common.ImageID, 0, 10_000)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -197,7 +197,7 @@ func BenchmarkNamespaceFilter(b *testing.B) {
 }
 
 func BenchmarkNamespaceTextMatch(b *testing.B) {
-	index, err := NewNamespaceIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func BenchmarkNamespaceTextMatch(b *testing.B) {
 	replacements := make([]TextReplacement, 0, 10_000)
 	for n := 0; n < 10_000; n++ {
 		replacements = append(replacements, TextReplacement{
-			ImageID: ImageID(n + 1),
+			ImageID: common.ImageID(n + 1),
 			After:   []string{fmt.Sprintf("alpha beta gamma delta%d", n)},
 		})
 	}
@@ -225,7 +225,7 @@ func BenchmarkNamespaceHashValue(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		_ = hashCanonical(cameraModel, KindEnum, value)
+		_ = hashCanonical(cameraModel, common.KindBitmapEnum, value)
 	}
 }
 
@@ -234,7 +234,7 @@ func BenchmarkNamespaceHashValue(b *testing.B) {
 func batchEntries(total int) []Entry {
 	entries := make([]Entry, total)
 	for i := range entries {
-		entries[i] = Entry{ImageID: ImageID(i + 1), Value: StringValue("v")}
+		entries[i] = Entry{ImageID: common.ImageID(i + 1), Value: EnumStringValue("v")}
 	}
 	return entries
 }
@@ -244,7 +244,7 @@ func benchmarkNamespaceApplyN(b *testing.B, batch, total int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -277,7 +277,7 @@ func BenchmarkNamespaceApplyChannel8(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -347,11 +347,11 @@ func BenchmarkCompiledFilter(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	candidates := make([]ImageID, 10_000)
+	candidates := make([]common.ImageID, 10_000)
 	for n := range candidates {
-		candidates[n] = ImageID(n*7 + 1)
+		candidates[n] = common.ImageID(n*7 + 1)
 	}
-	buffer := make([]ImageID, 0, 10_000)
+	buffer := make([]common.ImageID, 0, 10_000)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -364,7 +364,7 @@ func BenchmarkCompiledFilter(b *testing.B) {
 }
 
 func BenchmarkCompiledTextMatch(b *testing.B) {
-	index, err := NewNamespaceIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func BenchmarkCompiledTextMatch(b *testing.B) {
 	replacements := make([]TextReplacement, 0, 10_000)
 	for n := 0; n < 10_000; n++ {
 		replacements = append(replacements, TextReplacement{
-			ImageID: ImageID(n + 1),
+			ImageID: common.ImageID(n + 1),
 			After:   []string{fmt.Sprintf("alpha beta gamma delta%d", n)},
 		})
 	}
@@ -397,26 +397,26 @@ var sinkTable postingTable
 
 // seededEnumNamespace builds a compacted enum base with count members under one
 // value and returns the namespace, the value key, and the Value.
-func seededEnumNamespace(b *testing.B, count int) (*NamespaceIndex, NamespaceKey, Value) {
+func seededEnumNamespace(b *testing.B, count int) (*Index, NamespaceKey, Value) {
 	b.Helper()
-	value := StringValue("v")
-	namespace, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	value := EnumStringValue("v")
+	namespace, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = namespace.Close() })
 	for id := 1; id <= count; id++ {
 		commit(b, namespace, func(bt *Batch) error {
-			return bt.Add(Entry{ImageID: ImageID(id), Value: value})
+			return bt.Add(Entry{ImageID: common.ImageID(id), Value: value})
 		})
 	}
 	if err := namespace.Compact(); err != nil {
 		b.Fatal(err)
 	}
-	return namespace, hashCanonical(common.NamespaceTag, KindEnum, []byte("v")), value
+	return namespace, hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("v")), value
 }
 
-func testDelta(key NamespaceKey, add, remove []ImageID) *namespaceDelta {
+func testDelta(key NamespaceKey, add, remove []common.ImageID) *namespaceDelta {
 	bd := newBitmapDelta(add, remove)
 	if bd == nil {
 		return nil
@@ -431,15 +431,15 @@ func BenchmarkContainerFold(b *testing.B) {
 	cases := []struct {
 		name   string
 		base   int
-		add    []ImageID
-		remove []ImageID
+		add    []common.ImageID
+		remove []common.ImageID
 	}{
-		{"TinyAdd", 3, []ImageID{1000}, nil},
-		{"TinyPromote", 4, []ImageID{1000}, nil},
-		{"TinyDrop", 1, nil, []ImageID{1}},
-		{"BitmapAdd", 64, []ImageID{1000}, nil},
-		{"BitmapDemote", 5, nil, []ImageID{1}},
-		{"BitmapDrop", 5, nil, []ImageID{1, 2, 3, 4, 5}},
+		{"TinyAdd", 3, []common.ImageID{1000}, nil},
+		{"TinyPromote", 4, []common.ImageID{1000}, nil},
+		{"TinyDrop", 1, nil, []common.ImageID{1}},
+		{"BitmapAdd", 64, []common.ImageID{1000}, nil},
+		{"BitmapDemote", 5, nil, []common.ImageID{1}},
+		{"BitmapDrop", 5, nil, []common.ImageID{1, 2, 3, 4, 5}},
 	}
 	for _, testCase := range cases {
 		b.Run(testCase.name, func(b *testing.B) {
@@ -469,7 +469,7 @@ func BenchmarkContainerDelta(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
-				id := ImageID(10_000 + (n & 1023))
+				id := common.ImageID(10_000 + (n & 1023))
 				if err := batch.Reset(); err != nil {
 					b.Fatal(err)
 				}
@@ -527,12 +527,12 @@ func BenchmarkContainerGeoMove(b *testing.B) {
 			b.Cleanup(func() { _ = namespace.Close() })
 			for id := 1; id <= testCase.from; id++ {
 				commit(b, namespace, func(bt *Batch) error {
-					return bt.Add(Entry{ImageID: ImageID(id), Value: GeoValue(paris)})
+					return bt.Add(Entry{ImageID: common.ImageID(id), Value: GeoValue(paris)})
 				})
 			}
 			for id := 1000; id < 1000+testCase.to; id++ {
 				commit(b, namespace, func(bt *Batch) error {
-					return bt.Add(Entry{ImageID: ImageID(id), Value: GeoValue(london)})
+					return bt.Add(Entry{ImageID: common.ImageID(id), Value: GeoValue(london)})
 				})
 			}
 			if err := namespace.Compact(); err != nil {
@@ -626,7 +626,7 @@ func BenchmarkContainerFlip(b *testing.B) {
 		b.Cleanup(func() { _ = namespace.Close() })
 		for id := 1; id <= 4; id++ {
 			commit(b, namespace, func(bt *Batch) error {
-				return bt.Add(Entry{ImageID: ImageID(id), Value: GeoValue(paris)})
+				return bt.Add(Entry{ImageID: common.ImageID(id), Value: GeoValue(paris)})
 			})
 		}
 		if err := namespace.Compact(); err != nil {

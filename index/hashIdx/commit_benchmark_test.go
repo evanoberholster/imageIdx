@@ -1,16 +1,17 @@
 package hashidx
 
 import (
+	common "github.com/evanoberholster/imageIdx/common"
 	"sync/atomic"
 	"testing"
 )
 
-// Group-commit probes. DurabilitySync is the interesting mode: the commit
+// Group-commit probes. common.DurabilitySync is the interesting mode: the commit
 // loop coalesces every request queued while a sync is in flight into one
 // group sharing one fsync, while a lone writer still pays one fsync per
 // Apply.
 func BenchmarkApplySyncSingle(b *testing.B) {
-	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilitySync)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), common.DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -20,7 +21,7 @@ func BenchmarkApplySyncSingle(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		id := next.Add(1)
-		if err := idx.Apply([]Entry{{ImageID: ImageID(id), PHash64: id, PDQ: pdqFrom(id)}}); err != nil {
+		if err := idx.Apply([]Entry{{ImageID: common.ImageID(id), PHash64: id, PDQ: pdqFrom(id)}}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -28,7 +29,7 @@ func BenchmarkApplySyncSingle(b *testing.B) {
 }
 
 func BenchmarkApplySyncParallel(b *testing.B) {
-	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), DurabilitySync)
+	idx, err := newIndex(b.TempDir(), testPerceptualSpec(Config{}), common.DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -39,7 +40,7 @@ func BenchmarkApplySyncParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			id := next.Add(1)
-			if err := idx.Apply([]Entry{{ImageID: ImageID(id), PHash64: id, PDQ: pdqFrom(id)}}); err != nil {
+			if err := idx.Apply([]Entry{{ImageID: common.ImageID(id), PHash64: id, PDQ: pdqFrom(id)}}); err != nil {
 				b.Error(err)
 				return
 			}

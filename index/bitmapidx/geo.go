@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	// GeoS2Level is the fixed cell level of a KindGeo namespace. All geo
+	// GeoS2Level is the fixed cell level of a KindBitmapGeo namespace. All geo
 	// postings bucket by level-16 keys; coarser inputs expand and finer
 	// inputs snap to their level-16 ancestor.
 	GeoS2Level = 16
@@ -41,21 +41,21 @@ func EncodeS2Key(cellID uint64) S2Key { return cellID >> geoKeyShift }
 // shifting. It does not validate level; use CellIDFromKey for that.
 func DecodeS2Key(key S2Key) uint64 { return uint64(key) << geoKeyShift }
 
-// GeoEntry is one image coordinate used to seed a KindGeo namespace via
+// GeoEntry is one image coordinate used to seed a KindBitmapGeo namespace via
 // NewGeoNamespace.
 type GeoEntry struct {
-	ImageID   ImageID
+	ImageID   common.ImageID
 	Latitude  float64
 	Longitude float64
 }
 
-// NewGeoNamespace constructs a KindGeo namespace index seeded with entries. It
-// builds a StoragePerType definition with GeoCodec version 1 and converts
-// every coordinate through KeyFromLatLng. Use NewNamespaceIndex directly for
+// NewGeoNamespace constructs a KindBitmapGeo namespace index seeded with entries. It
+// builds a geographic definition with GeoCodec version 1 and converts
+// every coordinate through KeyFromLatLng. Use NewIndex directly for
 // full control of the definition. Failures close the partial index.
-func NewGeoNamespace(t common.Namespace, entries []GeoEntry, config NamespaceConfig) (*NamespaceIndex, error) {
-	spec := NamespaceSpec{Namespace: t, Kind: KindGeo, Storage: StoragePerType, Geo: GeoCodec{Version: 1}}
-	index, err := NewNamespaceIndex(spec, config)
+func NewGeoNamespace(t common.Namespace, entries []GeoEntry, config NamespaceConfig) (*Index, error) {
+	spec := NamespaceSpec{Namespace: t, Kind: common.KindBitmapGeo, Geo: GeoCodec{Version: 1}}
+	index, err := NewIndex(spec, config)
 	if err != nil {
 		return nil, err
 	}

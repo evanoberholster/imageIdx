@@ -1,368 +1,353 @@
 package bitmapidx
 
 import (
-	"crypto/rand"
-	"encoding/binary"
+	"context"
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
-	"slices"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	commitqueue "github.com/evanoberholster/imageIdx/internal/commit"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	"github.com/evanoberholster/imageIdx/internal/textanalyzer"
 )
 
-const namespaceManifestMagic uint32 = 0x424d464d
+var (
+	// ErrInvalidMutation reports a malformed membership transition.
+	ErrInvalidMutation = errors.New("bitmapidx: invalid mutation")
+	// ErrInvalidImageID reports ImageID zero, which is reserved.
+	ErrInvalidImageID = errors.New("bitmapidx: image ID zero is reserved")
+	// ErrDuplicateImageID reports an image already holding a value in a namespace
+	// that allows only one value per image.
+	ErrDuplicateImageID = errors.New("bitmapidx: duplicate image ID")
+)
 
-// Index persists a fixed registry of namespaces with one serialized WAL
-// writer. Child Add/Apply/Move/ReplaceText calls automatically append to
-// that WAL. Each batch is atomic within one namespace; cross-namespace
-// transactions are not provided. Reads remain lock-free across writes and
-// checkpoints. Close owns all child and mmap lifetimes.
-//
-// There is no automatic checkpoint trigger: the WAL grows with every write
-// until the caller invokes Checkpoint or Vacuum, and the prior snapshot
-// generation is retained until Vacuum retires it. Deployments must schedule
-// maintenance, bound WAL growth, and monitor free space themselves; the
-// package benchmark suite probes the checkpoint write stall and restart
-// budgets.
-type Index struct {
-	dir        string
-	namespaces map[common.Namespace]*NamespaceIndex // immutable after construction
-	order      []*NamespaceIndex
-	config     NamespaceConfig
-	durability Durability
-	storeID    [16]byte // binds manifest, snapshots, and WAL to one store
-	writeMu    sync.Mutex
-	closed     bool
-	failed     error
-	lock       *os.File
-	wal        *storage.WAL
-	generation uint64
-	mapping    []byte
+// NamespaceConfig controls namespace delta rotation and compaction. The zero
+// value is valid; NewIndex fills defaults. ActiveTarget rotates
+// Active to Frozen and schedules background compaction; HardDeltaLimit
+// and MaxDeltaValues instead fold the batch directly into Base on the
+// write path, bounding every reader-visible delta.
+type NamespaceConfig struct {
+	// ActiveTarget is the Active ID count at which a write rotates the
+	// delta to Frozen and schedules background compaction.
+	ActiveTarget int
+	// HardDeltaLimit bounds the IDs in one visible delta. Exceeding it
+	// folds the batch into Base synchronously.
+	HardDeltaLimit int
+	// MaxDeltaValues bounds the distinct values touched in one visible
+	// delta. Exceeding it folds the batch into Base synchronously.
+	MaxDeltaValues int
+	// CompactDelay pauses background compaction, primarily for tests and
+	// workload tuning. Zero compacts immediately.
+	CompactDelay time.Duration
 }
 
-// newStoreID returns a fresh random identity. Persisting it in the manifest
-// and every snapshot and WAL frame lets open detect files mixed between
-// different stores after a backup or restore.
-func newStoreID() ([16]byte, error) {
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		return [16]byte{}, err
+const (
+	// DefaultNamespaceActiveTarget is the default Active-to-Frozen rotation bound.
+	DefaultNamespaceActiveTarget = 2_048
+	// DefaultNamespaceHardDeltaLimit is the maximum default visible delta size.
+	DefaultNamespaceHardDeltaLimit = 4_096
+	// DefaultNamespaceMaxDeltaValues is the default distinct-value delta bound.
+	DefaultNamespaceMaxDeltaValues = 256
+)
+
+func (c NamespaceConfig) withDefaults() (NamespaceConfig, error) {
+	if c.ActiveTarget < 0 || c.HardDeltaLimit < 0 || c.MaxDeltaValues < 0 || c.CompactDelay < 0 {
+		return NamespaceConfig{}, ErrInvalidConfig
 	}
-	return id, nil
+	if c.ActiveTarget == 0 {
+		c.ActiveTarget = DefaultNamespaceActiveTarget
+	}
+	if c.HardDeltaLimit == 0 {
+		c.HardDeltaLimit = DefaultNamespaceHardDeltaLimit
+	}
+	if c.MaxDeltaValues == 0 {
+		c.MaxDeltaValues = DefaultNamespaceMaxDeltaValues
+	}
+	if c.HardDeltaLimit < 2 || c.ActiveTarget >= c.HardDeltaLimit {
+		return NamespaceConfig{}, ErrInvalidConfig
+	}
+	return c, nil
 }
 
-// NewIndex creates a new mmap-backed namespace store. The
-// directory must be empty (besides the lock file). NamespaceSpec definitions are
-// validated, persisted in the first checkpoint, and immutable after;
-// config is runtime-only policy. Handles become store-owned on success
-// and must be closed via the store.
-func NewIndex(dir string, namespaces []NamespaceSpec, config NamespaceConfig, durability Durability) (*Index, error) {
+// NamespaceMetadata is a copied summary of the current namespace snapshot:
+// the immutable definition, the monotonically increasing view
+// generation, and the number of values in Base.
+type NamespaceMetadata struct {
+	Spec       NamespaceSpec
+	Generation uint64
+	BaseValues uint64
+}
+
+// Index is one immutable-namespace, multi-value index. Readers load one
+// atomically published namespaceView and take no locks beyond the reader
+// tracker; writers stage Pebble-style batches that commit through one
+// background pipeline per index, coalescing concurrent batches into a
+// group sharing one lock hold, one WAL sync, and one view publication.
+// One batch publishes atomically across postings and dictionary.
+//
+// Reads against a closed index report empty results, as do queries
+// compiled after close; writes and maintenance report ErrClosed. The zero
+// value is not usable; construct with NewIndex. Store-owned indexes
+// (owner != nil) route writes through the store WAL and must be closed via
+// the store.
+type Index struct {
+	owner    *Store // immutable before exposing the handle
+	view     atomic.Pointer[namespaceView]
+	readers  *storage.ReaderTracker
+	writerMu sync.Mutex
+	config   NamespaceConfig
+	closed   atomic.Bool
+	workers  sync.WaitGroup
+	pending  atomic.Int64
+	dict     dictionaryWriter
+	analyzer *textanalyzer.Analyzer
+	// Commit pipeline: prepared batches and barrier markers queue here;
+	// the shared commit.Queue collects each burst into one group that the
+	// loop commits under a single lock hold. barrierErr latches the first
+	// commit error since the previous barrier and is touched only by the
+	// loop goroutine.
+	commits    *commitqueue.Queue[commitReq]
+	barrierErr error
+}
+
+// NewIndex constructs an empty namespace index from a validated
+// definition. Config zero values take defaults. The definition is
+// deep-copied; text namespaces also build their analyzer here so writes and
+// queries never construct one per batch.
+func NewIndex(namespace NamespaceSpec, config NamespaceConfig) (*Index, error) {
+	if err := validateNamespace(namespace); err != nil {
+		return nil, err
+	}
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
 	}
-	if !durability.Valid() {
-		return nil, ErrInvalidConfig
+	namespace.Normalizer = namespace.Normalizer.clone()
+	namespace.Analyzer = namespace.Analyzer.clone()
+	index := &Index{
+		config:  config,
+		readers: &storage.ReaderTracker{},
 	}
-	specs := slices.Clone(namespaces)
-	slices.SortFunc(specs, func(a, b NamespaceSpec) int { return int(a.Namespace) - int(b.Namespace) })
-	if err := validateNamespaceSpecs(specs); err != nil {
-		return nil, err
-	}
-	storeID, err := newStoreID()
-	if err != nil {
-		return nil, err
-	}
-	lock, err := storage.AcquireLock(dir, storeLockName, true)
-	if err != nil {
-		return nil, err
-	}
-	s := &Index{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, namespaces: make(map[common.Namespace]*NamespaceIndex)}
-	for _, spec := range specs {
-		index, err := NewNamespaceIndex(spec, config)
+	index.commits = commitqueue.New(commitQueueCapacity, index.commitGroup)
+	if namespace.Kind == common.KindBitmapString {
+		index.analyzer, err = textanalyzer.New(namespace.Analyzer.Code, namespace.Analyzer.Version, namespace.Analyzer.Params)
 		if err != nil {
-			s.Close()
 			return nil, err
 		}
-		s.namespaces[spec.Namespace] = index
-		s.order = append(s.order, index)
 	}
-	if err := s.Checkpoint(); err != nil {
-		s.Close()
-		return nil, err
-	}
-	for _, index := range s.order {
-		index.owner = s
-	}
-	return s, nil
+	index.view.Store(&namespaceView{namespace: namespace, dict: index.dict.view(), generation: 1})
+	return index, nil
 }
 
-// OpenIndex opens a checkpoint, replays its WAL, and repairs
-// only an incomplete terminal frame before making namespace handles
-// available. Generation, namespace count, segment checksums, and WAL offsets
-// all validate; any other corruption fails the open for external recovery.
-func OpenIndex(dir string, config NamespaceConfig, durability Durability) (*Index, error) {
-	config, err := config.withDefaults()
+// Spec returns a deep copy of the immutable namespace definition.
+func (i *Index) Spec() NamespaceSpec { return i.view.Load().namespace.clone() }
+
+// spec returns the current immutable definition without copying. Internal
+// paths only read it; callers that may retain or mutate the definition use
+// the cloning Spec method.
+func (i *Index) spec() NamespaceSpec { return i.view.Load().namespace }
+
+// Metadata returns a copied summary of the current snapshot.
+func (i *Index) Metadata() NamespaceMetadata {
+	view := i.view.Load()
+	return NamespaceMetadata{Spec: view.namespace.clone(), Generation: view.generation, BaseValues: uint64(len(view.base.keys))}
+}
+
+// PendingCompactions reports the number of in-flight background
+// compactions folding Frozen into Base.
+func (i *Index) PendingCompactions() int64 { return i.pending.Load() }
+
+// WaitIdle blocks until background compactions drain or ctx is cancelled.
+// It polls every 100µs via storage.WaitForCondition and never takes the writer lock.
+func (i *Index) WaitIdle(ctx context.Context) error {
+	return storage.WaitForCondition(ctx, func() bool { return i.pending.Load() == 0 })
+}
+
+// Contains reports whether id holds value in this namespace. Unknown values
+// report false with no error; kind mismatches and oversized values report
+// errors. Closed indexes report false.
+func (i *Index) Contains(id common.ImageID, value Value) (bool, error) {
+	base, canonical, err := i.keyForValue(i.spec(), value)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	if !durability.Valid() {
-		return nil, ErrInvalidConfig
+	token := i.readers.Acquire()
+	view := i.view.Load()
+	if i.closed.Load() {
+		i.readers.Release(token)
+		return false, nil
 	}
-	lock, err := storage.AcquireLock(dir, storeLockName, false)
-	if err != nil {
-		return nil, err
-	}
-	s := &Index{dir: dir, config: config, durability: durability, lock: lock}
-	ok := false
-	defer func() {
+	key := base
+	if canonical != nil {
+		resolved, ok := view.dict.resolve(base, canonical)
 		if !ok {
-			s.Close()
+			i.readers.Release(token)
+			return false, nil
 		}
-	}()
-	data, err := os.ReadFile(filepath.Join(dir, "manifest"))
-	if err != nil {
-		return nil, err
+		key = resolved
 	}
-	if err := storage.VerifyManifest(data, 48, namespaceManifestMagic, 2, 44, 44); err != nil {
-		return nil, ErrCorruptManifest
-	}
-	copy(s.storeID[:], data[24:40])
-	if s.storeID == ([16]byte{}) {
-		return nil, ErrCorruptManifest
-	}
-	s.generation = binary.LittleEndian.Uint64(data[8:16])
-	if s.generation == 0 {
-		return nil, ErrCorruptManifest
-	}
-	s.order, s.mapping, err = openNamespaceSegment(s.snapshotPath(s.generation), s.generation, config, s.storeID)
-	if err != nil {
-		return nil, err
-	}
-	if uint64(len(s.order)) != binary.LittleEndian.Uint64(data[16:24]) {
-		return nil, ErrCorruptManifest
-	}
-	s.namespaces = make(map[common.Namespace]*NamespaceIndex, len(s.order))
-	for _, index := range s.order {
-		s.namespaces[index.spec().Namespace] = index
-	}
-	walPath := s.walPath(s.generation)
-	if _, err := os.Stat(walPath); err != nil {
-		return nil, err
-	}
-	end, err := s.replay(walPath)
-	if err != nil {
-		return nil, err
-	}
-	s.wal, err = storage.OpenWAL(walPath, 0)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.wal.RepairTail(end); err != nil {
-		return nil, err
-	}
-	for _, index := range s.order {
-		index.owner = s
-	}
-	ok = true
-	return s, nil
+	present := view.contains(key, id)
+	i.readers.Release(token)
+	return present, nil
 }
 
-// Lookup returns the store-owned namespace for t. All mutations append to the
-// store WAL. The handle must not be closed directly.
-func (s *Index) Lookup(t common.Namespace) (*NamespaceIndex, bool) {
-	index, ok := s.namespaces[t]
-	return index, ok
+// ContainsKey reports whether id holds the posting named by key,
+// including its collision slot. It skips canonicalization for callers
+// that already resolved keys.
+func (i *Index) ContainsKey(id common.ImageID, key NamespaceKey) bool {
+	token := i.readers.Acquire()
+	view := i.view.Load()
+	present := !i.closed.Load() && view.contains(key, id)
+	i.readers.Release(token)
+	return present
 }
 
-// Len returns the number of namespaces in physical storage order.
-func (s *Index) Len() int { return len(s.order) }
+// Writes stage through Batch and commit through the background pipeline;
+// see batch.go and commit.go. A batch queued with Batch.Apply becomes
+// visible after Barrier.
 
-// Namespaces returns store-owned handles in physical storage order. The slice
-// is a copy; the handles are shared and must not be closed directly.
-func (s *Index) Namespaces() []*NamespaceIndex { return append([]*NamespaceIndex(nil), s.order...) }
-
-func (s *Index) writable() error {
-	if s.closed {
-		return ErrClosed
-	}
-	return s.failed
-}
-
-func (s *Index) snapshotPath(gen uint64) string {
-	return filepath.Join(s.dir, fmt.Sprintf("namespaces-%020d.idx", gen))
-}
-func (s *Index) walPath(gen uint64) string {
-	return filepath.Join(s.dir, fmt.Sprintf("namespaces-%020d.wal", gen))
-}
-
-// Checkpoint blocks writers, not readers. It syncs the WAL, writes and
-// revalidates a new mmap snapshot, syncs an empty successor WAL and the
-// directory, then publishes the manifest. Afterwards it swaps namespace
-// roots, drains prior readers, and unmaps the old snapshot. A completed
-// checkpoint bounds subsequent replay to its WAL.
-func (s *Index) Checkpoint() error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.checkpointLocked(false)
-}
-
-// Vacuum checkpoints with dead dictionary entries dropped, then removes
-// obsolete snapshot and WAL generations. Retirement serializes with
-// manifest publication; only the live generation's files remain.
-func (s *Index) Vacuum() error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.checkpointLocked(true); err != nil {
-		return err
-	}
-	if err := storage.RemoveObsolete(s.dir, "namespaces-*.idx", s.snapshotPath(s.generation)); err != nil {
-		return err
-	}
-	return storage.RemoveObsolete(s.dir, "namespaces-*.wal", s.walPath(s.generation))
-}
-
-// checkpointLocked writes, validates, and publishes one generation. Crash
-// safety rests on the old manifest staying authoritative until the new
-// one publishes: segment and successor WAL writes precede it, directory
-// names sync before it, and an unpublished successor from a prior crash
-// is safe to truncate while the lock is held. Dictionary generations are
-// preserved on plain checkpoints so compiled queries keep their fast
-// path; vacuum advances them because dead values may leave the set.
-func (s *Index) checkpointLocked(vacuum bool) error {
-	if err := s.writable(); err != nil {
-		return err
-	}
-	if s.generation == ^uint64(0) {
-		return ErrInvalidConfig
-	}
-	if s.wal != nil {
-		if err := s.wal.Sync(); err != nil {
-			s.failed = err
+// Compact synchronously merges Frozen and Active into a new Base and
+// seals the dictionary. It preserves the visible value set, so only
+// posting storage moves.
+func (i *Index) Compact() error {
+	if i.owner != nil {
+		i.owner.writeMu.Lock()
+		defer i.owner.writeMu.Unlock()
+		if err := i.owner.writable(); err != nil {
 			return err
 		}
 	}
-	for _, index := range s.order {
-		index.writerMu.Lock()
+	i.writerMu.Lock()
+	if i.closed.Load() {
+		i.writerMu.Unlock()
+		return ErrClosed
 	}
-	locked := true
-	defer func() {
-		if locked {
-			for _, index := range s.order {
-				index.writerMu.Unlock()
-			}
-		}
-	}()
-	gen := s.generation + 1
-	target := s.snapshotPath(gen)
-	if err := writeNamespaceSegment(target+".tmp", gen, s.order, vacuum, s.storeID); err != nil {
-		return err
-	}
-	if err := os.Rename(target+".tmp", target); err != nil {
-		return err
-	}
-	loaded, mapping, err := openNamespaceSegment(target, gen, s.config, s.storeID)
-	if err != nil {
-		return err
-	}
-	keepMapping := false
-	defer func() {
-		if !keepMapping {
-			storage.Unmap(mapping)
-		}
-	}()
-	// An unpublished successor left by a crash is safe to replace while we
-	// exclusively own the directory and the old manifest remains authoritative.
-	wf, err := os.OpenFile(s.walPath(gen), os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
-	}
-	err = wf.Sync()
-	closeErr := wf.Close()
-	if err = errors.Join(err, closeErr); err != nil {
-		return err
-	}
-	nextWAL, err := storage.OpenWAL(s.walPath(gen), 0)
-	if err != nil {
-		return err
-	}
-	manifest := storage.BuildManifest(48, namespaceManifestMagic, 2, 44, 44, func(data []byte) {
-		binary.LittleEndian.PutUint64(data[8:16], gen)
-		binary.LittleEndian.PutUint64(data[16:24], uint64(len(s.order)))
-		copy(data[24:40], s.storeID[:])
-	})
-	// Sync names before publishing their manifest reference.
-	if err = storage.SyncDir(s.dir); err != nil {
-		nextWAL.Close()
-		return err
-	}
-	if err = storage.WriteManifest(s.dir, manifest); err != nil {
-		nextWAL.Close()
-		s.failed = errors.Join(ErrRecoveryRequired, err)
-		return s.failed
-	}
-	oldMapping, oldWAL := s.mapping, s.wal
-	for n, index := range s.order {
-		old := index.view.Load()
-		next := loaded[n].view.Load()
-		next.generation = old.generation + 1
-		index.dict = loaded[n].dict
-		if vacuum {
-			index.dict.generation = old.dictGen + 1
-		} else {
-			index.dict.generation = old.dictGen
-		}
-		next.dictGen = index.dict.generation
-		index.view.Store(next)
-	}
-	s.mapping, s.wal, s.generation = mapping, nextWAL, gen
-	keepMapping = true
-	for _, index := range s.order {
-		index.writerMu.Unlock()
-	}
-	locked = false
-	for _, index := range s.order {
-		index.readers.WaitForPriorReaders()
-	}
-	var retireErr error
-	if oldWAL != nil {
-		retireErr = oldWAL.Close()
-	}
-	return errors.Join(retireErr, storage.Unmap(oldMapping),
-		storage.RemoveObsolete(s.dir, "namespaces-*.wal", s.walPath(s.generation)))
+	current := i.view.Load()
+	base := current.effectiveTable(current.frozen, current.active)
+	i.dict.seal()
+	i.publishLocked(current, base, nil, nil)
+	i.writerMu.Unlock()
+	i.readers.WaitForPriorReaders()
+	return nil
 }
 
-// Close marks the store closed, closes children without per-index
-// locks, then closes the WAL, unmaps the snapshot, and releases the
-// directory lock. It is idempotent. Commit loops stop before the write
-// lock is taken: their final groups need it, and queued batches commit
-// before Close returns.
-func (s *Index) Close() error {
-	for _, index := range s.order {
-		index.commits.Stop()
+// Vacuum compacts the namespace and drops dictionary values with no
+// remaining posting. It is the only operation that removes dead
+// dictionary entries, and the only one that advances the dictionary
+// generation without new values.
+func (i *Index) Vacuum() error {
+	if i.owner != nil {
+		i.owner.writeMu.Lock()
+		defer i.owner.writeMu.Unlock()
+		if err := i.owner.writable(); err != nil {
+			return err
+		}
 	}
-	for _, index := range s.order {
-		index.commits.Wait()
+	i.writerMu.Lock()
+	if i.closed.Load() {
+		i.writerMu.Unlock()
+		return ErrClosed
 	}
-	for _, index := range s.order {
-		index.workers.Wait()
+	current := i.view.Load()
+	base := current.effectiveTable(current.frozen, current.active)
+	i.rebuildDictionary(current, base)
+	i.publishLocked(current, base, nil, nil)
+	i.writerMu.Unlock()
+	i.readers.WaitForPriorReaders()
+	return nil
+}
+
+// Close marks a standalone namespace closed, waits for compactions and prior
+// readers, and rejects further writes. Store-owned indexes reject Close;
+// close the store instead.
+func (i *Index) Close() error {
+	if i.owner != nil {
+		return ErrOwnedIndex
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.closed {
-		return nil
+	return i.closeInternal()
+}
+
+func (i *Index) closeInternal() error {
+	// Stop the commit queue first so queued batches commit before the
+	// writer locks below are taken: the loop's final groups need
+	// writerMu, which close holds only briefly here.
+	i.commits.Stop()
+	i.commits.Wait()
+	i.writerMu.Lock()
+	i.closed.Store(true)
+	i.writerMu.Unlock()
+	i.workers.Wait()
+	i.readers.WaitForPriorReaders()
+	return nil
+}
+
+// LookupValue appends the canonical bytes for key to dst. It reports
+// hash-plus-slot presence without byte verification; use KeyForValue to
+// resolve a value to its verified slot first.
+func (i *Index) LookupValue(dst []byte, key NamespaceKey) ([]byte, bool) {
+	token := i.readers.Acquire()
+	view := i.view.Load()
+	if i.closed.Load() {
+		i.readers.Release(token)
+		return dst, false
 	}
-	s.closed = true
-	for _, index := range s.order {
-		index.closeInternal()
+	out, ok := view.dict.lookup(dst, key)
+	i.readers.Release(token)
+	return out, ok
+}
+
+// Iterate visits one dictionary value per key in key order. Returning
+// false stops early. Values alias chunk/mmap storage valid only for the
+// call. It materializes merged state, so it allocates. The reader guard is
+// released even if fn panics; fn must not call maintenance operations.
+func (i *Index) Iterate(fn func(key NamespaceKey, value []byte) bool) {
+	token := i.readers.Acquire()
+	defer i.readers.Release(token)
+	view := i.view.Load()
+	if !i.closed.Load() {
+		view.dict.iterate(fn)
 	}
-	var err error
-	if s.wal != nil {
-		err = s.wal.Close()
+}
+
+// Prefix visits dictionary values starting with prefix, in byte order of
+// canonical values. Values alias storage valid only for the call. It
+// re-sorts by value, so it is O(N log N); see dictionaryView.prefix. The
+// reader guard is released even if fn panics; fn must not call maintenance
+// operations.
+func (i *Index) Prefix(prefix []byte, fn func(key NamespaceKey, value []byte) bool) {
+	token := i.readers.Acquire()
+	defer i.readers.Release(token)
+	view := i.view.Load()
+	if !i.closed.Load() {
+		view.dict.prefix(prefix, fn)
 	}
-	return errors.Join(err, storage.Unmap(s.mapping), storage.ReleaseLock(s.lock))
+}
+
+// KeyForValue canonicalizes and hashes value, returning its dictionary
+// key including its collision slot. Absent values, and any value on a
+// closed index, report ok=false. Continuous values have no dictionary
+// entry and report their order key directly.
+func (i *Index) KeyForValue(value Value) (NamespaceKey, bool, error) {
+	namespace := i.spec()
+	key, canonical, err := i.keyForValue(namespace, value)
+	if err != nil {
+		return NamespaceKey{}, false, err
+	}
+	if canonical == nil {
+		return key, true, nil // continuous values have no dictionary entry
+	}
+	token := i.readers.Acquire()
+	view := i.view.Load()
+	if i.closed.Load() {
+		i.readers.Release(token)
+		return NamespaceKey{}, false, nil
+	}
+	resolved, ok := view.dict.resolve(key, canonical)
+	i.readers.Release(token)
+	if !ok {
+		return key, false, nil
+	}
+	return resolved, true, nil
 }

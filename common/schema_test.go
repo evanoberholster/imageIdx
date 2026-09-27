@@ -9,8 +9,8 @@ import (
 func TestSchemaRegistrationAndUniqueness(t *testing.T) {
 	schema := NewSchema()
 	defs := []NamespaceDef{
-		{Namespace: NamespaceLocation, Name: "location", Kind: KindBitmap, Config: []byte{1, 2, 3}},
-		{Namespace: NamespaceTag, Name: "tag", Kind: KindBitmap},
+		{Namespace: NamespaceLocation, Name: "location", Kind: KindBitmapGeo, Config: []byte{1, 2, 3}},
+		{Namespace: NamespaceTag, Name: "tag", Kind: KindBitmapEnum},
 		{Namespace: 90, Name: "timeline", Kind: KindTimestamp},
 		{Namespace: 100, Name: "vec-image", Kind: KindVector},
 	}
@@ -32,20 +32,23 @@ func TestSchemaRegistrationAndUniqueness(t *testing.T) {
 	if _, ok := schema.LookupName("missing"); ok {
 		t.Fatal("missing name resolved")
 	}
-	if got := len(schema.DefsOfKind(KindBitmap)); got != 2 {
-		t.Fatalf("bitmap defs = %d", got)
+	if got := len(schema.DefsOfKind(KindBitmapEnum)); got != 1 {
+		t.Fatalf("enum defs = %d", got)
+	}
+	if got := len(schema.DefsOfKind(KindBitmapGeo)); got != 1 {
+		t.Fatalf("geo defs = %d", got)
 	}
 
-	if err := schema.Register(NamespaceDef{Namespace: NamespaceLocation, Name: "other", Kind: KindBitmap}); !errors.Is(err, ErrNamespaceDuplicate) {
+	if err := schema.Register(NamespaceDef{Namespace: NamespaceLocation, Name: "other", Kind: KindBitmapEnum}); !errors.Is(err, ErrNamespaceDuplicate) {
 		t.Fatalf("duplicate id err = %v", err)
 	}
-	if err := schema.Register(NamespaceDef{Namespace: 500, Name: "location", Kind: KindBitmap}); !errors.Is(err, ErrNamespaceName) {
+	if err := schema.Register(NamespaceDef{Namespace: 500, Name: "location", Kind: KindBitmapEnum}); !errors.Is(err, ErrNamespaceName) {
 		t.Fatalf("duplicate name err = %v", err)
 	}
-	if err := schema.Register(NamespaceDef{Namespace: 0, Name: "zero", Kind: KindBitmap}); !errors.Is(err, ErrNamespaceInvalid) {
+	if err := schema.Register(NamespaceDef{Namespace: 0, Name: "zero", Kind: KindBitmapEnum}); !errors.Is(err, ErrNamespaceInvalid) {
 		t.Fatalf("zero err = %v", err)
 	}
-	if err := schema.Register(NamespaceDef{Namespace: 501, Name: "", Kind: KindBitmap}); !errors.Is(err, ErrNamespaceName) {
+	if err := schema.Register(NamespaceDef{Namespace: 501, Name: "", Kind: KindBitmapEnum}); !errors.Is(err, ErrNamespaceName) {
 		t.Fatalf("empty name err = %v", err)
 	}
 	if err := schema.Register(NamespaceDef{Namespace: 502, Name: "bad", Kind: 99}); !errors.Is(err, ErrNamespaceKind) {
@@ -56,7 +59,7 @@ func TestSchemaRegistrationAndUniqueness(t *testing.T) {
 func TestSchemaRoundTrip(t *testing.T) {
 	schema := NewSchema()
 	if err := schema.RegisterAll(
-		NamespaceDef{Namespace: NamespaceAlbum, Name: "album", Kind: KindBitmap, Config: []byte("codec")},
+		NamespaceDef{Namespace: NamespaceAlbum, Name: "album", Kind: KindBitmapEnum, Config: []byte("codec")},
 		NamespaceDef{Namespace: 700, Name: "sha256", Kind: KindHashExact, Config: []byte{9}},
 		NamespaceDef{Namespace: 701, Name: "pdq", Kind: KindHashPerceptual},
 	); err != nil {
@@ -89,7 +92,7 @@ func TestSchemaRoundTrip(t *testing.T) {
 
 func TestSchemaRejectsCorruption(t *testing.T) {
 	schema := NewSchema()
-	if err := schema.Register(NamespaceDef{Namespace: 1, Name: "a", Kind: KindBitmap}); err != nil {
+	if err := schema.Register(NamespaceDef{Namespace: 1, Name: "a", Kind: KindBitmapEnum}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := schema.MarshalBinary()
@@ -113,7 +116,7 @@ func TestSchemaRejectsCorruption(t *testing.T) {
 		}
 	}
 	// A rejected unmarshal must not replace the receiver.
-	if err := target.Register(NamespaceDef{Namespace: 2, Name: "keep", Kind: KindBitmap}); err != nil {
+	if err := target.Register(NamespaceDef{Namespace: 2, Name: "keep", Kind: KindBitmapEnum}); err != nil {
 		t.Fatal(err)
 	}
 	if err := target.UnmarshalBinary(cases["crc"]); err == nil {
@@ -144,12 +147,20 @@ func TestNamespaceAndKindValidity(t *testing.T) {
 	if !NamespaceTag.Valid() {
 		t.Fatal("tag namespace invalid")
 	}
-	for _, kind := range []NamespaceKind{KindBitmap, KindTimestamp, KindHashExact, KindHashPerceptual, KindVector} {
+	for _, kind := range []NamespaceKind{
+		KindBitmapEnum, KindBitmapBool, KindBitmapString,
+		KindBitmapContinuous, KindBitmapGeo, KindBitmapBSI, KindTimestamp, KindHashExact,
+		KindHashPerceptual, KindVector, KindKV,
+	} {
 		if !kind.Valid() || kind.String() == "unknown" {
 			t.Fatalf("kind %d valid=%v name=%q", kind, kind.Valid(), kind.String())
 		}
 	}
-	if NamespaceKind(0).Valid() || NamespaceKind(99).Valid() {
+	if !KindBitmapEnum.IsBitmap() || !KindBitmapString.IsBitmap() || !KindBitmapBSI.IsBitmap() || KindVector.IsBitmap() {
+		t.Fatal("bitmap kind classification is incorrect")
+	}
+	if NamespaceKind(0).Valid() || NamespaceKind(1).Valid() || NamespaceKind(0x10).Valid() ||
+		NamespaceKind(0x17).Valid() || NamespaceKind(0x18).Valid() || NamespaceKind(0x19).Valid() || NamespaceKind(99).Valid() {
 		t.Fatal("invalid kind accepted")
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // Fuzz targets cover the byte parsers that face untrusted store files.
@@ -16,7 +18,7 @@ func validBlockImage(count uint32) []byte {
 	for k := uint32(0); k < count; k++ {
 		var h Hash
 		binary.LittleEndian.PutUint64(h[24:32], uint64(k))
-		encodeRecord(payload[k*RecordSize:(k+1)*RecordSize], ExactEntry{Hash: h, ImageID: ImageID(k + 1)})
+		encodeRecord(payload[k*RecordSize:(k+1)*RecordSize], ExactEntry{Hash: h, ImageID: common.ImageID(k + 1)})
 	}
 	image := make([]byte, blockHeaderSize+len(payload))
 	encodeBlockHeader(image, count, crc32.ChecksumIEEE(payload))

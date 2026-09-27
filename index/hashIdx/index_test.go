@@ -1,6 +1,7 @@
 package hashidx
 
 import (
+	common "github.com/evanoberholster/imageIdx/common"
 	"math/rand"
 	"testing"
 
@@ -9,7 +10,7 @@ import (
 
 func mustNewIndex(t *testing.T, cfg Config) *Index {
 	t.Helper()
-	idx, err := newIndex(t.TempDir(), testPerceptualSpec(cfg), DurabilityOS)
+	idx, err := newIndex(t.TempDir(), testPerceptualSpec(cfg), common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,15 +33,15 @@ func pdqFrom(seed uint64) PDQHash {
 
 func entryFromSeed(seed uint64) Entry {
 	return Entry{
-		ImageID: ImageID(seed + 1),
+		ImageID: common.ImageID(seed + 1),
 		PHash64: pdqFrom(seed)[0],
 		PDQ:     pdqFrom(seed ^ 0xAAAAAAAAAAAAAAAA),
 	}
 }
 
-type idSet map[ImageID]struct{}
+type idSet map[common.ImageID]struct{}
 
-func (s idSet) Contains(id ImageID) bool {
+func (s idSet) Contains(id common.ImageID) bool {
 	_, ok := s[id]
 	return ok
 }
@@ -163,20 +164,20 @@ func TestPHashRadius(t *testing.T) {
 		0x1 | 1<<40, // 2
 	}
 	for k, hash := range hashes {
-		if err := idx.Add(Entry{ImageID: ImageID(k + 1), PHash64: hash}); err != nil {
+		if err := idx.Add(Entry{ImageID: common.ImageID(k + 1), PHash64: hash}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, tc := range []struct {
 		maxDistance uint8
-		wantIDs     []ImageID
+		wantIDs     []common.ImageID
 		wantDist    []uint16
 	}{
-		{0, []ImageID{1}, []uint16{0}},
-		{1, []ImageID{1, 2, 6}, []uint16{0, 1, 1}},
-		{2, []ImageID{1, 2, 3, 6, 7}, []uint16{0, 1, 2, 1, 2}},
-		{3, []ImageID{1, 2, 3, 4, 6, 7}, []uint16{0, 1, 2, 3, 1, 2}},
-		{64, []ImageID{1, 2, 3, 4, 5, 6, 7}, []uint16{0, 1, 2, 3, 64, 1, 2}},
+		{0, []common.ImageID{1}, []uint16{0}},
+		{1, []common.ImageID{1, 2, 6}, []uint16{0, 1, 1}},
+		{2, []common.ImageID{1, 2, 3, 6, 7}, []uint16{0, 1, 2, 1, 2}},
+		{3, []common.ImageID{1, 2, 3, 4, 6, 7}, []uint16{0, 1, 2, 3, 1, 2}},
+		{64, []common.ImageID{1, 2, 3, 4, 5, 6, 7}, []uint16{0, 1, 2, 3, 64, 1, 2}},
 	} {
 		got := idx.SearchPHashRadius(nil, 0, tc.maxDistance, nil)
 		if len(got) != len(tc.wantIDs) {
@@ -201,7 +202,7 @@ func TestPDQRadiusAgainstNaive(t *testing.T) {
 	entries := make([]Entry, total)
 	for k := range entries {
 		entries[k] = Entry{
-			ImageID: ImageID(k + 1),
+			ImageID: common.ImageID(k + 1),
 			PHash64: rng.Uint64(),
 			PDQ:     pdqFrom(uint64(k) * 31),
 		}
@@ -228,7 +229,7 @@ func TestPDQRadiusCandidateFilter(t *testing.T) {
 	const total = 300
 	entries := make([]Entry, total)
 	for k := range entries {
-		entries[k] = Entry{ImageID: ImageID(k + 1), PDQ: pdqFrom(uint64(k) * 7)}
+		entries[k] = Entry{ImageID: common.ImageID(k + 1), PDQ: pdqFrom(uint64(k) * 7)}
 	}
 	idx := mustNewIndex(t, Config{RecordsPerPage: 32})
 	if err := idx.Apply(entries); err != nil {
@@ -263,13 +264,13 @@ func TestPDQRadiusCandidateFilter(t *testing.T) {
 func TestRoarBitmapAsCandidateSet(t *testing.T) {
 	idx := mustNewIndex(t, Config{})
 	for k := 0; k < 20; k++ {
-		if err := idx.Add(Entry{ImageID: ImageID(k + 1), PDQ: pdqFrom(uint64(k))}); err != nil {
+		if err := idx.Add(Entry{ImageID: common.ImageID(k + 1), PDQ: pdqFrom(uint64(k))}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	bitmap := roar.FromUnsorted([]uint64{2, 4, 6})
 	got := idx.SearchPDQRadius(nil, pdqFrom(3), 256, bitmap)
-	want := []ImageID{2, 4, 6}
+	want := []common.ImageID{2, 4, 6}
 	if len(got) != len(want) {
 		t.Fatalf("bitmap candidates = %v", got)
 	}
@@ -284,7 +285,7 @@ func TestTopKAgainstNaive(t *testing.T) {
 	const total = 400
 	entries := make([]Entry, total)
 	for k := range entries {
-		entries[k] = Entry{ImageID: ImageID(k + 1), PDQ: pdqFrom(uint64(k) * 13)}
+		entries[k] = Entry{ImageID: common.ImageID(k + 1), PDQ: pdqFrom(uint64(k) * 13)}
 	}
 	idx := mustNewIndex(t, Config{RecordsPerPage: 64})
 	if err := idx.Apply(entries); err != nil {
@@ -310,7 +311,7 @@ func TestTopKDeterministicTies(t *testing.T) {
 	idx := mustNewIndex(t, Config{})
 	query := pdqFrom(1)
 	for k := 0; k < 6; k++ {
-		if err := idx.Add(Entry{ImageID: ImageID(k + 1), PDQ: query}); err != nil {
+		if err := idx.Add(Entry{ImageID: common.ImageID(k + 1), PDQ: query}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -327,7 +328,7 @@ func TestPHashTopK(t *testing.T) {
 	idx := mustNewIndex(t, Config{})
 	hashes := []uint64{0xF0F0F0F0F0F0F0F0, 0, ^uint64(0), 0x0F0F0F0F0F0F0F0F}
 	for k, hash := range hashes {
-		if err := idx.Add(Entry{ImageID: ImageID(k + 1), PHash64: hash}); err != nil {
+		if err := idx.Add(Entry{ImageID: common.ImageID(k + 1), PHash64: hash}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -484,11 +485,11 @@ func TestSearchZeroAllocations(t *testing.T) {
 
 func TestConfigValidation(t *testing.T) {
 	for _, recordsPerPage := range []uint32{1, 7, 9, maxRecordsPerPage + 8} {
-		if _, err := newIndex(t.TempDir(), testPerceptualSpec(Config{RecordsPerPage: recordsPerPage}), DurabilityOS); err != ErrInvalidConfig {
+		if _, err := newIndex(t.TempDir(), testPerceptualSpec(Config{RecordsPerPage: recordsPerPage}), common.DurabilityOS); err != ErrInvalidConfig {
 			t.Fatalf("records per page %d error = %v", recordsPerPage, err)
 		}
 	}
-	idx, err := newIndex(t.TempDir(), testPerceptualSpec(Config{RecordsPerPage: 8}), DurabilityOS)
+	idx, err := newIndex(t.TempDir(), testPerceptualSpec(Config{RecordsPerPage: 8}), common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("minimum page size rejected: %v", err)
 	}

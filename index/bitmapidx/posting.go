@@ -1,6 +1,7 @@
 package bitmapidx
 
 import (
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -74,7 +75,7 @@ func (p *posting) contains(id uint64) bool {
 }
 
 // appendTo appends all IDs in ascending order to dst.
-func (p *posting) appendTo(dst []ImageID) []ImageID {
+func (p *posting) appendTo(dst []common.ImageID) []common.ImageID {
 	if p.isTiny() {
 		return append(dst, p.tiny.ids[:p.tiny.n]...)
 	}

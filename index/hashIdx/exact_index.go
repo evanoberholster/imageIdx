@@ -386,14 +386,14 @@ func viewContains(view *exactIndexView, hash Hash) bool {
 		if len(remGroup) == 0 {
 			return true
 		}
-		if !overlayContainsID(remGroup, ImageID(binary.LittleEndian.Uint64(rec[32:40]))) {
+		if !overlayContainsID(remGroup, common.ImageID(binary.LittleEndian.Uint64(rec[32:40]))) {
 			return true
 		}
 	}
 }
 
 // Lookup appends the sorted unique ImageIDs for hash to dst.
-func (i *ExactIndex) Lookup(dst []ImageID, hash Hash) []ImageID {
+func (i *ExactIndex) Lookup(dst []common.ImageID, hash Hash) []common.ImageID {
 	token := i.readers.Acquire()
 	if !i.closed.Load() {
 		if view := i.view.Load(); view != nil {
@@ -404,7 +404,7 @@ func (i *ExactIndex) Lookup(dst []ImageID, hash Hash) []ImageID {
 	return dst
 }
 
-func viewLookup(dst []ImageID, view *exactIndexView, hash Hash) []ImageID {
+func viewLookup(dst []common.ImageID, view *exactIndexView, hash Hash) []common.ImageID {
 	start := len(dst)
 	it := newRunIterator(view.blocks, hash)
 	for {
@@ -412,7 +412,7 @@ func viewLookup(dst []ImageID, view *exactIndexView, hash Hash) []ImageID {
 		if !ok {
 			break
 		}
-		dst = append(dst, ImageID(binary.LittleEndian.Uint64(rec[32:40])))
+		dst = append(dst, common.ImageID(binary.LittleEndian.Uint64(rec[32:40])))
 	}
 	if view.overlay == nil {
 		return dst
@@ -436,7 +436,7 @@ func viewLookup(dst []ImageID, view *exactIndexView, hash Hash) []ImageID {
 	if len(addGroup) == 0 {
 		return dst[:start+len(kept)]
 	}
-	merged := make([]ImageID, 0, len(kept)+len(addGroup))
+	merged := make([]common.ImageID, 0, len(kept)+len(addGroup))
 	i, j := 0, 0
 	for i < len(kept) && j < len(addGroup) {
 		switch {
@@ -501,12 +501,12 @@ type Mutation struct {
 }
 
 // Add inserts one pair through the shared mutation path.
-func (i *ExactIndex) Add(hash Hash, imageID ImageID) error {
+func (i *ExactIndex) Add(hash Hash, imageID common.ImageID) error {
 	return i.Apply(Mutation{Add: []ExactEntry{{Hash: hash, ImageID: imageID}}})
 }
 
 // Remove deletes one pair through the shared mutation path.
-func (i *ExactIndex) Remove(hash Hash, imageID ImageID) error {
+func (i *ExactIndex) Remove(hash Hash, imageID common.ImageID) error {
 	return i.Apply(Mutation{Remove: []ExactEntry{{Hash: hash, ImageID: imageID}}})
 }
 
@@ -957,7 +957,7 @@ func locatePair(blocks []blockHandle, e ExactEntry) int {
 		if !ok {
 			return -1
 		}
-		if ImageID(binary.LittleEndian.Uint64(rec[32:40])) == e.ImageID {
+		if common.ImageID(binary.LittleEndian.Uint64(rec[32:40])) == e.ImageID {
 			return blockIndex
 		}
 	}

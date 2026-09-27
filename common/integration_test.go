@@ -10,7 +10,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
-	"github.com/evanoberholster/imageIdx/index/hashIdx"
+	hashidx "github.com/evanoberholster/imageIdx/index/hashIdx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
 )
@@ -24,56 +24,6 @@ const (
 	vectorNamespace     common.Namespace = 102
 )
 
-// TestSharedIdentifierAndDurabilityAliases proves every index package shares
-// the common identifiers: the ImageID aliases are type-identical, the
-// principal types round-trip, and every durability constant is the same
-// common.Durability value.
-func TestSharedIdentifierAndDurabilityAliases(t *testing.T) {
-	const raw uint64 = 42
-
-	// Convert through every package in both directions. Because each alias
-	// is type-identical to common.ImageID these conversions compile without
-	// an explicit cast at any step.
-	bitmapID := bitmapidx.ImageID(raw)
-	timeID := timeidx.ImageID(bitmapID)
-	hashID := hashidx.ImageID(timeID)
-	vectorID := vectoridx.ImageID(hashID)
-	var canonical common.ImageID = vectorID
-	if canonical != raw {
-		t.Fatalf("ImageID round-trip = %d, want %d", canonical, raw)
-	}
-	if timeidx.ImageID(canonical) != raw || hashidx.ImageID(canonical) != raw || vectoridx.ImageID(canonical) != raw {
-		t.Fatal("ImageID aliases do not share one representation")
-	}
-
-	// UserID and GroupID are defined types rather than aliases, but the
-	// bitmapidx principal aliases must preserve the common values.
-	user := common.UserID(7)
-	group := common.GroupID(8)
-	var bitmapUser bitmapidx.UserID = user
-	var bitmapGroup bitmapidx.GroupID = group
-	if common.UserID(bitmapUser) != user {
-		t.Fatalf("UserID round-trip = %d, want %d", bitmapUser, user)
-	}
-	if common.GroupID(bitmapGroup) != group {
-		t.Fatalf("GroupID round-trip = %d, want %d", bitmapGroup, group)
-	}
-
-	// Every package's DurabilitySync (and DurabilityOS) is the common one.
-	if bitmapidx.DurabilitySync != common.DurabilitySync ||
-		timeidx.DurabilitySync != common.DurabilitySync ||
-		hashidx.DurabilitySync != common.DurabilitySync ||
-		vectoridx.DurabilitySync != common.DurabilitySync {
-		t.Fatal("DurabilitySync aliases disagree with common.DurabilitySync")
-	}
-	if bitmapidx.DurabilityOS != common.DurabilityOS ||
-		timeidx.DurabilityOS != common.DurabilityOS ||
-		hashidx.DurabilityOS != common.DurabilityOS ||
-		vectoridx.DurabilityOS != common.DurabilityOS {
-		t.Fatal("DurabilityOS aliases disagree with common.DurabilityOS")
-	}
-}
-
 // integrationDefs builds one NamespaceDef per index kind: bitmap, timestamp,
 // exact hash, perceptual hash, and vector.
 func integrationDefs(t *testing.T) []common.NamespaceDef {
@@ -81,12 +31,10 @@ func integrationDefs(t *testing.T) []common.NamespaceDef {
 
 	bitmapDef, err := bitmapidx.NamespaceSpec{
 		Namespace: common.NamespaceTag,
-		Name:      "tag",
-		Kind:      bitmapidx.KindEnum,
-		Storage:   bitmapidx.StoragePerType,
-	}.SchemaDef()
+		Kind:      common.KindBitmapEnum,
+	}.NamespaceDef("tag")
 	if err != nil {
-		t.Fatalf("bitmap SchemaDef: %v", err)
+		t.Fatalf("bitmap NamespaceDef: %v", err)
 	}
 
 	vectorDef := vectoridx.Config{Namespace: vectorNamespace}.NamespaceDef()
@@ -117,12 +65,12 @@ func TestSchemaRegistersEveryIndexKind(t *testing.T) {
 	// A repeated namespace number and a repeated name each fail with their
 	// sentinel error.
 	if err := schema.Register(common.NamespaceDef{
-		Namespace: common.NamespaceTag, Name: "tag-duplicate", Kind: common.KindBitmap,
+		Namespace: common.NamespaceTag, Name: "tag-duplicate", Kind: common.KindBitmapEnum,
 	}); !errors.Is(err, common.ErrNamespaceDuplicate) {
 		t.Fatalf("duplicate number err = %v, want ErrNamespaceDuplicate", err)
 	}
 	if err := schema.Register(common.NamespaceDef{
-		Namespace: 250, Name: "tag", Kind: common.KindBitmap,
+		Namespace: 250, Name: "tag", Kind: common.KindBitmapEnum,
 	}); !errors.Is(err, common.ErrNamespaceName) {
 		t.Fatalf("duplicate name err = %v, want ErrNamespaceName", err)
 	}
@@ -161,7 +109,7 @@ func TestSchemaRegistersEveryIndexKind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NamespaceSpecFromSchemaDef: %v", err)
 	}
-	if spec.Namespace != common.NamespaceTag || spec.Kind != bitmapidx.KindEnum || spec.Storage != bitmapidx.StoragePerType {
+	if spec.Namespace != common.NamespaceTag || spec.Kind != common.KindBitmapEnum {
 		t.Fatalf("restored bitmap spec = %+v", spec)
 	}
 }
@@ -173,13 +121,11 @@ func TestSchemaRegistersEveryIndexKind(t *testing.T) {
 func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 	tagSpec := bitmapidx.NamespaceSpec{
 		Namespace: common.NamespaceTag,
-		Name:      "tag",
-		Kind:      bitmapidx.KindEnum,
-		Storage:   bitmapidx.StoragePerType,
+		Kind:      common.KindBitmapEnum,
 	}
-	tags, err := bitmapidx.NewNamespaceIndex(tagSpec, bitmapidx.NamespaceConfig{})
+	tags, err := bitmapidx.NewIndex(tagSpec, bitmapidx.NamespaceConfig{})
 	if err != nil {
-		t.Fatalf("NewNamespaceIndex: %v", err)
+		t.Fatalf("NewIndex: %v", err)
 	}
 	defer func() {
 		if err := tags.Close(); err != nil {
@@ -213,7 +159,7 @@ func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 	hashStore, err := hashidx.NewStore(t.TempDir(), hashidx.StoreSpec{
 		Perceptual: hashidx.PerceptualSpec{Namespace: perceptualNamespace, Name: "perceptual"},
 		Exact:      hashidx.ExactSpec{Namespace: exactHashNamespace, Name: "exact-content", Algorithm: hashidx.AlgorithmBLAKE3},
-	}, hashidx.DurabilityOS)
+	}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("hashidx.NewStore: %v", err)
 	}

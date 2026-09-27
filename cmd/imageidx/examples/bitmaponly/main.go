@@ -23,10 +23,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	store, err := bitmapidx.NewIndex(dir, []bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Namespace: common.NamespaceAlbum, Name: "album", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-	}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
+	store, err := bitmapidx.NewStore(dir, []bitmapidx.NamespaceSpec{
+		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
+		{Namespace: common.NamespaceAlbum, Kind: common.KindBitmapEnum},
+	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -35,10 +35,10 @@ func main() {
 	album, _ := store.Lookup(common.NamespaceAlbum)
 	tagsBatch := tags.NewBatch()
 	if err := tagsBatch.Add(
-		bitmapidx.Entry{ImageID: 1, Value: bitmapidx.StringValue("favorite")},
-		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("favorite")},
-		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("favorite")},
-		bitmapidx.Entry{ImageID: 5, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 1, Value: bitmapidx.EnumStringValue("favorite")},
+		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.EnumStringValue("favorite")},
+		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.EnumStringValue("favorite")},
+		bitmapidx.Entry{ImageID: 5, Value: bitmapidx.EnumStringValue("favorite")},
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -51,9 +51,9 @@ func main() {
 	}
 	albumBatch := album.NewBatch()
 	if err := albumBatch.Add(
-		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.StringValue("holiday")},
-		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.StringValue("holiday")},
-		bitmapidx.Entry{ImageID: 4, Value: bitmapidx.StringValue("holiday")},
+		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.EnumStringValue("holiday")},
+		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.EnumStringValue("holiday")},
+		bitmapidx.Entry{ImageID: 4, Value: bitmapidx.EnumStringValue("holiday")},
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -66,8 +66,8 @@ func main() {
 	}
 
 	plan, err := search.Compile(
-		search.AllValues(tags, bitmapidx.StringValue("favorite")),
-		search.AllValues(album, bitmapidx.StringValue("holiday")),
+		search.AllValues(tags, bitmapidx.EnumStringValue("favorite")),
+		search.AllValues(album, bitmapidx.EnumStringValue("holiday")),
 	)
 	if err != nil {
 		log.Fatal(err)

@@ -55,7 +55,7 @@ type stage struct {
 	kind     StageKind
 	estimate uint64
 
-	namespaceIndex *bitmapidx.NamespaceIndex
+	namespaceIndex *bitmapidx.Index
 	namespaceKind  namespaceClauseKind
 	namespaceQuery bitmapidx.Query
 	namespaceRange bitmapidx.NumericRange
@@ -65,7 +65,7 @@ type stage struct {
 	tsEnd   uint64
 	tsExact timeidx.ExactTimestampFunc
 
-	geoIndex  *bitmapidx.NamespaceIndex
+	geoIndex  *bitmapidx.Index
 	geoRanges []bitmapidx.GeoRange
 
 	aclQueries []bitmapidx.Query
@@ -270,11 +270,11 @@ func Compile(clauses ...Clause) (Plan, error) {
 // CompileWithStore binds WithACL clauses to the store's UserACL and GroupACL
 // namespaces. Plans keep compiled namespace queries, so the store must stay open while
 // they execute. Other clauses compile identically to Compile.
-func CompileWithStore(store *bitmapidx.Index, clauses ...Clause) (Plan, error) {
+func CompileWithStore(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 	return compile(store, clauses...)
 }
 
-func compile(store *bitmapidx.Index, clauses ...Clause) (Plan, error) {
+func compile(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 	if len(clauses) == 0 {
 		return Plan{}, ErrEmptyQuery
 	}

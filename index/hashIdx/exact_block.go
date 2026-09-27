@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"slices"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 const (
@@ -186,7 +188,7 @@ func encodeRecord(dst []byte, e ExactEntry) {
 func decodeRecord(src []byte) ExactEntry {
 	var e ExactEntry
 	copy(e.Hash[:], src[:32])
-	e.ImageID = ImageID(binary.LittleEndian.Uint64(src[32:40]))
+	e.ImageID = common.ImageID(binary.LittleEndian.Uint64(src[32:40]))
 	return e
 }
 

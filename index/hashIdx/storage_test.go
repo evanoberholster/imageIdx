@@ -3,6 +3,7 @@ package hashidx
 import (
 	"encoding/binary"
 	"errors"
+	common "github.com/evanoberholster/imageIdx/common"
 	"hash/crc32"
 	"math"
 	"os"
@@ -12,7 +13,7 @@ import (
 
 func mustNewPersistent(t *testing.T, dir string, cfg Config) *Index {
 	t.Helper()
-	idx, err := newIndex(dir, testPerceptualSpec(cfg), DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(cfg), common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +23,7 @@ func mustNewPersistent(t *testing.T, dir string, cfg Config) *Index {
 
 func mustOpenPersistent(t *testing.T, dir string, cfg Config) *Index {
 	t.Helper()
-	idx, err := openIndex(dir, cfg, DurabilityOS)
+	idx, err := openIndex(dir, cfg, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestPersistentCheckpointReopen(t *testing.T) {
 		t.Fatalf("adopted records per page = %d", got)
 	}
 	// A conflicting explicit page size is rejected.
-	if _, err := openIndex(dir, Config{RecordsPerPage: 128}, DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := openIndex(dir, Config{RecordsPerPage: 128}, common.DurabilityOS); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("mismatched page size error = %v", err)
 	}
 }
@@ -195,7 +196,7 @@ func TestCorruptWALRejected(t *testing.T) {
 	if err := os.WriteFile(wal, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openIndex(dir, Config{}, DurabilityOS); !errors.Is(err, ErrCorruptWAL) {
+	if _, err := openIndex(dir, Config{}, common.DurabilityOS); !errors.Is(err, ErrCorruptWAL) {
 		t.Fatalf("corrupt wal error = %v, want ErrCorruptWAL", err)
 	}
 }
@@ -215,7 +216,7 @@ func TestCorruptManifestRejected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openIndex(dir, Config{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openIndex(dir, Config{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("corrupt manifest error = %v, want ErrCorrupt", err)
 	}
 }
@@ -240,18 +241,18 @@ func TestManifestVersionRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	bumpVersion(t, filepath.Join(dir, "manifest"))
-	if _, err := openIndex(dir, Config{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
+	if _, err := openIndex(dir, Config{}, common.DurabilityOS); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("versioned manifest error = %v, want ErrUnsupported", err)
 	}
 
 	exactDir := persistentDir(t)
-	exactIdx, err := newExact(exactDir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	exactIdx, err := newExact(exactDir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = exactIdx.Close()
 	bumpVersion(t, filepath.Join(exactDir, "manifest"))
-	if _, err := openExact(exactDir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
+	if _, err := openExact(exactDir, ExactConfig{}, common.DurabilityOS); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("versioned exact manifest error = %v, want ErrUnsupported", err)
 	}
 
@@ -307,7 +308,7 @@ func TestCorruptGenerationHeaderRejected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openIndex(dir, Config{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openIndex(dir, Config{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("corrupt generation header error = %v, want ErrCorrupt", err)
 	}
 }
@@ -337,7 +338,7 @@ func TestCorruptPagePayloadRejected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openIndex(dir, Config{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openIndex(dir, Config{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("corrupt page error = %v, want ErrCorrupt", err)
 	}
 }
@@ -365,7 +366,7 @@ func TestCorruptDirectoryRejected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openIndex(dir, Config{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openIndex(dir, Config{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("corrupt directory error = %v, want ErrCorrupt", err)
 	}
 }
@@ -383,7 +384,7 @@ func TestMissingGenerationRejected(t *testing.T) {
 	if err := os.Remove(generationPath(dir, manifest.generation)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openIndex(dir, Config{}, DurabilityOS); err == nil {
+	if _, err := openIndex(dir, Config{}, common.DurabilityOS); err == nil {
 		t.Fatal("expected an error for a missing generation file")
 	}
 }
@@ -548,7 +549,7 @@ func TestVacuumReclaimsWALStorage(t *testing.T) {
 
 func TestPersistentDurabilitySync(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := newIndex(dir, testPerceptualSpec(Config{RecordsPerPage: 16}), DurabilitySync)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{RecordsPerPage: 16}), common.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +574,7 @@ func persistentDir(t *testing.T) string {
 func TestCreateOpenCheckpoint(t *testing.T) {
 	dir := persistentDir(t)
 	entries := entriesForRange(0, 30, 1)
-	idx, err := newExact(dir, ExactSpec{Namespace: testExactNamespace, Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 1024}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Namespace: testExactNamespace, Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 1024}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,14 +589,14 @@ func TestCreateOpenCheckpoint(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{BlockSize: 1024}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{BlockSize: 1024}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
 	for i := uint64(0); i < 30; i++ {
 		got := reopened.Lookup(nil, makeHash(i))
-		if len(got) != 1 || got[0] != ImageID(i+1) {
+		if len(got) != 1 || got[0] != common.ImageID(i+1) {
 			t.Fatalf("post-open lookup %d = %v", i, got)
 		}
 	}
@@ -606,13 +607,13 @@ func TestCreateOpenCheckpoint(t *testing.T) {
 
 func TestExactWALReplayWithoutCheckpoint(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var adds []ExactEntry
 	for i := uint64(0); i < 25; i++ {
-		adds = append(adds, ExactEntry{Hash: makeHash(i), ImageID: ImageID(i + 1)})
+		adds = append(adds, ExactEntry{Hash: makeHash(i), ImageID: common.ImageID(i + 1)})
 	}
 	if err := idx.Apply(Mutation{Add: adds}); err != nil {
 		t.Fatal(err)
@@ -621,7 +622,7 @@ func TestExactWALReplayWithoutCheckpoint(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -635,7 +636,7 @@ func TestExactWALReplayWithoutCheckpoint(t *testing.T) {
 
 func TestExactIncompleteTrailingWALBatch(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -659,7 +660,7 @@ func TestExactIncompleteTrailingWALBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = idx.Close()
-	reopened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +673,7 @@ func TestExactIncompleteTrailingWALBatch(t *testing.T) {
 
 func TestReplacementWithoutRootPublication(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entriesForRange(0, 10, 1)}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entriesForRange(0, 10, 1)}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,7 +685,7 @@ func TestReplacementWithoutRootPublication(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -696,7 +697,7 @@ func TestReplacementWithoutRootPublication(t *testing.T) {
 
 func TestExactCorruptManifestRejected(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -710,7 +711,7 @@ func TestExactCorruptManifestRejected(t *testing.T) {
 	if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openExact(dir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openExact(dir, ExactConfig{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("manifest corruption err = %v, want ErrCorrupt", err)
 	}
 }
@@ -741,7 +742,7 @@ func TestExactOversizedNamespaceRejected(t *testing.T) {
 
 func TestCorruptBlockPayloadRejected(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entriesForRange(0, 20, 1)}, ExactConfig{BlockSize: 1024}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entriesForRange(0, 20, 1)}, ExactConfig{BlockSize: 1024}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,14 +761,14 @@ func TestCorruptBlockPayloadRejected(t *testing.T) {
 	if err := os.WriteFile(genPath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openExact(dir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openExact(dir, ExactConfig{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("block corruption err = %v, want ErrCorrupt", err)
 	}
 }
 
 func TestExactCorruptWALRejected(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,7 +790,7 @@ func TestExactCorruptWALRejected(t *testing.T) {
 	if err := os.WriteFile(walPath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openExact(dir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrCorruptWAL) {
+	if _, err := openExact(dir, ExactConfig{}, common.DurabilityOS); !errors.Is(err, ErrCorruptWAL) {
 		t.Fatalf("wal corruption err = %v, want ErrCorruptWAL", err)
 	}
 }
@@ -797,7 +798,7 @@ func TestExactCorruptWALRejected(t *testing.T) {
 func TestCorruptDirectoryOrderingRejected(t *testing.T) {
 	dir := persistentDir(t)
 	entries := entriesForRange(0, 40, 1)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 512}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +825,7 @@ func TestCorruptDirectoryOrderingRejected(t *testing.T) {
 	if err := os.WriteFile(genPath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openExact(dir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openExact(dir, ExactConfig{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("directory corruption err = %v, want ErrCorrupt", err)
 	}
 }
@@ -832,7 +833,7 @@ func TestCorruptDirectoryOrderingRejected(t *testing.T) {
 func TestUnsortedBlockRecordsRejected(t *testing.T) {
 	dir := persistentDir(t)
 	entries := entriesForRange(0, 10, 1)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 4096}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{BlockSize: 4096}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,7 +858,7 @@ func TestUnsortedBlockRecordsRejected(t *testing.T) {
 	if err := os.WriteFile(genPath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openExact(dir, ExactConfig{}, DurabilityOS); !errors.Is(err, ErrCorrupt) {
+	if _, err := openExact(dir, ExactConfig{}, common.DurabilityOS); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("unsorted records err = %v, want ErrCorrupt", err)
 	}
 }
@@ -878,7 +879,7 @@ func fixBlockCRC(file []byte, payloadOff int) {
 
 func TestVacuumAndReopen(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -886,7 +887,7 @@ func TestVacuumAndReopen(t *testing.T) {
 	for round := 0; round < 10; round++ {
 		var adds []ExactEntry
 		for k := 0; k < 20; k++ {
-			adds = append(adds, ExactEntry{Hash: makeHash(uint64(round*20 + k)), ImageID: ImageID(round*20 + k + 1)})
+			adds = append(adds, ExactEntry{Hash: makeHash(uint64(round*20 + k)), ImageID: common.ImageID(round*20 + k + 1)})
 		}
 		if err := idx.Apply(Mutation{Add: adds}); err != nil {
 			t.Fatal(err)
@@ -899,7 +900,7 @@ func TestVacuumAndReopen(t *testing.T) {
 	// Delete half to create sparse blocks, then vacuum.
 	var removes []ExactEntry
 	for k := 0; k < 100; k++ {
-		removes = append(removes, ExactEntry{Hash: makeHash(uint64(k)), ImageID: ImageID(k + 1)})
+		removes = append(removes, ExactEntry{Hash: makeHash(uint64(k)), ImageID: common.ImageID(k + 1)})
 	}
 	if err := idx.Apply(Mutation{Remove: removes}); err != nil {
 		t.Fatal(err)
@@ -926,7 +927,7 @@ func TestVacuumAndReopen(t *testing.T) {
 	}
 	gen := idx.Metadata().Generation
 	_ = idx.Close()
-	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{BlockSize: 512}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -945,12 +946,12 @@ func TestVacuumAndReopen(t *testing.T) {
 func TestAlgorithmPersistedAuthoritatively(t *testing.T) {
 	dir := t.TempDir()
 	spec := ExactSpec{Namespace: testExactNamespace, Algorithm: AlgorithmBLAKE3, Entries: []ExactEntry{{Hash: SumBLAKE3([]byte("x")), ImageID: 1}}}
-	idx, err := newExact(dir, spec, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, spec, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = idx.Close()
-	reopened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -966,14 +967,14 @@ func TestAlgorithmPersistedAuthoritatively(t *testing.T) {
 func TestVacuumWithoutRepackKeepsViewReadable(t *testing.T) {
 	dir := persistentDir(t)
 	entries := entriesForRange(0, 20, 1)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256, Entries: entries}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -982,7 +983,7 @@ func TestVacuumWithoutRepackKeepsViewReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := uint64(0); i < 20; i++ {
-		if got := reopened.Lookup(nil, makeHash(i)); len(got) != 1 || got[0] != ImageID(i+1) {
+		if got := reopened.Lookup(nil, makeHash(i)); len(got) != 1 || got[0] != common.ImageID(i+1) {
 			t.Fatalf("post-vacuum lookup %d = %v", i, got)
 		}
 	}
@@ -995,7 +996,7 @@ func TestVacuumWithoutRepackKeepsViewReadable(t *testing.T) {
 // epoch, removes superseded WAL files, and keeps the index replayable.
 func TestVacuumReclaimsExactWAL(t *testing.T) {
 	dir := persistentDir(t)
-	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: AlgorithmSHA256}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,7 +1005,7 @@ func TestVacuumReclaimsExactWAL(t *testing.T) {
 		var adds []ExactEntry
 		for k := 0; k < 100; k++ {
 			n := round*100 + k
-			adds = append(adds, ExactEntry{Hash: makeHash(uint64(n)), ImageID: ImageID(n + 1)})
+			adds = append(adds, ExactEntry{Hash: makeHash(uint64(n)), ImageID: common.ImageID(n + 1)})
 		}
 		if err := idx.Apply(Mutation{Add: adds}); err != nil {
 			t.Fatal(err)
@@ -1032,7 +1033,7 @@ func TestVacuumReclaimsExactWAL(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+	reopened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

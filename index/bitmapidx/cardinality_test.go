@@ -10,7 +10,7 @@ import (
 
 func TestNamespaceCardinalityTracksLiveValues(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
-	a, b := StringValue("a"), StringValue("b")
+	a, b := EnumStringValue("a"), EnumStringValue("b")
 	if got := index.Cardinality(); got != 0 {
 		t.Fatal(got)
 	}
@@ -50,9 +50,9 @@ func TestNamespaceCardinalityTracksLiveValues(t *testing.T) {
 func TestNamespaceCardinalityAcrossRotations(t *testing.T) {
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
 	rng := rand.New(rand.NewSource(17))
-	values := []Value{StringValue("a"), StringValue("b"), StringValue("c"), StringValue("d"), StringValue("e")}
+	values := []Value{EnumStringValue("a"), EnumStringValue("b"), EnumStringValue("c"), EnumStringValue("d"), EnumStringValue("e")}
 	for step := range 300 {
-		entry := Entry{ImageID: ImageID(rng.Intn(12) + 1), Value: values[rng.Intn(len(values))]}
+		entry := Entry{ImageID: common.ImageID(rng.Intn(12) + 1), Value: values[rng.Intn(len(values))]}
 		if rng.Intn(3) == 0 {
 			commit(t, index, func(bt *Batch) error { return bt.Remove(entry) })
 		} else {
@@ -86,7 +86,7 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 		geoNamespaceFor(common.NamespaceLocation),
 		enumNamespace(common.NamespaceUserACL), // registered but empty
 	}
-	store, err := NewIndex(dir, namespaces, NamespaceConfig{}, DurabilityOS)
+	store, err := NewStore(dir, namespaces, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,9 +96,9 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	object, _ := store.Lookup(common.NamespaceObject)
 	location, _ := store.Lookup(common.NamespaceLocation)
 	for _, entry := range []Entry{
-		{ImageID: 1, Value: StringValue("a")},
-		{ImageID: 1, Value: StringValue("b")},
-		{ImageID: 2, Value: StringValue("a")},
+		{ImageID: 1, Value: EnumStringValue("a")},
+		{ImageID: 1, Value: EnumStringValue("b")},
+		{ImageID: 2, Value: EnumStringValue("a")},
 	} {
 		commit(t, tag, func(bt *Batch) error { return bt.Add(entry) })
 	}
@@ -137,7 +137,7 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenIndex(dir, NamespaceConfig{}, DurabilityOS)
+	reopened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

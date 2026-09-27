@@ -10,7 +10,7 @@ import (
 
 // commit stages fill into a one-shot batch, applies it, and barriers
 // until visible. It is the test equivalent of the old synchronous write.
-func commit(tb testing.TB, index *NamespaceIndex, fill func(*Batch) error) {
+func commit(tb testing.TB, index *Index, fill func(*Batch) error) {
 	tb.Helper()
 	batch := index.NewBatch()
 	defer batch.Close()
@@ -28,7 +28,7 @@ func commit(tb testing.TB, index *NamespaceIndex, fill func(*Batch) error) {
 // commitBarrier stages fill, applies it, and returns the barrier result
 // so tests can assert commit-time errors (geo validation, encode
 // limits) that only surface once the batch commits.
-func commitBarrier(tb testing.TB, index *NamespaceIndex, fill func(*Batch) error) error {
+func commitBarrier(tb testing.TB, index *Index, fill func(*Batch) error) error {
 	tb.Helper()
 	batch := index.NewBatch()
 	defer batch.Close()
@@ -42,30 +42,30 @@ func commitBarrier(tb testing.TB, index *NamespaceIndex, fill func(*Batch) error
 }
 
 func TestBatchValidation(t *testing.T) {
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = index.Close() })
 	batch := index.NewBatch()
 	defer batch.Close()
-	if err := batch.Add(Entry{ImageID: 0, Value: StringValue("x")}); !errors.Is(err, ErrInvalidImageID) {
+	if err := batch.Add(Entry{ImageID: 0, Value: EnumStringValue("x")}); !errors.Is(err, ErrInvalidImageID) {
 		t.Fatalf("zero ID err = %v", err)
 	}
 	if err := batch.Add(Entry{ImageID: 1, Value: BoolValue(true)}); !errors.Is(err, ErrValueKind) {
 		t.Fatalf("kind mismatch err = %v", err)
 	}
-	if err := batch.Remove(Entry{ImageID: 0, Value: StringValue("x")}); !errors.Is(err, ErrInvalidImageID) {
+	if err := batch.Remove(Entry{ImageID: 0, Value: EnumStringValue("x")}); !errors.Is(err, ErrInvalidImageID) {
 		t.Fatalf("remove zero ID err = %v", err)
 	}
-	text, err := NewNamespaceIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	text, err := NewIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = text.Close() })
 	textBatch := text.NewBatch()
 	defer textBatch.Close()
-	if err := textBatch.Add(Entry{ImageID: 1, Value: Value{Kind: KindText, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
+	if err := textBatch.Add(Entry{ImageID: 1, Value: Value{Kind: common.KindBitmapString, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
 		t.Fatalf("text Add err = %v", err)
 	}
 	if err := textBatch.ReplaceText(TextReplacement{ImageID: 1, After: []string{"x"}}, TextReplacement{ImageID: 1, After: []string{"y"}}); !errors.Is(err, ErrDuplicateImageID) {
@@ -83,7 +83,7 @@ func TestBatchValidation(t *testing.T) {
 }
 
 func TestBatchEmptyApply(t *testing.T) {
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestBatchEmptyApply(t *testing.T) {
 }
 
 func TestBatchResetReuse(t *testing.T) {
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestBatchResetReuse(t *testing.T) {
 	batch := index.NewBatch()
 	defer batch.Close()
 	for n := uint64(1); n <= 3; n++ {
-		if err := batch.Add(Entry{ImageID: ImageID(n), Value: StringValue("v")}); err != nil {
+		if err := batch.Add(Entry{ImageID: common.ImageID(n), Value: EnumStringValue("v")}); err != nil {
 			t.Fatal(err)
 		}
 		if err := batch.Apply(); err != nil {
@@ -127,21 +127,21 @@ func TestBatchResetReuse(t *testing.T) {
 		// Deltas may not have folded; verify visibility instead.
 		_ = got
 	}
-	present, err := index.Contains(2, StringValue("v"))
+	present, err := index.Contains(2, EnumStringValue("v"))
 	if err != nil || !present {
 		t.Fatalf("reused batch writes visible = %v, %v", present, err)
 	}
 }
 
 func TestBatchQueuedUntilBarrier(t *testing.T) {
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = index.Close() })
 	batch := index.NewBatch()
 	defer batch.Close()
-	if err := batch.Add(Entry{ImageID: 9, Value: StringValue("q")}); err != nil {
+	if err := batch.Add(Entry{ImageID: 9, Value: EnumStringValue("q")}); err != nil {
 		t.Fatal(err)
 	}
 	if err := batch.Apply(); err != nil {
@@ -151,14 +151,14 @@ func TestBatchQueuedUntilBarrier(t *testing.T) {
 	if err := index.Barrier(); err != nil {
 		t.Fatal(err)
 	}
-	present, err := index.Contains(9, StringValue("q"))
+	present, err := index.Contains(9, EnumStringValue("q"))
 	if err != nil || !present {
 		t.Fatalf("post-barrier visible = %v, %v", present, err)
 	}
 }
 
 func TestBatchSealed(t *testing.T) {
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestBatchSealed(t *testing.T) {
 	if err := batch.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := batch.Add(Entry{ImageID: 1, Value: StringValue("x")}); !errors.Is(err, ErrBatchClosed) {
+	if err := batch.Add(Entry{ImageID: 1, Value: EnumStringValue("x")}); !errors.Is(err, ErrBatchClosed) {
 		t.Fatalf("sealed Add err = %v", err)
 	}
 	if err := batch.Apply(); !errors.Is(err, ErrBatchClosed) {
@@ -179,7 +179,7 @@ func TestBatchSealed(t *testing.T) {
 }
 
 func TestBatchGroupCommitConcurrent(t *testing.T) {
-	index, err := NewNamespaceIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,8 +194,8 @@ func TestBatchGroupCommitConcurrent(t *testing.T) {
 			batch := index.NewBatch()
 			defer batch.Close()
 			for n := 0; n < perWriter; n++ {
-				id := ImageID(w*perWriter + n + 1)
-				if err := batch.Add(Entry{ImageID: id, Value: StringValue("g")}); err != nil {
+				id := common.ImageID(w*perWriter + n + 1)
+				if err := batch.Add(Entry{ImageID: id, Value: EnumStringValue("g")}); err != nil {
 					errs <- err
 					return
 				}
@@ -219,7 +219,7 @@ func TestBatchGroupCommitConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for id := 1; id <= writers*perWriter; id++ {
-		present, err := index.Contains(ImageID(id), StringValue("g"))
+		present, err := index.Contains(common.ImageID(id), EnumStringValue("g"))
 		if err != nil || !present {
 			t.Fatalf("id %d visible = %v, %v", id, present, err)
 		}

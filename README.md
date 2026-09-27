@@ -6,20 +6,21 @@ vector search, and one query planner that combines them.
 Every indexed collection is a `common.Namespace` — a unique number and name
 registered in a `common.Schema`. Packages: `common` (shared types),
 `bitmapidx` (enum/bool/text/continuous/geo namespaces), `timeidx` (timestamp
-ranges), `vectoridx` (HNSW ANN), `search` (combined queries).
+ranges), `vectoridx` (HNSW ANN), `store` (Pebble key-value collections), and
+`search` (combined queries).
 
 ## Open an index
 
 ### Namespace index (enum, bool, text, continuous, geo)
 
 ```go
-store, err := bitmapidx.NewIndex(
+store, err := bitmapidx.NewStore(
 	"./data/namespaces",
 	[]bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType},
-		{Namespace: common.NamespaceLocation, Name: "location", Kind: bitmapidx.KindGeo, Storage: bitmapidx.StoragePerType, Geo: bitmapidx.GeoCodec{Version: 1}},
-		{Namespace: common.Namespace(101), Name: "focal-length", Kind: bitmapidx.KindContinuous, Storage: bitmapidx.StoragePerType, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}},
-		{Namespace: common.Namespace(102), Name: "title", Kind: bitmapidx.KindText, Storage: bitmapidx.StoragePerType, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion}},
+		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
+		{Namespace: common.NamespaceLocation, Kind: common.KindBitmapGeo, Geo: bitmapidx.GeoCodec{Version: 1}},
+		{Namespace: common.Namespace(101), Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}},
+		{Namespace: common.Namespace(102), Kind: common.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion}},
 	},
 	bitmapidx.NamespaceConfig{},
 	common.DurabilityOS,
@@ -35,7 +36,7 @@ focals, _ := store.Lookup(common.Namespace(101))
 titles, _ := store.Lookup(common.Namespace(102))
 ```
 
-Reopen the same store with `bitmapidx.OpenIndex(dir, config, durability)`.
+Reopen the same store with `bitmapidx.OpenStore(dir, config, durability)`.
 
 ### Timestamp index
 
@@ -75,6 +76,22 @@ defer vectors.Close()
 
 Reopen with `vectoridx.Open(path, durability)`.
 
+### Key-value store
+
+`store` is a Pebble-backed collection for values that are not bitmap indexes,
+timestamps, or vectors. The schema is persisted on creation and verified on
+every open.
+
+```go
+kv, err := store.Open("./data/kv",
+	store.Spec{Namespace: common.Namespace(200), Name: "metadata"},
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer kv.Close()
+```
+
 ## Add items
 
 ### Bitmap namespaces
@@ -86,8 +103,8 @@ Stage one or more entries in a reusable `Batch`, `Apply` to queue them, then
 ```go
 batch := tags.NewBatch()
 if err := batch.Add(
-	bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("Trekking")},
-	bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("Travel")},
+	bitmapidx.Entry{ImageID: 100, Value: bitmapidx.EnumStringValue("Trekking")},
+	bitmapidx.Entry{ImageID: 200, Value: bitmapidx.EnumStringValue("Travel")},
 ); err != nil {
 	log.Fatal(err)
 }
@@ -149,20 +166,32 @@ if err := vectors.Delete(100); err != nil {
 }
 ```
 
+### Key-value store
+
+```go
+key := store.Key{Namespace: common.Namespace(200), ID: 100}
+if err := kv.Set(key, []byte("camera: X100V")); err != nil {
+	log.Fatal(err)
+}
+if err := kv.Delete(key); err != nil {
+	log.Fatal(err)
+}
+```
+
 ## Search
 
 ### Bitmap namespaces
 
 ```go
 // MatchValues requires every supplied value (AND).
-match, err := tags.MatchValues(bitmapidx.StringValue("Trekking"))
+match, err := tags.MatchValues(bitmapidx.EnumStringValue("Trekking"))
 if err != nil {
 	log.Fatal(err)
 }
 ids := match.AppendTo(nil)
 
-travelers, err := tags.ValueIDs(nil, bitmapidx.StringValue("Travel")) // one value, sorted IDs
-count, err := tags.CountValues(bitmapidx.StringValue("Trekking"))
+travelers, err := tags.ValueIDs(nil, bitmapidx.EnumStringValue("Travel")) // one value, sorted IDs
+count, err := tags.CountValues(bitmapidx.EnumStringValue("Trekking"))
 ```
 
 Continuous and geo namespaces use range queries:
@@ -199,13 +228,28 @@ for _, r := range results {
 }
 ```
 
+### Key-value store
+
+```go
+value, err := kv.Get(store.Key{Namespace: common.Namespace(200), ID: 100})
+if err != nil {
+	log.Fatal(err)
+}
+log.Println(string(value))
+
+err = kv.Scan(common.Namespace(200), func(key store.Key, value []byte) error {
+	log.Println(key.ID, string(value))
+	return nil
+})
+```
+
 ### Combined search
 
 Clauses are combined with AND semantics and executed in cardinality order:
 
 ```go
 plan, err := search.Compile(
-	search.AllValues(tags, bitmapidx.StringValue("Trekking")),
+	search.AllValues(tags, bitmapidx.EnumStringValue("Trekking")),
 	search.During(times, start, end),
 	search.InCells(geo, cellIDs...),
 )

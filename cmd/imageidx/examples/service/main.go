@@ -25,9 +25,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	namespaces, err := bitmapidx.NewIndex(namespaceDir, []bitmapidx.NamespaceSpec{{
-		Namespace: common.NamespaceTag, Name: "tag", Kind: bitmapidx.KindEnum, Storage: bitmapidx.StoragePerType,
-	}}, bitmapidx.NamespaceConfig{}, bitmapidx.DurabilityOS)
+	namespaces, err := bitmapidx.NewStore(namespaceDir, []bitmapidx.NamespaceSpec{{
+		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum}}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,9 +37,9 @@ func main() {
 	}
 	favoritesBatch := favorites.NewBatch()
 	if err := favoritesBatch.Add(
-		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.StringValue("favorite")},
-		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.StringValue("favorite")},
-		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.StringValue("favorite")},
+		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.EnumStringValue("favorite")},
+		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.EnumStringValue("favorite")},
+		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.EnumStringValue("favorite")},
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -67,7 +66,7 @@ func main() {
 	defer times.Close()
 
 	plan, err := search.Compile(
-		search.AllValues(favorites, bitmapidx.StringValue("favorite")),
+		search.AllValues(favorites, bitmapidx.EnumStringValue("favorite")),
 		search.During(times, quantum, 3*quantum),
 	)
 	if err != nil {

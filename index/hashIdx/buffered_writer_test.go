@@ -2,13 +2,14 @@ package hashidx
 
 import (
 	"errors"
+	common "github.com/evanoberholster/imageIdx/common"
 	"testing"
 	"time"
 )
 
 func testWriterIndex(t *testing.T, dir string) *Index {
 	t.Helper()
-	idx, err := newIndex(dir, testPerceptualSpec(Config{}), DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{}), common.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +35,7 @@ func TestBufferedWriterThresholdFlush(t *testing.T) {
 	bw := NewBufferedWriter(idx, 4, time.Hour)
 	defer func() { _ = bw.Close() }()
 	for i := 1; i <= 4; i++ {
-		if err := bw.Apply([]Entry{{ImageID: ImageID(i), PHash64: uint64(i)}}); err != nil {
+		if err := bw.Apply([]Entry{{ImageID: common.ImageID(i), PHash64: uint64(i)}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -70,7 +71,7 @@ func TestBufferedWriterExplicitFlushAndStats(t *testing.T) {
 	if err := bw.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []ImageID{1, 2, 3} {
+	for _, id := range []common.ImageID{1, 2, 3} {
 		if err := bw.Apply([]Entry{{ImageID: id}}); err != nil {
 			t.Fatal(err)
 		}
@@ -143,7 +144,7 @@ func TestBufferedWriterCloseDrainsAndIdempotent(t *testing.T) {
 	idx := testWriterIndex(t, t.TempDir())
 	bw := NewBufferedWriter(idx, 1<<20, time.Hour)
 	for i := 1; i <= 5; i++ {
-		if err := bw.Apply([]Entry{{ImageID: ImageID(i)}}); err != nil {
+		if err := bw.Apply([]Entry{{ImageID: common.ImageID(i)}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -173,7 +174,7 @@ func TestBufferedWriterConcurrentApply(t *testing.T) {
 				}
 			}()
 			for k := 0; k < perWriter; k++ {
-				id := ImageID(1 + w*perWriter + k)
+				id := common.ImageID(1 + w*perWriter + k)
 				for {
 					if err := bw.Apply([]Entry{{ImageID: id}}); err == nil {
 						break

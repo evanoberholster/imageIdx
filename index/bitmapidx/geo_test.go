@@ -14,8 +14,7 @@ import (
 func geoNamespaceFor(t common.Namespace) NamespaceSpec {
 	return NamespaceSpec{
 		Namespace: t,
-		Kind:      KindGeo,
-		Storage:   StoragePerType,
+		Kind:      common.KindBitmapGeo,
 		Geo:       GeoCodec{Version: 1},
 	}
 }
@@ -208,7 +207,7 @@ func TestGeoSplitRangesMatchMerged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeoRanges: %v", err)
 	}
-	if ids := match.AppendTo(nil); !slices.Equal(ids, []ImageID{1, 2}) {
+	if ids := match.AppendTo(nil); !slices.Equal(ids, []common.ImageID{1, 2}) {
 		t.Fatalf("split ranges matched %v, want [1 2]", ids)
 	}
 }
@@ -228,7 +227,7 @@ func TestGeoCoarseLevelQuery(t *testing.T) {
 		return latLng.Lat.Degrees(), latLng.Lng.Degrees()
 	}
 	points := []struct {
-		id   ImageID
+		id   common.ImageID
 		cell s2.CellID
 	}{
 		{1, first},
@@ -257,15 +256,15 @@ func TestGeoCoarseLevelQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeoRanges: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1, 2, 3, 4}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 2, 3, 4}) {
 		t.Fatalf("level-10 query = %v, want [1 2 3 4]", got)
 	}
 	count, err := namespace.CountGeoRanges(ranges)
 	if err != nil || count != 4 {
 		t.Fatalf("CountGeoRanges = %d, %v", count, err)
 	}
-	filtered, err := namespace.FilterGeoRanges(nil, []ImageID{1, 2, 3, 4, 5, 6}, ranges)
-	if err != nil || !slices.Equal(filtered, []ImageID{1, 2, 3, 4}) {
+	filtered, err := namespace.FilterGeoRanges(nil, []common.ImageID{1, 2, 3, 4, 5, 6}, ranges)
+	if err != nil || !slices.Equal(filtered, []common.ImageID{1, 2, 3, 4}) {
 		t.Fatalf("FilterGeoRanges = %v, %v", filtered, err)
 	}
 	if err := namespace.Compact(); err != nil {
@@ -284,13 +283,13 @@ func TestGeoCoarseLevelQuery(t *testing.T) {
 	for _, check := range []struct {
 		name string
 		cell s2.CellID
-		want []ImageID
+		want []common.ImageID
 	}{
-		{"first bucket", first, []ImageID{1}},
-		{"second bucket", second, []ImageID{2, 3}},
-		{"last bucket", insideEnd, []ImageID{4}},
-		{"next coarse cell", outside, []ImageID{5}},
-		{"previous coarse cell", first.Prev(), []ImageID{6}},
+		{"first bucket", first, []common.ImageID{1}},
+		{"second bucket", second, []common.ImageID{2, 3}},
+		{"last bucket", insideEnd, []common.ImageID{4}},
+		{"next coarse cell", outside, []common.ImageID{5}},
+		{"previous coarse cell", first.Prev(), []common.ImageID{6}},
 	} {
 		exact, err := RangesFromCellIDs(nil, []uint64{uint64(check.cell)})
 		if err != nil {
@@ -403,7 +402,7 @@ func TestGeoNamespaceRangesCountsAndDeltas(t *testing.T) {
 	config := NamespaceConfig{ActiveTarget: 2, HardDeltaLimit: 4, MaxDeltaValues: 2}
 	index := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), config)
 	type city struct {
-		id   ImageID
+		id   common.ImageID
 		lat  float64
 		lng  float64
 		name string
@@ -440,7 +439,7 @@ func TestGeoNamespaceRangesCountsAndDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeoRanges: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1, 5}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 5}) {
 		t.Fatalf("San Francisco cell = %v, want [1 5]", got)
 	}
 	count, err := index.CountGeoRanges(ranges)
@@ -451,13 +450,13 @@ func TestGeoNamespaceRangesCountsAndDeltas(t *testing.T) {
 	if err != nil || estimate != 2 {
 		t.Fatalf("EstimateGeoRanges = %d, %v", estimate, err)
 	}
-	candidates := []ImageID{1, 2, 3, 4, 5}
+	candidates := []common.ImageID{1, 2, 3, 4, 5}
 	filtered, err := index.FilterGeoRanges(nil, candidates, ranges)
-	if err != nil || !slices.Equal(filtered, []ImageID{1, 5}) {
+	if err != nil || !slices.Equal(filtered, []common.ImageID{1, 5}) {
 		t.Fatalf("FilterGeoRanges = %v, %v", filtered, err)
 	}
 	all := index.AppendTo(nil)
-	if !slices.Equal(all, []ImageID{1, 2, 3, 4, 5}) {
+	if !slices.Equal(all, []common.ImageID{1, 2, 3, 4, 5}) {
 		t.Fatalf("AppendTo = %v", all)
 	}
 	if err := index.Vacuum(); err != nil {
@@ -467,15 +466,15 @@ func TestGeoNamespaceRangesCountsAndDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeoRanges after vacuum: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1, 5}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 5}) {
 		t.Fatalf("after vacuum = %v", got)
 	}
 }
 
 func TestGeoCoverAndNearest(t *testing.T) {
 	index := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), NamespaceConfig{})
-	keys := make(map[ImageID]uint64)
-	for id, coordinate := range map[ImageID][2]float64{
+	keys := make(map[common.ImageID]uint64)
+	for id, coordinate := range map[common.ImageID][2]float64{
 		1: {37.7749, -122.4194}, // San Francisco
 		2: {37.8044, -122.2712}, // Oakland
 		3: {34.0522, -118.2437}, // Los Angeles
@@ -501,7 +500,7 @@ func TestGeoCoverAndNearest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeoRanges: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []ImageID{1, 2}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 2}) {
 		t.Fatalf("bay area = %v, want [1 2]", got)
 	}
 	if _, err := CoverRegion(nil, nil, GeoCoverOptions{}); err != ErrInvalidRegion {
@@ -513,8 +512,8 @@ func TestGeoCoverAndNearest(t *testing.T) {
 		t.Fatalf("cap cover = %+v, %v", capped, err)
 	}
 
-	lookup := func(id ImageID) (float64, float64, bool) {
-		coordinate, ok := map[ImageID][2]float64{
+	lookup := func(id common.ImageID) (float64, float64, bool) {
+		coordinate, ok := map[common.ImageID][2]float64{
 			1: {37.7749, -122.4194},
 			2: {37.8044, -122.2712},
 			3: {34.0522, -118.2437},
@@ -543,7 +542,7 @@ func TestGeoCoverAndNearest(t *testing.T) {
 // unmapped underneath it.
 func TestGeoReadersSurviveVacuum(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewIndex(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, DurabilityOS)
+	s, err := NewStore(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
 	}
@@ -551,7 +550,7 @@ func TestGeoReadersSurviveVacuum(t *testing.T) {
 	key := sfKey(t)
 	for id := 1; id <= 64; id++ {
 		commit(t, index, func(b *Batch) error {
-			return b.Move(Move{ImageID: ImageID(id), To: int64(key)})
+			return b.Move(Move{ImageID: common.ImageID(id), To: int64(key)})
 		})
 	}
 	if err := s.Checkpoint(); err != nil {
@@ -603,7 +602,7 @@ func TestGeoNamespaceDefinitionValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeNamespaceSpecs: %v", err)
 	}
-	if len(restored) != 1 || restored[0].Geo != spec.Geo || restored[0].Kind != KindGeo {
+	if len(restored) != 1 || restored[0].Geo != spec.Geo || restored[0].Kind != common.KindBitmapGeo {
 		t.Fatalf("restored = %+v, want %+v", restored, spec)
 	}
 }

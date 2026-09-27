@@ -8,7 +8,7 @@ import (
 )
 
 // ErrInvalidACLField reports a nil namespace or one that is not the dedicated
-// KindEnum ACL namespace the handle requires.
+// KindBitmapEnum ACL namespace the handle requires.
 var ErrInvalidACLField = errors.New("search: invalid ACL namespace")
 
 // UserGrants manages direct image grants for the NamespaceUserACL namespace:
@@ -17,8 +17,8 @@ var ErrInvalidACLField = errors.New("search: invalid ACL namespace")
 type UserGrants = grantNamespace[common.UserID]
 
 // NewUserGrants binds the store's user ACL namespace. It rejects a nil index
-// and any namespace that is not the dedicated KindEnum user namespace.
-func NewUserGrants(index *bitmapidx.NamespaceIndex) (UserGrants, error) {
+// and any namespace that is not the dedicated KindBitmapEnum user namespace.
+func NewUserGrants(index *bitmapidx.Index) (UserGrants, error) {
 	return newGrantNamespace[common.UserID](index, common.NamespaceUserACL)
 }
 
@@ -29,8 +29,8 @@ func NewUserGrants(index *bitmapidx.NamespaceIndex) (UserGrants, error) {
 type GroupGrants = grantNamespace[common.GroupID]
 
 // NewGroupGrants binds the store's group ACL namespace. It rejects a nil index
-// and any namespace that is not the dedicated KindEnum group namespace.
-func NewGroupGrants(index *bitmapidx.NamespaceIndex) (GroupGrants, error) {
+// and any namespace that is not the dedicated KindBitmapEnum group namespace.
+func NewGroupGrants(index *bitmapidx.Index) (GroupGrants, error) {
 	return newGrantNamespace[common.GroupID](index, common.NamespaceGroupACL)
 }
 
@@ -40,16 +40,16 @@ func NewGroupGrants(index *bitmapidx.NamespaceIndex) (GroupGrants, error) {
 // genuinely new dictionary values are copied under the writer lock — so
 // helpers add no allocations of their own beyond the batch itself.
 type grantNamespace[T ~uint64] struct {
-	index *bitmapidx.NamespaceIndex
+	index *bitmapidx.Index
 }
 
 // newGrantNamespace validates index against the dedicated ACL namespace.
-func newGrantNamespace[T ~uint64](index *bitmapidx.NamespaceIndex, namespace common.Namespace) (grantNamespace[T], error) {
+func newGrantNamespace[T ~uint64](index *bitmapidx.Index, namespace common.Namespace) (grantNamespace[T], error) {
 	if index == nil {
 		return grantNamespace[T]{}, ErrInvalidACLField
 	}
 	def := index.Spec()
-	if def.Namespace != namespace || def.Kind != bitmapidx.KindEnum {
+	if def.Namespace != namespace || def.Kind != common.KindBitmapEnum {
 		return grantNamespace[T]{}, ErrInvalidACLField
 	}
 	return grantNamespace[T]{index: index}, nil
@@ -60,7 +60,7 @@ func newGrantNamespace[T ~uint64](index *bitmapidx.NamespaceIndex, namespace com
 // helper below since staging and Apply complete synchronously in the call.
 func principalValue(id uint64, key *[8]byte) bitmapidx.Value {
 	*key = principalKey(id)
-	return bitmapidx.Value{Kind: bitmapidx.KindEnum, Bytes: key[:]}
+	return bitmapidx.Value{Kind: common.KindBitmapEnum, Bytes: key[:]}
 }
 
 // Add grants each image to id in one atomic batch. Unknown images are
@@ -100,7 +100,7 @@ func (h grantNamespace[T]) Add(id T, imageIDs ...ImageID) error {
 
 // addLarge grants a batch that exceeds the stack inline capacity. The one
 // entries slice is inherent to batching: the equivalent hand-rolled
-// NamespaceIndex call allocates it too.
+// Index call allocates it too.
 func (h grantNamespace[T]) addLarge(id uint64, imageIDs []ImageID) error {
 	var key [8]byte
 	value := principalValue(id, &key)

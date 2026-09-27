@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -16,7 +17,7 @@ import (
 type persistedState struct {
 	mu           sync.Mutex
 	dir          string
-	durability   Durability
+	durability   common.Durability
 	wal          *storage.WAL
 	walEpoch     uint64
 	mappings     [][]byte

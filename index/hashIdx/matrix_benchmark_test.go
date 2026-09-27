@@ -2,6 +2,7 @@ package hashidx
 
 import (
 	"fmt"
+	common "github.com/evanoberholster/imageIdx/common"
 	"runtime"
 	"testing"
 
@@ -77,7 +78,7 @@ func matrixCryptoEntries(seed int64, n int) ([]ExactEntry, []Hash) {
 	entries := make([]ExactEntry, n)
 	for i := range raw {
 		hashes[i] = Hash(raw[i])
-		entries[i] = ExactEntry{Hash: hashes[i], ImageID: ImageID(i + 1)}
+		entries[i] = ExactEntry{Hash: hashes[i], ImageID: common.ImageID(i + 1)}
 	}
 	return entries, hashes
 }
@@ -96,7 +97,7 @@ func matrixPerceptualEntries(n int) []Entry {
 	entries := make([]Entry, n)
 	for i := range entries {
 		entries[i] = Entry{
-			ImageID: ImageID(i + 1),
+			ImageID: common.ImageID(i + 1),
 			PHash64: phashes[i],
 			PDQ:     PDQHash(pdqs[i]),
 		}
@@ -140,7 +141,7 @@ func matrixBuildPersistentExact(b *testing.B, algo Algorithm, n, tail int) (*Exa
 	dir := b.TempDir()
 	entries, hashes := matrixCryptoEntries(matrixDigestSeed, n)
 	before := bench.HeapBytes()
-	idx, err := newExact(dir, ExactSpec{Algorithm: algo, Entries: entries}, ExactConfig{}, DurabilityOS)
+	idx, err := newExact(dir, ExactSpec{Algorithm: algo, Entries: entries}, ExactConfig{}, common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -150,7 +151,7 @@ func matrixBuildPersistentExact(b *testing.B, algo Algorithm, n, tail int) (*Exa
 		for start := 0; start < len(tailEntries); start += chunkSize {
 			chunk := tailEntries[start:min(start+chunkSize, len(tailEntries))]
 			for i := range chunk {
-				chunk[i].ImageID = ImageID(n + start + i + 1)
+				chunk[i].ImageID = common.ImageID(n + start + i + 1)
 			}
 			if err := idx.Apply(Mutation{Add: chunk}); err != nil {
 				_ = idx.Close()
@@ -199,7 +200,7 @@ func matrixNewPerceptualFrom(b *testing.B, entries []Entry) (*Index, matrixSizin
 	b.Helper()
 	dir := b.TempDir()
 	before := bench.HeapBytes()
-	idx, err := newIndex(dir, testPerceptualSpec(Config{}), DurabilityOS)
+	idx, err := newIndex(dir, testPerceptualSpec(Config{}), common.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -328,7 +329,7 @@ func benchmarkHashExactLookup(b *testing.B) {
 					cold := bench.HotSetWorkload(matrixQuerySeed+1, n, matrixWorkCount, 0.2, 0.0, nil)
 
 					b.Run("Case=Hit", func(b *testing.B) {
-						dst := make([]ImageID, 0, n)
+						dst := make([]common.ImageID, 0, n)
 						b.ReportAllocs()
 						for b.Loop() {
 							dst = idx.Lookup(dst[:0], hit)
@@ -337,7 +338,7 @@ func benchmarkHashExactLookup(b *testing.B) {
 						sizing.report(b)
 					})
 					b.Run("Case=Miss", func(b *testing.B) {
-						dst := make([]ImageID, 0, n)
+						dst := make([]common.ImageID, 0, n)
 						b.ReportAllocs()
 						for b.Loop() {
 							dst = idx.Lookup(dst[:0], miss)
@@ -346,7 +347,7 @@ func benchmarkHashExactLookup(b *testing.B) {
 						sizing.report(b)
 					})
 					b.Run("Case=Hot", func(b *testing.B) {
-						dst := make([]ImageID, 0, n)
+						dst := make([]common.ImageID, 0, n)
 						next := 0
 						b.ReportAllocs()
 						for b.Loop() {
@@ -357,7 +358,7 @@ func benchmarkHashExactLookup(b *testing.B) {
 						sizing.report(b)
 					})
 					b.Run("Case=Cold", func(b *testing.B) {
-						dst := make([]ImageID, 0, n)
+						dst := make([]common.ImageID, 0, n)
 						next := 0
 						b.ReportAllocs()
 						for b.Loop() {
@@ -445,7 +446,7 @@ func benchmarkHashExactAdd(b *testing.B) {
 					slot := 0
 					b.ReportAllocs()
 					for b.Loop() {
-						if err := idx.Add(Hash(adds[slot]), ImageID(nextID)); err != nil {
+						if err := idx.Add(Hash(adds[slot]), common.ImageID(nextID)); err != nil {
 							b.Fatal(err)
 						}
 						slot = (slot + 1) & (matrixAddBatch - 1)
@@ -473,7 +474,7 @@ func benchmarkHashExactOpen(b *testing.B) {
 					}
 					b.ReportAllocs()
 					for b.Loop() {
-						opened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+						opened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -504,7 +505,7 @@ func benchmarkHashExactRecovery(b *testing.B) {
 					}
 					b.ReportAllocs()
 					for b.Loop() {
-						opened, err := openExact(dir, ExactConfig{}, DurabilityOS)
+						opened, err := openExact(dir, ExactConfig{}, common.DurabilityOS)
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -533,7 +534,7 @@ func benchmarkHashExactAdversarial(b *testing.B) {
 		b.Run(fmt.Sprintf("Algo=%s", algo), func(b *testing.B) {
 			b.Run("Case=Empty", func(b *testing.B) {
 				idx, sizing := matrixBuildInMemoryExact(b, algo, nil, fmt.Sprintf("HashExact/%s/empty", algo))
-				dst := make([]ImageID, 0, 4)
+				dst := make([]common.ImageID, 0, 4)
 				b.ReportAllocs()
 				for b.Loop() {
 					dst = idx.Lookup(dst[:0], miss)
@@ -554,7 +555,7 @@ func benchmarkHashExactAdversarial(b *testing.B) {
 				{"UnindexedDigest", miss},
 			} {
 				b.Run("Case="+tc.name, func(b *testing.B) {
-					dst := make([]ImageID, 0, 2)
+					dst := make([]common.ImageID, 0, 2)
 					b.ReportAllocs()
 					for b.Loop() {
 						dst = idx.Lookup(dst[:0], tc.hash)

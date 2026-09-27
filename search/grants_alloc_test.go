@@ -28,7 +28,7 @@ func minAllocs(samples, runs int, f func()) float64 {
 }
 
 // TestGrantsAddNoAllocations proves the grant helpers allocate nothing
-// beyond the equivalent hand-rolled NamespaceIndex calls. Reads carry one
+// beyond the equivalent hand-rolled Index calls. Reads carry one
 // 8-byte key alloc from bitmapidx's swappable hash seam (hashCanonical is
 // a package variable so collision-injection tests can replace it, which
 // forces the key heap-ward); the helper must match the manual baseline
@@ -63,7 +63,7 @@ func TestGrantsAddNoAllocations(t *testing.T) {
 	stackUserValue := func(id uint64) bitmapidx.Value {
 		var key [8]byte
 		binary.LittleEndian.PutUint64(key[:], id)
-		return bitmapidx.Value{Kind: bitmapidx.KindEnum, Bytes: key[:]}
+		return bitmapidx.Value{Kind: common.KindBitmapEnum, Bytes: key[:]}
 	}
 	manualContains := func() { _, _ = userNamespace.Contains(1, stackUserValue(42)) }
 	helperContains := func() { _, _ = users.Contains(42, 1) }

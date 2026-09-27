@@ -62,7 +62,7 @@ func encodeNamespaceChanges(changes []stagedChange) ([]byte, uint32, error) {
 		binary.LittleEndian.PutUint32(group[16:20], uint32(len(removes)))
 		copy(group[24:], change.canonical)
 		pos := 24 + len(change.canonical)
-		for _, ids := range [][]ImageID{adds, removes} {
+		for _, ids := range [][]common.ImageID{adds, removes} {
 			for _, id := range ids {
 				binary.LittleEndian.PutUint64(group[pos:pos+8], id)
 				pos += 8
@@ -76,7 +76,7 @@ func encodeNamespaceChanges(changes []stagedChange) ([]byte, uint32, error) {
 // commits append every frame unsynced and sync once, so one fsync covers
 // the whole group; callers hold the store write lock. Failures mark the
 // store failed so later writes require recovery.
-func (s *Index) appendFrame(index *NamespaceIndex, payload []byte, groups, updates uint32, sync bool) error {
+func (s *Store) appendFrame(index *Index, payload []byte, groups, updates uint32, sync bool) error {
 	if updates == 0 {
 		return nil
 	}
@@ -109,7 +109,7 @@ func (s *Index) appendFrame(index *NamespaceIndex, payload []byte, groups, updat
 // counts, and payload CRCs. Changes apply with idempotent set semantics
 // and no live geo preconditions, because the WAL already validated once;
 // text needs no re-analysis since groups carry canonical bytes.
-func (s *Index) replay(path string) (int64, error) {
+func (s *Store) replay(path string) (int64, error) {
 	position := uint64(0)
 	return storage.ReplayEnd(path, 0, storage.FrameSpec{HeaderSize: namespaceWALHeaderSize, Magic: namespaceWALMagic, Version: 2, Corrupt: ErrCorruptWAL, MaxPayload: MaxNamespaceBatchBytes}, func(header []byte) (uint64, error) {
 		if crc32.ChecksumIEEE(header[:60]) != binary.LittleEndian.Uint32(header[60:64]) ||
@@ -169,11 +169,11 @@ func decodeNamespaceChanges(namespace NamespaceSpec, payload []byte, groups uint
 			return nil, 0, ErrCorruptWAL
 		}
 		change := stagedChange{base: NamespaceKey{Namespace: namespace.Namespace, Hash: hash}, next: -1}
-		if namespace.Kind == KindContinuous || namespace.Kind == KindGeo {
+		if namespace.Kind == common.KindBitmapContinuous || namespace.Kind == common.KindBitmapGeo {
 			if n != 0 {
 				return nil, 0, ErrCorruptWAL
 			}
-			if namespace.Kind == KindGeo {
+			if namespace.Kind == common.KindBitmapGeo {
 				if _, err := CellIDFromKey(hash); err != nil {
 					return nil, 0, ErrCorruptWAL
 				}
@@ -186,7 +186,7 @@ func decodeNamespaceChanges(namespace NamespaceSpec, payload []byte, groups uint
 		}
 		pos := 24 + n
 		for side, count := range []uint64{a, r} {
-			ids := make([]ImageID, count)
+			ids := make([]common.ImageID, count)
 			for j := range ids {
 				ids[j] = binary.LittleEndian.Uint64(payload[pos : pos+8])
 				pos += 8
