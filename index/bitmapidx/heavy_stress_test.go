@@ -65,7 +65,7 @@ func TestHeavyStress(t *testing.T) {
 	}
 	store, err := NewStore(dir, namespaces, config, loadDurability)
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	defer func() { _ = store.Close() }()
 	indexes := make([]*Index, namespacesN)

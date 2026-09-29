@@ -18,9 +18,6 @@ import (
 // refers to is defined by the schema namespace the index serves.
 type NodeID uint32
 
-// ImageID is the database-wide identifier type shared by all index packages.
-type ImageID = common.ImageID
-
 // ElementType selects the fixed per-index vector representation.
 type ElementType uint8
 
@@ -241,19 +238,19 @@ func (c Config) ElementSize() int {
 // VectorBytes returns Dimensions*ElementSize for a validated Config.
 func (c Config) VectorBytes() int { return int(c.Dimensions) * c.ElementSize() }
 
-// Result is one nearest-neighbor match. ImageID is the stored NodeID widened
+// Result is one nearest-neighbor match. ValueID is the stored NodeID widened
 // to the database-wide identifier type; its semantics come from the index's
 // schema namespace. Score is monotonic with the index metric distance:
 // a smaller distance always yields a smaller-or-equal Score. For L2 it tracks
 // squared L2; for cosine it tracks (1-cos)*2^30; for dot it tracks
 // querySelfDot-dot (zero for self). See EncodeScore for the saturation rule.
 type Result struct {
-	ImageID ImageID
+	ValueID common.ValueID
 	Score   uint32
 }
 
 // widenedID converts a stored NodeID to the database-wide identifier type.
-func widenedID(id NodeID) ImageID { return ImageID(id) }
+func widenedID(id NodeID) common.ValueID { return common.ValueID(id) }
 
 // CandidateFilter restricts which live nodes may be returned. A nil filter
 // accepts every live, non-tombstoned node. Filtering is applied after ANN
@@ -262,7 +259,8 @@ func widenedID(id NodeID) ImageID { return ImageID(id) }
 // Adapt a bitmap index with a closure:
 //
 //	filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
-//	    return bitmap.Contains(common.ImageID(id))
+//	    imageID, ok := imageForValue(common.ValueID(id))
+//	    return ok && bitmap.Contains(imageID)
 //	})
 type CandidateFilter func(NodeID) bool
 

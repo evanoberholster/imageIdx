@@ -156,8 +156,8 @@ func TestTinyPostingTierKinds(t *testing.T) {
 	focals := mustNamespace(t, continuousNamespace(testFocalLength), NamespaceConfig{})
 	commit(t, focals, func(b *Batch) error {
 		return b.Move(
-			Move{ImageID: 1, To: 24, HasTo: true},
-			Move{ImageID: 2, To: 50, HasTo: true},
+			Move{ImageID: 1, To: 24},
+			Move{ImageID: 2, To: 50},
 		)
 	})
 	if err := focals.Compact(); err != nil {

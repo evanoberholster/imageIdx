@@ -15,7 +15,7 @@ import (
 
 func enumNamespaceForSearch(t *testing.T, typ common.Namespace, value string, ids []uint64) *bitmapidx.Index {
 	t.Helper()
-	index, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+	index, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
 		Namespace: typ, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +47,7 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
 	albums := enumNamespaceForSearch(t, common.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
 
-	timeIndex, err := timeidx.New(timeidx.Spec{Entries: []timeidx.Entry{
+	timeIndex, err := timeidx.NewMemory(timeidx.Spec{Entries: []timeidx.Entry{
 		{Timestamp: quantum, ImageID: 1}, {Timestamp: 2 * quantum, ImageID: 2},
 		{Timestamp: 3 * quantum, ImageID: 3}, {Timestamp: 4 * quantum, ImageID: 4},
 		{Timestamp: 5 * quantum, ImageID: 5},
@@ -118,15 +118,15 @@ func TestInCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
 
 func TestSearchUsesExactTimestampLookup(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
-	times := map[timeidx.ImageID]uint64{1: quantum + 10, 2: quantum + 20}
-	index, err := timeidx.New(timeidx.Spec{Entries: []timeidx.Entry{
+	times := map[common.ValueID]uint64{1: quantum + 10, 2: quantum + 20}
+	index, err := timeidx.NewMemory(timeidx.Spec{Entries: []timeidx.Entry{
 		{Timestamp: times[1], ImageID: 1}, {Timestamp: times[2], ImageID: 2},
 	}}, timeidx.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer index.Close()
-	got, err := SearchOnce(context.Background(), nil, During(index, quantum+15, quantum+25, ExactTimestamp(func(id timeidx.ImageID) (uint64, bool) {
+	got, err := SearchOnce(context.Background(), nil, During(index, quantum+15, quantum+25, ExactTimestamp(func(id common.ValueID) (uint64, bool) {
 		value, ok := times[id]
 		return value, ok
 	})))
@@ -171,7 +171,7 @@ func TestNamespaceOnlyCountMatchesSearch(t *testing.T) {
 }
 
 func TestNamespaceTextAndRangeClauses(t *testing.T) {
-	text, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+	text, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
 		Namespace: common.Namespace(24), Kind: common.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
@@ -185,7 +185,7 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 		)
 	})
 
-	continuous, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+	continuous, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
 		Namespace: common.Namespace(25), Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
@@ -194,8 +194,8 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 	defer continuous.Close()
 	commitBitmap(t, continuous, func(b *bitmapidx.Batch) error {
 		return b.Move(
-			bitmapidx.Move{ImageID: 1, To: 10, HasTo: true},
-			bitmapidx.Move{ImageID: 2, To: 20, HasTo: true},
+			bitmapidx.Move{ImageID: 1, To: 10},
+			bitmapidx.Move{ImageID: 2, To: 20},
 		)
 	})
 	plan, err := Compile(

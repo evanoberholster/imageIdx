@@ -83,7 +83,7 @@ func NewStore(dir string, namespaces []NamespaceSpec, config NamespaceConfig, du
 	}
 	s := &Store{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, namespaces: make(map[common.Namespace]*Index)}
 	for _, spec := range specs {
-		index, err := NewIndex(spec, config)
+		index, err := NewMemory(spec, config)
 		if err != nil {
 			s.Close()
 			return nil, err

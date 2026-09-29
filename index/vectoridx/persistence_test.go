@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func tempPath(t *testing.T) string {
@@ -17,7 +19,7 @@ func tempPath(t *testing.T) string {
 
 func TestCreateCheckpointReopen(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +37,7 @@ func TestCreateCheckpointReopen(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +50,7 @@ func TestCreateCheckpointReopen(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].ImageID != uint64(id) {
+		if len(results) != 1 || results[0].ValueID != uint64(id) {
 			t.Fatalf("node %d self-search after reopen = %+v", id, results)
 		}
 	}
@@ -62,7 +64,7 @@ func TestCreateCheckpointReopen(t *testing.T) {
 
 func TestWALReplayWithoutCheckpoint(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +82,7 @@ func TestWALReplayWithoutCheckpoint(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +94,7 @@ func TestWALReplayWithoutCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 2 {
+	if len(results) != 1 || results[0].ValueID != 2 {
 		t.Fatalf("WAL-replayed search = %+v", results)
 	}
 	if got := reopened.TombstoneCount(); got != 1 {
@@ -102,7 +104,7 @@ func TestWALReplayWithoutCheckpoint(t *testing.T) {
 
 func TestCrashTornTailRecovery(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +135,7 @@ func TestCrashTornTailRecovery(t *testing.T) {
 	if err := os.Truncate(walPath, info.Size()-1); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +151,7 @@ func TestCrashTornTailRecovery(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	again, err := Open(path, DurabilitySync)
+	again, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +163,7 @@ func TestCrashTornTailRecovery(t *testing.T) {
 
 func TestCorruptFileDetected(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +187,7 @@ func TestCorruptFileDetected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
+	if _, err := OpenStore(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
 		t.Fatalf("open corrupt file = %v, want ErrCorruptStorage", err)
 	}
 	if err := VerifyFile(path); !errors.Is(err, ErrCorruptStorage) {
@@ -196,14 +198,14 @@ func TestCorruptFileDetected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
+	if _, err := OpenStore(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
 		t.Fatalf("open bad-magic file = %v, want ErrCorruptStorage", err)
 	}
 }
 
 func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +238,7 @@ func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].ImageID != uint64(id) {
+		if len(results) != 1 || results[0].ValueID != uint64(id) {
 			t.Fatalf("live node %d after compact = %+v", id, results)
 		}
 	}
@@ -247,7 +249,7 @@ func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,20 +265,20 @@ func TestCompactPurgesTombstonesPreservesIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].ImageID != uint64(id) {
+		if len(results) != 1 || results[0].ValueID != uint64(id) {
 			t.Fatalf("node %d after reopen post-compact = %+v", id, results)
 		}
 	}
 }
 
 func TestOpenMissingFile(t *testing.T) {
-	if _, err := Open(filepath.Join(t.TempDir(), "nope.idx"), DurabilitySync); !os.IsNotExist(err) {
+	if _, err := OpenStore(filepath.Join(t.TempDir(), "nope.idx"), DurabilitySync); !os.IsNotExist(err) {
 		t.Fatalf("open missing = %v, want not-exist", err)
 	}
 }
 
 func TestCheckpointInMemoryFails(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +290,7 @@ func TestCheckpointInMemoryFails(t *testing.T) {
 
 func TestReAddAfterDeleteReopen(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +306,7 @@ func TestReAddAfterDeleteReopen(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,24 +321,24 @@ func TestReAddAfterDeleteReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 5 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 5 || results[0].Score != 0 {
 		t.Fatalf("re-added node after reopen = %+v", results)
 	}
 }
 
 func TestDurabilityValidation(t *testing.T) {
 	path := tempPath(t)
-	if _, err := Create(path, testConfigFloat512(), Durability(200)); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewStore(path, testConfigFloat512(), Durability(200)); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("Create invalid durability = %v, want ErrInvalidConfig", err)
 	}
-	if _, err := Open(path, Durability(200)); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := OpenStore(path, Durability(200)); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("Open invalid durability = %v, want ErrInvalidConfig", err)
 	}
 }
 
 func TestOpenDurabilityIsRuntimePolicy(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +346,7 @@ func TestOpenDurabilityIsRuntimePolicy(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilityOS)
+	reopened, err := OpenStore(path, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +354,7 @@ func TestOpenDurabilityIsRuntimePolicy(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	again, err := Open(path, DurabilitySync)
+	again, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,25 +367,25 @@ func TestOpenDurabilityIsRuntimePolicy(t *testing.T) {
 func TestStoreLock(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vec.idx")
-	first, err := Create(path, testConfigFloat512(), DurabilitySync)
+	first, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrStoreBusy) {
+	if _, err := OpenStore(path, DurabilitySync); !errors.Is(err, ErrStoreBusy) {
 		t.Fatalf("second Open = %v, want ErrStoreBusy", err)
 	}
-	if _, err := Create(path, testConfigFloat512(), DurabilitySync); !errors.Is(err, ErrStoreBusy) {
+	if _, err := NewStore(path, testConfigFloat512(), DurabilitySync); !errors.Is(err, ErrStoreBusy) {
 		t.Fatalf("second Create = %v, want ErrStoreBusy", err)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Open(path, DurabilitySync)
+	second, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatalf("Open after Close: %v", err)
 	}
 	// Distinct index paths in the same directory take distinct locks.
-	other, err := Create(filepath.Join(dir, "other.idx"), testConfigFloat512(), DurabilitySync)
+	other, err := NewStore(filepath.Join(dir, "other.idx"), testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatalf("Create sibling index: %v", err)
 	}
@@ -397,7 +399,7 @@ func TestStoreLock(t *testing.T) {
 
 func TestStatsAndFileSize(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +441,7 @@ func TestStatsAndFileSize(t *testing.T) {
 
 func TestSyncIntervalGroupCommit(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilityOS, WithSyncInterval(5*time.Millisecond))
+	idx, err := NewStore(path, testConfigFloat512(), DurabilityOS, WithSyncInterval(5*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +467,7 @@ func TestSyncIntervalGroupCommit(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilityOS)
+	reopened, err := OpenStore(path, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +478,7 @@ func TestSyncIntervalGroupCommit(t *testing.T) {
 }
 
 func TestSyncInMemoryReturnsNotPersistent(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +489,7 @@ func TestSyncInMemoryReturnsNotPersistent(t *testing.T) {
 }
 
 func TestCreateRejectsNegativeSyncInterval(t *testing.T) {
-	if _, err := Create(tempPath(t), testConfigFloat512(), DurabilityOS, WithSyncInterval(-time.Second)); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewStore(tempPath(t), testConfigFloat512(), DurabilityOS, WithSyncInterval(-time.Second)); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("negative sync interval = %v, want ErrInvalidConfig", err)
 	}
 }
@@ -496,7 +498,7 @@ func TestWALSegmentRotationAndReplay(t *testing.T) {
 	path := tempPath(t)
 	// One 512-d float32 record frames to ~2KB, so 16 KiB segments rotate
 	// every handful of writes.
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync, WithWALSegmentBytes(16<<10))
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync, WithWALSegmentBytes(16<<10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +519,7 @@ func TestWALSegmentRotationAndReplay(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync, WithWALSegmentBytes(16<<10))
+	reopened, err := OpenStore(path, DurabilitySync, WithWALSegmentBytes(16<<10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +532,7 @@ func TestWALSegmentRotationAndReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].ImageID != ImageID(id) {
+		if len(results) != 1 || results[0].ValueID != common.ValueID(id) {
 			t.Fatalf("node %d self-search after segmented replay = %+v", id, results)
 		}
 	}
@@ -538,7 +540,7 @@ func TestWALSegmentRotationAndReplay(t *testing.T) {
 
 func TestWALCheckpointRemovesOldSegments(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync, WithWALSegmentBytes(16<<10))
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync, WithWALSegmentBytes(16<<10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +564,7 @@ func TestWALCheckpointRemovesOldSegments(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,7 +576,7 @@ func TestWALCheckpointRemovesOldSegments(t *testing.T) {
 
 func TestLegacyWALMigration(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +595,7 @@ func TestLegacyWALMigration(t *testing.T) {
 	if err := os.Rename(segs[0].path, legacy); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatalf("Open with legacy WAL: %v", err)
 	}
@@ -613,7 +615,7 @@ func TestLegacyWALMigration(t *testing.T) {
 
 func TestWALTornOlderSegmentIsCorruption(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilityOS, WithWALSegmentBytes(16<<10))
+	idx, err := NewStore(path, testConfigFloat512(), DurabilityOS, WithWALSegmentBytes(16<<10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,14 +634,14 @@ func TestWALTornOlderSegmentIsCorruption(t *testing.T) {
 	if err := os.Truncate(first.path, first.size-1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path, DurabilityOS); !errors.Is(err, ErrCorruptWAL) {
+	if _, err := OpenStore(path, DurabilityOS); !errors.Is(err, ErrCorruptWAL) {
 		t.Fatalf("Open with torn older segment = %v, want ErrCorruptWAL", err)
 	}
 }
 
 func TestCheckpointWritesDeltaWithoutBaseRewrite(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +674,7 @@ func TestCheckpointWritesDeltaWithoutBaseRewrite(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -687,7 +689,7 @@ func TestCheckpointWritesDeltaWithoutBaseRewrite(t *testing.T) {
 
 func TestDeltaCheckpointCarriesDeletesAndUpdates(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,7 +717,7 @@ func TestDeltaCheckpointCarriesDeletesAndUpdates(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,14 +732,14 @@ func TestDeltaCheckpointCarriesDeletesAndUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 6 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 6 || results[0].Score != 0 {
 		t.Fatalf("re-added node 6 after delta reopen = %+v", results)
 	}
 }
 
 func TestVacuumMergesDeltas(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -785,7 +787,7 @@ func TestVacuumMergesDeltas(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,7 +799,7 @@ func TestVacuumMergesDeltas(t *testing.T) {
 
 func TestOrphanDeltaIgnored(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,7 +820,7 @@ func TestOrphanDeltaIgnored(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -838,7 +840,7 @@ func TestOrphanDeltaIgnored(t *testing.T) {
 
 func TestCheckpointNoopWhenClean(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,7 +859,7 @@ func TestCheckpointNoopWhenClean(t *testing.T) {
 
 func TestManifestCorruptionDetected(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -877,14 +879,14 @@ func TestManifestCorruptionDetected(t *testing.T) {
 	if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
+	if _, err := OpenStore(path, DurabilitySync); !errors.Is(err, ErrCorruptStorage) {
 		t.Fatalf("Open with corrupt manifest = %v, want ErrCorruptStorage", err)
 	}
 }
 
 func TestAutoVacuumByDeltaCount(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -922,7 +924,7 @@ func TestAutoVacuumByDeltaCount(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -937,7 +939,7 @@ func TestAutoVacuumByDeltaCount(t *testing.T) {
 
 func TestAutoVacuumByFragmentation(t *testing.T) {
 	path := tempPath(t)
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -978,7 +980,7 @@ func TestAutoVacuumByFragmentation(t *testing.T) {
 }
 
 func TestSetAutoVacuumValidation(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}

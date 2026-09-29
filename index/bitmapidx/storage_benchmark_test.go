@@ -122,7 +122,7 @@ func BenchmarkNamespaceReopen(b *testing.B) {
 
 func benchmarkMaxCardinalityIndex(b *testing.B) *Index {
 	b.Helper()
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}

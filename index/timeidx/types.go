@@ -10,8 +10,6 @@ import (
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-type ImageID = common.ImageID
-
 type timemarker uint32
 
 const TimestampShift uint8 = 24
@@ -89,7 +87,7 @@ type blockMetadata struct {
 // Entry is one canonical timestamp to index.
 type Entry struct {
 	Timestamp uint64
-	ImageID   ImageID
+	ImageID   common.ValueID
 }
 
 // Spec describes an index's stable identity, compression offset, and initial

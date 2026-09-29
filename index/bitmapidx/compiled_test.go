@@ -162,7 +162,7 @@ func TestCompiledQueryValidation(t *testing.T) {
 		t.Fatal("compiled text differs from MatchText")
 	}
 
-	closed, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	closed, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

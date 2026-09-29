@@ -15,7 +15,7 @@ import (
 // A checkpoint appends an immutable delta file holding the mutations since
 // the previous checkpoint instead of rewriting the whole base generation.
 // The manifest names the base generation and the ordered delta files, so
-// Open loads base regions, applies deltas oldest to newest, and then replays
+// OpenStore loads base regions, applies deltas oldest to newest, and then replays
 // the WAL tail. Vacuum merges base plus deltas into a fresh base and removes
 // the delta files; Compact rebuilds the graph first and then vacuums.
 //
@@ -374,7 +374,7 @@ func (v *VectorIdx) collectPendingLocked() []deltaRecord {
 }
 
 // applyDeltasLocked replays published delta generations in order on top of
-// the loaded base. It runs during Open before the WAL tail is replayed.
+// the loaded base. It runs during OpenStore before the WAL tail is replayed.
 func (v *VectorIdx) applyDeltasLocked(m *manifestData) error {
 	if m == nil || len(m.deltas) == 0 {
 		return nil

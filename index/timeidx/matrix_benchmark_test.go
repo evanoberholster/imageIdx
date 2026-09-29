@@ -8,6 +8,7 @@ import (
 	"slices"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/bench"
 )
 
@@ -137,7 +138,7 @@ func benchmarkTimeOpen(b *testing.B) {
 			dir := b.TempDir()
 			entries := matrixEntries(bench.Timestamps(matrixSeed, n, bench.TimeUniform))
 			heapBefore := bench.HeapBytes()
-			writer, err := NewPersistent(dir, Spec{Entries: entries}, matrixOpenConfig, DurabilityOS)
+			writer, err := NewStore(dir, Spec{Entries: entries}, matrixOpenConfig, DurabilityOS)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -148,7 +149,7 @@ func benchmarkTimeOpen(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				opened, err := OpenPersistent(dir, matrixOpenConfig, DurabilityOS)
+				opened, err := OpenStore(dir, matrixOpenConfig, DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -161,7 +162,7 @@ func benchmarkTimeOpen(b *testing.B) {
 	}
 }
 
-// benchmarkTimeRecovery measures OpenPersistent replaying a WAL tail: a
+// benchmarkTimeRecovery measures OpenStore replaying a WAL tail: a
 // checkpointed base of N records is written first, then N more records are
 // applied without another checkpoint, so every reopen must replay N frames
 // and reapply them to the mapped base.
@@ -171,7 +172,7 @@ func benchmarkTimeRecovery(b *testing.B) {
 			dir := b.TempDir()
 			base := matrixEntries(bench.Timestamps(matrixSeed, n, bench.TimeUniform))
 			tail := bench.Timestamps(matrixTailSeed, n, bench.TimeUniform)
-			writer, err := NewPersistent(dir, Spec{Entries: base}, matrixRecoveryConfig, DurabilityOS)
+			writer, err := NewStore(dir, Spec{Entries: base}, matrixRecoveryConfig, DurabilityOS)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -182,7 +183,7 @@ func benchmarkTimeRecovery(b *testing.B) {
 			b.Logf("TimeRecovery N=%d disk=%d bytes", n, bench.DiskBytes(dir))
 			b.ReportAllocs()
 			for b.Loop() {
-				recovered, err := OpenPersistent(dir, matrixRecoveryConfig, DurabilityOS)
+				recovered, err := OpenStore(dir, matrixRecoveryConfig, DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -201,7 +202,7 @@ func benchmarkTimeRecovery(b *testing.B) {
 // iteration) so benchstat sees how many IDs each window returns.
 func runTimeSearch(b *testing.B, index *Index, window timeWindow) {
 	seed := index.Search(nil, window.start, window.end)
-	dst := make([]ImageID, 0, len(seed)+1)
+	dst := make([]common.ValueID, 0, len(seed)+1)
 	b.ReportAllocs()
 	for b.Loop() {
 		dst = index.Search(dst[:0], window.start, window.end)
@@ -287,7 +288,7 @@ func matrixMissWindow(entries []blockEntry) (uint64, uint64) {
 // assigning each record a unique ImageID.
 func newMatrixIndex(b *testing.B, timestamps []uint64, config Config) *Index {
 	b.Helper()
-	index, err := New(Spec{Entries: matrixEntries(timestamps)}, config)
+	index, err := NewMemory(Spec{Entries: matrixEntries(timestamps)}, config)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -298,7 +299,7 @@ func newMatrixIndex(b *testing.B, timestamps []uint64, config Config) *Index {
 func matrixEntries(timestamps []uint64) []Entry {
 	entries := make([]Entry, len(timestamps))
 	for i, timestamp := range timestamps {
-		entries[i] = Entry{Timestamp: timestamp, ImageID: ImageID(i + 1)}
+		entries[i] = Entry{Timestamp: timestamp, ImageID: common.ValueID(i + 1)}
 	}
 	return entries
 }
@@ -315,7 +316,7 @@ func applyTimeTail(b *testing.B, index *Index, tail []uint64, idBase int) {
 			b.Fatal("batch still in flight")
 		}
 		for i := start; i < end; i++ {
-			if !batch.Append(Insert(ImageID(idBase+i+1), tail[i])) {
+			if !batch.Append(Insert(common.ValueID(idBase+i+1), tail[i])) {
 				b.Fatalf("append mutation %d failed", i)
 			}
 		}

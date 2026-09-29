@@ -106,7 +106,7 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 		return bt.Add(Entry{ImageID: 1, Value: BoolValue(true)}, Entry{ImageID: 2, Value: BoolValue(false)})
 	})
 	commit(t, rating, func(bt *Batch) error {
-		return bt.Move(Move{ImageID: 1, To: 7, HasTo: true}, Move{ImageID: 2, To: 8, HasTo: true})
+		return bt.Move(Move{ImageID: 1, To: 7}, Move{ImageID: 2, To: 8})
 	})
 	commit(t, object, func(bt *Batch) error {
 		return bt.ReplaceText(TextReplacement{ImageID: 1, After: []string{"red blue"}}, TextReplacement{ImageID: 2, After: []string{"blue green"}})
@@ -116,7 +116,7 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	commit(t, location, func(bt *Batch) error {
-		return bt.Move(Move{ImageID: 1, To: int64(cell), HasTo: true})
+		return bt.Move(Move{ImageID: 1, To: int64(cell)})
 	})
 	want := map[common.Namespace]uint64{
 		common.NamespaceTag: 2, common.NamespaceFlag: 2, common.NamespaceRating: 2,

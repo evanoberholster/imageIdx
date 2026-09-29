@@ -101,7 +101,7 @@ func buildMixedStore(tb testing.TB, dir string, n int, values []Value) (*Store, 
 	tb.Helper()
 	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
-		tb.Fatalf("NewIndex: %v", err)
+		tb.Fatalf("NewMemory: %v", err)
 	}
 	index, ok := store.Lookup(common.NamespaceTag)
 	if !ok {

@@ -68,7 +68,7 @@ type asyncOp struct {
 type VectorIdx struct {
 	cfgBase    Config // persisted identity (Namespace/Dims/Elem/Metric/M/M0/Ef*), immutable
 	durability Durability
-	path       string // empty for in-memory indexes (New)
+	path       string // empty for in-memory indexes (NewMemory)
 
 	view    atomic.Pointer[vectorSnapshot]
 	readers *storage.ReaderTracker
@@ -113,18 +113,18 @@ type VectorIdx struct {
 	pending          map[NodeID]struct{} // writer-only, changes since last checkpoint
 	pendingMutations int                 // writer-only, raw mutation count
 	coalescedRecords atomic.Uint64
-	loadingDelta     bool // writer-only during Open
+	loadingDelta     bool // writer-only during OpenStore
 
 	asyncCh      chan asyncOp
 	asyncWg      sync.WaitGroup
 	asyncPending atomic.Int64
 }
 
-// New returns an in-memory index with no persistence. It is the fastest path
-// for tests and for callers that manage durability themselves. Checkpoint,
-// Compact (rebuild), search, and WAL-free mutation all work; file recovery
-// does not apply.
-func New(cfg Config) (*VectorIdx, error) {
+// NewMemory returns an in-memory index with no persistence. It is the fastest
+// path for tests and for callers that manage durability themselves. Search,
+// Compact (rebuild), and WAL-free mutation work; Checkpoint, Sync, and Vacuum
+// return ErrNotPersistent.
+func NewMemory(cfg Config) (*VectorIdx, error) {
 	validated, err := cfg.withDefaults()
 	if err != nil {
 		return nil, err
@@ -159,12 +159,12 @@ func New(cfg Config) (*VectorIdx, error) {
 	return v, nil
 }
 
-// Create creates (truncating) a persistent index at path and checkpoints an
-// empty generation so Open can recover it later. Durability selects whether
+// NewStore creates (truncating) a persistent index at path and checkpoints an
+// empty generation so OpenStore can recover it later. Durability selects whether
 // each acknowledged mutation is fsynced (DurabilitySync) or left to the OS
 // page cache (DurabilityOS). WithSyncInterval adds periodic group commit for
 // DurabilityOS. The path is exclusively locked until Close.
-func Create(path string, cfg Config, durability Durability, opts ...Option) (*VectorIdx, error) {
+func NewStore(path string, cfg Config, durability Durability, opts ...Option) (*VectorIdx, error) {
 	validated, err := cfg.withDefaults()
 	if err != nil {
 		return nil, err
@@ -236,13 +236,13 @@ func Create(path string, cfg Config, durability Durability, opts ...Option) (*Ve
 	return v, nil
 }
 
-// Open opens an index created by Create, validates its superblock and region
+// OpenStore opens an index created by NewStore, validates its superblock and region
 // checksums, then replays WAL records after CheckpointLSN. Recovery stops at
 // the first incomplete trailing record and truncates the torn tail so the
 // next open is deterministic. Durability and options are runtime policy and
-// need not match the values used at Create time. The path is exclusively
+// need not match the values used at NewStore time. The path is exclusively
 // locked until Close.
-func Open(path string, durability Durability, opts ...Option) (*VectorIdx, error) {
+func OpenStore(path string, durability Durability, opts ...Option) (*VectorIdx, error) {
 	if path == "" || !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}

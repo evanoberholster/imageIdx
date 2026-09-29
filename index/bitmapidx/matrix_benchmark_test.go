@@ -62,9 +62,9 @@ func buildNamespaceMatrix(tb testing.TB, n int) *namespaceMatrix {
 	for i := range values {
 		values[i] = EnumStringValue(fmt.Sprintf("value-%d", i))
 	}
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		tb.Fatalf("NewIndex: %v", err)
+		tb.Fatalf("NewMemory: %v", err)
 	}
 	matrix := &namespaceMatrix{index: index, ids: ids, values: values}
 	matrix.hits = make([]Entry, 0, min(n, matrixSampleSize))
@@ -273,7 +273,7 @@ func benchmarkNamespaceMatrixSize(b *testing.B, n int) {
 // that do not depend on a dataset size: empty index, single entry, and a
 // membership at math.MaxUint64.
 func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
-	empty, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	empty, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -349,7 +349,7 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		sinkNamespaceAppended = dst
 	})
 
-	single, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	single, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -401,7 +401,7 @@ func benchmarkNamespaceMatrixAdversarial(b *testing.B) {
 		sinkNamespaceAppended = dst
 	})
 
-	maxNamespace, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	maxNamespace, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}

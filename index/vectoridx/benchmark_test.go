@@ -59,7 +59,7 @@ func benchDistance(b *testing.B, elem ElementType, dims Dimensions) {
 
 func buildBenchIndex(b *testing.B, n int) (*VectorIdx, [][]float32) {
 	b.Helper()
-	idx, err := New(Config{
+	idx, err := NewMemory(Config{
 		Namespace:      testNamespace,
 		Dimensions:     Dim512,
 		ElementType:    ElementFloat32,
@@ -128,7 +128,7 @@ func TestSearchSteadyStateAllocs(t *testing.T) {
 	if raceEnabled {
 		t.Skip("allocation counts are calibrated for non-race builds; the race detector adds bookkeeping allocs")
 	}
-	idx, err := New(Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32})
+	idx, err := NewMemory(Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestSearchSteadyStateAllocs(t *testing.T) {
 func benchPersistentIndex(b *testing.B, n int, durability Durability, opts ...Option) *VectorIdx {
 	b.Helper()
 	path := filepath.Join(b.TempDir(), "bench.idx")
-	idx, err := Create(path, testConfigFloat512(), durability, opts...)
+	idx, err := NewStore(path, testConfigFloat512(), durability, opts...)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func BenchmarkOpen(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		re, err := Open(path, DurabilityOS)
+		re, err := OpenStore(path, DurabilityOS)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -319,7 +319,7 @@ func BenchmarkOpenDelta(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		re, err := Open(path, DurabilityOS)
+		re, err := OpenStore(path, DurabilityOS)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -340,7 +340,7 @@ func BenchmarkOpenReplay(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		re, err := Open(path, DurabilityOS)
+		re, err := OpenStore(path, DurabilityOS)
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -264,7 +264,7 @@ func (s *vectorSnapshot) assemble(entries []searchEntry, filter CandidateFilter,
 	metric := s.cfg.Metric
 	out := buf[:0]
 	for _, e := range filtered {
-		out = append(out, Result{ImageID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
+		out = append(out, Result{ValueID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
 	}
 	return out
 }
@@ -330,7 +330,7 @@ func (s *vectorSnapshot) exactSearchInto(ctx *SearchContext, query []byte, filte
 	}
 	out := buf[:0]
 	for _, e := range all {
-		out = append(out, Result{ImageID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
+		out = append(out, Result{ValueID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
 	}
 	return out
 }
@@ -371,7 +371,7 @@ func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int
 	}
 	out := make([]Result, len(all))
 	for i, sc := range all {
-		out[i] = Result{ImageID: widenedID(sc.id), Score: encodeScoreForMetric(metric, sc.dist, querySelfDot)}
+		out[i] = Result{ValueID: widenedID(sc.id), Score: encodeScoreForMetric(metric, sc.dist, querySelfDot)}
 	}
 	return out
 }

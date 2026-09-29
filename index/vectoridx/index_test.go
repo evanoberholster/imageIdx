@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func TestConfigValidation(t *testing.T) {
@@ -15,11 +17,11 @@ func TestConfigValidation(t *testing.T) {
 		{Dimensions: Dim512, ElementType: ElementFloat32, EfConstruction: 5000},
 		{Dimensions: 0, ElementType: ElementFloat32},
 	} {
-		if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
+		if _, err := NewMemory(cfg); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("cfg %+v: expected ErrInvalidConfig, got %v", cfg, err)
 		}
 	}
-	idx, err := New(Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32})
+	idx, err := NewMemory(Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +35,7 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestAddSearchSingleFloat(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +47,7 @@ func TestAddSearchSingleFloat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 42 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 42 || results[0].Score != 0 {
 		t.Fatalf("single search = %+v, want [{42 0}]", results)
 	}
 	if got := idx.LiveCount(); got != 1 {
@@ -54,7 +56,7 @@ func TestAddSearchSingleFloat(t *testing.T) {
 }
 
 func TestAddDuplicateRejected(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,13 +80,13 @@ func TestAddDuplicateRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 1 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 1 || results[0].Score != 0 {
 		t.Fatalf("re-add search = %+v", results)
 	}
 }
 
 func TestDeleteSemantics(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,14 +131,14 @@ func TestDeleteSemantics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].ImageID != uint64(i+1) {
+		if len(results) != 1 || results[0].ValueID != uint64(i+1) {
 			t.Fatalf("node %d self-search = %+v", i+1, results)
 		}
 	}
 }
 
 func TestSparseNodeIDs(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +159,7 @@ func TestSparseNodeIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].ImageID != uint64(id) {
+		if len(results) != 1 || results[0].ValueID != uint64(id) {
 			t.Fatalf("sparse id %d self-search = %+v", id, results)
 		}
 	}
@@ -167,7 +169,7 @@ func TestSparseNodeIDs(t *testing.T) {
 }
 
 func TestTypedAPIMismatchRejected(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,46 +211,46 @@ func TestAllElementTypesRoundTrip(t *testing.T) {
 		vi16[i] = int16(rng.Intn(65536) - 32768)
 		vu16[i] = uint16(rng.Intn(65536))
 	}
-	idx8, _ := New(cfgs[0])
+	idx8, _ := NewMemory(cfgs[0])
 	defer idx8.Close()
 	if err := idx8.AddInt8(5, v8); err != nil {
 		t.Fatal(err)
 	}
 	res, err := idx8.SearchInt8(v8, nil, 1)
-	if err != nil || len(res) != 1 || res[0].ImageID != 5 || res[0].Score != 0 {
+	if err != nil || len(res) != 1 || res[0].ValueID != 5 || res[0].Score != 0 {
 		t.Fatalf("int8 round trip = %+v, %v", res, err)
 	}
-	idxU, _ := New(cfgs[1])
+	idxU, _ := NewMemory(cfgs[1])
 	defer idxU.Close()
 	if err := idxU.AddUint8(6, vu); err != nil {
 		t.Fatal(err)
 	}
 	res, err = idxU.SearchUint8(vu, nil, 1)
-	if err != nil || len(res) != 1 || res[0].ImageID != 6 {
+	if err != nil || len(res) != 1 || res[0].ValueID != 6 {
 		t.Fatalf("uint8 round trip = %+v, %v", res, err)
 	}
-	idx16, _ := New(cfgs[2])
+	idx16, _ := NewMemory(cfgs[2])
 	defer idx16.Close()
 	if err := idx16.AddInt16(7, vi16); err != nil {
 		t.Fatal(err)
 	}
 	res, err = idx16.SearchInt16(vi16, nil, 1)
-	if err != nil || len(res) != 1 || res[0].ImageID != 7 {
+	if err != nil || len(res) != 1 || res[0].ValueID != 7 {
 		t.Fatalf("int16 round trip = %+v, %v", res, err)
 	}
-	idxU16, _ := New(cfgs[3])
+	idxU16, _ := NewMemory(cfgs[3])
 	defer idxU16.Close()
 	if err := idxU16.AddUint16(8, vu16); err != nil {
 		t.Fatal(err)
 	}
 	res, err = idxU16.SearchUint16(vu16, nil, 1)
-	if err != nil || len(res) != 1 || res[0].ImageID != 8 {
+	if err != nil || len(res) != 1 || res[0].ValueID != 8 {
 		t.Fatalf("uint16 round trip = %+v, %v", res, err)
 	}
 }
 
 func TestSearchIntoReusesCallerBuffer(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,21 +276,21 @@ func TestSearchIntoReusesCallerBuffer(t *testing.T) {
 	first := append([]Result(nil), dst...)
 	// Second call reuses the same backing array without aliasing pooled memory:
 	// mutating the first copy must not affect the next result.
-	first[0].ImageID = 999999
+	first[0].ValueID = 999999
 	dst2, err := idx.SearchIntoFloat32(dst[:0], query, nil, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dst2[0].ImageID == 999999 {
+	if dst2[0].ValueID == 999999 {
 		t.Fatalf("pooled memory aliased caller buffer")
 	}
-	if len(dst2) != 5 || dst2[0].ImageID != 1 {
+	if len(dst2) != 5 || dst2[0].ValueID != 1 {
 		t.Fatalf("second SearchInto = %+v", dst2)
 	}
 }
 
 func TestConcurrentReadersSingleWriter(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +341,7 @@ func TestConcurrentReadersSingleWriter(t *testing.T) {
 }
 
 func TestClosedIndexErrors(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +361,7 @@ func TestClosedIndexErrors(t *testing.T) {
 }
 
 func TestReAddAfterDeleteReplacesVector(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,13 +398,13 @@ func TestReAddAfterDeleteReplacesVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 7 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 7 || results[0].Score != 0 {
 		t.Fatalf("self-search after re-add = %+v", results)
 	}
 }
 
 func TestReAddEntryAfterDelete(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,13 +426,13 @@ func TestReAddEntryAfterDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != ImageID(entry) || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != common.ValueID(entry) || results[0].Score != 0 {
 		t.Fatalf("entry self-search after re-add = %+v", results)
 	}
 }
 
 func TestCompactResultAndBusy(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,8 @@ package timeidx
 import (
 	"cmp"
 	"slices"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 type compactionTask struct {
@@ -18,7 +20,7 @@ type compactionResult struct {
 
 type compactRecord struct {
 	marker timemarker
-	id     ImageID
+	id     common.ValueID
 }
 
 type compactRecords []compactRecord
@@ -74,7 +76,7 @@ func compact(base *base, frozen *delta) *base {
 	}
 	slices.SortFunc(records, compareCompactRecord)
 	markers := make([]timemarker, len(records))
-	ids := make([]ImageID, len(records))
+	ids := make([]common.ValueID, len(records))
 	for index, record := range records {
 		markers[index] = record.marker
 		ids[index] = record.id

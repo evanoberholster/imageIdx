@@ -71,7 +71,7 @@ func TestStressMixedWorkload(t *testing.T) {
 		enumNamespace(enumType), textNamespace(textType), continuousNamespace(continuousType), geoNamespaceFor(geoType),
 	}, config, common.DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	tag, _ := store.Lookup(enumType)
 	title, _ := store.Lookup(textType)
@@ -146,20 +146,18 @@ func TestStressMixedWorkload(t *testing.T) {
 					textChanges = append(textChanges, TextReplacement{ImageID: id, Before: prevText[i], After: nextText})
 					prevText[i] = nextText
 
-					toCont := int64((round*7 + i + w) % 4096)
-					contMove := Move{ImageID: id, To: toCont, HasTo: true}
+					toCont := int64((round*7+i+w)%4096 + 1)
+					contMove := Move{ImageID: id, To: toCont}
 					if round > 0 {
 						contMove.From = prevCont[i]
-						contMove.HasFrom = true
 					}
 					contMoves = append(contMoves, contMove)
 					prevCont[i] = toCont
 
 					toGeo := keys[(round+i+w)%len(keys)]
-					geoMove := Move{ImageID: id, To: int64(toGeo), HasTo: true}
+					geoMove := Move{ImageID: id, To: int64(toGeo)}
 					if round > 0 {
 						geoMove.From = int64(curGeo[i])
-						geoMove.HasFrom = true
 					}
 					geoMoves = append(geoMoves, geoMove)
 					curGeo[i] = toGeo
@@ -361,7 +359,7 @@ func TestStressReaderGuardUnderMaintenance(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewStore(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	loc, _ := store.Lookup(common.NamespaceLocation)
 	key := sfKey(t)

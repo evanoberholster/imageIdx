@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"sync/atomic"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // BenchmarkSearch pins hot range-scan cost across narrow/medium/broad
@@ -22,7 +24,7 @@ func BenchmarkSearchParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		buffer := make([]ImageID, 0, 4_096)
+		buffer := make([]common.ValueID, 0, 4_096)
 		for pb.Next() {
 			buffer = index.Search(buffer[:0], end/2, end/2+1_024*testQuantum)
 		}
@@ -53,7 +55,7 @@ func benchmarkSearchSize(b *testing.B, size int) {
 	}
 	for _, test := range ranges {
 		b.Run(test.name, func(b *testing.B) {
-			buffer := make([]ImageID, 0, test.cap)
+			buffer := make([]common.ValueID, 0, test.cap)
 			start := end / 2
 			finish := start + test.width*testQuantum
 			b.ReportAllocs()
@@ -76,7 +78,7 @@ func BenchmarkUpdate(b *testing.B) {
 	b.ResetTimer()
 	for iteration := 0; iteration < b.N; iteration++ {
 		batch.Reset()
-		batch.Append(Insert(ImageID(iteration%65_536+1), uint64(iteration%65_536)*testQuantum))
+		batch.Append(Insert(common.ImageID(iteration%65_536+1), uint64(iteration%65_536)*testQuantum))
 		submitWithBackpressure(index, batch)
 	}
 }
@@ -87,13 +89,13 @@ func BenchmarkUpdateParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		idBase := ImageID(workerID.Add(1) * 1_000_000)
+		idBase := common.ImageID(workerID.Add(1) * 1_000_000)
 		batch := NewBatch(1)
 		var sequence uint64
 		for pb.Next() {
 			sequence++
 			batch.Reset()
-			batch.Append(Insert(idBase+ImageID(sequence%1_024), (sequence%65_536)*testQuantum))
+			batch.Append(Insert(idBase+common.ImageID(sequence%1_024), (sequence%65_536)*testQuantum))
 			submitWithBackpressure(index, batch)
 		}
 	})
@@ -108,7 +110,7 @@ func BenchmarkDeltaCapacity(b *testing.B) {
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
 				batch.Reset()
-				batch.Append(Insert(ImageID(iteration%65_536+1), uint64(iteration%65_536)*testQuantum))
+				batch.Append(Insert(common.ImageID(iteration%65_536+1), uint64(iteration%65_536)*testQuantum))
 				submitWithBackpressure(index, batch)
 			}
 		})
@@ -119,7 +121,7 @@ func BenchmarkBlockSize(b *testing.B) {
 	for _, size := range []int{32_768, 65_536, 131_072} {
 		b.Run(fmt.Sprintf("Entries-%d", size), func(b *testing.B) {
 			index, end := benchmarkIndex(b, 1_000_000, Config{BlockSize: size})
-			buffer := make([]ImageID, 0, 16_384)
+			buffer := make([]common.ValueID, 0, 16_384)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
@@ -135,10 +137,10 @@ func benchmarkIndex(b *testing.B, count int, config Config) (*Index, uint64) {
 	for index := range records {
 		records[index] = Entry{
 			Timestamp: uint64(index) * testQuantum,
-			ImageID:   ImageID(index + 1),
+			ImageID:   common.ImageID(index + 1),
 		}
 	}
-	idx, err := New(Spec{Entries: records}, config)
+	idx, err := NewMemory(Spec{Entries: records}, config)
 	if err != nil {
 		b.Fatal(err)
 	}

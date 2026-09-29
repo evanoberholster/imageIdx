@@ -83,6 +83,7 @@ type GeoCodec struct {
 type NamespaceSpec struct {
 	Namespace  common.Namespace
 	Kind       common.NamespaceKind
+	Name       string    // Namespace Name; not persisted, only for user display
 	Quant      Quantizer // KindBitmapContinuous only
 	Geo        GeoCodec  // KindBitmapGeo only
 	Normalizer CodecSpec // KindBitmapEnum only
@@ -277,9 +278,7 @@ func EnumStringValue(value string) Value {
 // through preparation and copied under the writer lock only if the value
 // is new to the dictionary; callers must not mutate it until the write
 // returns.
-func EnumBytesValue(value []byte) Value {
-	return Value{Kind: common.KindBitmapEnum, Bytes: value}
-}
+func EnumBytesValue(value []byte) Value { return Value{Kind: common.KindBitmapEnum, Bytes: value} }
 
 // BoolValue returns an explicit boolean value. False is distinct from
 // absent: an image with no bool membership is neither true nor false.
@@ -309,17 +308,13 @@ type namespaceMutation struct {
 	Remove []Entry
 }
 
-// Move is an explicit value transition for continuous and geo namespaces:
-// HasFrom=false inserts, HasTo=false removes, both set moves. Flags
-// resolve the zero-value ambiguity. Continuous keeps explicit flags
-// because zero is a valid grid value; geo may omit them because a
-// level-16 S2 key is never zero, so zero is the absent sentinel.
+// Move is a value transition for continuous and geo namespaces. From == 0
+// inserts, To == 0 removes, and both nonzero values move. Both zero is a no-op.
+// A continuous value of zero must use Batch.Add or Batch.Remove instead.
 type Move struct {
 	ImageID common.ImageID
 	From    int64
 	To      int64
-	HasFrom bool
-	HasTo   bool
 }
 
 // TextReplacement replaces one image's complete logical text namespace.

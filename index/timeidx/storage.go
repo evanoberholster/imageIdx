@@ -61,10 +61,10 @@ type persistentState struct {
 	mappings   [][]byte
 }
 
-// NewPersistent creates and locks a store directory, then creates a
+// NewStore creates and locks a store directory, then creates a
 // persistent index and publishes its initial checkpoint. The directory
 // must be empty; a held lock reports ErrStoreBusy.
-func NewPersistent(storeDir string, spec Spec, config Config, durability Durability) (*Index, error) {
+func NewStore(storeDir string, spec Spec, config Config, durability Durability) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -78,7 +78,7 @@ func NewPersistent(storeDir string, spec Spec, config Config, durability Durabil
 			_ = storage.ReleaseLock(lock)
 		}
 	}()
-	index, err := New(spec, config)
+	index, err := NewMemory(spec, config)
 	if err != nil {
 		return nil, err
 	}
@@ -97,12 +97,12 @@ func NewPersistent(storeDir string, spec Spec, config Config, durability Durabil
 	return index, nil
 }
 
-// OpenPersistent maps the published base generation and replays the WAL tail.
+// OpenStore maps the published base generation and replays the WAL tail.
 // Block sizing is open-time policy, not persisted state: the files record
 // offsets and counts only, so a different BlockSize or DeltaCapacity than
 // the writer used changes memory use and compaction cadence, never the
 // logical contents.
-func OpenPersistent(storeDir string, config Config, durability Durability) (*Index, error) {
+func OpenStore(storeDir string, config Config, durability Durability) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -623,7 +623,7 @@ func writeMarkers(file *os.File, markers []timemarker) error {
 	return nil
 }
 
-func writeImageIDs(file *os.File, ids []ImageID) error {
+func writeImageIDs(file *os.File, ids []common.ImageID) error {
 	buffer := make([]byte, 64*1024)
 	for len(ids) != 0 {
 		count := min(len(ids), len(buffer)/8)
@@ -690,7 +690,7 @@ func decodeDirectory(data, markerData, idData []byte, config Config) (*blockDire
 		if err != nil {
 			return nil, err
 		}
-		ids, err := storage.View[ImageID](idData, meta.IDOffset, uint64(meta.Count), ErrInvalidBase, ErrUnsupportedEndian)
+		ids, err := storage.View[common.ValueID](idData, meta.IDOffset, uint64(meta.Count), ErrInvalidBase, ErrUnsupportedEndian)
 		if err != nil {
 			return nil, err
 		}

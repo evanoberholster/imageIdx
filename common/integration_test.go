@@ -123,9 +123,9 @@ func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 		Namespace: common.NamespaceTag,
 		Kind:      common.KindBitmapEnum,
 	}
-	tags, err := bitmapidx.NewIndex(tagSpec, bitmapidx.NamespaceConfig{})
+	tags, err := bitmapidx.NewMemory(tagSpec, bitmapidx.NamespaceConfig{})
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	defer func() {
 		if err := tags.Close(); err != nil {
@@ -139,13 +139,13 @@ func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 		t.Fatalf("bitmap Spec namespace = %d, want %d", got, common.NamespaceTag)
 	}
 
-	timeline, err := timeidx.New(timeidx.Spec{
+	timeline, err := timeidx.NewMemory(timeidx.Spec{
 		Namespace: timelineNamespace,
 		Name:      "timeline",
 		Entries:   []timeidx.Entry{{ImageID: 100, Timestamp: 1 << timeidx.TimestampShift}},
 	}, timeidx.Config{})
 	if err != nil {
-		t.Fatalf("timeidx.New: %v", err)
+		t.Fatalf("timeidx.NewMemory: %v", err)
 	}
 	defer func() {
 		if err := timeline.Close(); err != nil {
@@ -175,13 +175,13 @@ func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 		t.Fatalf("hashidx exact namespace = %d, want %d", got, exactHashNamespace)
 	}
 
-	vectors, err := vectoridx.New(vectoridx.Config{
+	vectors, err := vectoridx.NewMemory(vectoridx.Config{
 		Namespace:   vectorNamespace,
 		Dimensions:  vectoridx.Dim512,
 		ElementType: vectoridx.ElementFloat32,
 	})
 	if err != nil {
-		t.Fatalf("vectoridx.New: %v", err)
+		t.Fatalf("vectoridx.NewMemory: %v", err)
 	}
 	defer func() {
 		if err := vectors.Close(); err != nil {

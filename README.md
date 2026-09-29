@@ -41,7 +41,7 @@ Reopen the same store with `bitmapidx.OpenStore(dir, config, durability)`.
 ### Timestamp index
 
 ```go
-times, err := timeidx.NewPersistent(
+times, err := timeidx.NewStore(
 	"./data/time",
 	timeidx.Spec{Namespace: common.Namespace(90), Name: "timeline"},
 	timeidx.Config{},
@@ -53,13 +53,13 @@ if err != nil {
 defer times.Close()
 ```
 
-Reopen with `timeidx.OpenPersistent(dir, config, durability)`; use
-`timeidx.New(spec, config)` for an in-memory index.
+Reopen with `timeidx.OpenStore(dir, config, durability)`; use
+`timeidx.NewMemory(spec, config)` for an in-memory index.
 
 ### Vector index
 
 ```go
-vectors, err := vectoridx.Create(
+vectors, err := vectoridx.NewStore(
 	"./data/vectors",
 	vectoridx.Config{
 		Namespace:   common.Namespace(100),
@@ -74,7 +74,8 @@ if err != nil {
 defer vectors.Close()
 ```
 
-Reopen with `vectoridx.Open(path, durability)`.
+Reopen with `vectoridx.OpenStore(path, durability)`; use
+`vectoridx.NewMemory(config)` for an in-memory index.
 
 ### Key-value store
 
@@ -118,8 +119,10 @@ if err := tags.Barrier(); err != nil {
 ```
 
 Other value shapes use the same batch: `batch.Remove(...)` for removals,
-`batch.Move(bitmapidx.Move{ImageID, From, To, HasFrom, HasTo})` for
+`batch.Move(bitmapidx.Move{ImageID, From, To})` for
 continuous and geo values, and `batch.ReplaceText(...)` for text.
+For a continuous value of zero, use `batch.Add` or `batch.Remove`;
+`Move` uses zero to mean no value.
 
 ```go
 key, err := bitmapidx.KeyFromLatLng(37.7749, -122.4194)
@@ -224,7 +227,7 @@ if err != nil {
 	log.Fatal(err)
 }
 for _, r := range results {
-	log.Println(r.ImageID, r.Score)
+	log.Println(r.ValueID, r.Score)
 }
 ```
 

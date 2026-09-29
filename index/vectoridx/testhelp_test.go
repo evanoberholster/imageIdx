@@ -36,17 +36,17 @@ func mustAddFloat(t *testing.T, idx *VectorIdx, id NodeID, vec []float32) {
 	}
 }
 
-func resultIDs(results []Result) []ImageID {
-	ids := make([]ImageID, len(results))
+func resultIDs(results []Result) []common.ValueID {
+	ids := make([]common.ValueID, len(results))
 	for i, r := range results {
-		ids[i] = r.ImageID
+		ids[i] = r.ValueID
 	}
 	return ids
 }
 
-func containsResult(results []Result, id ImageID) bool {
+func containsResult(results []Result, id common.ValueID) bool {
 	for _, r := range results {
-		if r.ImageID == id {
+		if r.ValueID == id {
 			return true
 		}
 	}

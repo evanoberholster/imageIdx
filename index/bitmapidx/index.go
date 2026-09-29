@@ -24,7 +24,7 @@ var (
 )
 
 // NamespaceConfig controls namespace delta rotation and compaction. The zero
-// value is valid; NewIndex fills defaults. ActiveTarget rotates
+// value is valid; NewMemory fills defaults. ActiveTarget rotates
 // Active to Frozen and schedules background compaction; HardDeltaLimit
 // and MaxDeltaValues instead fold the batch directly into Base on the
 // write path, bounding every reader-visible delta.
@@ -89,7 +89,7 @@ type NamespaceMetadata struct {
 //
 // Reads against a closed index report empty results, as do queries
 // compiled after close; writes and maintenance report ErrClosed. The zero
-// value is not usable; construct with NewIndex. Store-owned indexes
+// value is not usable; construct with NewMemory. Store-owned indexes
 // (owner != nil) route writes through the store WAL and must be closed via
 // the store.
 type Index struct {
@@ -112,11 +112,11 @@ type Index struct {
 	barrierErr error
 }
 
-// NewIndex constructs an empty namespace index from a validated
+// NewMemory constructs an empty namespace index from a validated
 // definition. Config zero values take defaults. The definition is
 // deep-copied; text namespaces also build their analyzer here so writes and
 // queries never construct one per batch.
-func NewIndex(namespace NamespaceSpec, config NamespaceConfig) (*Index, error) {
+func NewMemory(namespace NamespaceSpec, config NamespaceConfig) (*Index, error) {
 	if err := validateNamespace(namespace); err != nil {
 		return nil, err
 	}

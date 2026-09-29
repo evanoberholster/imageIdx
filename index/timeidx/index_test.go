@@ -8,13 +8,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 const testQuantum = uint64(1) << TimestampShift
 
 func TestSearchExactFiltersLossyBoundaryMarkers(t *testing.T) {
 	const offset = uint64(10_000)
-	timestamps := map[ImageID]uint64{
+	timestamps := map[common.ValueID]uint64{
 		1: offset + testQuantum + 10,
 		2: offset + testQuantum + 20,
 		3: offset + testQuantum + 30,
@@ -26,16 +28,16 @@ func TestSearchExactFiltersLossyBoundaryMarkers(t *testing.T) {
 	}
 	index := mustNewIndex(t, records, offset, Config{})
 
-	candidates := index.Search(make([]ImageID, 0, 4), offset+testQuantum+15, offset+testQuantum+25)
+	candidates := index.Search(make([]common.ValueID, 0, 4), offset+testQuantum+15, offset+testQuantum+25)
 	if len(candidates) != 3 {
 		t.Fatalf("candidate count = %d, want 3", len(candidates))
 	}
-	exact := index.SearchExact(make([]ImageID, 0, 4), offset+testQuantum+15, offset+testQuantum+25,
-		func(id ImageID) (uint64, bool) {
+	exact := index.SearchExact(make([]common.ValueID, 0, 4), offset+testQuantum+15, offset+testQuantum+25,
+		func(id common.ValueID) (uint64, bool) {
 			timestamp, ok := timestamps[id]
 			return timestamp, ok
 		})
-	if !equalIDSet(exact, []ImageID{2}) {
+	if !equalIDSet(exact, []common.ValueID{2}) {
 		t.Fatalf("exact result = %v, want [2]", exact)
 	}
 }
@@ -58,16 +60,16 @@ func TestAddDeleteAndRepeatedUpdateInActiveDelta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	all := index.Search(make([]ImageID, 0, 4), offset, offset+6*testQuantum)
-	if !equalIDSet(all, []ImageID{1, 3}) {
+	all := index.Search(make([]common.ValueID, 0, 4), offset, offset+6*testQuantum)
+	if !equalIDSet(all, []common.ValueID{1, 3}) {
 		t.Fatalf("all = %v, want IDs 1 and 3", all)
 	}
-	old := index.Search(make([]ImageID, 0, 2), offset+testQuantum, offset+3*testQuantum)
+	old := index.Search(make([]common.ValueID, 0, 2), offset+testQuantum, offset+3*testQuantum)
 	if len(old) != 0 {
 		t.Fatalf("old ranges still contain %v", old)
 	}
-	latest := index.Search(make([]ImageID, 0, 2), offset+5*testQuantum, offset+6*testQuantum)
-	if !equalIDSet(latest, []ImageID{1}) {
+	latest := index.Search(make([]common.ValueID, 0, 2), offset+5*testQuantum, offset+6*testQuantum)
+	if !equalIDSet(latest, []common.ValueID{1}) {
 		t.Fatalf("latest = %v, want [1]", latest)
 	}
 }
@@ -99,15 +101,15 @@ func TestRotationAndCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	all := index.Search(make([]ImageID, 0, 4), offset, offset+6*testQuantum)
-	if !equalIDSet(all, []ImageID{1, 3, 4}) {
+	all := index.Search(make([]common.ValueID, 0, 4), offset, offset+6*testQuantum)
+	if !equalIDSet(all, []common.ValueID{1, 3, 4}) {
 		t.Fatalf("result after compaction = %v", all)
 	}
 	view := index.directory.Load().entries[0].block.view.Load()
 	if view.frozen != nil {
 		t.Fatal("frozen delta remained after compaction")
 	}
-	if !equalMarkers(view.base.markers, []timemarker{3, 4}) || !equalIDs(view.base.imageIDs, []ImageID{3, 1}) {
+	if !equalMarkers(view.base.markers, []timemarker{3, 4}) || !equalIDs(view.base.imageIDs, []common.ValueID{3, 1}) {
 		t.Fatalf("compacted base = (%v, %v)", view.base.markers, view.base.imageIDs)
 	}
 }
@@ -159,7 +161,7 @@ func TestConcurrentReadersUpdatesAndCompaction(t *testing.T) {
 	const offset = uint64(1_000)
 	records := make([]Entry, 256)
 	for i := range records {
-		records[i] = Entry{Timestamp: offset + uint64(i)*testQuantum, ImageID: ImageID(i + 1)}
+		records[i] = Entry{Timestamp: offset + uint64(i)*testQuantum, ImageID: common.ImageID(i + 1)}
 	}
 	index := mustNewIndex(t, records, offset, Config{BlockSize: 64, DeltaCapacity: 32})
 
@@ -169,7 +171,7 @@ func TestConcurrentReadersUpdatesAndCompaction(t *testing.T) {
 		readers.Add(1)
 		go func() {
 			defer readers.Done()
-			buffer := make([]ImageID, 0, 512)
+			buffer := make([]common.ImageID, 0, 512)
 			for !stop.Load() {
 				buffer = index.Search(buffer[:0], offset, offset+512*testQuantum)
 			}
@@ -183,7 +185,7 @@ func TestConcurrentReadersUpdatesAndCompaction(t *testing.T) {
 	}
 	for iteration := 0; iteration < 400; iteration++ {
 		position := iteration % 128
-		id := ImageID(position + 1)
+		id := common.ImageID(position + 1)
 		oldMarker := currentMarker[position]
 		newMarker := uint64(256 + position)
 		batch.Reset()
@@ -214,10 +216,10 @@ func TestSteadyStateSearchAllocations(t *testing.T) {
 	const offset = uint64(1_000)
 	records := make([]Entry, 1_024)
 	for i := range records {
-		records[i] = Entry{Timestamp: offset + uint64(i)*testQuantum, ImageID: ImageID(i + 1)}
+		records[i] = Entry{Timestamp: offset + uint64(i)*testQuantum, ImageID: common.ImageID(i + 1)}
 	}
 	index := mustNewIndex(t, records, offset, Config{})
-	buffer := make([]ImageID, 0, len(records))
+	buffer := make([]common.ValueID, 0, len(records))
 	allocations := testing.AllocsPerRun(1_000, func() {
 		buffer = index.Search(buffer[:0], offset, offset+uint64(len(records))*testQuantum)
 	})
@@ -244,7 +246,7 @@ func TestSteadyStateUpdateAllocations(t *testing.T) {
 }
 
 func TestRejectsDuplicateImageID(t *testing.T) {
-	_, err := New(Spec{Entries: []Entry{{Timestamp: 1, ImageID: 1}, {Timestamp: 2, ImageID: 1}}}, Config{})
+	_, err := NewMemory(Spec{Entries: []Entry{{Timestamp: 1, ImageID: 1}, {Timestamp: 2, ImageID: 1}}}, Config{})
 	if err != ErrDuplicateImageID {
 		t.Fatalf("error = %v, want %v", err, ErrDuplicateImageID)
 	}
@@ -252,7 +254,7 @@ func TestRejectsDuplicateImageID(t *testing.T) {
 
 func mustNewIndex(t *testing.T, records []Entry, offset uint64, config Config) *Index {
 	t.Helper()
-	index, err := New(Spec{Offset: offset, Entries: records}, config)
+	index, err := NewMemory(Spec{Offset: offset, Entries: records}, config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +266,7 @@ func mustNewIndex(t *testing.T, records []Entry, offset uint64, config Config) *
 	return index
 }
 
-func equalIDSet(got, want []ImageID) bool {
+func equalIDSet(got, want []common.ImageID) bool {
 	got = slices.Clone(got)
 	want = slices.Clone(want)
 	slices.Sort(got)
@@ -293,12 +295,12 @@ func TestDoubleApplyCollapses(t *testing.T) {
 	}
 	apply()
 	apply()
-	all := index.Search(make([]ImageID, 0, 4), offset, offset+4*testQuantum)
-	if !equalIDSet(all, []ImageID{1, 2}) {
+	all := index.Search(make([]common.ValueID, 0, 4), offset, offset+4*testQuantum)
+	if !equalIDSet(all, []common.ValueID{1, 2}) {
 		t.Fatalf("doubled batch reads %v, want IDs 1 and 2 once each", all)
 	}
-	moved := index.Search(make([]ImageID, 0, 2), offset+3*testQuantum, offset+4*testQuantum)
-	if !equalIDSet(moved, []ImageID{1}) {
+	moved := index.Search(make([]common.ValueID, 0, 2), offset+3*testQuantum, offset+4*testQuantum)
+	if !equalIDSet(moved, []common.ValueID{1}) {
 		t.Fatalf("moved range reads %v, want [1]", moved)
 	}
 }

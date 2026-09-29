@@ -13,7 +13,7 @@ import (
 
 func benchmarkEnumNamespace(tb testing.TB, typ common.Namespace, value string, ids []uint64) *bitmapidx.Index {
 	tb.Helper()
-	index, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{Namespace: typ, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
+	index, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{Namespace: typ, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func BenchmarkCombinedSearch(b *testing.B) {
 		geoEntries[index] = bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122}
 	}
 	namespaceIndex := benchmarkEnumNamespace(b, common.NamespaceTag, "favorite", namespaceIDs)
-	timeIndex, err := timeidx.New(timeidx.Spec{Entries: records}, timeidx.Config{})
+	timeIndex, err := timeidx.NewMemory(timeidx.Spec{Entries: records}, timeidx.Config{})
 	if err != nil {
 		b.Fatal(err)
 	}

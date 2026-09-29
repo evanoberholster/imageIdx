@@ -122,9 +122,14 @@ func (c Config) withDefaults() (Config, error) {
 	return c, nil
 }
 
+// pHash64 is the 64-bit perceptual hash used for fast Hamming distance
+// filtering. It is stored in the Entry record and is never persisted as a
+// string or hex.
+type pHash64 uint64
+
 // pHashDistance is the scalar reference for exact 64-bit Hamming distance.
-func pHashDistance(a, b uint64) uint8 {
-	return uint8(bits.OnesCount64(a ^ b))
+func pHashDistance(a, b pHash64) uint8 {
+	return uint8(bits.OnesCount64(uint64(a) ^ uint64(b)))
 }
 
 // pdqDistance is the scalar reference for exact 256-bit Hamming distance.

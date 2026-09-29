@@ -55,7 +55,7 @@ func TestPlanGeoEstimateIsOnlyAHint(t *testing.T) {
 		return b.Add(bitmapidx.Entry{ImageID: 1, Value: bitmapidx.EnumStringValue("x")})
 	})
 	commitBitmap(t, geo, func(b *bitmapidx.Batch) error {
-		return b.Move(bitmapidx.Move{ImageID: 1, To: int64(key), HasTo: true})
+		return b.Move(bitmapidx.Move{ImageID: 1, To: int64(key)})
 	})
 	if got, err := p.AppendIDs(context.Background(), nil, nil); err != nil || !slices.Equal(got, []ImageID{1}) {
 		t.Fatal(got)
@@ -94,7 +94,7 @@ func TestPagesCountVisitAndBufferedTimestamps(t *testing.T) {
 	// membership list once rather than rescanning it for each candidate batch.
 	quantum := uint64(1) << timeidx.TimestampShift
 	records := []timeidx.Entry{{ImageID: 9, Timestamp: quantum}, {ImageID: 3, Timestamp: 2 * quantum}, {ImageID: 6, Timestamp: 3 * quantum}}
-	ti, err := timeidx.New(timeidx.Spec{Entries: records}, timeidx.Config{})
+	ti, err := timeidx.NewMemory(timeidx.Spec{Entries: records}, timeidx.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,14 +153,14 @@ func TestFilterIDsDeltasAndRange(t *testing.T) {
 	if err != nil || !slices.Equal(got, []ImageID{4, 5, 1, 4}) {
 		t.Fatal(got, err)
 	}
-	numeric, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{Namespace: 102, Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}}, bitmapidx.NamespaceConfig{})
+	numeric, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{Namespace: 102, Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer numeric.Close()
 	for n := 1; n <= 20; n++ {
 		commitBitmap(t, numeric, func(b *bitmapidx.Batch) error {
-			return b.Move(bitmapidx.Move{ImageID: uint64(n), To: int64(n), HasTo: true})
+			return b.Move(bitmapidx.Move{ImageID: uint64(n), To: int64(n)})
 		})
 	}
 	for _, compact := range []bool{false, true} {
@@ -272,7 +272,7 @@ func TestExecutorRetentionRefreshAndValidation(t *testing.T) {
 	if _, err := Compile(AllValues(a)); err == nil {
 		t.Fatal("empty values accepted")
 	}
-	ti, err := timeidx.New(timeidx.Spec{}, timeidx.Config{})
+	ti, err := timeidx.NewMemory(timeidx.Spec{}, timeidx.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

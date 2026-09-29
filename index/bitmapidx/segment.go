@@ -212,7 +212,7 @@ func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, store
 	var indexes []*Index
 	byType := make(map[common.Namespace]*Index)
 	for _, spec := range specs {
-		index, err := NewIndex(spec, config)
+		index, err := NewMemory(spec, config)
 		if err != nil {
 			return fail()
 		}

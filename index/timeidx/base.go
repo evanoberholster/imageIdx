@@ -1,13 +1,17 @@
 package timeidx
 
-import "slices"
+import (
+	"slices"
+
+	common "github.com/evanoberholster/imageIdx/common"
+)
 
 type base struct {
 	markers  []timemarker
-	imageIDs []ImageID
+	imageIDs []common.ValueID
 }
 
-func newBase(markers []timemarker, imageIDs []ImageID) (*base, error) {
+func newBase(markers []timemarker, imageIDs []common.ValueID) (*base, error) {
 	if len(markers) != len(imageIDs) {
 		return nil, ErrInvalidBase
 	}

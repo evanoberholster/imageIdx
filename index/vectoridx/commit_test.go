@@ -13,7 +13,7 @@ import (
 // when many writers fsync different segments concurrently.
 func TestConcurrentSyncAddReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "idx")
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestConcurrentSyncAddReopen(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -313,7 +313,7 @@ func TestGeoNamespaceMoveAndValidation(t *testing.T) {
 		t.Fatalf("KeyFromLatLng: %v", err)
 	}
 
-	// Geo presence flags may be omitted: a level-16 key is never zero.
+	// A level-16 geo key is never zero, so zero denotes absence.
 	commit(t, index, func(b *Batch) error {
 		return b.Move(Move{ImageID: 1, To: int64(sanFrancisco)})
 	})
@@ -325,9 +325,9 @@ func TestGeoNamespaceMoveAndValidation(t *testing.T) {
 	}); err != ErrDuplicateImageID {
 		t.Fatalf("duplicate insert error = %v, want ErrDuplicateImageID", err)
 	}
-	// Explicit flags still work and report stale transitions.
+	// A stale From value still fails validation.
 	if err := commitBarrier(t, index, func(b *Batch) error {
-		return b.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco), HasFrom: true, HasTo: true})
+		return b.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco)})
 	}); err != ErrInvalidMutation {
 		t.Fatalf("stale From error = %v, want ErrInvalidMutation", err)
 	}
@@ -357,13 +357,26 @@ func TestGeoNamespaceMoveAndValidation(t *testing.T) {
 	if ids := appendIDs(t, index, GeoValue(losAngeles)); len(ids) != 0 {
 		t.Fatalf("removed image still present: %v", ids)
 	}
-	// Continuous namespaces keep explicit flags because zero is a valid value.
+	// Continuous zero is a valid value through Add and Remove, while Move
+	// treats zero as absence.
 	focals := mustNamespace(t, continuousNamespace(testFocalLength), NamespaceConfig{})
 	commit(t, focals, func(b *Batch) error {
 		return b.Move(Move{ImageID: 1, To: 0})
 	})
 	if present, err := focals.Contains(1, IntValue(0)); err != nil || present {
-		t.Fatalf("continuous zero inserted without a flag: present=%v err=%v", present, err)
+		t.Fatalf("continuous zero inserted by Move: present=%v err=%v", present, err)
+	}
+	commit(t, focals, func(b *Batch) error {
+		return b.Add(Entry{ImageID: 1, Value: IntValue(0)})
+	})
+	if present, err := focals.Contains(1, IntValue(0)); err != nil || !present {
+		t.Fatalf("continuous zero missing after Add: present=%v err=%v", present, err)
+	}
+	commit(t, focals, func(b *Batch) error {
+		return b.Remove(Entry{ImageID: 1, Value: IntValue(0)})
+	})
+	if present, err := focals.Contains(1, IntValue(0)); err != nil || present {
+		t.Fatalf("continuous zero remains after Remove: present=%v err=%v", present, err)
 	}
 }
 
@@ -383,7 +396,7 @@ func TestFailedBatchDiscardsStagedDictionary(t *testing.T) {
 		t.Fatalf("KeyFromLatLng: %v", err)
 	}
 	if err := commitBarrier(t, index, func(b *Batch) error {
-		return b.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco), HasFrom: true, HasTo: true})
+		return b.Move(Move{ImageID: 1, From: int64(losAngeles), To: int64(sanFrancisco)})
 	}); err != ErrInvalidMutation {
 		t.Fatalf("stale From error = %v, want ErrInvalidMutation", err)
 	}
@@ -544,7 +557,7 @@ func TestGeoReadersSurviveVacuum(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewStore(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	index, _ := s.Lookup(common.NamespaceLocation)
 	key := sfKey(t)

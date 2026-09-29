@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // Crash-window matrix: what each failure point leaves behind and where it
@@ -22,7 +24,7 @@ import (
 func TestStrayTmpFilesIgnored(t *testing.T) {
 	const offset = uint64(1_000)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{Offset: offset, Entries: []Entry{
+	index, err := NewStore(directory, Spec{Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 	}}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilityOS)
 	if err != nil {
@@ -42,13 +44,13 @@ func TestStrayTmpFilesIgnored(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	reopened, err := OpenPersistent(directory, Config{}, DurabilityOS)
+	reopened, err := OpenStore(directory, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatalf("open with stray tmp files: %v", err)
 	}
 	defer func() { _ = reopened.Close() }()
 	got := reopened.Search(nil, offset, offset+2*testQuantum)
-	if !equalIDSet(got, []ImageID{1}) {
+	if !equalIDSet(got, []common.ValueID{1}) {
 		t.Fatalf("reopened search = %v, want [1]", got)
 	}
 }
@@ -56,7 +58,7 @@ func TestStrayTmpFilesIgnored(t *testing.T) {
 func TestMaintenanceIdempotent(t *testing.T) {
 	const offset = uint64(1_000)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{Offset: offset}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilityOS)
+	index, err := NewStore(directory, Spec{Offset: offset}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +78,7 @@ func TestMaintenanceIdempotent(t *testing.T) {
 		}
 	}
 	got := index.Search(nil, offset, offset+3*testQuantum)
-	if !equalIDSet(got, []ImageID{1, 2}) {
+	if !equalIDSet(got, []common.ValueID{1, 2}) {
 		t.Fatalf("search after repeated maintenance = %v, want [1 2]", got)
 	}
 }

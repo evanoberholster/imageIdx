@@ -5,11 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func mustVerifyStore(t *testing.T, dir string) {
 	t.Helper()
-	index, err := NewPersistent(dir, Spec{Offset: 1_000}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilityOS)
+	index, err := NewStore(dir, Spec{Offset: 1_000}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,12 +37,12 @@ func TestVerifyHealthy(t *testing.T) {
 		t.Fatalf("Verify = %v, want nil", err)
 	}
 	// Verification is read-only: the store still opens with data intact.
-	reopened, err := OpenPersistent(dir, Config{}, DurabilityOS)
+	reopened, err := OpenStore(dir, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
-	if got := reopened.Search(nil, 1_000, 2_000); !equalIDSet(got, []ImageID{1, 2}) {
+	if got := reopened.Search(nil, 1_000, 2_000); !equalIDSet(got, []common.ValueID{1, 2}) {
 		t.Fatalf("search after verify = %v, want [1 2]", got)
 	}
 }

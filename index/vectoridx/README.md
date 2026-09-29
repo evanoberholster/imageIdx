@@ -15,7 +15,7 @@ scalar kernels here are their correctness reference.
   `common.KindVector`) is the shared schema identity of one vector space.
   `NodeID` (`uint32`) is the stored identifier; HNSW edges store NodeIDs,
   never pointers or ordinals. Results widen the stored NodeID to
-  `common.ImageID` (`Result{ImageID, Score}`).
+  `common.ValueID` (`Result{ValueID, Score}`).
 - **Dense physical data.** Vectors pack contiguously in insertion-ordinal
   order even when NodeIDs are sparse. A dense O(1) table serves dense ID
   ranges with atomic fills; the sorted `NodeID → ordinal` locator covers
@@ -47,7 +47,7 @@ scalar kernels here are their correctness reference.
 ## Usage
 
 ```go
-idx, err := vectoridx.Create(path, vectoridx.Config{
+idx, err := vectoridx.NewStore(path, vectoridx.Config{
     Namespace:   1, // common.Namespace registered as common.KindVector
     Dimensions:  vectoridx.Dim512,
     ElementType: vectoridx.ElementFloat32,
@@ -64,8 +64,8 @@ results, err := idx.SearchFloat32(query, nil, 10)
 if err != nil {
     log.Fatal(err)
 }
-// results are []Result{ImageID, Score}, sorted by ascending Score
-// (monotonic with squared L2); ImageID is the widened NodeID.
+// results are []Result{ValueID, Score}, sorted by ascending Score
+// (monotonic with squared L2); ValueID is the widened NodeID.
 ```
 
 Reuse caller storage on hot paths:
@@ -78,7 +78,8 @@ Filter with any bitmap representation:
 
 ```go
 filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
-    return bitmap.Contains(common.ImageID(id))
+    imageID, ok := imageForValue(common.ValueID(id))
+    return ok && bitmap.Contains(imageID)
 })
 ```
 
@@ -90,7 +91,7 @@ once per index open.
 In-memory indexes (tests, caller-managed durability):
 
 ```go
-idx, err := vectoridx.New(vectoridx.Config{...})
+idx, err := vectoridx.NewMemory(vectoridx.Config{...})
 ```
 
 ## Persistence
@@ -121,16 +122,16 @@ generations, and segmented `<path>.wal.<seq>` logs:
 - WAL files rotate at `WithWALSegmentBytes` (64 MiB default); recovery
   replays segments oldest to newest, stops at the newest torn tail and
   truncates it, and a checkpoint removes every non-active segment.
-- The index path is exclusively locked (`<path>.lock`) from `Create`/`Open`
+- The index path is exclusively locked (`<path>.lock`) from `NewStore`/`OpenStore`
   until `Close`; a second handle returns `ErrStoreBusy`.
 - `Stats` reports generation, counts, checkpoint LSN, WAL counters, delta
   generations/fragmentation/promotion counters, file sizes, pending async
   ops, and the last compaction; `FileSize` returns base plus WAL bytes.
 - `Verify` deep-checks in-memory structure; `VerifyFile` validates the base
   file offline (header, bounds, checksums), and a corrupt manifest or delta
-  fails Open with `ErrCorruptStorage`.
+  fails OpenStore with `ErrCorruptStorage`.
 
-Crash model: `Create`/`Open` select a durability policy; with
+Crash model: `NewStore`/`OpenStore` select a durability policy; with
 `DurabilitySync` acknowledged mutations are WAL-synced before return, with
 `DurabilityOS` they are in the OS page cache. `WithSyncInterval(d)` adds
 periodic group commit for `DurabilityOS`: fsync happens when the async queue
@@ -149,7 +150,7 @@ generation.
 - Duplicate `Add` of a live NodeID returns `ErrDuplicateNodeID`. Adding a
   tombstoned NodeID replaces its vector and reconnects it, so `Delete`
   followed by `Add` is an update; `Compact` purges tombstones and rebuilds.
-- `Create`/`Open` take a durability policy: `DurabilitySync` fsyncs every
+- `NewStore`/`OpenStore` take a durability policy: `DurabilitySync` fsyncs every
   acknowledged mutation, `DurabilityOS` leaves records to the OS page cache
   (add `vectoridx.WithSyncInterval(d)` for periodic group commit). Invalid
   values return `ErrInvalidConfig`.

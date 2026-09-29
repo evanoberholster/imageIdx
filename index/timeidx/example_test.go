@@ -18,7 +18,7 @@ func ExampleIndex() {
 	defer os.RemoveAll(dir)
 	const offset = uint64(1_000_000)
 	const quantum = uint64(1) << timeidx.TimestampShift
-	index, err := timeidx.NewPersistent(dir, timeidx.Spec{Offset: offset}, timeidx.Config{}, timeidx.DurabilityOS)
+	index, err := timeidx.NewStore(dir, timeidx.Spec{Offset: offset}, timeidx.Config{}, timeidx.DurabilityOS)
 	if err != nil {
 		panic(err)
 	}
@@ -37,7 +37,7 @@ func ExampleIndex() {
 	if err := index.Close(); err != nil {
 		panic(err)
 	}
-	reopened, err := timeidx.OpenPersistent(dir, timeidx.Config{}, timeidx.DurabilityOS)
+	reopened, err := timeidx.OpenStore(dir, timeidx.Config{}, timeidx.DurabilityOS)
 	if err != nil {
 		panic(err)
 	}

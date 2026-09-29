@@ -207,7 +207,7 @@ func newDemoService() (*demoService, error) {
 		300: 3 * demoQuantum,
 		400: 4 * demoQuantum,
 	}
-	times, err := timeidx.New(timeidx.Spec{
+	times, err := timeidx.NewMemory(timeidx.Spec{
 		Namespace: common.Namespace(100),
 		Name:      "timestamp",
 		Entries: []timeidx.Entry{

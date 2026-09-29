@@ -20,7 +20,7 @@ func breakWAL(t *testing.T, idx *Index) {
 func TestFailedWALRequiresRecovery(t *testing.T) {
 	const offset = uint64(1_000)
 	dir := t.TempDir()
-	idx, err := NewPersistent(dir, Spec{Offset: offset, Entries: []Entry{
+	idx, err := NewStore(dir, Spec{Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 	}}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilityOS)
 	if err != nil {
@@ -60,7 +60,7 @@ func TestFailedWALRequiresRecovery(t *testing.T) {
 	// Recovery is close plus reopen: the failed append never touched the
 	// file (it failed seeking before writing), so the tail replays clean
 	// and the failed batch is absent.
-	reopened, err := OpenPersistent(dir, Config{}, DurabilityOS)
+	reopened, err := OpenStore(dir, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}

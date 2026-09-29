@@ -16,6 +16,13 @@ package common
 // backend uses it as its sentinel.
 type ImageID = uint64
 
+// ValueID identifies a value across every index and persisted format. It is
+// an alias so existing uint64 storage and batch APIs remain zero-conversion.
+//
+// ValueID 0 is reserved and never represents a value; the roar bitmap
+// backend uses it as its sentinel.
+type ValueID = uint64
+
 // UserID identifies a user principal across every index package. Unlike
 // ImageID it is a defined type rather than an alias, so user, group, and
 // image IDs never mix implicitly; convert explicitly at trust boundaries.

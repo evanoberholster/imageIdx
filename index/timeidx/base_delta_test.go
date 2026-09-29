@@ -1,17 +1,21 @@
 package timeidx
 
-import "testing"
+import (
+	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
+)
 
 func TestBaseRequiresDeterministicOrdering(t *testing.T) {
 	if _, err := newBase(
 		[]timemarker{1, 1},
-		[]ImageID{2, 1},
+		[]common.ValueID{2, 1},
 	); err != ErrInvalidBase {
 		t.Fatalf("error = %v, want %v", err, ErrInvalidBase)
 	}
 	base, err := newBase(
 		[]timemarker{1, 1, 2},
-		[]ImageID{1, 2, 1},
+		[]common.ValueID{1, 2, 1},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +52,7 @@ func TestDeltaIsFixedCapacityAndTracksLatestState(t *testing.T) {
 func TestCompactIsSortedAndAppliesLatestState(t *testing.T) {
 	base, err := newBase(
 		[]timemarker{1, 2, 3},
-		[]ImageID{1, 2, 3},
+		[]common.ValueID{1, 2, 3},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +65,7 @@ func TestCompactIsSortedAndAppliesLatestState(t *testing.T) {
 
 	got := compact(base, delta)
 	wantMarkers := []timemarker{3, 5, 6}
-	wantIDs := []ImageID{3, 1, 4}
+	wantIDs := []common.ValueID{3, 1, 4}
 	if !equalMarkers(got.markers, wantMarkers) || !equalIDs(got.imageIDs, wantIDs) {
 		t.Fatalf("compact = (%v, %v), want (%v, %v)", got.markers, got.imageIDs, wantMarkers, wantIDs)
 	}
@@ -79,7 +83,7 @@ func equalMarkers(a, b []timemarker) bool {
 	return true
 }
 
-func equalIDs(a, b []ImageID) bool {
+func equalIDs(a, b []common.ValueID) bool {
 	if len(a) != len(b) {
 		return false
 	}

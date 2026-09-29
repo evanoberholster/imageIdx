@@ -10,7 +10,7 @@ import (
 
 func buildRecallIndex(t *testing.T, n int, seed int64) (*VectorIdx, [][]float32) {
 	t.Helper()
-	idx, err := New(Config{
+	idx, err := NewMemory(Config{
 		Namespace:      testNamespace,
 		Dimensions:     Dim512,
 		ElementType:    ElementFloat32,
@@ -51,10 +51,10 @@ func recallAtK(t *testing.T, idx *VectorIdx, vecs [][]float32, queries int, k in
 		assertSortedByScore(t, approx)
 		exactSet := make(map[NodeID]bool, k)
 		for _, r := range exact {
-			exactSet[NodeID(r.ImageID)] = true
+			exactSet[NodeID(r.ValueID)] = true
 		}
 		for _, r := range approx {
-			if exactSet[NodeID(r.ImageID)] {
+			if exactSet[NodeID(r.ValueID)] {
 				hits++
 			}
 			total++
@@ -107,7 +107,7 @@ func TestHNSWRecallAfterCompact(t *testing.T) {
 }
 
 func TestExactSearchIsGroundTruth(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,9 +134,9 @@ func TestExactSearchIsGroundTruth(t *testing.T) {
 		t.Fatalf("scanned %d nodes, want 30", len(expected))
 	}
 	for i, r := range exact {
-		d, ok := expected[NodeID(r.ImageID)]
+		d, ok := expected[NodeID(r.ValueID)]
 		if !ok {
-			t.Fatalf("result %d unknown node %d", i, r.ImageID)
+			t.Fatalf("result %d unknown node %d", i, r.ValueID)
 		}
 		if r.Score != EncodeScore(d) {
 			t.Fatalf("result %d score mismatch", i)

@@ -11,7 +11,7 @@
 //   - Namespace is the shared schema identity of one vector space: a
 //     non-zero common.Namespace (KindVector) assigned by the application's
 //     schema. IDs are stored and filtered as compact uint32 NodeIDs and
-//     widened to common.ImageID in Result values.
+//     widened to common.ValueID in Result values.
 //   - Standard HNSW insertion/search with direct uint32 NodeID edges, a dense
 //     O(1) locator with sorted sparse fallback, and heuristic neighbor
 //     selection (closest-only available for benchmarking).
@@ -44,7 +44,7 @@
 //   - Distance is scalar only. resolveDistance is the single dispatch point
 //     where v2 AVX2/NEON kernels plug in behind the distRaw signature.
 //   - Stored vectors are never quantized (v2 work).
-//   - Open copies region payloads into heap storage instead of retaining an
+//   - OpenStore copies region payloads into heap storage instead of retaining an
 //     mmap. The on-disk layout is already offset/length-addressed so a later
 //     mmap optimisation keeps format compatibility.
 //   - Re-adding a live NodeID is rejected; re-adding a tombstoned NodeID
@@ -53,7 +53,7 @@
 //
 // # Basic use
 //
-//	idx, err := vectoridx.Create(path, vectoridx.Config{
+//	idx, err := vectoridx.NewStore(path, vectoridx.Config{
 //	    Namespace:   1, // common.Namespace registered as common.KindVector
 //	    Dimensions:  vectoridx.Dim512,
 //	    ElementType: vectoridx.ElementFloat32,
@@ -63,8 +63,8 @@
 //
 //	idx.AddFloat32(7, queryVec)                       // NodeID 7 (uint32)
 //	results, err := idx.SearchFloat32(queryVec, nil, 10)
-//	// results[i] is a Result{ImageID imageidx.ImageID, Score uint32}, with
-//	// ImageID widened from the stored NodeID.
+//	// results[i] is a Result{ValueID common.ValueID, Score uint32}, with
+//	// ValueID widened from the stored NodeID.
 //
 // Filter with any bitmap representation through CandidateFilter, which sees
 // the stored uint32 NodeID:
@@ -76,5 +76,5 @@
 //
 // In-memory indexes skip persistence:
 //
-//	idx, err := vectoridx.New(vectoridx.Config{...})
+//	idx, err := vectoridx.NewMemory(vectoridx.Config{...})
 package vectoridx

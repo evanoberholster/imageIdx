@@ -13,7 +13,7 @@ import (
 // pairs Apply with Barrier, which carries the same durability and
 // visibility guarantee as the old synchronous Apply return.
 func BenchmarkWriteSequentialSingle(b *testing.B) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func BenchmarkWriteSequentialSingle(b *testing.B) {
 }
 
 func BenchmarkWriteSequentialBatch64(b *testing.B) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func BenchmarkWriteSequentialBatch64(b *testing.B) {
 // BenchmarkWriteSequentialBatch64Reused stages through one reused batch to
 // show steady-state cost with buffer retention.
 func BenchmarkWriteSequentialBatch64Reused(b *testing.B) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func BenchmarkWriteSequentialBatch64Reused(b *testing.B) {
 }
 
 func BenchmarkWriteParallelBatch16(b *testing.B) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}

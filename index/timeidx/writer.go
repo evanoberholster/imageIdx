@@ -1,6 +1,10 @@
 package timeidx
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	common "github.com/evanoberholster/imageIdx/common"
+)
 
 type barrierResult struct {
 	walOffset int64
@@ -36,24 +40,24 @@ const (
 // Mutation is one logical timestamp insertion, deletion, or move. Constructors
 // keep the discriminator private so invalid combinations cannot be built.
 type Mutation struct {
-	imageID ImageID
+	imageID common.ValueID
 	from    uint64
 	to      uint64
 	kind    mutationKind
 }
 
 // Insert creates a mutation for an image absent from the timestamp index.
-func Insert(imageID ImageID, timestamp uint64) Mutation {
+func Insert(imageID common.ValueID, timestamp uint64) Mutation {
 	return Mutation{imageID: imageID, to: timestamp, kind: mutationInsert}
 }
 
 // Delete creates a mutation that removes an image at its canonical timestamp.
-func Delete(imageID ImageID, timestamp uint64) Mutation {
+func Delete(imageID common.ValueID, timestamp uint64) Mutation {
 	return Mutation{imageID: imageID, from: timestamp, kind: mutationDelete}
 }
 
 // Move creates one logical mutation that removes from and inserts at to.
-func Move(imageID ImageID, from, to uint64) Mutation {
+func Move(imageID common.ValueID, from, to uint64) Mutation {
 	return Mutation{imageID: imageID, from: from, to: to, kind: mutationMove}
 }
 
@@ -66,7 +70,7 @@ const (
 
 type write struct {
 	timestamp uint64
-	imageID   ImageID
+	imageID   common.ValueID
 	op        writeOp
 }
 

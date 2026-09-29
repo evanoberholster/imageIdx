@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
 	const offset = uint64(1_000)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{Namespace: testNamespace, Flags: 3, Offset: offset, Entries: []Entry{
+	index, err := NewStore(directory, Spec{Namespace: testNamespace, Flags: 3, Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 		{Timestamp: offset + 2*testQuantum, ImageID: 2},
 		{Timestamp: offset + 3*testQuantum, ImageID: 3},
@@ -46,7 +48,7 @@ func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenPersistent(directory, Config{DeltaCapacity: 8}, DurabilitySync)
+	reopened, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,8 +62,8 @@ func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
 	if len(reopened.persistence.mappings) != 2 {
 		t.Fatalf("mapping count = %d, want 2", len(reopened.persistence.mappings))
 	}
-	got := reopened.Search(make([]ImageID, 0, 4), offset, offset+6*testQuantum)
-	if !equalIDSet(got, []ImageID{1, 3, 4}) {
+	got := reopened.Search(make([]common.ValueID, 0, 4), offset, offset+6*testQuantum)
+	if !equalIDSet(got, []common.ValueID{1, 3, 4}) {
 		t.Fatalf("reopened result = %v, want IDs 1, 3, and 4", got)
 	}
 
@@ -101,7 +103,7 @@ func TestPersistentStructureAlignment(t *testing.T) {
 func TestWALRecoversWritesAfterLastCheckpoint(t *testing.T) {
 	const offset = uint64(100)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{Offset: offset, Entries: []Entry{
+	index, err := NewStore(directory, Spec{Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 	}}, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
@@ -117,16 +119,16 @@ func TestWALRecoversWritesAfterLastCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := OpenPersistent(directory, Config{DeltaCapacity: 8}, DurabilitySync)
+	recovered, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = recovered.Close() })
-	got := recovered.Search(make([]ImageID, 0, 3), offset, offset+4*testQuantum)
-	if !equalIDSet(got, []ImageID{1, 2}) {
+	got := recovered.Search(make([]common.ValueID, 0, 3), offset, offset+4*testQuantum)
+	if !equalIDSet(got, []common.ValueID{1, 2}) {
 		t.Fatalf("recovered result = %v, want IDs 1 and 2", got)
 	}
-	old := recovered.Search(make([]ImageID, 0, 1), offset+testQuantum, offset+2*testQuantum)
+	old := recovered.Search(make([]common.ValueID, 0, 1), offset+testQuantum, offset+2*testQuantum)
 	if len(old) != 0 {
 		t.Fatalf("old timestamp survived WAL replay: %v", old)
 	}
@@ -134,7 +136,7 @@ func TestWALRecoversWritesAfterLastCheckpoint(t *testing.T) {
 
 func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{}, Config{DeltaCapacity: 8}, DurabilitySync)
+	index, err := NewStore(directory, Spec{}, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,13 +160,13 @@ func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := OpenPersistent(directory, Config{DeltaCapacity: 8}, DurabilityOS)
+	recovered, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = recovered.Close() })
-	got := recovered.Search(make([]ImageID, 0, 1), 0, 2*testQuantum)
-	if !equalIDSet(got, []ImageID{7}) {
+	got := recovered.Search(make([]common.ValueID, 0, 1), 0, 2*testQuantum)
+	if !equalIDSet(got, []common.ValueID{7}) {
 		t.Fatalf("result = %v, want [7]", got)
 	}
 }
@@ -173,7 +175,7 @@ func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
 // with ErrUnsupported instead of masquerading as corruption.
 func TestManifestVersionRejected(t *testing.T) {
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{Offset: 1_000}, Config{}, DurabilityOS)
+	index, err := NewStore(directory, Spec{Offset: 1_000}, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,14 +191,14 @@ func TestManifestVersionRejected(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenPersistent(directory, Config{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
+	if _, err := OpenStore(directory, Config{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("versioned manifest error = %v, want ErrUnsupported", err)
 	}
 }
 
 func TestManifestChecksumRejectsCorruption(t *testing.T) {
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{}, Config{}, DurabilityOS)
+	index, err := NewStore(directory, Spec{}, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +214,7 @@ func TestManifestChecksumRejectsCorruption(t *testing.T) {
 	if err = os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err = OpenPersistent(directory, Config{}, DurabilityOS)
+	_, err = OpenStore(directory, Config{}, DurabilityOS)
 	if !errors.Is(err, ErrCorruptManifest) {
 		t.Fatalf("error = %v, want %v", err, ErrCorruptManifest)
 	}
@@ -224,7 +226,7 @@ func TestManifestChecksumRejectsCorruption(t *testing.T) {
 func TestVacuumRotatesWALAndRetainsLiveGeneration(t *testing.T) {
 	const offset = uint64(500)
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{Offset: offset, Entries: []Entry{
+	index, err := NewStore(directory, Spec{Offset: offset, Entries: []Entry{
 		{Timestamp: offset + testQuantum, ImageID: 1},
 	}}, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
@@ -235,7 +237,7 @@ func TestVacuumRotatesWALAndRetainsLiveGeneration(t *testing.T) {
 		batch := NewBatch(4)
 		for k := uint64(0); k < 4; k++ {
 			n := 10 + round*4 + k
-			if !batch.Append(Insert(ImageID(n), offset+n*testQuantum)) {
+			if !batch.Append(Insert(common.ValueID(n), offset+n*testQuantum)) {
 				t.Fatal("batch append rejected")
 			}
 		}
@@ -283,13 +285,13 @@ func TestVacuumRotatesWALAndRetainsLiveGeneration(t *testing.T) {
 	if err = index.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenPersistent(directory, Config{DeltaCapacity: 8}, DurabilitySync)
+	reopened, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	got := reopened.Search(make([]ImageID, 0, 16), offset, offset+1_000*testQuantum)
-	if !equalIDSet(got, []ImageID{1, 10, 11, 12, 13, 14, 15, 16, 17, 999}) {
+	got := reopened.Search(make([]common.ValueID, 0, 16), offset, offset+1_000*testQuantum)
+	if !equalIDSet(got, []common.ValueID{1, 10, 11, 12, 13, 14, 15, 16, 17, 999}) {
 		t.Fatalf("reopened result = %v, want IDs 1, 10-17, and 999", got)
 	}
 	// A second vacuum must roll the epoch again without losing data.
@@ -312,7 +314,7 @@ func TestDecodeManifestRejectsOversizedNamespace(t *testing.T) {
 
 func TestOpenIgnoresUnpublishedManifestTemporary(t *testing.T) {
 	directory := t.TempDir()
-	index, err := NewPersistent(directory, Spec{Entries: []Entry{{Timestamp: testQuantum, ImageID: 1}}}, Config{}, DurabilityOS)
+	index, err := NewStore(directory, Spec{Entries: []Entry{{Timestamp: testQuantum, ImageID: 1}}}, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,13 +324,13 @@ func TestOpenIgnoresUnpublishedManifestTemporary(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(directory, "manifest.tmp"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenPersistent(directory, Config{}, DurabilityOS)
+	reopened, err := OpenStore(directory, Config{}, DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	got := reopened.Search(make([]ImageID, 0, 1), 0, 2*testQuantum)
-	if !equalIDSet(got, []ImageID{1}) {
+	got := reopened.Search(make([]common.ValueID, 0, 1), 0, 2*testQuantum)
+	if !equalIDSet(got, []common.ValueID{1}) {
 		t.Fatalf("result = %v, want [1]", got)
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 // TestConcurrentSyncApplyReopen proves the writer-loop group contract: every
@@ -13,7 +15,7 @@ import (
 // reopen, even when many writers commit in shared groups.
 func TestConcurrentSyncApplyReopen(t *testing.T) {
 	dir := t.TempDir()
-	idx, err := NewPersistent(dir, Spec{}, Config{DeltaCapacity: 4096}, DurabilitySync)
+	idx, err := NewStore(dir, Spec{}, Config{DeltaCapacity: 4096}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +28,7 @@ func TestConcurrentSyncApplyReopen(t *testing.T) {
 			defer wg.Done()
 			batch := NewBatch(1)
 			for n := 0; n < perWriter; n++ {
-				id := ImageID(next.Add(1))
+				id := common.ValueID(next.Add(1))
 				batch.Reset()
 				batch.Append(Insert(id, uint64(id)*testQuantum))
 				for {
@@ -47,7 +49,7 @@ func TestConcurrentSyncApplyReopen(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenPersistent(dir, Config{DeltaCapacity: 4096}, DurabilitySync)
+	reopened, err := OpenStore(dir, Config{DeltaCapacity: 4096}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}

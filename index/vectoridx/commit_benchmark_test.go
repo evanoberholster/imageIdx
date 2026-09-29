@@ -12,7 +12,7 @@ import (
 // writer's HNSW insertion instead of serializing every insert behind it.
 func BenchmarkAddSyncParallel(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "bench.idx")
-	idx, err := Create(path, testConfigFloat512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigFloat512(), DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}

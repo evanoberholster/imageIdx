@@ -1,13 +1,17 @@
 package timeidx
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	common "github.com/evanoberholster/imageIdx/common"
+)
 
 const deltaHashMultiplier uint64 = 0x9e3779b97f4a7c15
 
 type delta struct {
 	addMarkers  []timemarker
-	addImageIDs []ImageID
-	deleteIDs   []ImageID
+	addImageIDs []common.ValueID
+	deleteIDs   []common.ValueID
 
 	addSequences    []uint32
 	deleteSequences []uint32
@@ -35,8 +39,8 @@ func newDelta(capacity int) *delta {
 	}
 	return &delta{
 		addMarkers:      make([]timemarker, capacity),
-		addImageIDs:     make([]ImageID, capacity),
-		deleteIDs:       make([]ImageID, capacity),
+		addImageIDs:     make([]common.ValueID, capacity),
+		deleteIDs:       make([]common.ValueID, capacity),
 		addSequences:    make([]uint32, capacity),
 		deleteSequences: make([]uint32, capacity),
 		stateKeys:       make([]atomic.Uint64, tableSize),
@@ -63,21 +67,21 @@ func decodeState(meta uint64) (sequence, addIndex uint32, add bool) {
 	return uint32(meta >> 33), uint32((meta >> 1) - 1), meta&1 != 0
 }
 
-func (d *delta) stateSlot(id ImageID) (uint64, bool) {
+func (d *delta) stateSlot(id common.ValueID) (uint64, bool) {
 	start := (uint64(id) * deltaHashMultiplier) & d.stateMask
 	for probe := uint64(0); probe <= d.stateMask; probe++ {
 		slot := (start + probe) & d.stateMask
 		if d.stateUsed[slot].Load() == 0 {
 			return slot, false
 		}
-		if ImageID(d.stateKeys[slot].Load()) == id {
+		if common.ValueID(d.stateKeys[slot].Load()) == id {
 			return slot, true
 		}
 	}
 	return 0, false
 }
 
-func (d *delta) publishState(id ImageID, meta uint64) {
+func (d *delta) publishState(id common.ValueID, meta uint64) {
 	slot, found := d.stateSlot(id)
 	if found {
 		d.stateMeta[slot].Store(meta)
@@ -88,7 +92,7 @@ func (d *delta) publishState(id ImageID, meta uint64) {
 	d.stateUsed[slot].Store(1)
 }
 
-func (d *delta) state(id ImageID) (uint64, bool) {
+func (d *delta) state(id common.ValueID) (uint64, bool) {
 	slot, found := d.stateSlot(id)
 	if !found {
 		return 0, false
@@ -97,7 +101,7 @@ func (d *delta) state(id ImageID) (uint64, bool) {
 	return meta, meta != 0
 }
 
-func (d *delta) appendAdd(marker timemarker, id ImageID) bool {
+func (d *delta) appendAdd(marker timemarker, id common.ValueID) bool {
 	if d.opCount >= d.capacity {
 		return false
 	}
@@ -114,7 +118,7 @@ func (d *delta) appendAdd(marker timemarker, id ImageID) bool {
 	return true
 }
 
-func (d *delta) appendDelete(id ImageID) bool {
+func (d *delta) appendDelete(id common.ValueID) bool {
 	if d.opCount >= d.capacity {
 		return false
 	}
@@ -130,7 +134,7 @@ func (d *delta) appendDelete(id ImageID) bool {
 	return true
 }
 
-func (d *delta) latestAdd(id ImageID, addIndex uint32) bool {
+func (d *delta) latestAdd(id common.ValueID, addIndex uint32) bool {
 	meta, ok := d.state(id)
 	if !ok {
 		return false
@@ -139,7 +143,7 @@ func (d *delta) latestAdd(id ImageID, addIndex uint32) bool {
 	return add && latestIndex == addIndex
 }
 
-func (d *delta) hasState(id ImageID) bool {
+func (d *delta) hasState(id common.ValueID) bool {
 	_, ok := d.state(id)
 	return ok
 }

@@ -10,11 +10,11 @@ import (
 
 func TestConfigNamespaceValidation(t *testing.T) {
 	base := testConfigFloat512()
-	if _, err := New(base); err != nil {
+	if _, err := NewMemory(base); err != nil {
 		t.Fatalf("valid namespace config: %v", err)
 	}
 	base.Namespace = 0
-	if _, err := New(base); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewMemory(base); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("zero namespace config err = %v, want ErrInvalidConfig", err)
 	}
 }
@@ -40,11 +40,11 @@ func TestDimensionsValidation(t *testing.T) {
 }
 
 // TestNamespaceAndResultAcrossReopen pins the namespace in the header and
-// the NodeID -> ImageID widening in results.
+// the NodeID -> ValueID widening in results.
 func TestNamespaceAndResultAcrossReopen(t *testing.T) {
 	path := tempPath(t)
 	namespace := common.Namespace(5)
-	idx, err := Create(path, Config{Namespace: namespace, Dimensions: Dim512, ElementType: ElementFloat32}, DurabilitySync)
+	idx, err := NewStore(path, Config{Namespace: namespace, Dimensions: Dim512, ElementType: ElementFloat32}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestNamespaceAndResultAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := Open(path, DurabilitySync)
+	reopened, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestNamespaceAndResultAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != ImageID(id) || results[0].Score != 0 {
-		t.Fatalf("result = %+v, want ImageID %d Score 0", results, id)
+	if len(results) != 1 || results[0].ValueID != common.ValueID(id) || results[0].Score != 0 {
+		t.Fatalf("result = %+v, want ValueID %d Score 0", results, id)
 	}
 }

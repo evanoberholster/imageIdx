@@ -92,12 +92,9 @@ func (b *Batch) Remove(entries ...Entry) error {
 	return nil
 }
 
-// Move stages explicit value transitions for continuous and geo namespaces.
-// It applies the same validation as the former Move call: duplicate
-// images in one batch are rejected, no-op moves are dropped, and stale
-// From values fail at commit via geo validation. Geo may omit presence
-// flags because a level-16 key is never zero; continuous keeps explicit
-// flags because zero is a valid grid value.
+// Move stages value transitions for continuous and geo namespaces.
+// Duplicate images in one batch are rejected, no-op moves are dropped,
+// and stale From values fail at commit.
 func (b *Batch) Move(moves ...Move) error {
 	if b.sealed.Load() {
 		return ErrBatchClosed
@@ -115,18 +112,7 @@ func (b *Batch) Move(moves ...Move) error {
 				return ErrInvalidMutation
 			}
 		}
-		if namespace.Kind == common.KindBitmapGeo {
-			if !move.HasFrom && move.From != 0 {
-				move.HasFrom = true
-			}
-			if !move.HasTo && move.To != 0 {
-				move.HasTo = true
-			}
-		}
-		if !move.HasFrom && !move.HasTo {
-			continue
-		}
-		if move.HasFrom && move.HasTo && move.From == move.To {
+		if move.From == move.To {
 			continue
 		}
 		b.moves = append(b.moves, move)
@@ -283,10 +269,10 @@ func (b *Batch) expand() (namespaceMutation, error) {
 		return IntValue(v)
 	}
 	for _, move := range b.moves {
-		if move.HasFrom {
+		if move.From != 0 {
 			mutation.Remove = append(mutation.Remove, Entry{ImageID: move.ImageID, Value: value(move.From)})
 		}
-		if move.HasTo {
+		if move.To != 0 {
 			mutation.Add = append(mutation.Add, Entry{ImageID: move.ImageID, Value: value(move.To)})
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"hash/crc32"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -120,7 +121,7 @@ func replayWAL(path string, offset int64) ([]write, error) {
 			}
 			writes = append(writes, write{
 				timestamp: binary.LittleEndian.Uint64(payload[position : position+8]),
-				imageID:   ImageID(binary.LittleEndian.Uint64(payload[position+8 : position+16])),
+				imageID:   common.ValueID(binary.LittleEndian.Uint64(payload[position+8 : position+16])),
 				op:        op,
 			})
 		}

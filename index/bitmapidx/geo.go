@@ -51,11 +51,11 @@ type GeoEntry struct {
 
 // NewGeoNamespace constructs a KindBitmapGeo namespace index seeded with entries. It
 // builds a geographic definition with GeoCodec version 1 and converts
-// every coordinate through KeyFromLatLng. Use NewIndex directly for
+// every coordinate through KeyFromLatLng. Use NewMemory directly for
 // full control of the definition. Failures close the partial index.
 func NewGeoNamespace(t common.Namespace, entries []GeoEntry, config NamespaceConfig) (*Index, error) {
 	spec := NamespaceSpec{Namespace: t, Kind: common.KindBitmapGeo, Geo: GeoCodec{Version: 1}}
-	index, err := NewIndex(spec, config)
+	index, err := NewMemory(spec, config)
 	if err != nil {
 		return nil, err
 	}

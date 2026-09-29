@@ -167,7 +167,10 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 				return bt.Add(Entry{ImageID: 1, Value: IntValue(math.MinInt64)}, Entry{ImageID: 2, Value: IntValue(math.MaxInt64)})
 			})
 			commit(t, numbers, func(bt *Batch) error {
-				return bt.Move(Move{ImageID: 1, From: math.MinInt64, To: 0, HasFrom: true, HasTo: true})
+				if err := bt.Remove(Entry{ImageID: 1, Value: IntValue(math.MinInt64)}); err != nil {
+					return err
+				}
+				return bt.Add(Entry{ImageID: 1, Value: IntValue(0)})
 			})
 			cell := sfKey(t)
 			commit(t, geo, func(bt *Batch) error { return bt.Move(Move{ImageID: 1, To: int64(cell)}) })

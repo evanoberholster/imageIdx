@@ -121,7 +121,7 @@ func TestSearchWithMetricsCancellationAndNil(t *testing.T) {
 func TestSearchWithMetricsBufferedTimestampAndEmptyFilter(t *testing.T) {
 	const quantum = uint64(1) << timeidx.TimestampShift
 	namespaceIndex := benchmarkEnumNamespace(t, 134, "x", []uint64{1})
-	timestamps, err := timeidx.New(timeidx.Spec{Entries: []timeidx.Entry{
+	timestamps, err := timeidx.NewMemory(timeidx.Spec{Entries: []timeidx.Entry{
 		{ImageID: 1, Timestamp: quantum},
 		{ImageID: 3, Timestamp: 2 * quantum},
 	}}, timeidx.Config{})

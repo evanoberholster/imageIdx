@@ -1,8 +1,11 @@
 package timeidx
 
-import "github.com/evanoberholster/imageIdx/internal/storage"
+import (
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
+)
 
-type ExactTimestampFunc func(ImageID) (uint64, bool)
+type ExactTimestampFunc func(common.ValueID) (uint64, bool)
 
 // searchScope resolves the marker range and pins the directory for
 // lock-free readers, returning the release token alongside. The caller
@@ -24,7 +27,7 @@ func (i *Index) searchScope(start, end uint64) (directory *blockDirectory, lo, h
 
 // Search appends compressed-index candidates for [start, end) to dst. The
 // caller controls allocation by supplying enough spare capacity in dst.
-func (i *Index) Search(dst []ImageID, start, end uint64) []ImageID {
+func (i *Index) Search(dst []common.ValueID, start, end uint64) []common.ValueID {
 	directory, lo, hi, token, ok := i.searchScope(start, end)
 	if !ok {
 		return dst
@@ -43,7 +46,7 @@ func (i *Index) Search(dst []ImageID, start, end uint64) []ImageID {
 
 // SearchExact filters lossy compressed candidates through the canonical
 // timestamp lookup. The lookup must be safe for concurrent reads.
-func (i *Index) SearchExact(dst []ImageID, start, end uint64, lookup ExactTimestampFunc) []ImageID {
+func (i *Index) SearchExact(dst []common.ValueID, start, end uint64, lookup ExactTimestampFunc) []common.ValueID {
 	if lookup == nil {
 		return i.Search(dst, start, end)
 	}
@@ -113,12 +116,12 @@ func estimateDelta(delta *delta, lo, hi uint64) uint64 {
 }
 
 func searchBlock(
-	dst []ImageID,
+	dst []common.ValueID,
 	view *blockView,
 	lo, hi uint64,
 	exactStart, exactEnd uint64,
 	lookup ExactTimestampFunc,
-) []ImageID {
+) []common.ValueID {
 	active := view.active
 	for {
 		version := active.stableVersion()
@@ -132,12 +135,12 @@ func searchBlock(
 }
 
 func scanBlock(
-	dst []ImageID,
+	dst []common.ValueID,
 	view *blockView,
 	lo, hi uint64,
 	exactStart, exactEnd uint64,
 	lookup ExactTimestampFunc,
-) []ImageID {
+) []common.ValueID {
 	baseStart, baseEnd := view.base.rangeIndexes(lo, hi)
 	for index := baseStart; index < baseEnd; index++ {
 		id := view.base.imageIDs[index]
@@ -178,11 +181,11 @@ func scanBlock(
 }
 
 func appendIfExact(
-	dst []ImageID,
-	id ImageID,
+	dst []common.ValueID,
+	id common.ValueID,
 	start, end uint64,
 	lookup ExactTimestampFunc,
-) []ImageID {
+) []common.ValueID {
 	if lookup == nil {
 		return append(dst, id)
 	}

@@ -146,14 +146,14 @@ byTime, err := plan.RankTime(ctx, nil, &ws, lookupTime, target, 100)
 byGeo, err := plan.RankGeo(ctx, nil, &ws, lat, lng, lookupGeo, 100)
 ```
 
-`FilterRanked` bridges external vector search: it probes ANN entries
-against the plan while preserving source order, duplicates, and integer
-scores. Over-fetch from the ANN side because a selective plan can
-under-fill.
+`FilterRanked` bridges external vector search: map each vector ValueID to an
+ImageID, then probe ANN entries against the plan while preserving source order,
+duplicates, and integer scores. Over-fetch from the ANN side because a
+selective plan can under-fill.
 
 ```go
 kept, err := plan.FilterRanked(ctx, nil, &ws, annResults,
-    func(r vectoridx.Result) (imageidx.ImageID, bool) { return r.ImageID, true },
+    func(r vectoridx.Result) (imageidx.ImageID, bool) { return imageForValue(r.ValueID) },
     func(r vectoridx.Result) uint64 { return uint64(r.Score) })
 ```
 

@@ -277,8 +277,8 @@ func FilterGeo(dst, candidates []ImageID, index *bitmapidx.Index, cellIDs ...uin
 
 // FilterRanked appends the ranked entries that satisfy the plan to dst as
 // Result values, preserving the source's order and score. It is the bridge for
-// ANN results: pass vectoridx.Result entries with their ImageID and integer
-// score. Entries whose imageID reports ok=false are skipped.
+// ANN results: pass vectoridx.Result entries with a ValueID-to-ImageID lookup
+// and integer score. Entries whose imageID reports ok=false are skipped.
 //
 // Only supplied candidates are probed (lossy timestamps may buffer a range).
 // Because the plan is applied

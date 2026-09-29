@@ -10,9 +10,9 @@ import (
 
 func benchmarkEnumNamespace(tb testing.TB, values int, perValue int) (*Index, []Value) {
 	tb.Helper()
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		tb.Fatalf("NewIndex: %v", err)
+		tb.Fatalf("NewMemory: %v", err)
 	}
 	tb.Cleanup(func() { _ = index.Close() })
 	entries := make([]Entry, 0, values*perValue)
@@ -32,9 +32,9 @@ func benchmarkEnumNamespace(tb testing.TB, values int, perValue int) (*Index, []
 // has its own arithmetic ID set, and one image may carry all four values.
 func benchmarkEnumIntersectionNamespace(tb testing.TB) (*Index, []Value) {
 	tb.Helper()
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		tb.Fatalf("NewIndex: %v", err)
+		tb.Fatalf("NewMemory: %v", err)
 	}
 	tb.Cleanup(func() { _ = index.Close() })
 	const values, perValue = 4, 20_000
@@ -93,7 +93,7 @@ func BenchmarkNamespaceApplyDistinct1000(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -120,7 +120,7 @@ func BenchmarkNamespaceApplyBatch1000(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -155,7 +155,7 @@ func BenchmarkNamespaceValueIDs(b *testing.B) {
 }
 
 func BenchmarkNamespaceRange(b *testing.B) {
-	index, err := NewIndex(continuousNamespace(testFocalLength), NamespaceConfig{})
+	index, err := NewMemory(continuousNamespace(testFocalLength), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func BenchmarkNamespaceFilter(b *testing.B) {
 }
 
 func BenchmarkNamespaceTextMatch(b *testing.B) {
-	index, err := NewIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(textNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func benchmarkNamespaceApplyN(b *testing.B, batch, total int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -277,7 +277,7 @@ func BenchmarkNamespaceApplyChannel8(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+		index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -364,7 +364,7 @@ func BenchmarkCompiledFilter(b *testing.B) {
 }
 
 func BenchmarkCompiledTextMatch(b *testing.B) {
-	index, err := NewIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(textNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -400,7 +400,7 @@ var sinkTable postingTable
 func seededEnumNamespace(b *testing.B, count int) (*Index, NamespaceKey, Value) {
 	b.Helper()
 	value := EnumStringValue("v")
-	namespace, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	namespace, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -71,7 +71,7 @@ func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag), geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	defer store.Close()
 	tag, _ := store.Lookup(common.NamespaceTag)

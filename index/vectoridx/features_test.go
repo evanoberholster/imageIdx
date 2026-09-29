@@ -26,7 +26,7 @@ func testConfigDot512() Config {
 }
 
 func TestCosineMetricRoundTrip(t *testing.T) {
-	idx, err := New(testConfigCosine512())
+	idx, err := NewMemory(testConfigCosine512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestCosineMetricRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 1 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 1 || results[0].Score != 0 {
 		t.Fatalf("cosine self-search = %+v", results)
 	}
 	assertSortedByScore(t, results)
@@ -56,13 +56,13 @@ func TestCosineMetricRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(approx) == 0 || approx[0].ImageID != exact[0].ImageID {
+	if len(approx) == 0 || approx[0].ValueID != exact[0].ValueID {
 		t.Fatalf("cosine top-1 ann=%v exact=%v", approx, exact)
 	}
 }
 
 func TestDotMetricRoundTrip(t *testing.T) {
-	idx, err := New(testConfigDot512())
+	idx, err := NewMemory(testConfigDot512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,13 +80,13 @@ func TestDotMetricRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 1 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 1 || results[0].Score != 0 {
 		t.Fatalf("dot self-search = %+v", results)
 	}
 }
 
 func TestCosineOrthogonalOrdering(t *testing.T) {
-	idx, err := New(testConfigCosine512())
+	idx, err := NewMemory(testConfigCosine512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestCosineOrthogonalOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 2 || results[0].ImageID != 1 || results[0].Score != 0 {
+	if len(results) != 2 || results[0].ValueID != 1 || results[0].Score != 0 {
 		t.Fatalf("orthogonal ordering = %+v", results)
 	}
 	if results[1].Score <= results[0].Score {
@@ -112,7 +112,7 @@ func TestCosineOrthogonalOrdering(t *testing.T) {
 func TestMetricConfigValidation(t *testing.T) {
 	bad := testConfigFloat512()
 	bad.Metric = 9
-	if _, err := New(bad); err == nil {
+	if _, err := NewMemory(bad); err == nil {
 		t.Fatal("invalid metric accepted")
 	}
 }
@@ -122,7 +122,7 @@ func TestDynamicEfSearch(t *testing.T) {
 	cfg.DynamicEfFactor = 4
 	cfg.DynamicEfMin = 8
 	cfg.DynamicEfMax = 64
-	idx, err := New(cfg)
+	idx, err := NewMemory(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestDynamicEfSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 5 || results[0].ImageID != 1 {
+	if len(results) != 5 || results[0].ValueID != 1 {
 		t.Fatalf("dynamic-ef search = %+v", results)
 	}
 	if err := idx.SetSearchParams(32, 0, 0, 0, 0, 0, 0); err != nil {
@@ -150,7 +150,7 @@ func TestDynamicEfSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 5 || results[0].ImageID != 1 {
+	if len(results) != 5 || results[0].ValueID != 1 {
 		t.Fatalf("static-ef search = %+v", results)
 	}
 	if err := idx.SetSearchParams(0, 0, 0, 0, 0, 0, 999); err == nil {
@@ -159,7 +159,7 @@ func TestDynamicEfSearch(t *testing.T) {
 }
 
 func TestHeuristicToggle(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestHeuristicToggle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 1 {
+	if len(results) != 1 || results[0].ValueID != 1 {
 		t.Fatalf("closest-only self-search = %+v", results)
 	}
 	if err := idx.SetHeuristic(true); err != nil {
@@ -197,7 +197,7 @@ func TestHeuristicToggle(t *testing.T) {
 func TestFlatThresholdAndFilterHint(t *testing.T) {
 	cfg := testConfigFloat512()
 	cfg.FlatThreshold = 10000 // force exact path
-	idx, err := New(cfg)
+	idx, err := NewMemory(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestFlatThresholdAndFilterHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 5 || results[0].ImageID != 1 {
+	if len(results) != 5 || results[0].ValueID != 1 {
 		t.Fatalf("flat search = %+v", results)
 	}
 	// Filter hint at/below the cutoff must take the exact path with identical
@@ -240,7 +240,7 @@ func TestFlatThresholdAndFilterHint(t *testing.T) {
 }
 
 func TestAsyncAddDelete(t *testing.T) {
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestAsyncAddDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 7 {
+	if len(results) != 1 || results[0].ValueID != 7 {
 		t.Fatalf("async add search = %+v", results)
 	}
 	idx.DeleteAsync(7)
@@ -274,7 +274,7 @@ func TestAsyncAddDelete(t *testing.T) {
 
 func TestMetricPersistenceRoundTrip(t *testing.T) {
 	path := t.TempDir() + "/cos.vec"
-	idx, err := Create(path, testConfigCosine512(), DurabilitySync)
+	idx, err := NewStore(path, testConfigCosine512(), DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestMetricPersistenceRoundTrip(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	re, err := Open(path, DurabilitySync)
+	re, err := OpenStore(path, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +299,7 @@ func TestMetricPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ImageID != 3 || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != 3 || results[0].Score != 0 {
 		t.Fatalf("reopened cosine search = %+v", results)
 	}
 }

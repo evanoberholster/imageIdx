@@ -42,7 +42,7 @@ func commitBarrier(tb testing.TB, index *Index, fill func(*Batch) error) error {
 }
 
 func TestBatchValidation(t *testing.T) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestBatchValidation(t *testing.T) {
 	if err := batch.Remove(Entry{ImageID: 0, Value: EnumStringValue("x")}); !errors.Is(err, ErrInvalidImageID) {
 		t.Fatalf("remove zero ID err = %v", err)
 	}
-	text, err := NewIndex(textNamespace(common.NamespaceTag), NamespaceConfig{})
+	text, err := NewMemory(textNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestBatchValidation(t *testing.T) {
 	if err := textBatch.ReplaceText(TextReplacement{ImageID: 1, After: []string{"x"}}, TextReplacement{ImageID: 1, After: []string{"y"}}); !errors.Is(err, ErrDuplicateImageID) {
 		t.Fatalf("text dup err = %v", err)
 	}
-	if err := batch.Move(Move{ImageID: 1, To: 1, HasTo: true}); !errors.Is(err, ErrNamespaceMismatch) {
+	if err := batch.Move(Move{ImageID: 1, To: 1}); !errors.Is(err, ErrNamespaceMismatch) {
 		t.Fatalf("move on enum err = %v", err)
 	}
 	if err := batch.ReplaceText(TextReplacement{ImageID: 1}); !errors.Is(err, ErrNamespaceMismatch) {
@@ -83,7 +83,7 @@ func TestBatchValidation(t *testing.T) {
 }
 
 func TestBatchEmptyApply(t *testing.T) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestBatchEmptyApply(t *testing.T) {
 }
 
 func TestBatchResetReuse(t *testing.T) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestBatchResetReuse(t *testing.T) {
 }
 
 func TestBatchQueuedUntilBarrier(t *testing.T) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestBatchQueuedUntilBarrier(t *testing.T) {
 }
 
 func TestBatchSealed(t *testing.T) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestBatchSealed(t *testing.T) {
 }
 
 func TestBatchGroupCommitConcurrent(t *testing.T) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -55,7 +55,7 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 		geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122})
 	}
 
-	bitmap, err := bitmapidx.NewIndex(bitmapidx.NamespaceSpec{
+	bitmap, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
 		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
@@ -67,7 +67,7 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 	commitBitmap(tb, bitmap, func(bt *bitmapidx.Batch) error { return bt.Add(initialEntries...) })
 	tb.Cleanup(func() { _ = bitmap.Close() })
 
-	timeIndex, err := timeidx.New(timeidx.Spec{Namespace: 2, Entries: records}, timeidx.Config{})
+	timeIndex, err := timeidx.NewMemory(timeidx.Spec{Namespace: 2, Entries: records}, timeidx.Config{})
 	if err != nil {
 		tb.Fatal(err)
 	}

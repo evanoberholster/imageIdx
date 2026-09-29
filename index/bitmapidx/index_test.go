@@ -33,9 +33,9 @@ func textNamespace(t common.Namespace) NamespaceSpec {
 
 func mustNamespace(t *testing.T, namespace NamespaceSpec, config NamespaceConfig) *Index {
 	t.Helper()
-	index, err := NewIndex(namespace, config)
+	index, err := NewMemory(namespace, config)
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	t.Cleanup(func() { _ = index.Close() })
 	return index
@@ -406,7 +406,7 @@ func TestNamespaceIndexMove(t *testing.T) {
 		return b.Add(Entry{ImageID: 1, Value: IntValue(24)})
 	})
 	commit(t, index, func(b *Batch) error {
-		return b.Move(Move{ImageID: 1, From: 24, To: 35, HasFrom: true, HasTo: true})
+		return b.Move(Move{ImageID: 1, From: 24, To: 35})
 	})
 	if ids := appendIDs(t, index, IntValue(24)); len(ids) != 0 {
 		t.Fatalf("old value still present: %v", ids)
@@ -416,7 +416,7 @@ func TestNamespaceIndexMove(t *testing.T) {
 	}
 	// Same-value move is a no-op, not add/remove cancellation.
 	commit(t, index, func(b *Batch) error {
-		return b.Move(Move{ImageID: 1, From: 35, To: 35, HasFrom: true, HasTo: true})
+		return b.Move(Move{ImageID: 1, From: 35, To: 35})
 	})
 	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{1}) {
 		t.Fatalf("same-value move removed membership: %v", ids)
@@ -425,8 +425,8 @@ func TestNamespaceIndexMove(t *testing.T) {
 		batch := index.NewBatch()
 		defer batch.Close()
 		if err := batch.Move(
-			Move{ImageID: 1, From: 35, To: 50, HasFrom: true, HasTo: true},
-			Move{ImageID: 1, From: 50, To: 85, HasFrom: true, HasTo: true},
+			Move{ImageID: 1, From: 35, To: 50},
+			Move{ImageID: 1, From: 50, To: 85},
 		); !errors.Is(err, ErrInvalidMutation) {
 			t.Fatalf("duplicate move error = %v, want ErrInvalidMutation", err)
 		}
@@ -589,7 +589,7 @@ func TestNamespaceIndexPrefixAndLookup(t *testing.T) {
 }
 
 func TestNamespaceIndexValidation(t *testing.T) {
-	if _, err := NewIndex(NamespaceSpec{Namespace: 0, Kind: common.KindBitmapEnum}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
+	if _, err := NewMemory(NamespaceSpec{Namespace: 0, Kind: common.KindBitmapEnum}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
 		t.Fatalf("zero type error = %v", err)
 	}
 	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
@@ -675,13 +675,13 @@ func TestNamespaceIndexMoveToEmpty(t *testing.T) {
 		return b.Add(Entry{ImageID: 1, Value: IntValue(24)})
 	})
 	commit(t, index, func(b *Batch) error {
-		return b.Move(Move{ImageID: 1, HasFrom: true, From: 24, To: 0, HasTo: false})
+		return b.Move(Move{ImageID: 1, From: 24, To: 0})
 	})
 	if ids := appendIDs(t, index, IntValue(24)); len(ids) != 0 {
 		t.Fatalf("value after remove-move = %v", ids)
 	}
 	commit(t, index, func(b *Batch) error {
-		return b.Move(Move{ImageID: 2, HasTo: true, To: 35})
+		return b.Move(Move{ImageID: 2, To: 35})
 	})
 	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{2}) {
 		t.Fatalf("insert-move = %v", ids)
@@ -689,9 +689,9 @@ func TestNamespaceIndexMoveToEmpty(t *testing.T) {
 }
 
 func TestNamespaceIndexClose(t *testing.T) {
-	index, err := NewIndex(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	if err := index.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

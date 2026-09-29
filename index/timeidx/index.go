@@ -16,7 +16,7 @@ import (
 type indexedRecord struct {
 	marker    timemarker
 	timestamp uint64
-	imageID   ImageID
+	imageID   common.ValueID
 }
 
 // Index is one compressed timestamp candidate index. Readers search immutable
@@ -87,16 +87,16 @@ func (i *Index) failedErr() error {
 	return i.failed
 }
 
-// New constructs an in-memory index from stable metadata and canonical
+// NewMemory constructs an in-memory index from stable metadata and canonical
 // timestamp entries.
-func New(spec Spec, config Config) (*Index, error) {
+func NewMemory(spec Spec, config Config) (*Index, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
 	}
 
 	prepared := make([]indexedRecord, len(spec.Entries))
-	seen := make(map[ImageID]struct{}, len(spec.Entries))
+	seen := make(map[common.ValueID]struct{}, len(spec.Entries))
 	for i, record := range spec.Entries {
 		if _, duplicate := seen[record.ImageID]; duplicate {
 			return nil, ErrDuplicateImageID
@@ -202,7 +202,7 @@ func buildDirectory(records []indexedRecord, offset uint64, config Config) *bloc
 			endMarker = uint64(records[end].marker)
 		}
 		markers := make([]timemarker, end-start)
-		ids := make([]ImageID, end-start)
+		ids := make([]common.ValueID, end-start)
 		for j := start; j < end; j++ {
 			markers[j-start] = records[j].marker
 			ids[j-start] = records[j].imageID

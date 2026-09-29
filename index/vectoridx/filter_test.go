@@ -11,7 +11,7 @@ import (
 
 func buildFilterIndex(t *testing.T, n int) (*VectorIdx, [][]float32) {
 	t.Helper()
-	idx, err := New(testConfigFloat512())
+	idx, err := NewMemory(testConfigFloat512())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,8 +40,8 @@ func TestFilterEvenIDs(t *testing.T) {
 			t.Fatalf("filtered results = %d, want 10", len(results))
 		}
 		for _, r := range results {
-			if r.ImageID%2 != 0 {
-				t.Fatalf("odd node %d passed even filter: %+v", r.ImageID, results)
+			if r.ValueID%2 != 0 {
+				t.Fatalf("odd node %d passed even filter: %+v", r.ValueID, results)
 			}
 		}
 		assertSortedByScore(t, results)
@@ -51,8 +51,8 @@ func TestFilterEvenIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if exact[0].ImageID != results[0].ImageID {
-			t.Logf("top-1 differs: ann=%d exact=%d (acceptable occasionally)", results[0].ImageID, exact[0].ImageID)
+		if exact[0].ValueID != results[0].ValueID {
+			t.Logf("top-1 differs: ann=%d exact=%d (acceptable occasionally)", results[0].ValueID, exact[0].ValueID)
 		}
 	}
 }
@@ -73,15 +73,15 @@ func TestFilterHighlySelective(t *testing.T) {
 		t.Fatalf("selective filter results = %d, want 2 (all available)", len(results))
 	}
 	for _, r := range results {
-		if r.ImageID%100 != 0 {
-			t.Fatalf("node %d passed selective filter", r.ImageID)
+		if r.ValueID%100 != 0 {
+			t.Fatalf("node %d passed selective filter", r.ValueID)
 		}
 	}
 	exact, err := idx.ExactSearchFloat32(q, selective, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(exact) != 2 || exact[0].ImageID != results[0].ImageID || exact[1].ImageID != results[1].ImageID {
+	if len(exact) != 2 || exact[0].ValueID != results[0].ValueID || exact[1].ValueID != results[1].ValueID {
 		t.Fatalf("selective fallback != exact: ann=%+v exact=%+v", results, exact)
 	}
 }
@@ -142,8 +142,8 @@ func TestFilterWithTombstones(t *testing.T) {
 		t.Fatalf("odd-filtered results = %d, want 10", len(results))
 	}
 	for _, r := range results {
-		if r.ImageID%2 != 1 {
-			t.Fatalf("even node %d in odd-filtered results", r.ImageID)
+		if r.ValueID%2 != 1 {
+			t.Fatalf("even node %d in odd-filtered results", r.ValueID)
 		}
 	}
 }

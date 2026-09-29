@@ -4,7 +4,7 @@ import "testing"
 
 func TestEstimateRangeBoundsCandidates(t *testing.T) {
 	quantum := uint64(1) << TimestampShift
-	index, err := New(Spec{Entries: []Entry{
+	index, err := NewMemory(Spec{Entries: []Entry{
 		{Timestamp: quantum, ImageID: 1},
 		{Timestamp: 2 * quantum, ImageID: 2},
 		{Timestamp: 3 * quantum, ImageID: 3},

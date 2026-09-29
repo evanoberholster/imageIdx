@@ -2,7 +2,7 @@ package vectoridx
 
 import "time"
 
-// Option configures runtime policy for Create and Open. Options are not part
+// Option configures runtime policy for NewStore and OpenStore. Options are not part
 // of the persisted format and are not validated against the stored index.
 type Option func(*options)
 
@@ -16,7 +16,7 @@ type options struct {
 // least every d, so a batch of writes shares one fsync. Close always syncs
 // and Sync establishes an explicit durable boundary at any time. Zero (the
 // default) leaves records in the OS page cache; negative is rejected by
-// Create/Open with ErrInvalidConfig.
+// NewStore/OpenStore with ErrInvalidConfig.
 //
 // WithSyncInterval is ignored for DurabilitySync, which already fsyncs every
 // mutation.
@@ -27,7 +27,7 @@ func WithSyncInterval(d time.Duration) Option {
 // WithWALSegmentBytes sets the WAL rotation threshold. A checkpoint removes
 // every segment except the active one, so the threshold bounds single-file
 // growth between checkpoints. Zero (the default) uses
-// DefaultWALSegmentBytes; negative is rejected by Create/Open.
+// DefaultWALSegmentBytes; negative is rejected by NewStore/OpenStore.
 func WithWALSegmentBytes(n int64) Option {
 	return func(o *options) { o.walSegmentBytes = n }
 }
