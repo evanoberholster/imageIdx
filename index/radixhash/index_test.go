@@ -505,6 +505,36 @@ func TestLargeImageIDsUse64BitLeaves(t *testing.T) {
 	}
 }
 
+func TestMaxUint64ImageID(t *testing.T) {
+	index := newTestIndex(t, 1<<20, Config{})
+	defer index.Close()
+	h := hashWithPrefix([]byte{5, 5}, 5)
+	ids := []ImageID{1, 1 << 32, ^ImageID(0) - 1, ^ImageID(0)}
+	entries := make([]Entry, 0, len(ids))
+	for _, id := range ids {
+		entries = append(entries, Entry{Hash: h, ImageID: id})
+	}
+	if err := index.Apply(entries); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	sorted := append([]ImageID(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	// The leaf starts with small ids (32-bit width) and must widen to 64-bit
+	// when the maximum id is added.
+	if got := index.Lookup(nil, h); !equalIDs(got, sorted) {
+		t.Fatalf("Lookup = %v, want %v", got, sorted)
+	}
+	// A subsequent update must keep the widened leaf lossless.
+	if err := index.Apply([]Entry{{Hash: h, ImageID: ^ImageID(0) - 2}}); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	sorted = append(sorted, ^ImageID(0)-2)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	if got := index.Lookup(nil, h); !equalIDs(got, sorted) {
+		t.Fatalf("Lookup after widen = %v, want %v", got, sorted)
+	}
+}
+
 func TestAutoReclaimBoundsRetired(t *testing.T) {
 	index := newTestIndex(t, 4<<20, Config{AutoReclaimBytes: 4096})
 	defer index.Close()
