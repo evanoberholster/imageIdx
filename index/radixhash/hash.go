@@ -109,11 +109,14 @@ type Entry struct {
 
 // Config controls runtime tree policy. PromotionBytes is the leaf size at
 // which an individual leaf is promoted to another radix level; it is a runtime
-// tuning value rather than a persistent format constant. AutoReclaimBytes, when
-// nonzero, bounds retired space: after a publish whose retired bytes reach the
-// threshold the writer drains prior readers and reclaims automatically.
+// tuning value rather than a persistent format constant. MaxLeafSlots, when
+// nonzero, is an additional promotion cap by record count so scan and rewrite
+// cost stay bounded regardless of row width. AutoReclaimBytes, when nonzero,
+// bounds retired space: after a publish whose retired bytes reach the threshold
+// the writer drains prior readers and reclaims automatically.
 type Config struct {
 	PromotionBytes   uint32
+	MaxLeafSlots     uint32
 	AutoReclaimBytes uint64
 }
 

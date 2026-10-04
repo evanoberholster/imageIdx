@@ -174,9 +174,10 @@ func TestBatchRewritesBucketOnce(t *testing.T) {
 		t.Fatalf("second Apply: %v", err)
 	}
 	// One 50-entry batch targeting a single bucket must replace exactly one
-	// leaf, one L1 node, and the root -- not one leaf per entry.
-	if retired := index.Metadata().RetiredExtents; retired != 3 {
-		t.Fatalf("retired after second batch = %d, want 3", retired)
+	// leaf and one L1 node -- not one leaf per entry. (The root is view-local,
+	// so it is not an arena page.)
+	if retired := index.Metadata().RetiredExtents; retired != 2 {
+		t.Fatalf("retired after second batch = %d, want 2", retired)
 	}
 	if got := index.Count(h); got != 60 {
 		t.Fatalf("Count = %d, want 60", got)
@@ -244,25 +245,30 @@ func TestReclaimFreesRetiredExtents(t *testing.T) {
 	if err := index.Apply([]Entry{{Hash: h, ImageID: 1}}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	// The root node replaced by the batch is retired at the superseded
-	// generation. A reader still pinned there keeps it alive.
-	if index.Metadata().RetiredExtents != 1 {
-		t.Fatalf("retired = %d, want 1", index.Metadata().RetiredExtents)
+	if index.Metadata().RetiredExtents != 0 {
+		t.Fatalf("retired after first batch = %d, want 0", index.Metadata().RetiredExtents)
 	}
-	generation := index.Generation() - 1
-	if err := index.Reclaim(generation); err != nil {
+	// The second batch replaces the leaf and its L1 node at generation 2.
+	if err := index.Apply([]Entry{{Hash: h, ImageID: 2}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if index.Metadata().RetiredExtents != 2 {
+		t.Fatalf("retired = %d, want 2", index.Metadata().RetiredExtents)
+	}
+	// A reader still pinned at generation 2 keeps the replaced pages alive.
+	if err := index.Reclaim(2); err != nil {
 		t.Fatalf("Reclaim: %v", err)
 	}
-	if index.Metadata().RetiredExtents != 1 {
-		t.Fatalf("retired after early reclaim = %d, want 1", index.Metadata().RetiredExtents)
+	if index.Metadata().RetiredExtents != 2 {
+		t.Fatalf("retired after early reclaim = %d, want 2", index.Metadata().RetiredExtents)
 	}
-	if err := index.Reclaim(generation + 1); err != nil {
+	if err := index.Reclaim(3); err != nil {
 		t.Fatalf("Reclaim: %v", err)
 	}
 	if index.Metadata().RetiredExtents != 0 {
 		t.Fatalf("retired after reclaim = %d, want 0", index.Metadata().RetiredExtents)
 	}
-	if got := index.Lookup(nil, h); !equalIDs(got, []ImageID{1}) {
+	if got := index.Lookup(nil, h); !equalIDs(got, []ImageID{1, 2}) {
 		t.Fatalf("Lookup after reclaim = %v", got)
 	}
 }
@@ -616,6 +622,28 @@ func TestMmapArena(t *testing.T) {
 	}
 	if err := index.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestMaxLeafSlotsPromotes(t *testing.T) {
+	// A huge byte threshold makes the slot cap the only promotion trigger.
+	index := newTestIndex(t, 4<<20, Config{PromotionBytes: 1 << 30, MaxLeafSlots: 32})
+	defer index.Close()
+	var entries []Entry
+	for i := 0; i < 300; i++ {
+		entries = append(entries, Entry{Hash: hashWithPrefix([]byte{7, 9}, uint64(i)+1), ImageID: ImageID(i + 1)})
+	}
+	if err := index.Apply(entries); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if depth := index.Metadata().Depth; depth < 3 {
+		t.Fatalf("depth = %d, want >= 3 from the slot cap", depth)
+	}
+	for i := 0; i < 300; i++ {
+		h := hashWithPrefix([]byte{7, 9}, uint64(i)+1)
+		if got := index.Lookup(nil, h); !equalIDs(got, []ImageID{ImageID(i + 1)}) {
+			t.Fatalf("Lookup(%d) = %v", i, got)
+		}
 	}
 }
 

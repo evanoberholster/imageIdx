@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 const (
@@ -201,11 +202,54 @@ func readLeafSlots(arena []byte, ref pagealloc.Ref) ([]slot, leafHeader, error) 
 	return slots, header, nil
 }
 
+// parseLeafHeader reads a leaf header on the hot lookup path. It validates the
+// depth, id width, offsets, and that the arrays fit the extent, but unlike
+// readLeafHeader it does not recompute the maximal slot capacity (a loop).
+// Leaves are fully validated when written and by Verify, so the read path
+// trusts the stored capacity while still guarding every array bound.
+func parseLeafHeader(arena []byte, ref pagealloc.Ref) (leafHeader, error) {
+	if !validExtent(arena, ref, leafHeaderSize) {
+		return leafHeader{}, fmt.Errorf("%w: header outside arena", ErrCorrupt)
+	}
+	region := arena[extentOffset(ref):]
+	depth := int(region[6])
+	if depth < 1 || depth > maxDepth {
+		return leafHeader{}, fmt.Errorf("%w: bad depth %d", ErrCorrupt, depth)
+	}
+	idBytes := id64Bytes
+	if region[7]&leafFlagID32 != 0 {
+		idBytes = id32Bytes
+	}
+	count := int(binary.LittleEndian.Uint32(region[8:12]))
+	capacity := int(binary.LittleEndian.Uint32(region[12:16]))
+	if capacity < 1 || count < 1 || count > capacity {
+		return leafHeader{}, fmt.Errorf("%w: count %d capacity %d", ErrCorrupt, count, capacity)
+	}
+	tailLen := tailLenFor(depth)
+	idsOffset := int(binary.LittleEndian.Uint32(region[20:24]))
+	extentBytes := binary.LittleEndian.Uint32(region[24:28])
+	if idsOffset != idsOffsetFor(tailLen, capacity) {
+		return leafHeader{}, fmt.Errorf("%w: inconsistent offsets", ErrCorrupt)
+	}
+	if sizeForCapacity(depth, idBytes, capacity) > int(extentBytes) || !validExtent(arena, ref, extentBytes) {
+		return leafHeader{}, fmt.Errorf("%w: extent size %d", ErrCorrupt, extentBytes)
+	}
+	return leafHeader{
+		count:       count,
+		capacity:    capacity,
+		depth:       depth,
+		idBytes:     idBytes,
+		extentBytes: extentBytes,
+		tailOffset:  leafHeaderSize,
+		idsOffset:   idsOffset,
+	}, nil
+}
+
 // scanLeaf invokes visit for every slot whose tail equals query[depth:32]. It
-// returns the first error from visit, or nil. Slots are sorted by tail, so the
-// scan stops as soon as the tail passes the query.
+// binary-searches the sorted tail array for the lower bound and then walks the
+// (usually short) equal run, reading ids through zero-copy typed views.
 func scanLeaf(arena []byte, ref pagealloc.Ref, query Hash, depth int, visit func(ImageID) bool) error {
-	header, err := readLeafHeader(arena, ref)
+	header, err := parseLeafHeader(arena, ref)
 	if err != nil {
 		return err
 	}
@@ -214,23 +258,44 @@ func scanLeaf(arena []byte, ref pagealloc.Ref, query Hash, depth int, visit func
 	}
 	tailLen := tailLenFor(depth)
 	want := query[depth:]
-	offset := extentOffset(ref)
-	for i := 0; i < header.count; i++ {
-		tail := arena[offset+uint64(leafHeaderSize+tailLen*i) : offset+uint64(leafHeaderSize+tailLen*i)+uint64(tailLen)]
-		comparison := bytes.Compare(tail, want)
-		if comparison < 0 {
-			continue
+	base := extentOffset(ref) + uint64(leafHeaderSize)
+
+	lo, hi := 0, header.count
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		tail := arena[base+uint64(tailLen*mid):][:tailLen]
+		if bytes.Compare(tail, want) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
-		if comparison > 0 {
+	}
+
+	idsBase := extentOffset(ref) + uint64(header.idsOffset)
+	if header.idBytes == id32Bytes {
+		ids, err := storage.View[uint32](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
+		if err != nil {
+			return err
+		}
+		for i := lo; i < header.count; i++ {
+			if bytes.Compare(arena[base+uint64(tailLen*i):][:tailLen], want) != 0 {
+				break
+			}
+			if !visit(ImageID(ids[i])) {
+				return nil
+			}
+		}
+		return nil
+	}
+	ids, err := storage.View[uint64](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
+	if err != nil {
+		return err
+	}
+	for i := lo; i < header.count; i++ {
+		if bytes.Compare(arena[base+uint64(tailLen*i):][:tailLen], want) != 0 {
 			break
 		}
-		var id uint64
-		if header.idBytes == id32Bytes {
-			id = uint64(binary.LittleEndian.Uint32(arena[offset+uint64(header.idsOffset+4*i):]))
-		} else {
-			id = binary.LittleEndian.Uint64(arena[offset+uint64(header.idsOffset+8*i):])
-		}
-		if !visit(id) {
+		if !visit(ImageID(ids[i])) {
 			return nil
 		}
 	}

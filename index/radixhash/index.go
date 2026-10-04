@@ -3,12 +3,17 @@ package radixhash
 import (
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
+
+// parallelMinEntries is the batch size above which independent root buckets are
+// rebuilt concurrently. Below it the goroutine overhead outweighs the gain.
+const parallelMinEntries = 4096
 
 // indexView is one immutable, atomically published snapshot of the index.
 // Nothing reachable from a published view is ever mutated; a batch builds
@@ -17,7 +22,7 @@ import (
 // readers that pinned the previous view.
 type indexView struct {
 	generation  uint64
-	root        uint32 // encoded radix-node reference
+	root        *[radixFanout]uint32 // root radix node, indexed by Hash[0]
 	arena       []byte
 	entries     uint64
 	rootBuckets uint64
@@ -92,18 +97,13 @@ func NewMmap(path string, arenaBytes uint64, config Config) (*Index, error) {
 	return index, nil
 }
 
-// newIndex allocates the single root radix node and publishes the first view.
+// newIndex publishes the first view with an empty in-memory root node. The
+// root lives in the view (not the arena) so a publish does not allocate and a
+// lookup saves one random dereference; persistence will move it to the
+// superblock.
 func newIndex(allocator *pagealloc.Allocator, arena []byte, config Config) (*Index, error) {
 	index := &Index{alloc: allocator, arena: arena, config: config.withDefaults()}
-	rootRef, _, err := allocator.Alloc(radixNodeBytes)
-	if err != nil {
-		return nil, err
-	}
-	children := &[radixFanout]uint32{}
-	if err := writeNode(arena, rootRef, children); err != nil {
-		return nil, err
-	}
-	index.view.Store(&indexView{generation: 1, root: encodeChild(rootRef, true), arena: arena})
+	index.view.Store(&indexView{generation: 1, root: &[radixFanout]uint32{}, arena: arena})
 	return index, nil
 }
 
@@ -116,16 +116,21 @@ type extent struct {
 // txn tracks the replacements of one Apply. Allocated extents are recorded so
 // they can be freed if the batch fails; replaced extents are retired only after
 // the new view is published, so a failure never invalidates the live view.
+// alloc and retire serialize on mu so independent root buckets can rebuild in
+// parallel while the allocator stays single-owner.
 type txn struct {
 	index       *Index
 	generation  uint64
+	mu          sync.Mutex
 	newExtents  []extent
 	retirements []extent
-	delta       int64
-	maxDepth    int
+	delta       atomic.Int64
+	maxDepth    atomic.Int64
 }
 
 func (t *txn) alloc(size uint32) (pagealloc.Ref, uint32, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	ref, capacity, err := t.index.alloc.Alloc(size)
 	if err != nil {
 		return 0, 0, err
@@ -135,10 +140,25 @@ func (t *txn) alloc(size uint32) (pagealloc.Ref, uint32, error) {
 }
 
 func (t *txn) retire(ref pagealloc.Ref, bytes uint32) {
+	t.mu.Lock()
 	t.retirements = append(t.retirements, extent{ref: ref, bytes: bytes})
+	t.mu.Unlock()
+}
+
+func (t *txn) addDelta(delta int64) { t.delta.Add(delta) }
+
+func (t *txn) noteDepth(level int) {
+	for {
+		current := t.maxDepth.Load()
+		if int64(level) <= current || t.maxDepth.CompareAndSwap(current, int64(level)) {
+			return
+		}
+	}
 }
 
 func (t *txn) rollback() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, replacement := range t.newExtents {
 		_ = t.index.alloc.Free(replacement.ref, replacement.bytes)
 	}
@@ -171,52 +191,67 @@ func (i *Index) Apply(entries []Entry) error {
 	}
 
 	current := i.view.Load()
-	rootRef, _ := decodeChild(current.root)
-	if !validExtent(i.arena, rootRef, radixNodeBytes) {
-		return ErrCorrupt
-	}
-	var oldRoot [radixFanout]uint32
-	readNode(i.arena, rootRef, &oldRoot)
+	oldRoot := current.root
 
 	batch := &txn{index: i, generation: current.generation}
-	var newRoot [radixFanout]uint32
-	cloned := false
-	for key, records := range groups {
-		updated, err := batch.rebuildChild(oldRoot[key], 1, records)
-		if err != nil {
-			batch.rollback()
-			return err
-		}
-		if updated != oldRoot[key] {
-			if !cloned {
-				newRoot = oldRoot
-				cloned = true
+	nextRoot := *oldRoot // copy-on-write the 1 KiB root
+	workers := 1
+	if len(entries) >= parallelMinEntries && len(groups) > 1 {
+		workers = min(runtime.GOMAXPROCS(0), len(groups), 8)
+	}
+	if workers <= 1 {
+		for key, records := range groups {
+			updated, err := batch.rebuildChild(oldRoot[key], 1, records)
+			if err != nil {
+				batch.rollback()
+				return err
 			}
-			newRoot[key] = updated
+			nextRoot[key] = updated
+		}
+	} else {
+		jobs := make(chan byte, len(groups))
+		for key := range groups {
+			jobs <- key
+		}
+		close(jobs)
+		var wait sync.WaitGroup
+		var errMu sync.Mutex
+		var firstErr error
+		for w := 0; w < workers; w++ {
+			wait.Add(1)
+			go func() {
+				defer wait.Done()
+				for key := range jobs {
+					updated, err := batch.rebuildChild(oldRoot[key], 1, groups[key])
+					if err != nil {
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = err
+						}
+						errMu.Unlock()
+						continue
+					}
+					nextRoot[key] = updated
+				}
+			}()
+		}
+		wait.Wait()
+		if firstErr != nil {
+			batch.rollback()
+			return firstErr
 		}
 	}
-	if !cloned {
+	if nextRoot == *oldRoot {
 		return nil
 	}
 
-	newRootRef, _, err := batch.alloc(radixNodeBytes)
-	if err != nil {
-		batch.rollback()
-		return err
-	}
-	if err := writeNode(i.arena, newRootRef, &newRoot); err != nil {
-		batch.rollback()
-		return err
-	}
-	batch.retire(rootRef, radixNodeBytes)
-
 	i.view.Store(&indexView{
 		generation:  current.generation + 1,
-		root:        encodeChild(newRootRef, true),
+		root:        &nextRoot,
 		arena:       i.arena,
-		entries:     uint64(int64(current.entries) + batch.delta),
-		rootBuckets: countRootBuckets(&newRoot),
-		depth:       maxUint8(current.depth, uint8(batch.maxDepth)),
+		entries:     uint64(int64(current.entries) + batch.delta.Load()),
+		rootBuckets: countRootBuckets(&nextRoot),
+		depth:       maxUint8(current.depth, uint8(batch.maxDepth.Load())),
 	})
 	// Retirements happen after publication under the writer lock; the extents
 	// remain allocated until a later Reclaim proves no reader needs them.
@@ -254,12 +289,12 @@ func (t *txn) rebuildChild(oldChild uint32, level int, records []slot) (uint32, 
 	if len(merged) == len(existing) {
 		return oldChild, nil // every record was already present
 	}
-	if level >= maxDepth || fits(t.index.config.PromotionBytes, level, idBytesForSlots(merged), len(merged)) {
+	if level >= maxDepth || t.fits(level, idBytesForSlots(merged), len(merged)) {
 		return t.writeLeaf(level, merged, ref, header.extentBytes, len(existing))
 	}
 	// Promote this individual leaf to a radix node consuming Hash[level].
 	t.retire(ref, header.extentBytes)
-	t.delta -= int64(len(existing))
+	t.addDelta(-int64(len(existing)))
 	return t.buildNodeFromSlots(level, merged)
 }
 
@@ -309,7 +344,7 @@ func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32,
 // the records are large enough to promote immediately.
 func (t *txn) newSubtreeFromRecords(level int, records []slot) (uint32, error) {
 	records = dedupeSlots(records, tailLenFor(level))
-	if level != 1 && (level >= maxDepth || fits(t.index.config.PromotionBytes, level, idBytesForSlots(records), len(records))) {
+	if level != 1 && (level >= maxDepth || t.fits(level, idBytesForSlots(records), len(records))) {
 		return t.writeLeaf(level, records, 0, 0, 0)
 	}
 	return t.buildNodeFromRecords(level, records)
@@ -349,7 +384,7 @@ func (t *txn) buildNodeFromSlots(level int, slots []slot) (uint32, error) {
 // newSubtreeFromSlots creates a leaf, or recurses into another promotion when
 // the child would still exceed the threshold.
 func (t *txn) newSubtreeFromSlots(level int, slots []slot) (uint32, error) {
-	if level >= maxDepth || fits(t.index.config.PromotionBytes, level, idBytesForSlots(slots), len(slots)) {
+	if level >= maxDepth || t.fits(level, idBytesForSlots(slots), len(slots)) {
 		return t.writeLeaf(level, slots, 0, 0, 0)
 	}
 	return t.buildNodeFromSlots(level, slots)
@@ -370,10 +405,8 @@ func (t *txn) writeLeaf(level int, slots []slot, oldRef pagealloc.Ref, oldBytes 
 	if oldRef != 0 {
 		t.retire(oldRef, oldBytes)
 	}
-	t.delta += int64(len(slots) - oldCount)
-	if level > t.maxDepth {
-		t.maxDepth = level
-	}
+	t.addDelta(int64(len(slots) - oldCount))
+	t.noteDepth(level)
 	return encodeChild(ref, false), nil
 }
 
@@ -389,37 +422,41 @@ func (t *txn) writeNewNode(children *[radixFanout]uint32) (uint32, error) {
 	return encodeChild(ref, true), nil
 }
 
-// fits reports whether a leaf of count slots at level stays within threshold.
-func fits(threshold uint32, level, idBytes, count int) bool {
+// fits reports whether a leaf of count slots at level stays within the
+// configured byte and slot thresholds. It is a method so the policy lives in
+// one place and both promotion paths consult the same bounds.
+func (t *txn) fits(level, idBytes, count int) bool {
 	if count <= 0 {
 		return true
 	}
-	return sizeForCapacity(level, idBytes, count) <= int(threshold)
+	if maxSlots := int(t.index.config.MaxLeafSlots); maxSlots > 0 && count > maxSlots {
+		return false
+	}
+	return sizeForCapacity(level, idBytes, count) <= int(t.index.config.PromotionBytes)
 }
 
 // traverse follows the radix path for h and returns the leaf reference and its
-// depth, or ok=false on a miss.
+// depth, or ok=false on a miss. The root is a view-local array, so a lookup
+// saves one random dereference before reaching the arena-resident L1 nodes.
 func (i *Index) traverse(view *indexView, h Hash) (pagealloc.Ref, int, bool) {
-	ref, isNode := decodeChild(view.root)
-	if !isNode {
+	child := view.root[h[0]]
+	if child == 0 {
 		return 0, 0, false
 	}
-	level := 0
+	level := 1
 	for {
+		ref, isNode := decodeChild(child)
+		if !isNode {
+			return ref, level, true
+		}
 		if level >= maxDepth || !validExtent(view.arena, ref, radixNodeBytes) {
 			return 0, 0, false
 		}
-		child := nodeChild(view.arena, ref, h[level])
+		child = nodeChild(view.arena, ref, h[level])
 		if child == 0 {
 			return 0, 0, false
 		}
-		childLevel := level + 1
-		childRef, childIsNode := decodeChild(child)
-		if !childIsNode {
-			return childRef, childLevel, true
-		}
-		ref = childRef
-		level = childLevel
+		level++
 	}
 }
 
@@ -594,12 +631,20 @@ func (i *Index) Compact() error {
 
 // collectEntries walks the published tree and reconstructs every full hash.
 func (i *Index) collectEntries(view *indexView, out *[]Entry) {
-	ref, isNode := decodeChild(view.root)
-	if !isNode {
-		return
-	}
 	var prefix [hashBytes]byte
-	i.walkNode(view.arena, ref, 0, &prefix, out)
+	for index := 0; index < radixFanout; index++ {
+		child := view.root[index]
+		if child == 0 {
+			continue
+		}
+		prefix[0] = byte(index)
+		ref, isNode := decodeChild(child)
+		if isNode {
+			i.walkNode(view.arena, ref, 1, &prefix, out)
+			continue
+		}
+		i.extractLeaf(view.arena, ref, 1, &prefix, out)
+	}
 }
 
 // walkNode appends the entries below a node at level to out, tracking the
@@ -619,25 +664,30 @@ func (i *Index) walkNode(arena []byte, ref pagealloc.Ref, level int, prefix *[ha
 			i.walkNode(arena, childRef, level+1, prefix, out)
 			continue
 		}
-		depth := level + 1
-		header, err := readLeafHeader(arena, childRef)
-		if err != nil || header.depth != depth {
-			continue
+		i.extractLeaf(arena, childRef, level+1, prefix, out)
+	}
+}
+
+// extractLeaf appends every entry of the leaf at depth, rebuilding each full
+// hash from the consumed prefix and the stored tail.
+func (i *Index) extractLeaf(arena []byte, ref pagealloc.Ref, depth int, prefix *[hashBytes]byte, out *[]Entry) {
+	header, err := readLeafHeader(arena, ref)
+	if err != nil || header.depth != depth {
+		return
+	}
+	tailLen := tailLenFor(depth)
+	offset := extentOffset(ref)
+	for s := 0; s < header.count; s++ {
+		var hash Hash
+		copy(hash[:depth], prefix[:depth])
+		copy(hash[depth:], arena[offset+uint64(leafHeaderSize+tailLen*s):])
+		var id uint64
+		if header.idBytes == id32Bytes {
+			id = uint64(binary.LittleEndian.Uint32(arena[offset+uint64(header.idsOffset+4*s):]))
+		} else {
+			id = binary.LittleEndian.Uint64(arena[offset+uint64(header.idsOffset+8*s):])
 		}
-		tailLen := tailLenFor(depth)
-		offset := extentOffset(childRef)
-		for s := 0; s < header.count; s++ {
-			var hash Hash
-			copy(hash[:depth], prefix[:depth])
-			copy(hash[depth:], arena[offset+uint64(leafHeaderSize+tailLen*s):])
-			var id uint64
-			if header.idBytes == id32Bytes {
-				id = uint64(binary.LittleEndian.Uint32(arena[offset+uint64(header.idsOffset+4*s):]))
-			} else {
-				id = binary.LittleEndian.Uint64(arena[offset+uint64(header.idsOffset+8*s):])
-			}
-			*out = append(*out, Entry{Hash: hash, ImageID: id})
-		}
+		*out = append(*out, Entry{Hash: hash, ImageID: id})
 	}
 }
 

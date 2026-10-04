@@ -245,6 +245,12 @@ when its encoded size or record count crosses a configurable threshold. Start
 with a target promotion threshold around **64–128 KiB**, but benchmark the
 threshold rather than treating it as a permanent format constant.
 
+`Config.MaxLeafSlots` adds a record-count cap on top of the byte threshold so
+scan and copy-on-write cost stay bounded regardless of id width. Benchmark it:
+promoting too early scatters entries into minimum-size leaves and can multiply
+space use, while the byte threshold alone is usually enough once lookup uses a
+binary search over the sorted tails.
+
 The implementation must permit additional radix levels using the same
 mechanism if an unusually large leaf requires them (for example if many records
 share long hash prefixes). Because each leaf header stores its depth, lookup
@@ -385,6 +391,11 @@ The radix path itself is the coarse hash discriminator. A zero child is an
 immediate miss. At the leaf, compare the unconsumed tail (typically
 `Hash[2:32]`) against the query tail and return the corresponding `IndexID`s
 that are not tombstoned.
+
+The leaf tails are sorted, so lookup binary-searches for the lower bound and
+walks the short equal run rather than scanning the whole leaf. This keeps
+latency close to O(log n) even for large two-level leaves and removes most of
+the motivation for promoting solely to shorten a scan.
 
 Implement scalar first, then architecture-specific AVX2/AVX-512/NEON tail
 comparison kernels behind the same interface. The persistent layout must not
