@@ -180,6 +180,24 @@ func (a *Allocator) Free(ref Ref, size uint32) error {
 	return nil
 }
 
+// Reserve marks an already-allocated extent as used without going through
+// Alloc. It is used on reopen to reconstruct allocation state by walking the
+// persisted tree, and by index headers that pin fixed arena regions. It fails
+// if any block in the run is already used, which also detects overlapping
+// references in corrupt metadata.
+func (a *Allocator) Reserve(ref Ref, size uint32) error {
+	blocks, err := a.validate(ref, size)
+	if err != nil {
+		return err
+	}
+	if !a.allFree(uint64(ref), uint64(blocks)) {
+		return fmt.Errorf("%w: extent %d overlaps a used block", ErrInvalidRef, ref)
+	}
+	a.clearRun(uint64(ref), uint64(blocks))
+	a.freeCount -= uint64(blocks)
+	return nil
+}
+
 // Retire records the last generation that referenced the extent at ref. The
 // extent is not reused until a later Reclaim proves no reader can still
 // reference that generation. size must be the capacity returned by Alloc.
@@ -277,6 +295,16 @@ func (a *Allocator) anyFree(start, count uint64) bool {
 		}
 	}
 	return false
+}
+
+// allFree reports whether every block in [start, start+count) is free.
+func (a *Allocator) allFree(start, count uint64) bool {
+	for i := uint64(0); i < count; i++ {
+		if !a.isFree(start + i) {
+			return false
+		}
+	}
+	return true
 }
 
 // clearRun marks [start, start+count) allocated.

@@ -44,6 +44,10 @@ type Index struct {
 	release func() error
 	// sync, when non-nil, flushes a file-backed arena to disk.
 	sync func() error
+	// persistent is true for a file-backed, check-pointable arena.
+	persistent bool
+	// slot is the active superblock slot (0 or 1).
+	slot int
 
 	mu     sync.Mutex
 	view   atomic.Pointer[indexView]
@@ -70,31 +74,6 @@ func NewWithArena(arena []byte, config Config) (*Index, error) {
 		return nil, err
 	}
 	return newIndex(allocator, arena, config)
-}
-
-// NewMmap creates or truncates a file-backed arena of arenaBytes and returns an
-// empty index over it. The file is sparse until written, so a large logical
-// arena consumes disk and resident memory only for the pages actually used.
-// Sync flushes the mapping; Close unmaps and closes the file. A file-backed
-// index is not yet reopened from disk; that is the persistence follow-up.
-func NewMmap(path string, arenaBytes uint64, config Config) (*Index, error) {
-	mapped, err := storage.CreateMapped(path, int64(arenaBytes))
-	if err != nil {
-		return nil, err
-	}
-	allocator, err := pagealloc.New(uint64(len(mapped.Bytes())))
-	if err != nil {
-		_ = mapped.Close()
-		return nil, err
-	}
-	index, err := newIndex(allocator, mapped.Bytes()[:allocator.TotalBytes()], config)
-	if err != nil {
-		_ = mapped.Close()
-		return nil, err
-	}
-	index.release = mapped.Close
-	index.sync = mapped.Sync
-	return index, nil
 }
 
 // newIndex publishes the first view with an empty in-memory root node. The
@@ -619,6 +598,8 @@ func (i *Index) Compact() error {
 	i.arena = fresh.arena
 	i.release = fresh.release
 	i.sync = fresh.sync
+	i.persistent = false
+	i.slot = 0
 	i.view.Store(fresh.view.Load())
 	fresh.alloc = nil
 	fresh.release = nil

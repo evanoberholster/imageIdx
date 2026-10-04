@@ -232,6 +232,34 @@ func TestDecodeRejectsCorruption(t *testing.T) {
 	}
 }
 
+func TestReserveMarksExtentUsed(t *testing.T) {
+	allocator := newTestAllocator(t)
+	initial := allocator.FreeBytes()
+	const blocks = 3
+	if err := allocator.Reserve(1, blocks*MinBlockSize); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if got, want := allocator.FreeBytes(), initial-blocks*uint64(MinBlockSize); got != want {
+		t.Fatalf("FreeBytes = %d, want %d", got, want)
+	}
+	if err := allocator.Reserve(1, MinBlockSize); !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("double Reserve = %v, want ErrInvalidRef", err)
+	}
+	if err := allocator.Reserve(0, MinBlockSize); !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("Reserve(reserved block) = %v, want ErrInvalidRef", err)
+	}
+	if err := allocator.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	ref, _, err := allocator.Alloc(MinBlockSize)
+	if err != nil {
+		t.Fatalf("Alloc: %v", err)
+	}
+	if ref < 4 {
+		t.Fatalf("Alloc returned reserved block %d", ref)
+	}
+}
+
 func FuzzAllocator(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9})
 	f.Add([]byte{1, 0, 2, 1, 0, 2, 1, 0, 2, 1})

@@ -43,6 +43,30 @@ func CreateMapped(path string, size int64) (*MappedFile, error) {
 	return &MappedFile{file: file, data: data}, nil
 }
 
+// OpenMapped opens an existing file read-write and maps the whole file without
+// truncating it. The file must already be the intended size.
+func OpenMapped(path string) (*MappedFile, error) {
+	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if info.Size() <= 0 {
+		_ = file.Close()
+		return nil, ErrMappedSize
+	}
+	data, err := mmapFileRW(file, info.Size())
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return &MappedFile{file: file, data: data}, nil
+}
+
 // Bytes returns the mapped region. It is nil after Close.
 func (m *MappedFile) Bytes() []byte {
 	if m == nil {
