@@ -27,3 +27,16 @@ func mmapFile(file *os.File, size int64) ([]byte, error) {
 func unmapFile(data []byte) error {
 	return windows.UnmapViewOfFile(uintptr(unsafe.Pointer(&data[0])))
 }
+
+// mmapFileRW currently has no MapViewOfFile-backed read-write path; callers
+// receive a clear error rather than an unmapped buffer.
+func mmapFileRW(_ *os.File, _ int64) ([]byte, error) { return nil, errMmapUnsupported }
+
+func msyncMapped(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	return windows.FlushViewOfFile(uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)))
+}
+
+func munmapMapped(data []byte) error { return unmapFile(data) }
