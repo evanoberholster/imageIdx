@@ -91,22 +91,41 @@ ids := index.LookupFiltered(nil, digest, live)
 
 ### Durable / mmap arena
 
-`NewMmap` maps a sparse file, so committed memory follows the pages actually
-used. `Sync` flushes; `Close` unmaps.
+`NewMmap` creates a sparse file arena, so committed memory follows the pages
+actually used. `Checkpoint` writes the current root and metadata to a dual
+superblock (with CRCs) and flushes; `OpenMmap` reopens the file, picks the newest
+valid superblock, and reconstructs allocation state by walking the tree — so
+space retired before the last checkpoint is reclaimed on reopen. `Sync` flushes
+without a new generation; `Close` unmaps.
 
 ```go
-index, err := radixhash.NewMmap("/data/hashes.bin", 4<<30, radixhash.Config{
-    AutoReclaimBytes: 64 << 20, // bound retired space during sustained writes
-})
-defer index.Close()
+config := radixhash.Config{AutoReclaimBytes: 64 << 20}
 
+index, err := radixhash.NewMmap("/data/hashes.bin", 4<<30, config)
+if err != nil {
+    return err
+}
 if err := index.Apply(batch); err != nil {
     return err
 }
-if err := index.Sync(); err != nil { // durable
+if err := index.Checkpoint(); err != nil { // durable generation
     return err
 }
+if err := index.Close(); err != nil {
+    return err
+}
+
+// Later, in another process:
+reopened, err := radixhash.OpenMmap("/data/hashes.bin", config)
+if err != nil {
+    return err
+}
+defer reopened.Close()
+ids := reopened.Lookup(nil, digest)
 ```
+
+`Checkpoint` is a no-op for a heap arena; `OpenMmap` requires a file previously
+created by `NewMmap`.
 
 ### Reclamation and compaction
 
@@ -147,11 +166,23 @@ ids, err := plan.Search(ctx, nil, &ws)
 | `hash.go` | Public types (`Hash`, `Entry`, `Config`, `Metadata`) and errors. |
 | `node.go` | 256-way radix node encoding and child tagging. |
 | `leaf.go` | SoA leaf codec, sorted-tail search, promotion partitioning. |
-| `index.go` | Arena, views, copy-on-write `Apply`, lookup, reclaim, compact, mmap. |
+| `index.go` | Arena, views, copy-on-write `Apply`, lookup, reclaim, compact. |
+| `superblock.go` | Dual-superblock and root encoding with CRCs. |
+| `persist.go` | `NewMmap`/`OpenMmap`, `Checkpoint`, and reopen reconstruction. |
+| `internal/tailkernel` | Scalar reference + NEON/AVX2 16-byte tail-prefix kernels. |
+
+## Lookup kernels
+
+Leaves are sorted, so lookup binary-searches the tails — the correctness
+reference. Small leaves (≤ 64 slots) instead scan linearly with
+`internal/tailkernel`, which compares 16-byte prefixes on NEON (arm64) or AVX2
+(amd64) and confirms each hit with a full-tail compare; the scalar reference is
+used everywhere else.
 
 ## Scope
 
-Currently implemented: the exact-fit allocator, the byte-oriented radix
-engine, adaptive promotion, batched COW commits, generation-gated readers,
-and a file-backed mmap arena. Follow-ups: on-disk superblock/reopen, WAL
-durability modes, shard rollover and parallel lookup, and SIMD tail kernels.
+Implemented: the exact-fit allocator, the byte-oriented radix engine, adaptive
+promotion, batched COW commits, generation-gated readers, the file-backed mmap
+arena with superblock reopen/checkpoint, and SIMD tail kernels. Follow-ups: WAL
+durability modes, shard rollover and parallel lookup, and registering RadixHash
+in the unified `index.Store` schema.

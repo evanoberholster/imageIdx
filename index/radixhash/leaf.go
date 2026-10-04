@@ -5,11 +5,19 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 	"sort"
 
+	"github.com/evanoberholster/imageIdx/index/radixhash/internal/tailkernel"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
+
+// smallLeafLimit is the slot count below which scanLeaf scans linearly with the
+// tail kernel instead of binary-searching. The SIMD prefix compare beats a
+// branchy binary search only for small leaves; larger leaves use the sorted
+// binary search, which is the correctness reference.
+const smallLeafLimit = 64
 
 const (
 	// leafMagic identifies a leaf extent.
@@ -259,6 +267,44 @@ func scanLeaf(arena []byte, ref pagealloc.Ref, query Hash, depth int, visit func
 	tailLen := tailLenFor(depth)
 	want := query[depth:]
 	base := extentOffset(ref) + uint64(leafHeaderSize)
+
+	// Small leaves: SIMD prefix scan. The mask compares 16-byte prefixes; each
+	// set bit is confirmed with a full-tail compare before visiting.
+	if header.count <= smallLeafLimit && tailLen >= 16 {
+		mask := tailkernel.MatchMask(arena[base:], tailLen, header.count, want)
+		if mask == 0 {
+			return nil
+		}
+		idsBase := extentOffset(ref) + uint64(header.idsOffset)
+		if header.idBytes == id32Bytes {
+			ids, err := storage.View[uint32](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
+			if err != nil {
+				return err
+			}
+			for mask != 0 {
+				i := bits.TrailingZeros64(mask)
+				mask &= mask - 1
+				off := base + uint64(tailLen*i)
+				if bytes.Equal(arena[off:off+uint64(tailLen)], want) && !visit(ImageID(ids[i])) {
+					return nil
+				}
+			}
+			return nil
+		}
+		ids, err := storage.View[uint64](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
+		if err != nil {
+			return err
+		}
+		for mask != 0 {
+			i := bits.TrailingZeros64(mask)
+			mask &= mask - 1
+			off := base + uint64(tailLen*i)
+			if bytes.Equal(arena[off:off+uint64(tailLen)], want) && !visit(ImageID(ids[i])) {
+				return nil
+			}
+		}
+		return nil
+	}
 
 	lo, hi := 0, header.count
 	for lo < hi {
