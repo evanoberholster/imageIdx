@@ -5,7 +5,18 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
+
+// appendTestBatch writes a redo batch frame without applying it, simulating a
+// crash point at or after WAL publication.
+func appendTestBatch(t *testing.T, st *Store, updates ...Update) {
+	t.Helper()
+	if err := st.journal.appendBatch(st.generation, st.generation+1, updates, true); err != nil {
+		t.Fatalf("appendBatch: %v", err)
+	}
+}
 
 func TestUpsertAdvancesGeneration(t *testing.T) {
 	dir := t.TempDir()
@@ -44,8 +55,107 @@ func TestUpsertAdvancesGeneration(t *testing.T) {
 	}
 }
 
-// TestJournalCompletesInterruptedUpsert simulates a crash after the journal
-// record is durable but before the canonical columns are updated.
+// TestUpsertBatchOneGeneration asserts one batch is one logical generation.
+func TestUpsertBatchOneGeneration(t *testing.T) {
+	st := openStore(t, testConfig())
+	records := randRecords(50, 200)
+	if _, err := st.AppendBatch(records); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	before := st.Generation()
+	updates := make([]Update, 64)
+	for i := range updates {
+		updates[i] = Update{ImageID: common.ImageID(i + 1), Record: randRecords(int64(100+i), 1)[0]}
+	}
+	if err := st.UpsertBatch(updates); err != nil {
+		t.Fatalf("UpsertBatch: %v", err)
+	}
+	if st.Generation() != before+1 {
+		t.Fatalf("generation = %d, want %d", st.Generation(), before+1)
+	}
+}
+
+// TestUpsertBatchDuplicateLastWins checks duplicate ImageIDs resolve to the last
+// update in the batch.
+func TestUpsertBatchDuplicateLastWins(t *testing.T) {
+	st := openStore(t, testConfig())
+	if _, err := st.AppendBatch(randRecords(60, 4)); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	first := randRecords(61, 1)[0]
+	last := randRecords(62, 1)[0]
+	if err := st.UpsertBatch([]Update{
+		{ImageID: 2, Record: first},
+		{ImageID: 3, Record: randRecords(63, 1)[0]},
+		{ImageID: 2, Record: last},
+	}); err != nil {
+		t.Fatalf("UpsertBatch: %v", err)
+	}
+	if got, _ := st.Get(2); got != last {
+		t.Fatalf("Get(2) = %+v, want last %+v", got, last)
+	}
+}
+
+// TestUpsertBatchMatchesIndividual asserts a batch and the equivalent sequence
+// of single Upserts produce identical state.
+func TestUpsertBatchMatchesIndividual(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	st, err := Open(dir, cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := st.AppendBatch(randRecords(70, 512)); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	updates := make([]Update, 64)
+	for i := range updates {
+		updates[i] = Update{ImageID: common.ImageID(1 + (i*7)%512), Record: randRecords(int64(200+i), 1)[0]}
+	}
+	if err := st.UpsertBatch(updates); err != nil {
+		t.Fatalf("UpsertBatch: %v", err)
+	}
+	// Rebuild with single Upserts in a fresh store and compare every id.
+	dir2 := t.TempDir()
+	st2, err := Open(dir2, cfg)
+	if err != nil {
+		t.Fatalf("Open2: %v", err)
+	}
+	defer st2.Close()
+	if _, err := st2.AppendBatch(randRecords(70, 512)); err != nil {
+		t.Fatalf("AppendBatch2: %v", err)
+	}
+	for _, u := range updates {
+		if err := st2.Upsert(u.ImageID, u.Record); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+	}
+	for id := common.ImageID(1); id <= 512; id++ {
+		a, _ := st.Get(id)
+		b, _ := st2.Get(id)
+		if a != b {
+			t.Fatalf("id %d: batch %+v != individual %+v", id, a, b)
+		}
+	}
+	st.Close()
+}
+
+func TestUpsertBatchTooLarge(t *testing.T) {
+	st := openStore(t, testConfig())
+	if _, err := st.AppendBatch(randRecords(80, 4)); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	updates := make([]Update, maxBatchRecords+1)
+	for i := range updates {
+		updates[i] = Update{ImageID: 1, Record: Record{}}
+	}
+	if err := st.UpsertBatch(updates); err != ErrBatchTooLarge {
+		t.Fatalf("UpsertBatch = %v, want ErrBatchTooLarge", err)
+	}
+}
+
+// TestJournalCompletesInterruptedUpsert simulates a crash after the batch frame
+// is durable but before the canonical columns are updated.
 func TestJournalCompletesInterruptedUpsert(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig()
@@ -60,29 +170,21 @@ func TestJournalCompletesInterruptedUpsert(t *testing.T) {
 		t.Fatalf("Checkpoint: %v", err)
 	}
 	target := randRecords(2, 1)[0]
-	jr := journalRecord{imageID: 2, phash: target.PHash, pdq: target.PDQ, quality: target.Quality}
-	if err := st.journal.appendRecord(jr, true); err != nil {
-		t.Fatalf("journal: %v", err)
-	}
-	// No apply: simulate crash.
+	appendTestBatch(t, st, Update{ImageID: 2, Record: target})
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-
 	reopened, err := Open(dir, cfg)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer reopened.Close()
-	got, ok := reopened.Get(2)
-	if !ok || got != target {
+	if got, ok := reopened.Get(2); !ok || got != target {
 		t.Fatalf("recovered Get(2) = %+v, want %+v", got, target)
 	}
 }
 
-// TestJournalRepairsTornApply simulates a crash mid-apply (pHash and one PDQ
-// word written, sequence left odd) and asserts recovery produces a complete,
-// consistent tuple and resets the sequence.
+// TestJournalRepairsTornApply simulates a crash mid-apply with an odd sequence.
 func TestJournalRepairsTornApply(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig()
@@ -97,21 +199,16 @@ func TestJournalRepairsTornApply(t *testing.T) {
 		t.Fatalf("Checkpoint: %v", err)
 	}
 	target := randRecords(4, 1)[0]
-	jr := journalRecord{imageID: 3, phash: target.PHash, pdq: target.PDQ, quality: target.Quality}
-	if err := st.journal.appendRecord(jr, true); err != nil {
-		t.Fatalf("journal: %v", err)
-	}
-	// Torn apply: pHash and one PDQ word only, and leave the sequence odd.
+	appendTestBatch(t, st, Update{ImageID: 3, Record: target})
 	sh := st.shards[0]
 	pi := uint64(0)
-	atomic.StoreUint64(sh.phash(pi, 3), jr.phash)
-	words := hashWords(&jr.pdq)
+	atomic.StoreUint64(sh.phash(pi, 3), target.PHash)
+	words := hashWords(&target.PDQ)
 	atomic.StoreUint64(sh.pdqWord(pi, 3, 0), words[0])
 	atomic.StoreUint64(sh.seqPtr(pi, 0), 1)
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-
 	reopened, err := Open(dir, cfg)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -127,11 +224,8 @@ func TestJournalRepairsTornApply(t *testing.T) {
 	}
 }
 
-// TestJournalTornTailRepaired appends a partial frame after a valid record and
-// asserts recovery keeps the valid record and truncates the tail.
 // TestJournalRecoveryStages crashes at every journal/update stage and asserts
-// recovery yields either the old record (journal absent) or a complete new
-// tuple, with the sequence reset even.
+// recovery yields the old record (no journal) or a complete new tuple.
 func TestJournalRecoveryStages(t *testing.T) {
 	stages := []struct {
 		name     string
@@ -166,11 +260,8 @@ func TestJournalRecoveryStages(t *testing.T) {
 				t.Fatalf("Checkpoint: %v", err)
 			}
 			target := randRecords(12, 1)[0]
-			jr := journalRecord{imageID: 2, phash: target.PHash, pdq: target.PDQ, quality: target.Quality}
 			if stage.journal {
-				if err := st.journal.appendRecord(jr, true); err != nil {
-					t.Fatalf("journal: %v", err)
-				}
+				appendTestBatch(t, st, Update{ImageID: 2, Record: target})
 			}
 			sh := st.shards[0]
 			pi := uint64(0)
@@ -182,9 +273,7 @@ func TestJournalRecoveryStages(t *testing.T) {
 				atomic.StoreUint64(sh.pdqWord(pi, 2, k), words[k])
 			}
 			if stage.quality {
-				shift := qualityShift(2)
-				qw := sh.qualityWord(pi, 2)
-				atomic.StoreUint64(qw, (atomic.LoadUint64(qw)&^(0xff<<shift))|(uint64(target.Quality)<<shift))
+				st.storeQuality(sh, pi, 2, target.Quality)
 			}
 			if stage.seqOdd {
 				atomic.StoreUint64(sh.seqPtr(pi, 0), 1)
@@ -192,7 +281,6 @@ func TestJournalRecoveryStages(t *testing.T) {
 			if err := st.Close(); err != nil {
 				t.Fatalf("Close: %v", err)
 			}
-
 			reopened, err := Open(dir, cfg)
 			if err != nil {
 				t.Fatalf("reopen: %v", err)
@@ -214,8 +302,7 @@ func TestJournalRecoveryStages(t *testing.T) {
 	}
 }
 
-// TestCloseDoesNotPersist documents the radixhash-style contract: Close unmaps
-// but does not checkpoint, so uncommitted appends are lost on reopen.
+// TestCloseDoesNotPersist documents the radixhash-style contract.
 func TestCloseDoesNotPersist(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig()
@@ -253,10 +340,7 @@ func TestJournalTornTailRepaired(t *testing.T) {
 		t.Fatalf("Checkpoint: %v", err)
 	}
 	target := randRecords(6, 1)[0]
-	jr := journalRecord{imageID: 1, phash: target.PHash, pdq: target.PDQ, quality: target.Quality}
-	if err := st.journal.appendRecord(jr, true); err != nil {
-		t.Fatalf("journal: %v", err)
-	}
+	appendTestBatch(t, st, Update{ImageID: 1, Record: target})
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -269,7 +353,6 @@ func TestJournalTornTailRepaired(t *testing.T) {
 		t.Fatalf("write tail: %v", err)
 	}
 	_ = file.Close()
-
 	reopened, err := Open(dir, cfg)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -293,29 +376,50 @@ func TestJournalCorruptPayloadRejected(t *testing.T) {
 	if err := st.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
+	appendTestBatch(t, st, Update{ImageID: 1, Record: randRecords(8, 1)[0]})
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// Fabricate a full, framed record with a bad payload CRC.
-	rec := make([]byte, journalHeaderBytes+journalPayloadBytes)
-	put := func(off int, v uint32) {
-		rec[off] = byte(v)
-		rec[off+1] = byte(v >> 8)
-		rec[off+2] = byte(v >> 16)
-		rec[off+3] = byte(v >> 24)
-	}
-	put(0, journalMagic)
-	rec[4] = byte(journalVersion)
-	put(8, journalPayloadBytes)
-	// payload left zero, CRC will not match the zeroed contents' checksum only
-	// if we set a wrong CRC explicitly:
-	put(journalHeaderBytes+journalCRCOffset, 0xDEADBEEF)
+	// Flip the last byte (part of the batch CRC) to corrupt the frame.
 	path := filepath.Join(dir, journalFilename)
-	if err := os.WriteFile(path, rec, 0o600); err != nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	data[len(data)-1] ^= 0xff
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	if _, err := Open(dir, cfg); err == nil {
 		t.Fatal("Open accepted a corrupt journal payload")
+	}
+}
+
+// TestJournalRejectsGenerationGap checks the generation-chain validation.
+func TestJournalRejectsGenerationGap(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	st, err := Open(dir, cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := st.AppendBatch(randRecords(9, 4)); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if err := st.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	// A batch whose base does not chain from the manifest generation.
+	if err := st.journal.appendBatch(st.generation+5, st.generation+6, []Update{
+		{ImageID: 1, Record: randRecords(10, 1)[0]},
+	}, true); err != nil {
+		t.Fatalf("appendBatch: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := Open(dir, cfg); err == nil {
+		t.Fatal("Open accepted a broken generation chain")
 	}
 }
 
@@ -326,7 +430,7 @@ func TestSequenceResetOnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := st.AppendBatch(randRecords(8, 8)); err != nil {
+	if _, err := st.AppendBatch(randRecords(14, 8)); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 	if err := st.Checkpoint(); err != nil {
@@ -334,7 +438,7 @@ func TestSequenceResetOnOpen(t *testing.T) {
 	}
 	v := st.view.Load()
 	sh, pi := v.shardForHashPage(0)
-	atomic.StoreUint64(sh.seqPtr(pi, 0), 7) // odd, as after a crash
+	atomic.StoreUint64(sh.seqPtr(pi, 0), 7)
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

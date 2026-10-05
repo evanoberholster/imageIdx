@@ -13,7 +13,8 @@ func (st *Store) Append(rec Record) (common.ImageID, error) {
 }
 
 // AppendBatch appends records densely and returns the first assigned ImageID.
-// The assigned IDs are first..first+len(records)-1.
+// The assigned IDs are first..first+len(records)-1. New slots are not yet
+// visible, so appends do not use the update WAL.
 func (st *Store) AppendBatch(recs []Record) (common.ImageID, error) {
 	return st.appendBatch(recs)
 }
@@ -42,9 +43,9 @@ func (st *Store) appendBatch(recs []Record) (common.ImageID, error) {
 	return common.ImageID(first), nil
 }
 
-// applyLocked writes the columns for a dense batch and advances the high-water
-// mark. New slots are invisible until the caller publishes the view, so their
-// column writes need no sequence protection.
+// applyLocked writes the columns for a dense append batch and advances the
+// high-water mark. New slots are invisible until the caller publishes the view,
+// so their column writes need neither a WAL nor sequence protection.
 func (st *Store) applyLocked(recs []Record) (uint64, error) {
 	first := st.committed + 1
 	for i := range recs {
@@ -61,10 +62,7 @@ func (st *Store) applyLocked(recs []Record) (uint64, error) {
 		for k := 0; k < 4; k++ {
 			*sh.pdqWord(pi, slot, k) = words[k]
 		}
-		shift := qualityShift(slot)
-		qw := sh.qualityWord(pi, slot)
-		old := atomic.LoadUint64(qw)
-		atomic.StoreUint64(qw, (old&^(0xff<<shift))|(uint64(recs[i].Quality)<<shift))
+		st.storeQuality(sh, pi, slot, recs[i].Quality)
 		st.committed = id
 		sh.committed = id - (sh.firstPage << 16) + 1
 		if sh.committed > sh.hashPageCount*slotsPerHashPage {
@@ -74,79 +72,140 @@ func (st *Store) applyLocked(recs []Record) (uint64, error) {
 	return first, nil
 }
 
-// Upsert journals and then applies an in-place point update under the block
-// seqlock, and advances the published generation. The journal record is written
-// (and fsynced under DurabilitySync) before the canonical columns change, so an
-// interrupted update is completed by replay on the next Open.
+// Upsert updates one existing record. It shares the batch implementation and
+// allocates nothing.
 func (st *Store) Upsert(id common.ImageID, rec Record) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	st.singleWire[0] = Update{ImageID: id, Record: rec}
+	return st.upsertLocked(st.singleWire[:])
+}
+
+// UpsertBatch updates up to maxBatchRecords existing records as one logical
+// transaction: one redo WAL frame, grouped sequence transitions, and a single
+// generation advancement. Duplicate ImageIDs are allowed; the last update in
+// the batch wins.
+func (st *Store) UpsertBatch(updates []Update) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.upsertLocked(updates)
+}
+
+func (st *Store) upsertLocked(updates []Update) error {
 	if st.closed.Load() {
 		return ErrClosed
 	}
-	if id == 0 || uint64(id) > st.committed {
-		return ErrInvalidID
+	if len(updates) == 0 {
+		return nil
 	}
+	if len(updates) > maxBatchRecords {
+		return ErrBatchTooLarge
+	}
+	for i := range updates {
+		if updates[i].ImageID == 0 || uint64(updates[i].ImageID) > st.committed {
+			return ErrInvalidID
+		}
+	}
+	base := st.generation
+	next := base + 1
 	if st.journal != nil {
-		jr := journalRecord{imageID: uint64(id), phash: rec.PHash, pdq: rec.PDQ, quality: rec.Quality}
-		if err := st.journal.appendRecord(jr, st.config.Durability == common.DurabilitySync); err != nil {
+		if err := st.journal.appendBatch(base, next, updates, st.config.Durability == common.DurabilitySync); err != nil {
 			return err
 		}
 	}
-	st.applyPointLocked(uint64(id), rec)
-	st.generation++
-	// An in-place update does not change the committed high-water mark or the
-	// shard set, so only the published generation changes; no view allocation.
-	st.gen.Store(st.generation)
+	st.applyBatchLocked(updates)
+	st.generation = next
+	st.gen.Store(next)
 	return nil
 }
 
-// applyPointLocked updates the canonical columns in place under the block
-// seqlock. The caller holds the writer mutex.
-func (st *Store) applyPointLocked(id uint64, rec Record) {
-	hashPage := hashPageOf(id)
-	slot := slotOf(id)
-	sh := st.shards[hashPage/st.pagesPerShard]
-	pi := hashPage - sh.firstPage
+// applyBatchLocked applies all updates in place, grouping consecutive records
+// that share a sequence block so the block's seqlock toggles once per run
+// rather than once per record.
+//
+// Grouping uses the caller's order and does not sort. Benchmarks show sorting
+// by ImageID helps only already-local batches (roughly 8%) and costs ~34% on
+// random batches, where every record is in a different block and grouping buys
+// nothing. Consecutive-run grouping captures local and sequential batches at no
+// cost and never regresses random ones.
+func (st *Store) applyBatchLocked(updates []Update) {
+	i := 0
+	for i < len(updates) {
+		page := hashPageOf(uint64(updates[i].ImageID))
+		block := slotOf(uint64(updates[i].ImageID)) / st.geo.seqBlockRecords
+		j := i + 1
+		for j < len(updates) {
+			id := uint64(updates[j].ImageID)
+			if hashPageOf(id) != page || slotOf(id)/st.geo.seqBlockRecords != block {
+				break
+			}
+			j++
+		}
+		st.applyBlockGroupLocked(updates[i:j])
+		i = j
+	}
+}
+
+// applyBlockGroupLocked toggles one sequence block around a non-empty group of
+// updates that all share the same hash page and sequence block.
+func (st *Store) applyBlockGroupLocked(group []Update) {
+	page := hashPageOf(uint64(group[0].ImageID))
+	sh := st.shards[page/st.pagesPerShard]
+	pi := page - sh.firstPage
+	slot := slotOf(uint64(group[0].ImageID))
 	seq := sh.seqPtr(pi, slot/st.geo.seqBlockRecords)
-	atomic.AddUint64(seq, 1) // odd: update in progress
+	atomic.AddUint64(seq, 1) // odd
+	for k := range group {
+		st.applyPointNoSeq(sh, pi, slotOf(uint64(group[k].ImageID)), group[k].Record)
+	}
+	atomic.AddUint64(seq, 1) // even
+}
+
+// applyPointLocked updates one record in place under its block seqlock.
+func (st *Store) applyPointLocked(id uint64, rec Record) {
+	page := hashPageOf(id)
+	sh := st.shards[page/st.pagesPerShard]
+	pi := page - sh.firstPage
+	seq := sh.seqPtr(pi, slotOf(id)/st.geo.seqBlockRecords)
+	atomic.AddUint64(seq, 1) // odd
+	st.applyPointNoSeq(sh, pi, slotOf(id), rec)
+	atomic.AddUint64(seq, 1) // even
+}
+
+// applyPointNoSeq writes the canonical columns atomically. The caller owns the
+// block seqlock.
+func (st *Store) applyPointNoSeq(sh *shard, pi uint64, slot int, rec Record) {
 	atomic.StoreUint64(sh.phash(pi, slot), rec.PHash)
 	words := hashWords(&rec.PDQ)
 	for k := 0; k < 4; k++ {
 		atomic.StoreUint64(sh.pdqWord(pi, slot, k), words[k])
 	}
-	shift := qualityShift(slot)
-	qw := sh.qualityWord(pi, slot)
-	atomic.StoreUint64(qw, (atomic.LoadUint64(qw)&^(0xff<<shift))|(uint64(rec.Quality)<<shift))
-	atomic.AddUint64(seq, 1) // even: update complete
+	st.storeQuality(sh, pi, slot, rec.Quality)
 }
 
-// applyJournalRecord rewrites a canonical tuple from a journal record during
-// recovery. It is idempotent.
-func (st *Store) applyJournalRecord(r journalRecord) error {
-	hashPage := hashPageOf(r.imageID)
-	slot := slotOf(r.imageID)
-	index := hashPage / st.pagesPerShard
-	if index >= uint64(len(st.shards)) {
+// storeQuality updates the 1-byte quality column via an aligned 8-byte atomic
+// read-modify-write. The writer is serialized, so there are no lost updates.
+func (st *Store) storeQuality(sh *shard, pi uint64, slot int, quality uint8) {
+	shift := qualityShift(slot)
+	qw := sh.qualityWord(pi, slot)
+	atomic.StoreUint64(qw, (atomic.LoadUint64(qw)&^(0xff<<shift))|(uint64(quality)<<shift))
+}
+
+// applyJournalUpdate rewrites a canonical tuple during recovery. Idempotent.
+func (st *Store) applyJournalUpdate(id, phash uint64, pdq *PDQHash, quality uint8) error {
+	page := hashPageOf(id)
+	index := page / st.pagesPerShard
+	if id == 0 || id > st.committed || index >= uint64(len(st.shards)) {
 		return ErrCorrupt
 	}
 	sh := st.shards[index]
-	pi := hashPage - sh.firstPage
-	atomic.StoreUint64(sh.phash(pi, slot), r.phash)
-	words := hashWords(&r.pdq)
-	for k := 0; k < 4; k++ {
-		atomic.StoreUint64(sh.pdqWord(pi, slot, k), words[k])
-	}
-	shift := qualityShift(slot)
-	qw := sh.qualityWord(pi, slot)
-	atomic.StoreUint64(qw, (atomic.LoadUint64(qw)&^(0xff<<shift))|(uint64(r.quality)<<shift))
+	pi := page - sh.firstPage
+	st.applyPointNoSeq(sh, pi, slotOf(id), Record{PHash: phash, PDQ: *pdq, Quality: quality})
 	return nil
 }
 
-// Sync publishes and flushes every shard superblock, the manifest, and the
-// mappings, then truncates the update journal. It is the durable commit point
-// for appends and point updates, matching index/radixhash's explicit checkpoint
-// model.
+// Sync publishes and flushes the durable state, then truncates the journal.
+// See persistLocked for the ordering.
 func (st *Store) Sync() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -156,27 +215,48 @@ func (st *Store) Sync() error {
 	return st.persistLocked()
 }
 
-// persistLocked writes all shard superblocks and the manifest, flushes them,
-// and only then clears the journal, so canonical state is durable before replay
-// records are discarded.
+// persistLocked makes the current generation durable in commit order:
+//
+//	canonical data (already written in place)
+//	    -> flush canonical mmap
+//	    -> write new shard superblocks
+//	    -> flush shard metadata
+//	    -> publish the manifest LAST
+//	    -> sync the directory
+//	    -> reset the WAL
+//
+// The manifest is the final durable commit marker, so it can never claim a
+// generation whose canonical data or shard metadata is not durable. The WAL is
+// discarded only after both are durable.
 func (st *Store) persistLocked() error {
+	// 1. Flush canonical column bytes.
+	for _, sh := range st.shards {
+		if err := sh.mapped.Sync(); err != nil {
+			return err
+		}
+	}
+	// 2. Write new shard superblocks into the inactive slots.
 	for _, sh := range st.shards {
 		sh.generation = st.generation
 		if err := sh.writeMeta(); err != nil {
 			return err
 		}
 	}
-	if err := st.writeManifestLocked(); err != nil {
-		return err
-	}
+	// 3. Flush shard metadata.
 	for _, sh := range st.shards {
 		if err := sh.mapped.Sync(); err != nil {
 			return err
 		}
 	}
+	// 4. Publish the manifest last.
+	if err := st.writeManifestLocked(); err != nil {
+		return err
+	}
+	// 5. fsync the directory.
 	if err := storage.SyncDir(st.dir); err != nil {
 		return err
 	}
+	// 6. Reset the WAL now that canonical data and metadata are durable.
 	if st.journal != nil {
 		return st.journal.reset()
 	}

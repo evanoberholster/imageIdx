@@ -134,6 +134,8 @@ type Store struct {
 	committed  uint64
 	generation uint64
 	journal    *journal
+	// singleWire lets Upsert share the batch path without allocating.
+	singleWire [1]Update
 }
 
 // Open opens or creates a store in dir. If dir has no manifest, an empty store
@@ -355,8 +357,10 @@ func (st *Store) resetSequences() {
 	}
 }
 
-// recoverJournal replays valid point-update records into the canonical columns
-// and repairs an interrupted tail.
+// recoverJournal replays valid point-update batches into the canonical columns,
+// validates the generation chain from the manifest generation, and repairs an
+// interrupted tail. Batches already committed by the manifest (a crash between
+// manifest publication and WAL reset) are skipped, so replay is idempotent.
 func (st *Store) recoverJournal() error {
 	path := filepath.Join(st.dir, journalFilename)
 	j, err := openJournal(path)
@@ -364,17 +368,37 @@ func (st *Store) recoverJournal() error {
 		return err
 	}
 	st.journal = j
-	end, err := replayJournal(path, func(r journalRecord) error {
-		if r.imageID == 0 || r.imageID > st.committed {
-			return fmt.Errorf("%w: journal id %d", ErrCorrupt, r.imageID)
+	expected := st.generation
+	end, err := replayJournal(path, func(base, next uint64, payload []byte) error {
+		if next <= expected {
+			return nil // already covered by the durable manifest
 		}
-		return st.applyJournalRecord(r)
+		if base != expected || next != base+1 {
+			return fmt.Errorf("%w: journal generation %d->%d, want base %d", ErrCorrupt, base, next, expected)
+		}
+		var applyErr error
+		forEachUpdate(payload, func(id, phash uint64, pdq *PDQHash, quality uint8) {
+			if applyErr != nil {
+				return
+			}
+			applyErr = st.applyJournalUpdate(id, phash, pdq, quality)
+		})
+		if applyErr != nil {
+			return applyErr
+		}
+		expected = next
+		return nil
 	})
 	if err != nil {
 		_ = j.close()
 		return err
 	}
-	return j.wal.RepairTail(end)
+	if err := j.wal.RepairTail(end); err != nil {
+		return err
+	}
+	// A validated WAL chain may advance the generation beyond the manifest.
+	st.generation = expected
+	return nil
 }
 
 func (st *Store) closeShards() error {

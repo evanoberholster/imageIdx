@@ -16,6 +16,8 @@ var (
 	ErrClosed = errors.New("simhash: store is closed")
 	// ErrCorrupt reports a corrupt manifest, shard, or superblock.
 	ErrCorrupt = errors.New("simhash: corrupt store")
+	// ErrBatchTooLarge reports an update batch above maxBatchRecords.
+	ErrBatchTooLarge = errors.New("simhash: update batch too large")
 )
 
 // PDQHash is a 256-bit PDQ perceptual hash. The persistent representation is
@@ -31,6 +33,13 @@ type Record struct {
 	PDQ PDQHash
 	// Quality is the PDQ quality byte.
 	Quality uint8
+}
+
+// Update is one point update of an existing record. Batch updates are the
+// expected workload.
+type Update struct {
+	ImageID common.ImageID
+	Record  Record
 }
 
 // PHashMatch is one pHash-similar result.

@@ -11,8 +11,8 @@
 //	slot := uint16(imageID & 0xffff)
 //	hashPage := imageID >> 16
 //
-// A hash page (the brief calls it a logical page) therefore covers exactly
-// 65,536 ImageIDs and the ImageID is recovered by hashPage<<16|slot.
+// A hash page (the brief calls it a logical page) covers exactly 65,536
+// ImageIDs; the ImageID is recovered by hashPage<<16|slot.
 //
 // # Columnar layout
 //
@@ -26,44 +26,77 @@
 // quality is fetched on demand. Columns are 64-byte aligned and addressed by
 // arithmetic (slot<<3, slot<<5, slot). Total payload is 41 bytes per image.
 //
-// # Concurrency and the update journal
+// # Concurrency
 //
 // Many lock-free readers plus one serialized writer. Searches never take a
 // mutex. Point updates are performed in place (no COW) and protected by a
 // per-block seqlock: the writer publishes an odd sequence, updates the columns,
-// then publishes the next even sequence; a reader that observes a changed or
-// odd sequence retries only the affected block. All column accesses use
-// sync/atomic, so the tuple is race-free under the race detector while the
-// sequence detects a torn 32-byte PDQ.
+// then publishes the next even sequence; a reader that observes a changed or odd
+// sequence retries only the affected block. All column accesses use sync/atomic,
+// so the tuple is race-free under the race detector while the sequence detects a
+// torn 32-byte PDQ.
 //
-// Sequence counters are ephemeral runtime synchronization, not persistent state:
-// they live in the mmap file but are meaningless across processes. Open always
-// zeroes them after recovery, so a crash that left a counter odd can never make
-// a reader spin forever.
+// A batch groups consecutive updates that share a sequence block, so the block's
+// seqlock toggles once per run rather than once per record. The batch is not
+// sorted: benchmarks show sorting helps only already-local batches and regresses
+// random ones where every record is in a different block.
 //
-// The seqlock only protects runtime readers. Crash consistency for in-place
-// updates comes from a redo journal (see journal.go): each point update writes
-// an idempotent record (ImageID + full replacement tuple + CRC) before touching
-// the canonical columns. Open replays every valid record and repairs an
-// interrupted tail. A crash before the record is written leaves the previous
-// canonical state; a crash after it is completed by replay. A permanently mixed
-// pHash/PDQ/quality tuple is therefore impossible for any update whose journal
-// record survived.
+// Search consistency is per sequence block, not whole-query snapshot isolation:
+// a long scan may observe an already-updated block and a not-yet-updated block,
+// but every individual block it reads is internally consistent.
+//
+// # Sequence counters are ephemeral
+//
+// Sequence counters live in the mmap file but are runtime synchronization state,
+// not persistent state. Open zeroes every counter after recovery, so a crash
+// that left one odd can never make a reader spin forever.
+//
+// # Appends versus updates
+//
+// AppendBatch writes new slots that are not yet visible (the committed
+// high-water mark has not advanced), so a crash cannot expose a torn record and
+// appends do not use the update WAL. Upsert and UpsertBatch overwrite already
+// visible records, so they use a redo WAL because a 32-byte PDQ store is not
+// atomic and a crash mid-update could otherwise leave a torn tuple.
+//
+// # Update WAL and generations
+//
+// The update WAL is batch-oriented: one frame carries one logical transaction
+// with a base generation, a new generation, fixed-width updates, and a CRC.
+// Recovery never exposes half a batch. Protocol:
+//
+//	validate the batch
+//	encode one complete WAL frame
+//	append it (fsync under DurabilitySync)
+//	apply all records, grouping sequence blocks
+//	advance and publish the generation once
+//
+// For 64 updates that is one WAL transaction and one generation step, not 64.
+// Replay is idempotent and validates the generation chain from the manifest
+// generation, rejecting a gap. Duplicate ImageIDs within a batch are allowed and
+// the last update wins.
 //
 // # Durability
 //
 // Runtime atomicity and crash durability are separate. Append and Upsert publish
-// in memory and are visible to readers immediately. Checkpoint/Sync write the
-// shard superblocks and manifest, flush the mappings, and only then truncate the
-// journal. This matches index/radixhash's explicit checkpoint model: Close does
-// not checkpoint, and pending writes become durable only after Sync/Checkpoint
-// (or per-operation under DurabilitySync). After a crash without a checkpoint the
-// store reopens at the last committed generation.
+// in memory and are visible to readers immediately. Checkpoint/Sync commit in
+// this order:
 //
-// The manifest is the authoritative committed generation. On Open, shard
-// superblocks with a generation newer than the manifest are ignored as
-// interrupted commits, and a shard that does not cover the committed records is
-// rejected as corrupt.
+//	canonical columns (already written in place)
+//	-> flush canonical mmap
+//	-> write new shard superblocks
+//	-> flush shard metadata
+//	-> publish the manifest LAST
+//	-> fsync the directory
+//	-> reset the WAL
+//
+// The manifest is the final durable commit marker: it can never claim a
+// generation whose canonical data or shard metadata is not durable, and the WAL
+// is discarded only after both are durable. This matches index/radixhash's
+// explicit checkpoint model: Close does not checkpoint, and pending writes
+// become durable only after Sync/Checkpoint (or per-operation under
+// DurabilitySync). A validated WAL chain replayed on Open may advance the
+// generation beyond the manifest until the next checkpoint.
 //
 // # Deletion
 //
