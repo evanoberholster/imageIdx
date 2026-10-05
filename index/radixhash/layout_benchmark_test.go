@@ -24,7 +24,7 @@ func layoutHash(i uint64) Hash {
 }
 
 // benchLayout builds n entries in one of the two root shapes and reports build
-// throughput, index bytes/entry, cumulative bytes written/entry, lookup
+// throughput, index bytes/entry, cumulative COW allocation bytes/entry, lookup
 // latency, and lookup allocations. forceRadix selects Root->Radix->Leaf;
 // otherwise a small bucket stays a direct Root->Leaf.
 func benchLayout(b *testing.B, n int, forceRadix bool) {
@@ -56,7 +56,7 @@ func benchLayout(b *testing.B, n int, forceRadix bool) {
 	build := time.Since(start)
 	meta := index.Metadata()
 	used := meta.ArenaBytes - meta.FreeBytes
-	written := index.alloc.AllocatedBytes()
+	cowAlloc := index.alloc.AllocatedBytes()
 
 	const distinct = 8192
 	queries := make([]Hash, distinct)
@@ -77,12 +77,12 @@ func benchLayout(b *testing.B, n int, forceRadix bool) {
 	b.ReportMetric(build.Seconds(), "build_s")
 	b.ReportMetric(float64(n)/build.Seconds(), "insert/s")
 	b.ReportMetric(float64(used)/float64(n), "index_B/entry")
-	b.ReportMetric(float64(written)/float64(n), "write_B/entry")
+	b.ReportMetric(float64(cowAlloc)/float64(n), "cow_alloc_B/entry")
 	b.ReportMetric(float64(meta.Depth), "depth")
 	b.ReportMetric(float64(lookup.Nanoseconds())/float64(samples), "lookup_ns/op")
 	b.ReportMetric(allocs, "lookup_allocs/op")
-	b.Logf("n=%d root-radix=%v build=%s used=%d written=%d depth=%d lookup=%.1fns allocs=%.2f",
-		n, forceRadix, build, used, written, meta.Depth,
+	b.Logf("n=%d root-radix=%v build=%s used=%d cow_alloc=%d depth=%d lookup=%.1fns allocs=%.2f",
+		n, forceRadix, build, used, cowAlloc, meta.Depth,
 		float64(lookup.Nanoseconds())/float64(samples), allocs)
 	_ = buf
 }

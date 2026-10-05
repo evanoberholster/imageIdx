@@ -106,13 +106,13 @@ func TestExhaustAndCoalesce(t *testing.T) {
 	if _, _, err := allocator.Alloc(MinBlockSize); !errors.Is(err, ErrOutOfSpace) {
 		t.Fatalf("Alloc past exhaustion = %v, want ErrOutOfSpace", err)
 	}
-	for generation, extent := range extents {
-		if err := allocator.Retire(extent.ref, extent.cap, uint64(generation)); err != nil {
+	for _, extent := range extents {
+		if err := allocator.Retire(extent.ref, extent.cap); err != nil {
 			t.Fatalf("Retire(%d): %v", extent.ref, err)
 		}
 	}
-	if err := allocator.ReclaimAll(); err != nil {
-		t.Fatalf("ReclaimAll: %v", err)
+	if err := allocator.Reclaim(); err != nil {
+		t.Fatalf("Reclaim: %v", err)
 	}
 	if free := allocator.FreeBytes(); free != initial {
 		t.Fatalf("FreeBytes after reclaim = %d, want %d", free, initial)
@@ -143,18 +143,15 @@ func TestFreeAndReuseExactRun(t *testing.T) {
 	}
 }
 
-func TestRetireReclaimRespectsGeneration(t *testing.T) {
+func TestRetireReclaim(t *testing.T) {
 	allocator := newTestAllocator(t)
 	initial := allocator.FreeBytes()
 	ref, capacity, err := allocator.Alloc(MinBlockSize)
 	if err != nil {
 		t.Fatalf("Alloc: %v", err)
 	}
-	if err := allocator.Retire(ref, capacity, 5); err != nil {
+	if err := allocator.Retire(ref, capacity); err != nil {
 		t.Fatalf("Retire: %v", err)
-	}
-	if err := allocator.Reclaim(5); err != nil {
-		t.Fatalf("Reclaim(5): %v", err)
 	}
 	if allocator.Retired() != 1 {
 		t.Fatalf("Retired = %d, want 1", allocator.Retired())
@@ -162,8 +159,8 @@ func TestRetireReclaimRespectsGeneration(t *testing.T) {
 	if allocator.RetiredBytes() != uint64(capacity) {
 		t.Fatalf("RetiredBytes = %d, want %d", allocator.RetiredBytes(), capacity)
 	}
-	if err := allocator.Reclaim(6); err != nil {
-		t.Fatalf("Reclaim(6): %v", err)
+	if err := allocator.Reclaim(); err != nil {
+		t.Fatalf("Reclaim: %v", err)
 	}
 	if allocator.Retired() != 0 {
 		t.Fatalf("Retired = %d, want 0", allocator.Retired())
@@ -175,10 +172,10 @@ func TestRetireReclaimRespectsGeneration(t *testing.T) {
 
 func TestRetireRejectsBadReference(t *testing.T) {
 	allocator := newTestAllocator(t)
-	if err := allocator.Retire(0, MinBlockSize, 1); !errors.Is(err, ErrInvalidRef) {
+	if err := allocator.Retire(0, MinBlockSize); !errors.Is(err, ErrInvalidRef) {
 		t.Fatalf("Retire(null) = %v, want ErrInvalidRef", err)
 	}
-	if err := allocator.Retire(Ref(allocator.TotalBlocks()), MinBlockSize, 1); !errors.Is(err, ErrInvalidRef) {
+	if err := allocator.Retire(Ref(allocator.TotalBlocks()), MinBlockSize); !errors.Is(err, ErrInvalidRef) {
 		t.Fatalf("Retire(out of range) = %v, want ErrInvalidRef", err)
 	}
 }
@@ -290,13 +287,13 @@ func FuzzAllocator(f *testing.F) {
 				}
 				index := int(op) % len(refs)
 				entry := refs[index]
-				if err := allocator.Retire(entry.ref, entry.size, uint64(op)); err != nil {
+				if err := allocator.Retire(entry.ref, entry.size); err != nil {
 					t.Fatalf("Retire: %v", err)
 				}
 				refs[index] = refs[len(refs)-1]
 				refs = refs[:len(refs)-1]
 			case 2:
-				if err := allocator.Reclaim(uint64(op)); err != nil {
+				if err := allocator.Reclaim(); err != nil {
 					t.Fatalf("Reclaim: %v", err)
 				}
 			case 3:
@@ -314,12 +311,12 @@ func FuzzAllocator(f *testing.F) {
 			}
 		}
 		for _, entry := range refs {
-			if err := allocator.Retire(entry.ref, entry.size, ^uint64(0)-1); err != nil {
+			if err := allocator.Retire(entry.ref, entry.size); err != nil {
 				t.Fatalf("Retire: %v", err)
 			}
 		}
-		if err := allocator.ReclaimAll(); err != nil {
-			t.Fatalf("ReclaimAll: %v", err)
+		if err := allocator.Reclaim(); err != nil {
+			t.Fatalf("Reclaim: %v", err)
 		}
 		if allocator.FreeBytes() != initial {
 			t.Fatalf("FreeBytes after drain = %d, want %d", allocator.FreeBytes(), initial)

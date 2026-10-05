@@ -25,13 +25,13 @@
 //
 // # Copy-on-write retirement
 //
-// A published generation must stay readable until every reader that pinned it
-// has finished. Retire records a replaced extent together with the last
-// generation that referenced it; the extent is not reused until Reclaim is
-// called with an oldest-reader generation greater than it. Reclaim returns the
-// extent to the free bitmap, where it coalesces implicitly with adjacent free
-// blocks. Retired extents are runtime state: after a reopen there are no
-// readers from a previous process, so ReclaimAll returns every retired extent.
+// Page lifetime is owned by the caller, not the allocator. Retire records a
+// replaced extent; it is not reused until Reclaim frees every retired extent.
+// The caller must complete its own reader grace period before Reclaim (for
+// example storage.ReaderTracker.WaitForPriorReaders), because the allocator has
+// no knowledge of readers. Reclaim returns extents to the free bitmap, where
+// they coalesce implicitly with adjacent free blocks. Retired extents are
+// runtime state and are never persisted: after a reopen they are all free.
 //
 // # Persistence
 //
@@ -84,9 +84,8 @@ type Ref uint32
 
 // retiredExtent is one replaced extent awaiting reclamation.
 type retiredExtent struct {
-	ref        Ref
-	blocks     uint32
-	generation uint64
+	ref    Ref
+	blocks uint32
 }
 
 // Allocator is a first-fit, 512-byte-granular allocator over a fixed-size byte
@@ -100,7 +99,7 @@ type Allocator struct {
 	cursor      uint64
 	retired     []retiredExtent
 	// allocated accumulates the capacity of every successful Alloc, so callers
-	// can measure write amplification independently of reclamation.
+	// can measure copy-on-write allocation volume independently of reclamation.
 	allocated uint64
 }
 
@@ -167,8 +166,8 @@ func (a *Allocator) Alloc(size uint32) (Ref, uint32, error) {
 }
 
 // AllocatedBytes returns the cumulative capacity handed out by Alloc since the
-// allocator was created or decoded. It is a monotonic write-amplification
-// counter and is not persisted.
+// allocator was created or decoded. It measures copy-on-write allocation volume,
+// not physical disk writes, and is not persisted.
 func (a *Allocator) AllocatedBytes() uint64 {
 	if a == nil {
 		return 0
@@ -213,48 +212,36 @@ func (a *Allocator) Reserve(ref Ref, size uint32) error {
 	return nil
 }
 
-// Retire records the last generation that referenced the extent at ref. The
-// extent is not reused until a later Reclaim proves no reader can still
-// reference that generation. size must be the capacity returned by Alloc.
-func (a *Allocator) Retire(ref Ref, size uint32, generation uint64) error {
+// Retire records the extent at ref as replaced. size must be the capacity
+// returned by Alloc. The extent is not reused until Reclaim runs, and the
+// caller must complete its reader grace period before calling Reclaim.
+func (a *Allocator) Retire(ref Ref, size uint32) error {
 	blocks, err := a.validate(ref, size)
 	if err != nil {
 		return err
 	}
-	a.retired = append(a.retired, retiredExtent{ref: ref, blocks: blocks, generation: generation})
+	a.retired = append(a.retired, retiredExtent{ref: ref, blocks: blocks})
 	return nil
 }
 
-// Reclaim reuses every retired extent whose retired generation is strictly
-// older than oldestReaderGeneration.
-func (a *Allocator) Reclaim(oldestReaderGeneration uint64) error {
+// Reclaim frees every retired extent. The allocator has no knowledge of
+// readers, so the caller must have completed its reader grace period (for
+// example storage.ReaderTracker.WaitForPriorReaders) before calling Reclaim.
+func (a *Allocator) Reclaim() error {
 	if a == nil {
 		return nil
 	}
-	kept := a.retired[:0]
 	for _, extent := range a.retired {
-		if extent.generation < oldestReaderGeneration {
-			ref := uint64(extent.ref)
-			a.setRun(ref, uint64(extent.blocks))
-			a.freeCount += uint64(extent.blocks)
-			if ref < a.cursor {
-				a.cursor = ref
-			}
-			continue
+		ref := uint64(extent.ref)
+		a.setRun(ref, uint64(extent.blocks))
+		a.freeCount += uint64(extent.blocks)
+		if ref < a.cursor {
+			a.cursor = ref
 		}
-		kept = append(kept, extent)
 	}
-	for i := len(kept); i < len(a.retired); i++ {
-		a.retired[i] = retiredExtent{}
-	}
-	a.retired = kept
+	a.retired = a.retired[:0]
 	return nil
 }
-
-// ReclaimAll reuses every retired extent. It is valid when no reader from any
-// previous generation can still be active, such as immediately after Open or
-// before Close.
-func (a *Allocator) ReclaimAll() error { return a.Reclaim(^uint64(0)) }
 
 // Retired returns the number of extents awaiting reclamation.
 func (a *Allocator) Retired() int { return len(a.retired) }

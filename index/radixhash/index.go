@@ -235,12 +235,12 @@ func (i *Index) Apply(entries []Entry) error {
 	// Retirements happen after publication under the writer lock; the extents
 	// remain allocated until a later Reclaim proves no reader needs them.
 	for _, replaced := range batch.retirements {
-		_ = i.alloc.Retire(replaced.ref, replaced.bytes, current.generation)
+		_ = i.alloc.Retire(replaced.ref, replaced.bytes)
 	}
 	// Optional prompt reclamation bounds dead space during sustained writes.
 	if i.config.AutoReclaimBytes > 0 && i.alloc.RetiredBytes() >= i.config.AutoReclaimBytes {
 		i.tracker.WaitForPriorReaders()
-		_ = i.alloc.ReclaimAll()
+		_ = i.alloc.Reclaim()
 	}
 	return nil
 }
@@ -511,9 +511,12 @@ func (i *Index) Contains(h Hash) bool {
 
 // withView runs fn while pinning the current published view so that Reclaim,
 // Compact, and Close cannot reuse or unmap an arena the reader may still touch.
-// The closed flag is set by Close before it waits for prior readers, so a
-// reader that observes closed skips the view and never faults on a released
-// arena.
+//
+// The order is strict: Acquire -> check closed -> load/use the view -> Release.
+// Checking closed before Acquire is unsafe: the reader could observe false,
+// Close could then set the flag, complete its grace period, and unmap before
+// the Acquire registers the reader, letting the reader touch released memory.
+// Acquiring first makes Close's WaitForPriorReaders wait for this reader.
 func (i *Index) withView(fn func(*indexView)) {
 	token := i.tracker.Acquire()
 	if !i.closed.Load() {
@@ -554,7 +557,7 @@ func (i *Index) Reclaim() error {
 		return ErrClosed
 	}
 	i.tracker.WaitForPriorReaders()
-	return i.alloc.ReclaimAll()
+	return i.alloc.Reclaim()
 }
 
 // Compact rebuilds the tree into a fresh, tightly packed arena and atomically
@@ -574,6 +577,9 @@ func (i *Index) Compact() error {
 	if current.entries == 0 {
 		return nil
 	}
+	// TODO: compaction currently materializes the whole index as []Entry.
+	// Stream bounded entry batches from the old tree directly into the new
+	// arena so peak compaction memory is independent of index size.
 	entries := make([]Entry, 0, current.entries)
 	i.collectEntries(current, &entries)
 
@@ -691,8 +697,9 @@ func (i *Index) Sync() error {
 // Close marks the index closed, waits for in-flight readers to drain, then
 // reclaims retired extents and unmaps any file-backed arena. It follows the
 // arena lifetime invariant: prevent new operations -> wait for prior readers ->
-// reclaim -> release. The closed flag is set before the grace period so readers
-// that begin after Close returns never touch the released arena.
+// reclaim -> release. The closed flag is set before the grace period, and
+// readers Acquire before checking it; checking closed before Acquire would let
+// a reader register after the grace period and touch the released arena.
 func (i *Index) Close() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -701,7 +708,7 @@ func (i *Index) Close() error {
 	}
 	i.closed.Store(true)
 	i.tracker.WaitForPriorReaders()
-	err := i.alloc.ReclaimAll()
+	err := i.alloc.Reclaim()
 	if i.release != nil {
 		if releaseErr := i.release(); err == nil {
 			err = releaseErr

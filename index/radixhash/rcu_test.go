@@ -1,7 +1,9 @@
 package radixhash
 
 import (
+	"fmt"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -230,5 +232,49 @@ func TestDuplicatesAcrossPromotion(t *testing.T) {
 	}
 	if got := index.Count(h); got != 5 {
 		t.Fatalf("Count after duplicate re-add = %d, want 5", got)
+	}
+}
+
+// TestLookupCloseStress repeatedly races mmap Lookup against Close. Close
+// unmaps the arena, so a reader that registered after the grace period would
+// fault; the strict Acquire -> check closed -> use -> Release order prevents
+// that. Run with -race.
+func TestLookupCloseStress(t *testing.T) {
+	dir := t.TempDir()
+	for iter := 0; iter < 25; iter++ {
+		path := filepath.Join(dir, fmt.Sprintf("idx-%d.bin", iter))
+		index, err := NewMmap(path, 2<<20, Config{})
+		if err != nil {
+			t.Fatalf("NewMmap: %v", err)
+		}
+		const n = 16
+		hashes := make([]Hash, n)
+		entries := make([]Entry, n)
+		for i := 0; i < n; i++ {
+			hashes[i] = hashWithPrefix([]byte{byte(i), byte(iter)}, uint64(i)+1)
+			entries[i] = Entry{Hash: hashes[i], ImageID: ImageID(i + 1)}
+		}
+		if err := index.Apply(entries); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+
+		var readers sync.WaitGroup
+		for r := 0; r < 4; r++ {
+			readers.Add(1)
+			go func() {
+				defer readers.Done()
+				var dst []ImageID
+				for j := 0; j < 500; j++ {
+					for _, h := range hashes {
+						dst = index.Lookup(dst[:0], h)
+					}
+				}
+			}()
+		}
+		runtime.Gosched()
+		if err := index.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		readers.Wait()
 	}
 }
