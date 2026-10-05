@@ -87,7 +87,7 @@ func (i *Index) load() error {
 			continue
 		}
 		root := arena[rootOffset(candidate) : rootOffset(candidate)+uint64(radixNodeBytes)]
-		sb, ok := decodeSuperblock(arena[offset:offset+uint64(superblockBytes)], root)
+		sb, ok := decodeRadixSuperblock(arena[offset:offset+uint64(superblockBytes)], root)
 		if !ok {
 			continue
 		}
@@ -203,7 +203,7 @@ func (i *Index) writeSuperblock(slot int) error {
 	if offset+uint64(superblockBytes) > uint64(len(arena)) {
 		return fmt.Errorf("%w: superblock outside arena", ErrCorrupt)
 	}
-	encodeSuperblock(arena[offset:offset+uint64(superblockBytes)], superblock{
+	encodeRadixSuperblock(arena[offset:offset+uint64(superblockBytes)], superblock{
 		generation:  view.generation,
 		entries:     view.entries,
 		rootBuckets: view.rootBuckets,
