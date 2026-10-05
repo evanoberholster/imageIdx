@@ -8,10 +8,39 @@ import (
 	common "github.com/evanoberholster/imageIdx/common"
 )
 
+// SIMD note: the scalar scans below use sync/atomic loads so they are correct
+// against concurrent in-place point updates. A future AVX2/AVX-512/NEON kernel
+// cannot use plain wide loads for the same guarantee, because a 32-byte PDQ
+// store is not atomic. Before enabling SIMD, one of the following must be
+// proven and benchmarked: (a) SIMD reads are combined with the block sequence
+// validation and shown safe with a concurrent writer, (b) SIMD scans run in a
+// quiescent/update epoch with no concurrent writer, or (c) the scanned memory
+// is immutable (append-only). The scalar concurrent-safe path is the reference
+// implementation and must not be replaced merely for benchmark numbers.
+
+// seqSpinLimit bounds a reader's tight retry before it yields. The writer's
+// critical section is a handful of atomic stores, so a short spin usually
+// succeeds immediately.
+const seqSpinLimit = 64
+
+// waitSeqEven returns the current sequence once it is even, spinning briefly
+// and yielding only if the writer stays in its critical section.
+func waitSeqEven(seq *uint64) uint64 {
+	for spin := 0; ; spin++ {
+		v := atomic.LoadUint64(seq)
+		if v&1 == 0 {
+			return v
+		}
+		if spin >= seqSpinLimit {
+			runtime.Gosched()
+		}
+	}
+}
+
 // In the middle of the PDQ distance range the first-word reject branch is close
-// to 50/50 and mispredicts badly, so a branchless full four-word distance is
-// faster. Early rejection wins when the threshold is far below or far above the
-// per-word mean.
+// to 50/50 and mispredicts badly, so a two-word prefix (still branchy but
+// predictable) is faster. Early rejection wins when the threshold is far below
+// or far above the per-word mean.
 const (
 	pdqEarlyRejectMax = 20
 	pdqEarlyRejectMin = 40
@@ -52,13 +81,13 @@ func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int) []PH
 	if last == 0 {
 		return dst
 	}
-	lastPage := pageOf(last)
+	lastPage := hashPageOf(last)
 	lastSlot := slotOf(last)
 	blockRecords := v.geo.seqBlockRecords
-	for page := uint64(0); page <= lastPage; page++ {
-		sh, pi := v.shardForPage(page)
-		maxSlot := slotsPerPage - 1
-		if page == lastPage {
+	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
+		sh, pi := v.shardForHashPage(hashPage)
+		maxSlot := slotsPerHashPage - 1
+		if hashPage == lastPage {
 			maxSlot = lastSlot
 		}
 		for s0 := 0; s0 <= maxSlot; s0 += blockRecords {
@@ -69,13 +98,9 @@ func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int) []PH
 			seq := sh.seqPtr(pi, s0/blockRecords)
 			mark := len(dst)
 			for {
-				a := atomic.LoadUint64(seq)
-				if a&1 == 1 {
-					runtime.Gosched()
-					continue
-				}
+				a := waitSeqEven(seq)
 				for slot := s0; slot <= s1; slot++ {
-					id := idOf(page, slot)
+					id := imageIDFromHashPage(hashPage, slot)
 					if id == 0 {
 						continue
 					}
@@ -99,16 +124,16 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16) []P
 	if last == 0 {
 		return dst
 	}
-	lastPage := pageOf(last)
+	lastPage := hashPageOf(last)
 	lastSlot := slotOf(last)
 	blockRecords := v.geo.seqBlockRecords
 	limit := int(maxDistance)
 	early := useEarlyReject(limit)
 	qw := hashWords(query)
-	for page := uint64(0); page <= lastPage; page++ {
-		sh, pi := v.shardForPage(page)
-		maxSlot := slotsPerPage - 1
-		if page == lastPage {
+	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
+		sh, pi := v.shardForHashPage(hashPage)
+		maxSlot := slotsPerHashPage - 1
+		if hashPage == lastPage {
 			maxSlot = lastSlot
 		}
 		for s0 := 0; s0 <= maxSlot; s0 += blockRecords {
@@ -119,13 +144,9 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16) []P
 			seq := sh.seqPtr(pi, s0/blockRecords)
 			mark := len(dst)
 			for {
-				a := atomic.LoadUint64(seq)
-				if a&1 == 1 {
-					runtime.Gosched()
-					continue
-				}
+				a := waitSeqEven(seq)
 				for slot := s0; slot <= s1; slot++ {
-					id := idOf(page, slot)
+					id := imageIDFromHashPage(hashPage, slot)
 					if id == 0 {
 						continue
 					}
@@ -177,16 +198,16 @@ func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash i
 	if last == 0 {
 		return dst
 	}
-	lastPage := pageOf(last)
+	lastPage := hashPageOf(last)
 	lastSlot := slotOf(last)
 	blockRecords := v.geo.seqBlockRecords
 	limit := int(maxPDQ)
 	early := useEarlyReject(limit)
 	qw := hashWords(pdqQuery)
-	for page := uint64(0); page <= lastPage; page++ {
-		sh, pi := v.shardForPage(page)
-		maxSlot := slotsPerPage - 1
-		if page == lastPage {
+	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
+		sh, pi := v.shardForHashPage(hashPage)
+		maxSlot := slotsPerHashPage - 1
+		if hashPage == lastPage {
 			maxSlot = lastSlot
 		}
 		for s0 := 0; s0 <= maxSlot; s0 += blockRecords {
@@ -197,13 +218,9 @@ func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash i
 			seq := sh.seqPtr(pi, s0/blockRecords)
 			mark := len(dst)
 			for {
-				a := atomic.LoadUint64(seq)
-				if a&1 == 1 {
-					runtime.Gosched()
-					continue
-				}
+				a := waitSeqEven(seq)
 				for slot := s0; slot <= s1; slot++ {
-					id := idOf(page, slot)
+					id := imageIDFromHashPage(hashPage, slot)
 					if id == 0 {
 						continue
 					}
@@ -240,7 +257,7 @@ func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash i
 }
 
 // pdqWithin computes the exact PDQ distance, using early rejection or the
-// branchless full distance. ok is false when the distance exceeds limit.
+// two-word-prefix path. ok is false when the distance exceeds limit.
 func pdqWithin(sh *shard, pi uint64, slot int, qw *[4]uint64, limit int, early bool) (uint16, bool) {
 	if early {
 		return pdqDistanceAt(sh, pi, slot, qw, limit)
@@ -285,16 +302,12 @@ func (st *Store) Quality(id common.ImageID) (uint8, bool) {
 	if id == 0 || uint64(id) > v.committed {
 		return 0, false
 	}
-	page := pageOf(uint64(id))
+	hashPage := hashPageOf(uint64(id))
 	slot := slotOf(uint64(id))
-	sh, pi := v.shardForPage(page)
+	sh, pi := v.shardForHashPage(hashPage)
 	seq := sh.seqPtr(pi, slot/v.geo.seqBlockRecords)
 	for {
-		a := atomic.LoadUint64(seq)
-		if a&1 == 1 {
-			runtime.Gosched()
-			continue
-		}
+		a := waitSeqEven(seq)
 		q := uint8(atomic.LoadUint64(sh.qualityWord(pi, slot)) >> qualityShift(slot))
 		if atomic.LoadUint64(seq) == a {
 			return q, true

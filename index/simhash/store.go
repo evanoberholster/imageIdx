@@ -21,8 +21,10 @@ const (
 	manifestFilename        = "manifest"
 )
 
-// manifest is the store-level metadata: the format geometry and the committed
-// high-water mark. Shard files carry per-shard metadata for validation.
+// manifest is the store-level metadata and the authoritative committed
+// generation. Shard superblocks are validated against it on open; a shard
+// generation newer than the manifest is an interrupted commit and is not
+// selected.
 type manifest struct {
 	pagesPerShard   uint64
 	seqBlockRecords uint64
@@ -85,8 +87,17 @@ func readManifest(dir string) (manifest, bool, error) {
 	return m, true, nil
 }
 
+// shardFileSize returns header + pages*hashPageStride with an overflow check.
+func shardFileSize(pagesPerShard uint64, geo geometry) (uint64, bool) {
+	if geo.hashPageStride != 0 && pagesPerShard > (^uint64(0)-headerBytes)/geo.hashPageStride {
+		return 0, false
+	}
+	return uint64(headerBytes) + pagesPerShard*geo.hashPageStride, true
+}
+
 // view is one immutable, atomically published reader view: the committed
-// high-water mark, the format geometry, and the mapped shards.
+// high-water mark, the format geometry, and the mapped shards. Sequence
+// counters are runtime-only and are reset on open.
 type view struct {
 	generation    uint64
 	committed     uint64
@@ -95,9 +106,9 @@ type view struct {
 	shards        []*shard
 }
 
-func (v *view) shardForPage(page uint64) (*shard, uint64) {
-	sh := v.shards[page/v.pagesPerShard]
-	return sh, page - sh.firstPage
+func (v *view) shardForHashPage(hashPage uint64) (*shard, uint64) {
+	sh := v.shards[hashPage/v.pagesPerShard]
+	return sh, hashPage - sh.firstPage
 }
 
 // Store is a sharded, mmap-backed similarity store with lock-free readers and
@@ -118,21 +129,28 @@ type Store struct {
 	shards     []*shard
 	committed  uint64
 	generation uint64
+	journal    *journal
 }
 
 // Open opens or creates a store in dir. If dir has no manifest, an empty store
-// is created with the geometry selected by config.
+// is created with the geometry selected by config. It restores the committed
+// generation from the manifest, validates every shard against it, resets the
+// runtime sequence counters, then replays the update journal.
 func Open(dir string, config Config) (*Store, error) {
 	cfg, err := config.withDefaults()
 	if err != nil {
 		return nil, err
 	}
 	geo := newGeometry(cfg.SeqBlockRecords)
-	if cfg.MaxShardBytes < headerBytes+geo.pageStride {
+	size, ok := shardFileSize(1, geo)
+	if !ok || cfg.MaxShardBytes < size {
 		return nil, ErrInvalidConfig
 	}
-	pagesPerShard := (cfg.MaxShardBytes - headerBytes) / geo.pageStride
+	pagesPerShard := (cfg.MaxShardBytes - headerBytes) / geo.hashPageStride
 	if pagesPerShard == 0 {
+		return nil, ErrInvalidConfig
+	}
+	if size, ok := shardFileSize(pagesPerShard, geo); !ok || size > cfg.MaxShardBytes {
 		return nil, ErrInvalidConfig
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -164,27 +182,56 @@ func Open(dir string, config Config) (*Store, error) {
 			return nil, err
 		}
 	}
+	st.resetSequences()
+	if err := st.recoverJournal(); err != nil {
+		_ = st.closeShards()
+		return nil, err
+	}
 	st.publishLocked()
 	return st, nil
 }
 
-// openShard maps an existing shard file and recovers its newest superblock.
+// requiredShardCommitted is the number of committed records shard index must
+// contain given the manifest high-water mark.
+func (st *Store) requiredShardCommitted(index uint64) uint64 {
+	firstID := index * st.pagesPerShard * slotsPerHashPage
+	if firstID >= st.committed {
+		return 0
+	}
+	capacity := st.pagesPerShard * slotsPerHashPage
+	lastID := firstID + capacity - 1
+	if lastID > st.committed {
+		lastID = st.committed
+	}
+	low := firstID
+	if low < 1 {
+		low = 1
+	}
+	if lastID < low {
+		return 0
+	}
+	return lastID - low + 1
+}
+
+// openShard maps an existing shard file and selects the newest superblock whose
+// generation was committed by the manifest (generation <= committedGeneration).
+// It rejects a shard that does not cover the committed records.
 func (st *Store) openShard(index uint64) (*shard, error) {
 	mapped, err := storage.OpenMapped(shardPath(st.dir, index))
 	if err != nil {
 		return nil, err
 	}
 	sh := &shard{
-		index:     index,
-		mapped:    mapped,
-		arena:     mapped.Bytes(),
-		pageCount: st.pagesPerShard,
-		stride:    st.geo.pageStride,
+		index:         index,
+		mapped:        mapped,
+		arena:         mapped.Bytes(),
+		hashPageCount: st.pagesPerShard,
+		stride:        st.geo.hashPageStride,
 	}
-	expected := uint64(headerBytes) + st.pagesPerShard*st.geo.pageStride
-	if uint64(len(sh.arena)) < expected {
+	expected, ok := shardFileSize(st.pagesPerShard, st.geo)
+	if !ok || uint64(len(sh.arena)) < expected {
 		_ = mapped.Close()
-		return nil, fmt.Errorf("%w: shard %d too small", ErrCorrupt, index)
+		return nil, fmt.Errorf("%w: shard %d size", ErrCorrupt, index)
 	}
 	var (
 		best shardMeta
@@ -196,17 +243,23 @@ func (st *Store) openShard(index uint64) (*shard, error) {
 		if !ok {
 			continue
 		}
+		if m.generation > st.generation {
+			continue // never select metadata the manifest did not commit
+		}
+		if m.index != index || m.firstPage != index*st.pagesPerShard || m.hashPageCount != st.pagesPerShard {
+			continue
+		}
 		if slot == -1 || m.generation > best.generation {
 			best, slot = m, cand
 		}
 	}
 	if slot == -1 {
 		_ = mapped.Close()
-		return nil, fmt.Errorf("%w: no valid shard superblock", ErrCorrupt)
+		return nil, fmt.Errorf("%w: no committed shard superblock for shard %d", ErrCorrupt, index)
 	}
-	if best.index != index || best.firstPage != index*st.pagesPerShard || best.pageCount != st.pagesPerShard {
+	if best.committed < st.requiredShardCommitted(index) {
 		_ = mapped.Close()
-		return nil, fmt.Errorf("%w: shard %d metadata mismatch", ErrCorrupt, index)
+		return nil, fmt.Errorf("%w: shard %d missing committed records", ErrCorrupt, index)
 	}
 	sh.slot = slot
 	sh.firstPage = best.firstPage
@@ -219,19 +272,22 @@ func (st *Store) openShard(index uint64) (*shard, error) {
 // superblock.
 func (st *Store) createShardLocked(index uint64) (*shard, error) {
 	firstPage := index * st.pagesPerShard
-	size := uint64(headerBytes) + st.pagesPerShard*st.geo.pageStride
+	size, ok := shardFileSize(st.pagesPerShard, st.geo)
+	if !ok {
+		return nil, ErrInvalidConfig
+	}
 	mapped, err := storage.CreateMapped(shardPath(st.dir, index), int64(size))
 	if err != nil {
 		return nil, err
 	}
 	sh := &shard{
-		index:     index,
-		mapped:    mapped,
-		arena:     mapped.Bytes(),
-		firstPage: firstPage,
-		pageCount: st.pagesPerShard,
-		stride:    st.geo.pageStride,
-		slot:      1,
+		index:         index,
+		mapped:        mapped,
+		arena:         mapped.Bytes(),
+		firstPage:     firstPage,
+		hashPageCount: st.pagesPerShard,
+		stride:        st.geo.hashPageStride,
+		slot:          1,
 	}
 	if err := sh.writeMeta(); err != nil {
 		_ = mapped.Close()
@@ -240,9 +296,10 @@ func (st *Store) createShardLocked(index uint64) (*shard, error) {
 	return sh, nil
 }
 
-// ensureShardLocked returns the shard covering page, creating shards as needed.
-func (st *Store) ensureShardLocked(page uint64) (*shard, error) {
-	index := page / st.pagesPerShard
+// ensureShardLocked returns the shard covering hashPage, creating shards as
+// needed.
+func (st *Store) ensureShardLocked(hashPage uint64) (*shard, error) {
+	index := hashPage / st.pagesPerShard
 	for index >= uint64(len(st.shards)) {
 		sh, err := st.createShardLocked(uint64(len(st.shards)))
 		if err != nil {
@@ -274,6 +331,37 @@ func (st *Store) publishLocked() {
 	})
 }
 
+// resetSequences zeroes every sequence counter. Sequence counters are runtime
+// synchronization, not persistent state: after a crash that left a counter odd,
+// open must reset it to even so readers never spin forever.
+func (st *Store) resetSequences() {
+	for _, sh := range st.shards {
+		sh.resetSequences(st.geo.seqBlocksPerPage)
+	}
+}
+
+// recoverJournal replays valid point-update records into the canonical columns
+// and repairs an interrupted tail.
+func (st *Store) recoverJournal() error {
+	path := filepath.Join(st.dir, journalFilename)
+	j, err := openJournal(path)
+	if err != nil {
+		return err
+	}
+	st.journal = j
+	end, err := replayJournal(path, func(r journalRecord) error {
+		if r.imageID == 0 || r.imageID > st.committed {
+			return fmt.Errorf("%w: journal id %d", ErrCorrupt, r.imageID)
+		}
+		return st.applyJournalRecord(r)
+	})
+	if err != nil {
+		_ = j.close()
+		return err
+	}
+	return j.wal.RepairTail(end)
+}
+
 func (st *Store) closeShards() error {
 	var err error
 	for _, sh := range st.shards {
@@ -287,23 +375,25 @@ func (st *Store) closeShards() error {
 // Len returns the committed high-water mark: valid ImageIDs are 1..Len.
 func (st *Store) Len() uint64 { return st.view.Load().committed }
 
-// Generation returns the current published generation.
+// Generation returns the current published logical store version.
 func (st *Store) Generation() uint64 { return st.view.Load().generation }
 
-// PagesPerShard returns the configured logical pages per shard file.
+// PagesPerShard returns the configured hash pages per shard file.
 func (st *Store) PagesPerShard() uint64 { return st.pagesPerShard }
 
 // ShardCount returns the number of mapped shard files.
 func (st *Store) ShardCount() int { return len(st.view.Load().shards) }
 
-// Checkpoint persists every shard superblock and the manifest and flushes them.
-// It is the durable commit point for appends and point updates.
+// Checkpoint persists every shard superblock and the manifest, flushes the
+// mappings, and truncates the update journal. It is the durable commit point
+// for appends and point updates.
 func (st *Store) Checkpoint() error {
 	return st.Sync()
 }
 
-// Close waits for in-flight readers and unmaps every shard. It is safe to call
-// more than once.
+// Close waits for in-flight readers and unmaps every shard and the journal. It
+// does not checkpoint: like index/radixhash, explicit Sync/Checkpoint is
+// required to make pending writes durable. It is safe to call more than once.
 func (st *Store) Close() error {
 	if !st.closed.CompareAndSwap(false, true) {
 		return nil
@@ -311,7 +401,16 @@ func (st *Store) Close() error {
 	st.tracker.WaitForPriorReaders()
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.closeShards()
+	var err error
+	if st.journal != nil {
+		if e := st.journal.close(); e != nil {
+			err = e
+		}
+	}
+	if e := st.closeShards(); e != nil && err == nil {
+		err = e
+	}
+	return err
 }
 
 // Get returns the canonical record for id, validated by the block sequence.
@@ -322,15 +421,12 @@ func (st *Store) Get(id common.ImageID) (Record, bool) {
 	if id == 0 || uint64(id) > v.committed {
 		return Record{}, false
 	}
-	page := pageOf(uint64(id))
+	hashPage := hashPageOf(uint64(id))
 	slot := slotOf(uint64(id))
-	sh, pi := v.shardForPage(page)
+	sh, pi := v.shardForHashPage(hashPage)
 	seq := sh.seqPtr(pi, slot/v.geo.seqBlockRecords)
 	for {
-		a := atomic.LoadUint64(seq)
-		if a&1 == 1 {
-			continue
-		}
+		a := waitSeqEven(seq)
 		var rec Record
 		rec.PHash = atomic.LoadUint64(sh.phash(pi, slot))
 		words := hashWords(&rec.PDQ)

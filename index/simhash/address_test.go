@@ -17,14 +17,14 @@ func TestAddressMapping(t *testing.T) {
 		{0x1234567, 0x123, 0x4567},
 	}
 	for _, c := range cases {
-		if got := pageOf(c.id); got != c.page {
-			t.Fatalf("pageOf(%#x) = %#x, want %#x", c.id, got, c.page)
+		if got := hashPageOf(c.id); got != c.page {
+			t.Fatalf("hashPageOf(%#x) = %#x, want %#x", c.id, got, c.page)
 		}
 		if got := slotOf(c.id); got != c.slot {
 			t.Fatalf("slotOf(%#x) = %#x, want %#x", c.id, got, c.slot)
 		}
-		if got := idOf(c.page, c.slot); got != c.id {
-			t.Fatalf("idOf(%#x,%#x) = %#x, want %#x", c.page, c.slot, got, c.id)
+		if got := imageIDFromHashPage(c.page, c.slot); got != c.id {
+			t.Fatalf("imageIDFromHashPage(%#x,%#x) = %#x, want %#x", c.page, c.slot, got, c.id)
 		}
 	}
 }

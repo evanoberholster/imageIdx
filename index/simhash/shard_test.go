@@ -11,7 +11,7 @@ func TestShardBoundary(t *testing.T) {
 	}
 	defer st.Close()
 
-	n := 2*slotsPerPage + 5
+	n := 2*slotsPerHashPage + 5
 	records := randRecords(21, n)
 	if _, err := st.AppendBatch(records); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
@@ -22,7 +22,7 @@ func TestShardBoundary(t *testing.T) {
 	if st.ShardCount() != 3 {
 		t.Fatalf("ShardCount = %d, want 3", st.ShardCount())
 	}
-	for _, id := range []uint64{1, slotsPerPage - 1, slotsPerPage, slotsPerPage + 1, 2 * slotsPerPage, uint64(n)} {
+	for _, id := range []uint64{1, slotsPerHashPage - 1, slotsPerHashPage, slotsPerHashPage + 1, 2 * slotsPerHashPage, uint64(n)} {
 		got, ok := st.Get(id)
 		if !ok || got != records[id-1] {
 			t.Fatalf("Get(%d) = %+v, want %+v", id, got, records[id-1])
@@ -48,7 +48,7 @@ func TestShardBoundaryReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	n := slotsPerPage + 7
+	n := slotsPerHashPage + 7
 	records := randRecords(22, n)
 	if _, err := st.AppendBatch(records); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
@@ -73,6 +73,43 @@ func TestShardBoundaryReopen(t *testing.T) {
 	}
 }
 
+func TestShardGeometryAllSeqBlockSizes(t *testing.T) {
+	for _, seq := range []int{256, 512, 1024, 2048, 4096} {
+		geo := newGeometry(seq)
+		pps := (defaultMaxShardBytes - headerBytes) / geo.hashPageStride
+		if pps == 0 {
+			t.Fatalf("seq %d: pages per shard is zero", seq)
+		}
+		size, ok := shardFileSize(pps, geo)
+		if !ok || size > defaultMaxShardBytes {
+			t.Fatalf("seq %d: shard size %d exceeds %d", seq, size, defaultMaxShardBytes)
+		}
+	}
+}
+
+func TestShardGeometryRespectsConfiguredMax(t *testing.T) {
+	for _, seq := range []int{256, 512, 1024, 2048, 4096} {
+		geo := newGeometry(seq)
+		for _, max := range []uint64{minimumShardBytes, 8 << 20, 64 << 20, 1 << 30, defaultMaxShardBytes} {
+			if max < uint64(headerBytes)+geo.hashPageStride {
+				continue
+			}
+			pps := (max - headerBytes) / geo.hashPageStride
+			size, ok := shardFileSize(pps, geo)
+			if !ok || size > max {
+				t.Fatalf("seq %d max %d: shard size %d invalid", seq, max, size)
+			}
+		}
+	}
+}
+
+func TestShardFileSizeOverflowRejected(t *testing.T) {
+	geo := newGeometry(defaultSeqBlockRecords)
+	if _, ok := shardFileSize(^uint64(0), geo); ok {
+		t.Fatal("overflowing shard size was accepted")
+	}
+}
+
 func TestMaxShardSize(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{} // default 4 GiB
@@ -82,7 +119,7 @@ func TestMaxShardSize(t *testing.T) {
 	}
 	defer st.Close()
 	geo := newGeometry(defaultSeqBlockRecords)
-	size := uint64(headerBytes) + st.PagesPerShard()*geo.pageStride
+	size := uint64(headerBytes) + st.PagesPerShard()*geo.hashPageStride
 	if size > defaultMaxShardBytes {
 		t.Fatalf("shard size %d exceeds max %d", size, defaultMaxShardBytes)
 	}

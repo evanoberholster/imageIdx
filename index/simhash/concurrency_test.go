@@ -129,7 +129,7 @@ func TestSequenceOddEven(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 	v := st.view.Load()
-	sh, pi := v.shardForPage(0)
+	sh, pi := v.shardForHashPage(0)
 	seq := atomic.LoadUint64(sh.seqPtr(pi, 0))
 	if seq == 0 {
 		t.Fatal("sequence not advanced by an update")

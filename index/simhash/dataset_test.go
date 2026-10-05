@@ -11,7 +11,7 @@ import (
 // shard for the given sequence block size.
 func shardBytes(pages int, seqBlockRecords int) uint64 {
 	g := newGeometry(seqBlockRecords)
-	return uint64(headerBytes) + uint64(pages)*g.pageStride
+	return uint64(headerBytes) + uint64(pages)*g.hashPageStride
 }
 
 func openStore(t testing.TB, cfg Config) *Store {
