@@ -55,6 +55,13 @@ type Index struct {
 	// touched under mu, grows once, and is reused so a small batch allocates
 	// nothing to group records by root bucket.
 	records []slot
+	// partition holds the reusable per-level 256-way partition buffers. Like
+	// records it is writer-owned and only touched under mu.
+	partition partitionScratch
+	// workScratch holds per-worker partition buffers for the large-batch
+	// fan-out, reused across Apply calls. It is writer-owned and only touched
+	// under mu.
+	workScratch []partitionScratch
 }
 
 // New allocates a heap-backed arena of approximately arenaBytes and returns an
@@ -250,12 +257,12 @@ func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, ne
 		starts[key] = sum
 		sum += counts[key]
 	}
-	rebuild := func(key int) error {
+	rebuild := func(key int, scratch *partitionScratch) error {
 		n := counts[key]
 		if n == 0 {
 			return nil
 		}
-		updated, err := t.rebuildChild(oldRoot[key], 1, records[starts[key]:starts[key]+n])
+		updated, err := t.rebuildChild(oldRoot[key], 1, records[starts[key]:starts[key]+n], scratch)
 		if err != nil {
 			return err
 		}
@@ -264,8 +271,9 @@ func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, ne
 	}
 
 	if !parallel {
+		scratch := &t.index.partition
 		for key := 0; key < radixFanout; key++ {
-			if err := rebuild(key); err != nil {
+			if err := rebuild(key, scratch); err != nil {
 				return err
 			}
 		}
@@ -274,27 +282,37 @@ func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, ne
 
 	workers := min(runtime.GOMAXPROCS(0), sum, 8)
 	if workers < 2 {
+		scratch := &t.index.partition
 		for key := 0; key < radixFanout; key++ {
-			if err := rebuild(key); err != nil {
+			if err := rebuild(key, scratch); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
+	// Each worker owns a scratch so concurrent subtree rebuilds never share a
+	// partition buffer. The buffers are reused across Apply calls. This fan-out
+	// is only for large maintenance batches; the common <=64-record path stays
+	// serial on the writer's scratch.
+	if cap(t.index.workScratch) < workers {
+		t.index.workScratch = make([]partitionScratch, workers)
+	}
+	scratches := t.index.workScratch[:workers]
 	var next atomic.Int32
 	var wait sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
 	for w := 0; w < workers; w++ {
 		wait.Add(1)
-		go func() {
+		go func(w int) {
 			defer wait.Done()
+			scratch := &scratches[w]
 			for {
 				key := int(next.Add(1)) - 1
 				if key >= radixFanout {
 					return
 				}
-				if err := rebuild(key); err != nil {
+				if err := rebuild(key, scratch); err != nil {
 					errMu.Lock()
 					if firstErr == nil {
 						firstErr = err
@@ -302,7 +320,7 @@ func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, ne
 					errMu.Unlock()
 				}
 			}
-		}()
+		}(w)
 	}
 	wait.Wait()
 	return firstErr
@@ -311,13 +329,13 @@ func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, ne
 // rebuildChild returns the replacement child reference for the subtree rooted
 // at oldChild (level is the child's radix level). records carry the unconsumed
 // tail starting at Hash[level].
-func (t *txn) rebuildChild(oldChild uint32, level int, records []slot) (uint32, error) {
+func (t *txn) rebuildChild(oldChild uint32, level int, records []slot, scratch *partitionScratch) (uint32, error) {
 	if oldChild == 0 {
-		return t.newSubtreeFromRecords(level, records)
+		return t.newSubtreeFromRecords(level, records, scratch)
 	}
 	ref, isNode := decodeChild(oldChild)
 	if isNode {
-		return t.rebuildNode(ref, level, records)
+		return t.rebuildNode(ref, level, records, scratch)
 	}
 
 	existing, header, err := readLeafSlots(t.arena, ref)
@@ -337,24 +355,31 @@ func (t *txn) rebuildChild(oldChild uint32, level int, records []slot) (uint32, 
 	// Promote this individual leaf to a radix node consuming Hash[level].
 	t.retire(ref, header.extentBytes)
 	t.addDelta(-int64(len(existing)))
-	return t.buildNodeFromSlots(level, merged)
+	return t.buildNodeFromSlots(level, merged, scratch)
 }
 
 // rebuildNode path-copies the radix node at ref, applying each per-byte group
 // of records to the matching child. It returns the old reference unchanged when
 // no child changes.
-func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32, error) {
+func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot, scratch *partitionScratch) (uint32, error) {
 	if !validExtent(t.arena, ref, radixNodeBytes) {
 		return 0, fmt.Errorf("%w: node extent outside arena", ErrCorrupt)
 	}
 	var old [radixFanout]uint32
 	readNode(t.arena, ref, &old)
 
-	groups := partitionSlots(records, tailLenFor(level))
+	var counts [radixFanout]uint32
+	var offsets [radixFanout + 1]uint32
+	out := scratch.buffer(level, len(records))
+	partitionSlots(out, records, tailLenFor(level), &counts, &offsets)
+
 	var next [radixFanout]uint32
 	changed := false
-	for key, group := range groups {
-		updated, err := t.rebuildChild(old[key], level+1, group)
+	for key := 0; key < radixFanout; key++ {
+		if counts[key] == 0 {
+			continue
+		}
+		updated, err := t.rebuildChild(old[key], level+1, out[offsets[key]:offsets[key+1]], scratch)
 		if err != nil {
 			return 0, err
 		}
@@ -385,24 +410,31 @@ func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32,
 // records cross the promotion threshold the leaf is replaced by a radix node
 // (Root[Hash[0]] -> Radix[Hash[1]] -> leaves), and the same adaptive promotion
 // applies at deeper levels.
-func (t *txn) newSubtreeFromRecords(level int, records []slot) (uint32, error) {
+func (t *txn) newSubtreeFromRecords(level int, records []slot, scratch *partitionScratch) (uint32, error) {
 	records = dedupeSlots(records, tailLenFor(level))
 	if level == 1 && t.index.config.forceRootRadix {
-		return t.buildNodeFromRecords(level, records)
+		return t.buildNodeFromRecords(level, records, scratch)
 	}
 	if level >= maxDepth || t.fits(level, idBytesForSlots(records), len(records)) {
 		return t.writeLeaf(level, records, 0, 0, 0)
 	}
-	return t.buildNodeFromRecords(level, records)
+	return t.buildNodeFromRecords(level, records, scratch)
 }
 
 // buildNodeFromRecords creates a new radix node from records whose tail starts
 // at level, distributing them across child subtrees.
-func (t *txn) buildNodeFromRecords(level int, records []slot) (uint32, error) {
-	groups := partitionSlots(records, tailLenFor(level))
+func (t *txn) buildNodeFromRecords(level int, records []slot, scratch *partitionScratch) (uint32, error) {
+	var counts [radixFanout]uint32
+	var offsets [radixFanout + 1]uint32
+	out := scratch.buffer(level, len(records))
+	partitionSlots(out, records, tailLenFor(level), &counts, &offsets)
+
 	var children [radixFanout]uint32
-	for key, group := range groups {
-		child, err := t.newSubtreeFromRecords(level+1, group)
+	for key := 0; key < radixFanout; key++ {
+		if counts[key] == 0 {
+			continue
+		}
+		child, err := t.newSubtreeFromRecords(level+1, out[offsets[key]:offsets[key+1]], scratch)
 		if err != nil {
 			return 0, err
 		}
@@ -414,11 +446,18 @@ func (t *txn) buildNodeFromRecords(level int, records []slot) (uint32, error) {
 // buildNodeFromSlots is the promotion path: it turns an oversized leaf into a
 // radix node and redistributes the leaf's slots, which already have their next
 // unconsumed byte at tail[0].
-func (t *txn) buildNodeFromSlots(level int, slots []slot) (uint32, error) {
-	groups := partitionSlots(slots, tailLenFor(level))
+func (t *txn) buildNodeFromSlots(level int, slots []slot, scratch *partitionScratch) (uint32, error) {
+	var counts [radixFanout]uint32
+	var offsets [radixFanout + 1]uint32
+	out := scratch.buffer(level, len(slots))
+	partitionSlots(out, slots, tailLenFor(level), &counts, &offsets)
+
 	var children [radixFanout]uint32
-	for key, group := range groups {
-		child, err := t.newSubtreeFromSlots(level+1, group)
+	for key := 0; key < radixFanout; key++ {
+		if counts[key] == 0 {
+			continue
+		}
+		child, err := t.newSubtreeFromSlots(level+1, out[offsets[key]:offsets[key+1]], scratch)
 		if err != nil {
 			return 0, err
 		}
@@ -429,11 +468,11 @@ func (t *txn) buildNodeFromSlots(level int, slots []slot) (uint32, error) {
 
 // newSubtreeFromSlots creates a leaf, or recurses into another promotion when
 // the child would still exceed the threshold.
-func (t *txn) newSubtreeFromSlots(level int, slots []slot) (uint32, error) {
+func (t *txn) newSubtreeFromSlots(level int, slots []slot, scratch *partitionScratch) (uint32, error) {
 	if level >= maxDepth || t.fits(level, idBytesForSlots(slots), len(slots)) {
 		return t.writeLeaf(level, slots, 0, 0, 0)
 	}
-	return t.buildNodeFromSlots(level, slots)
+	return t.buildNodeFromSlots(level, slots, scratch)
 }
 
 // writeLeaf allocates and encodes a leaf, retires the replaced leaf when one is

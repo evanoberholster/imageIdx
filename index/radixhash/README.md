@@ -51,7 +51,9 @@ Leaf
   each affected leaf once with a linear merge of the already-sorted leaf and the
   small incoming group, path-copies nodes, and publishes one new immutable root.
   The normal ≤64-record batch takes a serial, allocation-light path with no map,
-  goroutine, or channel.
+  goroutine, or channel. Every interior radix level uses the same fixed
+  256-way counting/offset partition over reusable per-level scratch, so grouping
+  allocates no maps and no per-child slices.
 
 Storage is a caller-owned arena managed by `internal/pagealloc`: exact
 512-byte runs (no power-of-two rounding), `Retire`/`Reclaim` for

@@ -434,66 +434,6 @@ func TestConcurrentReadersAndWriter(t *testing.T) {
 	}
 }
 
-func BenchmarkLookupTwoLevelVersusThreeLevel(b *testing.B) {
-	for _, size := range []int{10_000, 100_000} {
-		b.Run(fmt.Sprintf("two-level/%d", size), func(b *testing.B) {
-			benchmarkLookupShape(b, size, Config{PromotionBytes: 1 << 30})
-		})
-		b.Run(fmt.Sprintf("three-level/%d", size), func(b *testing.B) {
-			benchmarkLookupShape(b, size, Config{PromotionBytes: 8 << 10})
-		})
-	}
-}
-
-func benchmarkLookupShape(b *testing.B, size int, config Config) {
-	// Concentrate hashes into a small number of Hash[0]/Hash[1] buckets so the
-	// promotion threshold is exercised.
-	index, err := New(64<<20, config)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer index.Close()
-	rng := rand.New(rand.NewSource(42))
-	hashes := make([]Hash, size)
-	batch := make([]Entry, 0, 4096)
-	for i := range hashes {
-		hashes[i] = hashWithPrefix([]byte{byte(i % 8), byte((i / 8) % 8)}, uint64(rng.Int63())+1)
-		batch = append(batch, Entry{Hash: hashes[i], ImageID: ImageID(i + 1)})
-	}
-	if err := index.Apply(batch); err != nil {
-		b.Fatal(err)
-	}
-	b.Logf("depth=%d", index.Metadata().Depth)
-	var dst []ImageID
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		dst = index.Lookup(dst[:0], hashes[i%len(hashes)])
-	}
-	_ = dst
-}
-
-func BenchmarkApplyBatch(b *testing.B) {
-	index, err := New(256<<20, Config{})
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer index.Close()
-	rng := rand.New(rand.NewSource(3))
-	batch := make([]Entry, 256)
-	for i := range batch {
-		batch[i] = Entry{Hash: hashWithPrefix([]byte{byte(rng.Intn(256)), byte(rng.Intn(256))}, uint64(i)+1), ImageID: ImageID(i + 1)}
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := index.Apply(batch); err != nil {
-			b.Fatal(err)
-		}
-		if err := index.Reclaim(); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 func TestLargeImageIDsUse64BitLeaves(t *testing.T) {
 	index := newTestIndex(t, 1<<20, Config{})
 	defer index.Close()

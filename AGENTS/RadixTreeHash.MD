@@ -505,6 +505,10 @@ small:
 - **Automatic reclamation.** `Config.AutoReclaimBytes` bounds retired space:
   once retired bytes reach the threshold, the writer drains prior readers and
   reclaims automatically instead of holding up to 2× live data as dead pages.
+- **Fixed 256-way partition.** Interior radix grouping uses fixed
+  `[256]uint32` counts, `[257]uint32` offsets, and one contiguous per-level
+  scratch buffer, so there is no `map[byte][]slot` and no per-child slice
+  allocation on the write path.
 - **File-backed mmap arena.** `NewMmap` maps a sparse file as the arena, so a
   large logical arena consumes disk and resident memory only for touched pages;
   `Sync` flushes and `Close` unmaps.
