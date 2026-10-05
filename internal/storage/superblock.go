@@ -21,6 +21,18 @@ const (
 // superblock envelope.
 var ErrSuperblockSize = errors.New("storage: superblock size")
 
+// crcTable is the single storage-oriented checksum table (CRC32C / Castagnoli).
+// It is built once at package init and shared by every superblock encode and
+// decode, so no table is ever constructed on a hot path.
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// Checksum returns the CRC32C checksum used by the superblock envelope. Index
+// packages use it when they want the same storage primitive for an
+// index-specific payload such as a root checksum.
+func Checksum(data []byte) uint32 {
+	return crc32.Checksum(data, crcTable)
+}
+
 // SuperblockHeader is the common envelope around an index-specific checkpoint
 // payload. It carries identity, format version, and generation; the payload is
 // opaque and owned by the index package (for example a root reference and
@@ -35,7 +47,7 @@ type SuperblockHeader struct {
 }
 
 // EncodeSuperblock writes header and payload into one fixed-size slot. The
-// payload gets its own CRC32 and the header gets a CRC32 over its own fields,
+// payload gets its own CRC32C and the header gets a CRC32C over its own fields,
 // so a torn or corrupt slot is rejected on decode. dst must be exactly
 // SuperblockSlotBytes and the payload must fit beside the header.
 func EncodeSuperblock(dst []byte, header SuperblockHeader, payload []byte) error {
@@ -47,18 +59,21 @@ func EncodeSuperblock(dst []byte, header SuperblockHeader, payload []byte) error
 	binary.LittleEndian.PutUint16(dst[6:8], header.Flags)
 	binary.LittleEndian.PutUint64(dst[8:16], header.Generation)
 	binary.LittleEndian.PutUint32(dst[16:20], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(dst[20:24], crc32.ChecksumIEEE(payload))
-	binary.LittleEndian.PutUint32(dst[24:28], crc32.ChecksumIEEE(dst[:24]))
+	binary.LittleEndian.PutUint32(dst[20:24], Checksum(payload))
+	binary.LittleEndian.PutUint32(dst[24:28], Checksum(dst[:24]))
 	copy(dst[superblockHeaderBytes:], payload)
 	clear(dst[superblockHeaderBytes+len(payload):])
 	return nil
 }
 
-// DecodeSuperblock validates a slot and returns its header and payload. ok is
-// false for an empty, mismatched, or corrupt slot; a recognized magic with a
-// different version is treated as not-this-format rather than corrupt.
+// DecodeSuperblock validates one complete superblock slot and returns its
+// header and payload. src must be exactly SuperblockSlotBytes; a shorter or
+// longer slice is rejected rather than validated against the 512-byte constant
+// while reading a truncated buffer. ok is false for an empty, mismatched, or
+// corrupt slot; a recognized magic with a different version is treated as
+// not-this-format rather than corrupt.
 func DecodeSuperblock(src []byte, magic uint32, version uint16) (SuperblockHeader, []byte, bool) {
-	if len(src) < superblockHeaderBytes {
+	if len(src) != SuperblockSlotBytes {
 		return SuperblockHeader{}, nil, false
 	}
 	header := SuperblockHeader{
@@ -75,11 +90,11 @@ func DecodeSuperblock(src []byte, magic uint32, version uint16) (SuperblockHeade
 	if header.PayloadLen > SuperblockSlotBytes-superblockHeaderBytes {
 		return SuperblockHeader{}, nil, false
 	}
-	if binary.LittleEndian.Uint32(src[24:28]) != crc32.ChecksumIEEE(src[:24]) {
+	if binary.LittleEndian.Uint32(src[24:28]) != Checksum(src[:24]) {
 		return SuperblockHeader{}, nil, false
 	}
 	payload := src[superblockHeaderBytes : superblockHeaderBytes+int(header.PayloadLen)]
-	if header.PayloadCRC != crc32.ChecksumIEEE(payload) {
+	if header.PayloadCRC != Checksum(payload) {
 		return SuperblockHeader{}, nil, false
 	}
 	return header, payload, true

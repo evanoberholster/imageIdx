@@ -49,3 +49,29 @@ func TestSuperblockRoundTripAndSelection(t *testing.T) {
 		t.Fatal("oversized payload encoded")
 	}
 }
+
+// TestSuperblockRejectsTruncatedAndCorruptPayload checks that decoding requires
+// a complete slot and that a payload CRC failure is rejected rather than read.
+func TestSuperblockRejectsTruncatedAndCorruptPayload(t *testing.T) {
+	const magic uint32 = 0x52485342
+	const version uint16 = 2
+	full := make([]byte, SuperblockSlotBytes)
+	if err := EncodeSuperblock(full, SuperblockHeader{Magic: magic, Version: version, Generation: 1}, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatalf("EncodeSuperblock: %v", err)
+	}
+	if _, _, ok := DecodeSuperblock(full, magic, version); !ok {
+		t.Fatal("valid slot rejected")
+	}
+	if _, _, ok := DecodeSuperblock(full[:len(full)-1], magic, version); ok {
+		t.Fatal("truncated slot accepted")
+	}
+	oversized := append(append([]byte(nil), full...), 0)
+	if _, _, ok := DecodeSuperblock(oversized, magic, version); ok {
+		t.Fatal("oversized slot accepted")
+	}
+	corrupt := append([]byte(nil), full...)
+	corrupt[superblockHeaderBytes] ^= 0xff
+	if _, _, ok := DecodeSuperblock(corrupt, magic, version); ok {
+		t.Fatal("corrupt payload accepted")
+	}
+}

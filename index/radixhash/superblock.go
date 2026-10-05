@@ -2,7 +2,6 @@ package radixhash
 
 import (
 	"encoding/binary"
-	"hash/crc32"
 
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
@@ -33,7 +32,7 @@ const (
 	headerBlocks             = superblockSlots + superblockSlots*rootBlocks
 
 	// radixPayloadBytes is the radix checkpoint payload: entries(8) +
-	// rootBuckets(8) + depth(1) + root CRC32(4).
+	// rootBuckets(8) + depth(1) + root CRC32C(4).
 	radixPayloadBytes = 21
 )
 
@@ -63,7 +62,7 @@ func encodeRadixSuperblock(dst []byte, sb superblock, root []byte) error {
 	binary.LittleEndian.PutUint64(payload[0:8], sb.entries)
 	binary.LittleEndian.PutUint64(payload[8:16], sb.rootBuckets)
 	payload[16] = sb.depth
-	binary.LittleEndian.PutUint32(payload[17:21], crc32.ChecksumIEEE(root))
+	binary.LittleEndian.PutUint32(payload[17:21], storage.Checksum(root))
 	return storage.EncodeSuperblock(dst, storage.SuperblockHeader{
 		Magic:      superblockMagic,
 		Version:    superblockVersion,
@@ -78,7 +77,7 @@ func decodeRadixSuperblock(src, root []byte) (superblock, bool) {
 	if !ok || len(payload) < radixPayloadBytes {
 		return superblock{}, false
 	}
-	if binary.LittleEndian.Uint32(payload[17:21]) != crc32.ChecksumIEEE(root) {
+	if binary.LittleEndian.Uint32(payload[17:21]) != storage.Checksum(root) {
 		return superblock{}, false
 	}
 	return superblock{
