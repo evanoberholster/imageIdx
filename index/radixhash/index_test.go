@@ -303,14 +303,14 @@ func TestCorruptLeafIsDetected(t *testing.T) {
 
 	// Corrupt magic.
 	arena[offset] = 0
-	if _, _, err := readLeafSlots(arena, ref); err == nil {
+	if _, _, err := readLeafSlotsInto(nil, arena, ref); err == nil {
 		t.Fatalf("readLeafSlots accepted a bad magic")
 	}
 	copy(arena[offset:offset+leafHeaderSize], before)
 
 	// Corrupt depth.
 	arena[offset+6] = 0
-	if _, _, err := readLeafSlots(arena, ref); err == nil {
+	if _, _, err := readLeafSlotsInto(nil, arena, ref); err == nil {
 		t.Fatalf("readLeafSlots accepted a bad depth")
 	}
 	copy(arena[offset:offset+leafHeaderSize], before)

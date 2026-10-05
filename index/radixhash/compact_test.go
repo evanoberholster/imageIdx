@@ -424,7 +424,7 @@ func TestMergeSlotsLinearDedup(t *testing.T) {
 	}
 	existing := []slot{mk(1, 1), mk(2, 2), mk(4, 4)}
 	added := []slot{mk(4, 4), mk(2, 2), mk(3, 3), mk(3, 3), mk(5, 5)}
-	merged := mergeSlots(existing, added, tailLen)
+	merged := mergeSlotsInto(nil, existing, added, tailLen)
 	if len(merged) != 5 {
 		t.Fatalf("merged length = %d, want 5", len(merged))
 	}

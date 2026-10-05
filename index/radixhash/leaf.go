@@ -181,25 +181,31 @@ func readLeafHeader(arena []byte, ref pagealloc.Ref) (leafHeader, error) {
 	}, nil
 }
 
-// readLeafSlots decodes every slot of a leaf. The returned header carries the
-// depth, id width, and extent size needed to interpret and retire the leaf.
-func readLeafSlots(arena []byte, ref pagealloc.Ref) ([]slot, leafHeader, error) {
+// readLeafSlotsInto decodes every slot of a leaf into dst, reusing its backing
+// array when it is large enough; the returned slice may be dst resliced or a
+// fresh allocation. header carries the depth, id width, and extent size needed
+// to interpret and retire the leaf.
+func readLeafSlotsInto(dst []slot, arena []byte, ref pagealloc.Ref) ([]slot, leafHeader, error) {
 	header, err := readLeafHeader(arena, ref)
 	if err != nil {
-		return nil, leafHeader{}, err
+		return dst[:0], leafHeader{}, err
 	}
 	tailLen := tailLenFor(header.depth)
 	offset := extentOffset(ref)
-	slots := make([]slot, header.count)
-	for i := range slots {
-		copy(slots[i].tail[:tailLen], arena[offset+uint64(leafHeaderSize+tailLen*i):])
+	if cap(dst) < header.count {
+		dst = make([]slot, header.count)
+	} else {
+		dst = dst[:header.count]
+	}
+	for i := range dst {
+		copy(dst[i].tail[:tailLen], arena[offset+uint64(leafHeaderSize+tailLen*i):])
 		if header.idBytes == id32Bytes {
-			slots[i].id = uint64(binary.LittleEndian.Uint32(arena[offset+uint64(header.idsOffset+4*i):]))
+			dst[i].id = uint64(binary.LittleEndian.Uint32(arena[offset+uint64(header.idsOffset+4*i):]))
 		} else {
-			slots[i].id = binary.LittleEndian.Uint64(arena[offset+uint64(header.idsOffset+8*i):])
+			dst[i].id = binary.LittleEndian.Uint64(arena[offset+uint64(header.idsOffset+8*i):])
 		}
 	}
-	return slots, header, nil
+	return dst, header, nil
 }
 
 // parseLeafHeader reads a leaf header on the hot lookup path. It validates the
@@ -314,12 +320,15 @@ func scanLeafBinary(arena []byte, ref pagealloc.Ref, query Hash, depth int, head
 	return nil
 }
 
-// partitionScratch owns the reusable per-level partition buffers for the
-// 256-way radix grouping. Buffers are indexed by node level so a parent's
-// grouped records stay valid while its children recurse. Writes are serialized,
-// so one scratch per writer (or per worker in the large-batch fan-out) is safe.
+// partitionScratch holds the reusable writer buffers for one rebuild: the
+// per-level 256-way partition buffers and the leaf read/merge temporaries.
+// Buffers are indexed by node level so a parent's grouped records stay valid
+// while its children recurse. Writes are serialized, so one scratch per writer
+// (or per worker in the large-batch fan-out) is safe.
 type partitionScratch struct {
-	levels [maxDepth][]slot
+	levels   [maxDepth][]slot
+	existing []slot
+	merged   []slot
 }
 
 // buffer returns a length-n slice for the given level, reusing the existing
@@ -429,16 +438,24 @@ func dedupeSlots(slots []slot, tailLen int) []slot {
 	return unique
 }
 
-// mergeSlots returns the sorted, deduplicated union of existing (already
-// sorted) and added. Only the small incoming group is sorted; the two sorted
-// runs are then merged linearly, so a small update never re-sorts the existing
-// leaf and the replacement is built with a single allocation.
-func mergeSlots(existing, added []slot, tailLen int) []slot {
+// mergeSlotsInto returns the sorted, deduplicated union of existing (already
+// sorted) and added, writing into dst and reusing its backing array when it is
+// large enough. dst must not alias existing or added. Only the small incoming
+// group is sorted; the two sorted runs are then merged linearly, so a small
+// update never re-sorts the existing leaf. The result is sorted by
+// (tail, ImageID) with exact duplicates collapsed.
+func mergeSlotsInto(dst, existing, added []slot, tailLen int) []slot {
 	if len(added) == 0 {
-		return existing
+		if cap(dst) < len(existing) {
+			dst = make([]slot, 0, len(existing))
+		}
+		return append(dst[:0], existing...)
 	}
 	sortSlots(added, tailLen)
-	merged := make([]slot, 0, len(existing)+len(added))
+	if cap(dst) < len(existing)+len(added) {
+		dst = make([]slot, 0, len(existing)+len(added))
+	}
+	dst = dst[:0]
 	i, j := 0, 0
 	for i < len(existing) || j < len(added) {
 		var next slot
@@ -450,10 +467,10 @@ func mergeSlots(existing, added []slot, tailLen int) []slot {
 			next = added[j]
 			j++
 		}
-		if len(merged) > 0 && sameSlot(&merged[len(merged)-1], &next, tailLen) {
+		if len(dst) > 0 && sameSlot(&dst[len(dst)-1], &next, tailLen) {
 			continue
 		}
-		merged = append(merged, next)
+		dst = append(dst, next)
 	}
-	return merged
+	return dst
 }

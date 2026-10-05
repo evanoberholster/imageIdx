@@ -338,14 +338,16 @@ func (t *txn) rebuildChild(oldChild uint32, level int, records []slot, scratch *
 		return t.rebuildNode(ref, level, records, scratch)
 	}
 
-	existing, header, err := readLeafSlots(t.arena, ref)
+	existing, header, err := readLeafSlotsInto(scratch.existing[:0], t.arena, ref)
 	if err != nil {
 		return 0, err
 	}
+	scratch.existing = existing
 	if header.depth != level {
 		return 0, fmt.Errorf("%w: leaf depth %d reached at level %d", ErrCorrupt, header.depth, level)
 	}
-	merged := mergeSlots(existing, records, tailLenFor(level))
+	merged := mergeSlotsInto(scratch.merged[:0], existing, records, tailLenFor(level))
+	scratch.merged = merged
 	if len(merged) == len(existing) {
 		return oldChild, nil // every record was already present
 	}
