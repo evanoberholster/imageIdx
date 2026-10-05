@@ -47,13 +47,13 @@ Leaf
   is promoted in place to the next radix level and redistributed, recursively.
 - Readers binary-search the sorted tails and walk only the equal run. The
   lookup path is lock-free and allocation-free.
-- `Apply` counting-sorts a batch into one reusable scratch by `Hash[0]`, rebuilds
-  each affected leaf once with a linear merge of the already-sorted leaf and the
-  small incoming group, path-copies nodes, and publishes one new immutable root.
-  The normal ≤64-record batch takes a serial, allocation-light path with no map,
-  goroutine, or channel. Every interior radix level uses the same fixed
-  256-way counting/offset partition over reusable per-level scratch, so grouping
-  allocates no maps and no per-child slices.
+- `Apply` counting-sorts a batch into one reusable scratch by `Hash[0]` and
+  rebuilds each affected leaf once by merging the small sorted incoming group
+  directly into a replacement encoded SoA leaf, path-copies nodes, and publishes
+  one new immutable root. The normal ≤64-record batch takes a serial,
+  allocation-light path with no map, goroutine, or channel. Every interior radix
+  level uses the same fixed 256-way counting/offset partition over reusable
+  per-level scratch, so grouping allocates no maps and no per-child slices.
 
 Storage is a caller-owned arena managed by `internal/pagealloc`: exact
 512-byte runs (no power-of-two rounding), `Retire`/`Reclaim` for
@@ -218,7 +218,7 @@ ids, err := plan.Search(ctx, nil, &ws)
 |---|---|
 | `hash.go` | Public types (`Hash`, `Entry`, `Config`, `Metadata`) and errors. |
 | `node.go` | 256-way radix node encoding and child tagging. |
-| `leaf.go` | SoA leaf codec, sorted-tail search, promotion partitioning. |
+| `leaf.go` | SoA leaf codec, sorted-tail search, direct encoded merge, promotion partitioning. |
 | `index.go` | Arena, views, copy-on-write `Apply`, lookup, reclaim, compact. |
 | `walk.go` | Bounded tree iterator used by streaming compaction. |
 | `superblock.go` | Radix payload + per-slot root over the common envelope. |

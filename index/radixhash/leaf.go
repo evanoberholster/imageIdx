@@ -38,11 +38,9 @@ type slot struct {
 // id in the leaf fits in 32 bits.
 type leafHeader struct {
 	count       int
-	capacity    int
 	depth       int
 	idBytes     int
 	extentBytes uint32
-	tailOffset  int
 	idsOffset   int
 }
 
@@ -295,19 +293,19 @@ func readLeafHeader(arena []byte, ref pagealloc.Ref) (leafHeader, error) {
 	}
 	return leafHeader{
 		count:       count,
-		capacity:    capacity,
 		depth:       depth,
 		idBytes:     idBytes,
 		extentBytes: extentBytes,
-		tailOffset:  tailOffset,
 		idsOffset:   idsOffset,
 	}, nil
 }
 
 // readLeafSlotsInto decodes every slot of a leaf into dst, reusing its backing
 // array when it is large enough; the returned slice may be dst resliced or a
-// fresh allocation. header carries the depth, id width, and extent size needed
-// to interpret and retire the leaf.
+// fresh allocation. It backs the promotion fallback (which must repartition)
+// and tests/benchmarks; the normal leaf update merges directly from the encoded
+// leaf. header carries the depth, id width, and extent size needed to interpret
+// and retire the leaf.
 func readLeafSlotsInto(dst []slot, arena []byte, ref pagealloc.Ref) ([]slot, leafHeader, error) {
 	header, err := readLeafHeader(arena, ref)
 	if err != nil {
@@ -365,11 +363,9 @@ func parseLeafHeader(arena []byte, ref pagealloc.Ref) (leafHeader, error) {
 	}
 	return leafHeader{
 		count:       count,
-		capacity:    capacity,
 		depth:       depth,
 		idBytes:     idBytes,
 		extentBytes: extentBytes,
-		tailOffset:  leafHeaderSize,
 		idsOffset:   idsOffset,
 	}, nil
 }
@@ -444,10 +440,11 @@ func scanLeafBinary(arena []byte, ref pagealloc.Ref, query Hash, depth int, head
 }
 
 // partitionScratch holds the reusable writer buffers for one rebuild: the
-// per-level 256-way partition buffers and the leaf read/merge temporaries.
-// Buffers are indexed by node level so a parent's grouped records stay valid
-// while its children recurse. Writes are serialized, so one scratch per writer
-// (or per worker in the large-batch fan-out) is safe.
+// per-level 256-way partition buffers plus the leaf read/merge temporaries used
+// only when a merged leaf must be promoted and repartitioned. Buffers are
+// indexed by node level so a parent's grouped records stay valid while its
+// children recurse. Writes are serialized, so one scratch per writer (or per
+// worker in the large-batch fan-out) is safe.
 type partitionScratch struct {
 	levels   [maxDepth][]slot
 	existing []slot
@@ -564,9 +561,10 @@ func dedupeSlots(slots []slot, tailLen int) []slot {
 // mergeSlotsInto returns the sorted, deduplicated union of existing (already
 // sorted) and added, writing into dst and reusing its backing array when it is
 // large enough. dst must not alias existing or added. Only the small incoming
-// group is sorted; the two sorted runs are then merged linearly, so a small
-// update never re-sorts the existing leaf. The result is sorted by
-// (tail, ImageID) with exact duplicates collapsed.
+// group is sorted; the two sorted runs are then merged linearly. It backs the
+// promotion fallback and tests/benchmarks; the normal leaf update merges
+// directly from the encoded leaf. The result is sorted by (tail, ImageID) with
+// exact duplicates collapsed.
 func mergeSlotsInto(dst, existing, added []slot, tailLen int) []slot {
 	if len(added) == 0 {
 		if cap(dst) < len(existing) {

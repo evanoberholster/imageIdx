@@ -110,7 +110,6 @@ type extent struct {
 type txn struct {
 	index       *Index
 	arena       []byte
-	generation  uint64
 	mu          sync.Mutex
 	newExtents  []extent
 	retirements []extent
@@ -185,7 +184,7 @@ func (i *Index) Apply(entries []Entry) error {
 
 	current := i.view.Load()
 	oldRoot := current.root
-	batch := &txn{index: i, arena: current.arena, generation: current.generation}
+	batch := &txn{index: i, arena: current.arena}
 	nextRoot := *oldRoot // copy-on-write the 1 KiB root
 
 	parallel := len(entries) >= parallelMinEntries
@@ -328,7 +327,8 @@ func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, ne
 
 // rebuildChild returns the replacement child reference for the subtree rooted
 // at oldChild (level is the child's radix level). records carry the unconsumed
-// tail starting at Hash[level].
+// tail starting at Hash[level]. An existing leaf is updated by merging directly
+// from its encoded SoA form; only a promotion falls back to decoded scratch.
 func (t *txn) rebuildChild(oldChild uint32, level int, records []slot, scratch *partitionScratch) (uint32, error) {
 	if oldChild == 0 {
 		return t.newSubtreeFromRecords(level, records, scratch)
