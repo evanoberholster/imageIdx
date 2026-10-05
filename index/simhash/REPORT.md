@@ -154,11 +154,30 @@ Apple M4 Pro (arm64), Go 1.27, warm mmap-resident data, 0 allocs/op unless noted
 
 | operation | cost |
 |---|---:|
-| point `Upsert` (in place) | 8 ns |
-| `AppendBatch` of 64 | ~18 ns/record |
+| point `Upsert` (journal + in place) | ~2.4 µs, 0 allocs |
+| `AppendBatch` of 64 | ~1.5 µs (~24 ns/record), 1 alloc |
 | checkpoint (1M records, one 43 MB shard) | ~12 ms |
 | open + map + journal recovery + sequence reset | ~42 µs |
 | sequence block 256/512/1024/2048/4096 @100k | 85/84/85/82/82 µs |
+
+`Upsert` grew from ~8 ns (in-place only) to ~2.4 µs because it now appends a
+journal record (a `write` syscall) before mutating the columns; that is the cost
+of crash safety and is not fsynced under relaxed durability.
+
+### Profiles (`go test -cpuprofile -memprofile`)
+
+CPU (store workloads, 40.3 s of samples): the three scalar scans account for
+~76%. Flat hotspots are `searchPHash` 28%, `searchPDQ` 21%, and the inline
+column addressing `pdqWord` 20%, `base` 6.6%, `imageIDFromHashPage` 6.0%; the
+remainder is the popcount loop. Roughly a third of CPU is address arithmetic,
+which is the headroom a future SIMD kernel would target.
+
+Memory: the store owns essentially no Go heap. In-use heap was ~2 MB; the 41
+B/image lives in the mmap arena. Searches allocate 0 bytes/op (the `B/op` at
+d = 32/64 is caller result-buffer growth, since the benchmark passes `nil` dst
+and d = 32 matches ≈ half the database). The update path is allocation-free for
+`Upsert` (0 allocs/op) and allocates one small `view` per append batch (~80 B per
+64 records) to publish the new committed high-water mark.
 
 Threshold 31 is exercised explicitly in correctness and performance tests, and
 the two-word prefix cut it from 5.9 ms (naive word-at-a-time, branch

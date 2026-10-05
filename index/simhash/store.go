@@ -97,9 +97,10 @@ func shardFileSize(pagesPerShard uint64, geo geometry) (uint64, bool) {
 
 // view is one immutable, atomically published reader view: the committed
 // high-water mark, the format geometry, and the mapped shards. Sequence
-// counters are runtime-only and are reset on open.
+// counters are runtime-only and are reset on open. The published generation is
+// tracked separately (Store.gen) so an in-place point update advances the
+// logical version without allocating a replacement view.
 type view struct {
-	generation    uint64
 	committed     uint64
 	pagesPerShard uint64
 	geo           geometry
@@ -122,6 +123,9 @@ type Store struct {
 	mu     sync.Mutex
 	view   atomic.Pointer[view]
 	closed atomic.Bool
+	// gen is the published logical version. It is separate from view so an
+	// in-place Upsert can advance it without allocating a new view.
+	gen atomic.Uint64
 	// tracker pins readers against shard unmap during Close.
 	tracker storage.ReaderTracker
 
@@ -190,6 +194,7 @@ func Open(dir string, config Config) (*Store, error) {
 	// counter to an even value so a crash that left one odd cannot make a
 	// reader spin forever.
 	st.resetSequences()
+	st.gen.Store(st.generation)
 	st.publishLocked()
 	return st, nil
 }
@@ -325,12 +330,19 @@ func (st *Store) writeManifestLocked() error {
 }
 
 func (st *Store) publishLocked() {
+	// Shards are immutable after creation, so an unchanged set can be shared
+	// with the previous view instead of copied on every publish.
+	var shards []*shard
+	if prev := st.view.Load(); prev != nil && len(prev.shards) == len(st.shards) {
+		shards = prev.shards
+	} else {
+		shards = append([]*shard(nil), st.shards...)
+	}
 	st.view.Store(&view{
-		generation:    st.generation,
 		committed:     st.committed,
 		pagesPerShard: st.pagesPerShard,
 		geo:           st.geo,
-		shards:        append([]*shard(nil), st.shards...),
+		shards:        shards,
 	})
 }
 
@@ -379,7 +391,7 @@ func (st *Store) closeShards() error {
 func (st *Store) Len() uint64 { return st.view.Load().committed }
 
 // Generation returns the current published logical store version.
-func (st *Store) Generation() uint64 { return st.view.Load().generation }
+func (st *Store) Generation() uint64 { return st.gen.Load() }
 
 // PagesPerShard returns the configured hash pages per shard file.
 func (st *Store) PagesPerShard() uint64 { return st.pagesPerShard }

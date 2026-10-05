@@ -69,17 +69,20 @@ func (j *journal) close() error {
 func (j *journal) reset() error { return j.wal.RepairTail(0) }
 
 func (j *journal) appendRecord(r journalRecord, sync bool) error {
-	var header [journalHeaderBytes]byte
+	// One reusable scratch holds the frame header and payload so the append
+	// path allocates nothing in steady state.
+	buf := j.wal.Scratch(journalHeaderBytes + journalPayloadBytes)
+	header := buf[:journalHeaderBytes]
+	payload := buf[journalHeaderBytes:]
 	binary.LittleEndian.PutUint32(header[0:4], journalMagic)
 	binary.LittleEndian.PutUint16(header[4:6], journalVersion)
 	binary.LittleEndian.PutUint32(header[8:12], journalPayloadBytes)
-	payload := j.wal.Scratch(journalPayloadBytes)
 	binary.LittleEndian.PutUint64(payload[0:8], r.imageID)
 	binary.LittleEndian.PutUint64(payload[8:16], r.phash)
 	copy(payload[16:48], r.pdq[:])
 	payload[48] = r.quality
 	binary.LittleEndian.PutUint32(payload[journalCRCOffset:journalPayloadBytes], storage.Checksum(payload[:journalCRCOffset]))
-	return j.wal.AppendFrame(header[:], payload, sync)
+	return j.wal.AppendFrame(header, payload, sync)
 }
 
 func decodeJournalPayload(src []byte) (journalRecord, bool) {

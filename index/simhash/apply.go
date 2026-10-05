@@ -33,6 +33,7 @@ func (st *Store) appendBatch(recs []Record) (common.ImageID, error) {
 	}
 	st.generation++
 	st.publishLocked()
+	st.gen.Store(st.generation)
 	if st.config.Durability == common.DurabilitySync {
 		if err := st.persistLocked(); err != nil {
 			return 0, err
@@ -94,7 +95,9 @@ func (st *Store) Upsert(id common.ImageID, rec Record) error {
 	}
 	st.applyPointLocked(uint64(id), rec)
 	st.generation++
-	st.publishLocked()
+	// An in-place update does not change the committed high-water mark or the
+	// shard set, so only the published generation changes; no view allocation.
+	st.gen.Store(st.generation)
 	return nil
 }
 
