@@ -4,12 +4,24 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
+	"testing"
 	"time"
 
 	common "github.com/evanoberholster/imageIdx/common"
-
-	"testing"
 )
+
+// applyPointLocked is the benchmark-only per-record update path used to compare
+// per-record and grouped sequence transitions.
+func (st *Store) applyPointLocked(id uint64, rec Record) {
+	page := hashPageOf(id)
+	sh := st.shards[page/st.pagesPerShard]
+	pi := page - sh.firstPage
+	seq := sh.seqPtr(pi, st.geo.blockOf(slotOf(id)))
+	atomic.AddUint64(seq, 1)
+	st.applyPointNoSeq(sh, pi, slotOf(id), rec)
+	atomic.AddUint64(seq, 1)
+}
 
 func reportNsPerUpdate(b *testing.B, updates int, elapsed time.Duration) {
 	b.Helper()
@@ -29,7 +41,7 @@ func BenchmarkUpsertBatch(b *testing.B) {
 	st, records := benchSetup(b, 1_000_000, defaultSeqBlockRecords)
 	defer st.Close()
 	base := common.ImageID(200_000)
-	for _, size := range []int{1, 4, 16, 32, 64} {
+	for _, size := range []int{1, 4, 16, 32, 64, 128, 256} {
 		ids := make([]common.ImageID, size)
 		for i := range ids {
 			ids[i] = base + common.ImageID(i*997)
@@ -193,7 +205,7 @@ func BenchmarkWALBatch(b *testing.B) {
 	st, _ := benchSetup(b, 8, defaultSeqBlockRecords)
 	defer st.Close()
 	records := randRecords(200, 64)
-	for _, size := range []int{1, 4, 16, 64} {
+	for _, size := range []int{1, 16, 32, 64, 128, 256} {
 		updates := makeUpdates(records, make([]common.ImageID, size))
 		for i := range updates {
 			updates[i].ImageID = common.ImageID(i + 1)
@@ -397,6 +409,29 @@ func BenchmarkConcurrentSearchUpdate(b *testing.B) {
 			wg.Wait()
 		})
 	}
+}
+
+// BenchmarkUpsertBatchDuplicates ensures duplicate ImageIDs do not take an
+// unexpected slow path (no map is used; last-wins falls out of applying in
+// order within a block group).
+func BenchmarkUpsertBatchDuplicates(b *testing.B) {
+	st, records := benchSetup(b, 1_000_000, defaultSeqBlockRecords)
+	defer st.Close()
+	updates := make([]Update, 64)
+	for i := range updates {
+		updates[i] = Update{ImageID: common.ImageID(1 + i%2), Record: records[i]}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	start := time.Now()
+	for i := 0; i < b.N; i++ {
+		if err := st.UpsertBatch(updates); err != nil {
+			b.Fatal(err)
+		}
+	}
+	elapsed := time.Since(start)
+	b.StopTimer()
+	reportNsPerUpdate(b, 64, elapsed)
 }
 
 // BenchmarkSeqBlockSizeUpdates extends the block-size benchmark to updates.

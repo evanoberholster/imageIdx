@@ -4,6 +4,7 @@ import (
 	"math/bits"
 	"runtime"
 	"sync/atomic"
+	"unsafe"
 
 	common "github.com/evanoberholster/imageIdx/common"
 )
@@ -18,9 +19,7 @@ import (
 // is immutable (append-only). The scalar concurrent-safe path is the reference
 // implementation and must not be replaced merely for benchmark numbers.
 
-// seqSpinLimit bounds a reader's tight retry before it yields. The writer's
-// critical section is a handful of atomic stores, so a short spin usually
-// succeeds immediately.
+// seqSpinLimit bounds a reader's tight retry before it yields.
 const seqSpinLimit = 64
 
 // waitSeqEven returns the current sequence once it is even, spinning briefly
@@ -58,6 +57,12 @@ const (
 
 func useEarlyReject(limit int) bool {
 	return limit <= pdqEarlyRejectMax || limit >= pdqEarlyRejectMin
+}
+
+// loadU64 is an atomic 64-bit load at a byte offset in the arena. The caller
+// guarantees 8-byte alignment (all column offsets are 64-byte aligned).
+func loadU64(arena []byte, off uint64) uint64 {
+	return atomic.LoadUint64((*uint64)(unsafe.Pointer(&arena[off])))
 }
 
 // SearchPHash appends every committed record whose 64-bit pHash is within
@@ -116,6 +121,8 @@ func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int, last
 	blockRecords := v.geo.seqBlockRecords
 	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
 		sh, pi := v.shardForHashPage(hashPage)
+		pageIDBase := hashPage << 16
+		pHashBase := sh.base(pi)
 		maxSlot := slotsPerHashPage - 1
 		if hashPage == lastPage {
 			maxSlot = lastSlot
@@ -130,11 +137,11 @@ func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int, last
 			for {
 				a := waitSeqEven(seq)
 				for slot := s0; slot <= s1; slot++ {
-					id := imageIDFromHashPage(hashPage, slot)
+					id := pageIDBase | uint64(slot)
 					if id == 0 {
 						continue
 					}
-					d := bits.OnesCount64(query ^ atomic.LoadUint64(sh.phash(pi, slot)))
+					d := bits.OnesCount64(query ^ loadU64(sh.arena, pHashBase+uint64(slot)*8))
 					if d <= maxDistance {
 						dst = append(dst, PHashMatch{ImageID: id, Distance: d})
 					}
@@ -161,6 +168,8 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16, las
 	qw := hashWords(query)
 	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
 		sh, pi := v.shardForHashPage(hashPage)
+		pageIDBase := hashPage << 16
+		pdqBase := sh.base(pi) + pdqColumnOffset
 		maxSlot := slotsPerHashPage - 1
 		if hashPage == lastPage {
 			maxSlot = lastSlot
@@ -175,35 +184,36 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16, las
 			for {
 				a := waitSeqEven(seq)
 				for slot := s0; slot <= s1; slot++ {
-					id := imageIDFromHashPage(hashPage, slot)
+					id := pageIDBase | uint64(slot)
 					if id == 0 {
 						continue
 					}
+					rec := pdqBase + uint64(slot)*32
 					if early {
-						d := bits.OnesCount64(qw[0] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 0)))
+						d := bits.OnesCount64(qw[0] ^ loadU64(sh.arena, rec))
 						if d > limit {
 							continue
 						}
-						d += bits.OnesCount64(qw[1] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 1)))
+						d += bits.OnesCount64(qw[1] ^ loadU64(sh.arena, rec+8))
 						if d > limit {
 							continue
 						}
-						d += bits.OnesCount64(qw[2] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 2)))
+						d += bits.OnesCount64(qw[2] ^ loadU64(sh.arena, rec+16))
 						if d > limit {
 							continue
 						}
-						d += bits.OnesCount64(qw[3] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 3)))
+						d += bits.OnesCount64(qw[3] ^ loadU64(sh.arena, rec+24))
 						if d > limit {
 							continue
 						}
 						dst = append(dst, PDQMatch{ImageID: id, Distance: uint16(d)})
 						continue
 					}
-					d := bits.OnesCount64(qw[0]^atomic.LoadUint64(sh.pdqWord(pi, slot, 0))) +
-						bits.OnesCount64(qw[1]^atomic.LoadUint64(sh.pdqWord(pi, slot, 1)))
+					d := bits.OnesCount64(qw[0]^loadU64(sh.arena, rec)) +
+						bits.OnesCount64(qw[1]^loadU64(sh.arena, rec+8))
 					if d <= limit {
-						d += bits.OnesCount64(qw[2]^atomic.LoadUint64(sh.pdqWord(pi, slot, 2))) +
-							bits.OnesCount64(qw[3]^atomic.LoadUint64(sh.pdqWord(pi, slot, 3)))
+						d += bits.OnesCount64(qw[2]^loadU64(sh.arena, rec+16)) +
+							bits.OnesCount64(qw[3]^loadU64(sh.arena, rec+24))
 						if d <= limit {
 							dst = append(dst, PDQMatch{ImageID: id, Distance: uint16(d)})
 						}
@@ -231,6 +241,10 @@ func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash i
 	qw := hashWords(pdqQuery)
 	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
 		sh, pi := v.shardForHashPage(hashPage)
+		pageIDBase := hashPage << 16
+		base := sh.base(pi)
+		pHashBase := base
+		pdqBase := base + pdqColumnOffset
 		maxSlot := slotsPerHashPage - 1
 		if hashPage == lastPage {
 			maxSlot = lastSlot
@@ -245,27 +259,27 @@ func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash i
 			for {
 				a := waitSeqEven(seq)
 				for slot := s0; slot <= s1; slot++ {
-					id := imageIDFromHashPage(hashPage, slot)
+					id := pageIDBase | uint64(slot)
 					if id == 0 {
 						continue
 					}
 					if order == PHashFirst {
-						ph := bits.OnesCount64(phashQuery ^ atomic.LoadUint64(sh.phash(pi, slot)))
+						ph := bits.OnesCount64(phashQuery ^ loadU64(sh.arena, pHashBase+uint64(slot)*8))
 						if ph > maxPHash {
 							continue
 						}
-						d, ok := pdqWithin(sh, pi, slot, qw, limit, early)
+						d, ok := pdqWithin(sh.arena, pdqBase, slot, qw, limit, early)
 						if !ok {
 							continue
 						}
 						dst = append(dst, CombinedMatch{ImageID: id, PHashDistance: ph, PDQDistance: d})
 						continue
 					}
-					d, ok := pdqWithin(sh, pi, slot, qw, limit, early)
+					d, ok := pdqWithin(sh.arena, pdqBase, slot, qw, limit, early)
 					if !ok {
 						continue
 					}
-					ph := bits.OnesCount64(phashQuery ^ atomic.LoadUint64(sh.phash(pi, slot)))
+					ph := bits.OnesCount64(phashQuery ^ loadU64(sh.arena, pHashBase+uint64(slot)*8))
 					if ph > maxPHash {
 						continue
 					}
@@ -281,42 +295,39 @@ func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash i
 	return dst
 }
 
-// pdqWithin computes the exact PDQ distance, using early rejection or the
-// two-word-prefix path. ok is false when the distance exceeds limit.
-func pdqWithin(sh *shard, pi uint64, slot int, qw *[4]uint64, limit int, early bool) (uint16, bool) {
+// pdqWithin computes the exact PDQ distance for one record whose four words
+// start at byte offset pdqBase+slot*32. ok is false when the distance exceeds
+// limit. It uses word-at-a-time early rejection for low/high thresholds and a
+// two-word prefix for the mid range, matching the standalone scan.
+func pdqWithin(arena []byte, pdqBase uint64, slot int, qw *[4]uint64, limit int, early bool) (uint16, bool) {
+	rec := pdqBase + uint64(slot)*32
 	if early {
-		return pdqDistanceAt(sh, pi, slot, qw, limit)
+		d := bits.OnesCount64(qw[0] ^ loadU64(arena, rec))
+		if d > limit {
+			return 0, false
+		}
+		d += bits.OnesCount64(qw[1] ^ loadU64(arena, rec+8))
+		if d > limit {
+			return 0, false
+		}
+		d += bits.OnesCount64(qw[2] ^ loadU64(arena, rec+16))
+		if d > limit {
+			return 0, false
+		}
+		d += bits.OnesCount64(qw[3] ^ loadU64(arena, rec+24))
+		if d > limit {
+			return 0, false
+		}
+		return uint16(d), true
 	}
-	d := bits.OnesCount64(qw[0]^atomic.LoadUint64(sh.pdqWord(pi, slot, 0))) +
-		bits.OnesCount64(qw[1]^atomic.LoadUint64(sh.pdqWord(pi, slot, 1)))
+	d := bits.OnesCount64(qw[0]^loadU64(arena, rec)) +
+		bits.OnesCount64(qw[1]^loadU64(arena, rec+8))
 	if d > limit {
 		return 0, false
 	}
-	d += bits.OnesCount64(qw[2]^atomic.LoadUint64(sh.pdqWord(pi, slot, 2))) +
-		bits.OnesCount64(qw[3]^atomic.LoadUint64(sh.pdqWord(pi, slot, 3)))
+	d += bits.OnesCount64(qw[2]^loadU64(arena, rec+16)) +
+		bits.OnesCount64(qw[3]^loadU64(arena, rec+24))
 	return uint16(d), d <= limit
-}
-
-// pdqDistanceAt computes the exact PDQ distance with early rejection. ok is
-// false when the partial distance already exceeds limit.
-func pdqDistanceAt(sh *shard, pi uint64, slot int, qw *[4]uint64, limit int) (uint16, bool) {
-	d := bits.OnesCount64(qw[0] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 0)))
-	if d > limit {
-		return 0, false
-	}
-	d += bits.OnesCount64(qw[1] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 1)))
-	if d > limit {
-		return 0, false
-	}
-	d += bits.OnesCount64(qw[2] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 2)))
-	if d > limit {
-		return 0, false
-	}
-	d += bits.OnesCount64(qw[3] ^ atomic.LoadUint64(sh.pdqWord(pi, slot, 3)))
-	if d > limit {
-		return 0, false
-	}
-	return uint16(d), true
 }
 
 // Quality returns the PDQ quality byte for id, validated by the block sequence.
@@ -338,9 +349,10 @@ func (st *Store) Quality(id common.ImageID) (uint8, bool) {
 	slot := slotOf(uint64(id))
 	sh, pi := v.shardForHashPage(hashPage)
 	seq := sh.seqPtr(pi, v.geo.blockOf(slot))
+	src := (*uint64)(unsafe.Pointer(&sh.arena[sh.base(pi)+qualityColumnOffset+uint64(slot&^7)]))
 	for {
 		a := waitSeqEven(seq)
-		q := uint8(atomic.LoadUint64(sh.qualityWord(pi, slot)) >> qualityShift(slot))
+		q := uint8(atomic.LoadUint64(src) >> qualityShift(slot))
 		if atomic.LoadUint64(seq) == a {
 			return q, true
 		}

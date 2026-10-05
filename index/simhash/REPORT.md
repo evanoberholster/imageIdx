@@ -109,9 +109,29 @@ that window by fsyncing the record before the apply.
   mappings, then truncate the journal.
 - `Close`: waits for readers and unmaps. Like `index/radixhash`, it does **not**
   checkpoint; explicit `Sync`/`Checkpoint` is required for durability.
-- `Open`: restores the **committed** generation from the manifest, so an
-  uncommitted `Upsert` generation bump rolls back on reopen even though its
-  canonical bytes may be repaired from the journal.
+- `Open`: the manifest generation is the **durable checkpoint floor**; a
+  validated WAL chain advances the runtime generation beyond it. For example,
+  manifest `G` with WAL batches `G→G+1` and `G+1→G+2` opens at runtime
+  generation `G+2`. An uncheckpointed `Upsert` is **recovered** from the WAL, not
+  rolled back. The three notions are distinct: checkpoint generation (manifest),
+  recoverable WAL state, and runtime generation.
+
+### Failure semantics
+
+- **Append preflight.** Required shards form a contiguous arithmetic range and
+  are ensured before any canonical write. A preflight failure leaves `committed`,
+  the generation, and the reader-visible high-water unchanged; any shard already
+  created is retained as physical capacity, never as a partial logical append.
+- **Sync append publication.** Under `DurabilitySync`, `AppendBatch` writes the
+  unpublished records, then persists canonical data, shard metadata, and the
+  manifest, and only then publishes `committedAtomic` and the generation. If
+  persistence fails, writer state is rolled back and readers never observe the
+  new IDs. Under `DurabilityOS` the faster write → publish → return path is used.
+- **Search consistency.** A search samples an immutable shard-set view, the
+  committed high-water at that moment, and per-sequence-block tuple consistency.
+  It does **not** get whole-generation MVCC snapshot isolation: a concurrent
+  writer may leave different sequence blocks at different points in time. This is
+  intentional and is not solved with locks or COW.
 
 ## Search
 
@@ -300,6 +320,30 @@ ns/op).
 required shards form a contiguous range derived arithmetically from the first and
 last ImageIDs, and all are ensured before the first record is written, so a
 preflight failure leaves logical state unchanged (no map of required shards).
+
+### Final performance pass
+
+- **Append addressing.** `writeRecordsLocked` now processes contiguous runs
+  within a hash page and hoists the column bases once per run. `AppendBatch/64`
+  improved from 346 to ~273 ns/op (0 allocs).
+- **Append boundaries** (`AppendBatch/64`, ns/op): within page 268, page
+  boundary 296, sequence-block boundary 272, shard boundary 281 — smooth, no
+  cliff, 0 allocs.
+- **Larger batches** degrade smoothly (`UpsertBatch` ns/update): 1→2803,
+  4→2665, 16→3157, 32→3929, 64→6147 (96/update), 128→60/update, 256→43/update.
+- **WAL frame size** grows linearly, ~49.6 B/update plus ~24 B fixed: 89 / 824 /
+  1608 / 3176 / 6312 / 12584 bytes for 1/16/32/64/128/256 updates; 64 individual
+  frames write 5696 B. A ≤64 batch stays one frame, one generation.
+- **Duplicate ImageIDs** take no slow path: `UpsertBatch` with 64 records that
+  collide on two IDs is 77 ns/update, 0 allocs.
+- **Search addressing.** The scan loops hoist the per-page column base and
+  reconstruct the ImageID from a per-page base. Measured A/B against the previous
+  helper-based loops on the same machine: ~5% faster PDQ d=16, ~12% faster
+  combined pHash-first, ~12% faster PDQ d=31.
+- **Unpublished quality writes** keep the aligned atomic read-modify-write. A
+  plain byte store was considered and rejected: an unpublished slot can share its
+  quality word with a published neighbour that a concurrent `Quality` read loads
+  atomically, so a plain store would race.
 
 ## Kernel package (SIMD and scalar)
 

@@ -49,7 +49,7 @@ func BenchmarkAppendBatch(b *testing.B) {
 	}
 	defer st.Close()
 	records := randRecords(901, optimizedBatchRecords)
-	for _, size := range []int{1, 4, 16, 32, 64} {
+	for _, size := range []int{1, 4, 16, 32, 64, 128, 256} {
 		batch := records[:size]
 		b.Run(fmt.Sprintf("batch=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
@@ -63,6 +63,53 @@ func BenchmarkAppendBatch(b *testing.B) {
 				}
 			}
 			b.ReportMetric(float64(size), "updates/op")
+		})
+	}
+}
+
+// setCommittedForBench positions the append watermark and ensures its shards
+// exist, so a boundary benchmark starts at a specific ImageID.
+func setCommittedForBench(st *Store, id uint64) {
+	st.mu.Lock()
+	_ = st.ensureShardsLocked(hashPageOf(id) / st.pagesPerShard)
+	st.committed = id
+	st.committedAtomic.Store(id)
+	st.mu.Unlock()
+}
+
+// BenchmarkAppendBoundary measures AppendBatch(64) at page, sequence-block, and
+// shard boundaries versus within a page.
+func BenchmarkAppendBoundary(b *testing.B) {
+	cfg := Config{MaxShardBytes: shardBytes(8, defaultSeqBlockRecords)}
+	st, err := Open(b.TempDir(), cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer st.Close()
+	recs := randRecords(950, optimizedBatchRecords)
+	pps := st.PagesPerShard()
+	cases := []struct {
+		name  string
+		start uint64
+	}{
+		{"withinPage", slotsPerHashPage / 2},
+		{"pageBoundary", slotsPerHashPage - 32},
+		{"seqBlockBoundary", defaultSeqBlockRecords - 32},
+		{"shardBoundary", pps*slotsPerHashPage - optimizedBatchRecords},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				setCommittedForBench(st, c.start)
+				b.StartTimer()
+				if _, err := st.AppendBatch(recs); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(64, "updates/op")
 		})
 	}
 }

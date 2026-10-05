@@ -87,6 +87,50 @@ func readManifest(dir string) (manifest, bool, error) {
 	return m, true, nil
 }
 
+// validateManifest rejects a CRC-valid but nonsensical manifest before any of
+// its geometry is used for arithmetic. It returns ErrCorrupt (never a panic or
+// an out-of-range index) for zero or overflowing geometry, an unsupported
+// sequence block size, a shard size above the configured maximum, or a committed
+// high-water mark that the declared shards cannot represent.
+func validateManifest(mf manifest, cfg Config) error {
+	if mf.pagesPerShard == 0 {
+		return fmt.Errorf("%w: pagesPerShard is zero", ErrCorrupt)
+	}
+	if mf.seqBlockRecords != uint64(cfg.SeqBlockRecords) || !validSeqBlockRecords(int(mf.seqBlockRecords)) {
+		return fmt.Errorf("%w: unsupported sequence block size %d", ErrCorrupt, mf.seqBlockRecords)
+	}
+	geo := newGeometry(int(mf.seqBlockRecords))
+	if mf.pagesPerShard > (^uint64(0)-headerBytes)/geo.hashPageStride {
+		return fmt.Errorf("%w: shard size overflow", ErrCorrupt)
+	}
+	size := uint64(headerBytes) + mf.pagesPerShard*geo.hashPageStride
+	if size > cfg.MaxShardBytes {
+		return fmt.Errorf("%w: shard size %d exceeds maximum %d", ErrCorrupt, size, cfg.MaxShardBytes)
+	}
+	if mf.pagesPerShard > ^uint64(0)/slotsPerHashPage {
+		return fmt.Errorf("%w: per-shard capacity overflow", ErrCorrupt)
+	}
+	perShard := mf.pagesPerShard * slotsPerHashPage
+	if mf.shardCount != 0 && mf.pagesPerShard > ^uint64(0)/mf.shardCount {
+		return fmt.Errorf("%w: shard count overflow", ErrCorrupt)
+	}
+	total := mf.shardCount * perShard
+	if mf.committed > total {
+		return fmt.Errorf("%w: committed %d exceeds shard capacity %d", ErrCorrupt, mf.committed, total)
+	}
+	// The committed high-water mark must be representable by exactly the
+	// declared shards: shard for a max ID is id/perShard, so shardCount is
+	// committed/perShard + 1 (0 when nothing is committed).
+	required := uint64(0)
+	if mf.committed != 0 {
+		required = mf.committed/perShard + 1
+	}
+	if mf.shardCount != required {
+		return fmt.Errorf("%w: shard count %d inconsistent with committed %d (want %d)", ErrCorrupt, mf.shardCount, mf.committed, required)
+	}
+	return nil
+}
+
 // shardFileSize returns header + pages*hashPageStride with an overflow check.
 func shardFileSize(pagesPerShard uint64, geo geometry) (uint64, bool) {
 	if geo.hashPageStride != 0 && pagesPerShard > (^uint64(0)-headerBytes)/geo.hashPageStride {
@@ -175,8 +219,8 @@ func Open(dir string, config Config) (*Store, error) {
 		return nil, err
 	}
 	if ok {
-		if mf.seqBlockRecords != uint64(cfg.SeqBlockRecords) {
-			return nil, fmt.Errorf("%w: sequence block size mismatch", ErrCorrupt)
+		if err := validateManifest(mf, cfg); err != nil {
+			return nil, err
 		}
 		st.pagesPerShard = mf.pagesPerShard
 		st.committed = mf.committed
@@ -311,20 +355,6 @@ func (st *Store) createShardLocked(index uint64) (*shard, error) {
 		return nil, err
 	}
 	return sh, nil
-}
-
-// ensureShardLocked returns the shard covering hashPage, creating shards as
-// needed.
-func (st *Store) ensureShardLocked(hashPage uint64) (*shard, error) {
-	index := hashPage / st.pagesPerShard
-	for index >= uint64(len(st.shards)) {
-		sh, err := st.createShardLocked(uint64(len(st.shards)))
-		if err != nil {
-			return nil, err
-		}
-		st.shards = append(st.shards, sh)
-	}
-	return st.shards[index], nil
 }
 
 func (st *Store) writeManifestLocked() error {

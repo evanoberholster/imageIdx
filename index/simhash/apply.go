@@ -2,6 +2,7 @@ package simhash
 
 import (
 	"sync/atomic"
+	"unsafe"
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
@@ -46,23 +47,38 @@ func (st *Store) appendBatchLocked(recs []Record) (common.ImageID, error) {
 
 	// Preflight: ensure every required shard exists before touching canonical
 	// state. ImageIDs are dense, so the required shards form a contiguous range.
+	// If a later shard creation fails, logical state is unchanged: committed,
+	// generation, and the reader-visible high-water are untouched, and any
+	// already-created shard is retained as physical capacity.
 	if err := st.ensureShardsLocked(lastShard); err != nil {
 		return 0, err
 	}
+	oldCommitted := st.committed
+	oldGeneration := st.generation
 	st.writeRecordsLocked(first, recs)
 	for si := firstShard; si <= lastShard; si++ {
 		sh := st.shards[si]
 		sh.committed = shardCommitted(sh, last)
 	}
 	st.committed = last
-	st.committedAtomic.Store(last)
 	st.generation++
-	st.gen.Store(st.generation)
+
+	// Under sync durability, do not publish the commit to readers until the
+	// canonical data, shard metadata, and manifest are durable. On failure,
+	// roll back writer state; readers never observed the new IDs.
 	if st.config.Durability == common.DurabilitySync {
 		if err := st.persistLocked(); err != nil {
+			st.committed = oldCommitted
+			st.generation = oldGeneration
+			for si := firstShard; si <= lastShard; si++ {
+				sh := st.shards[si]
+				sh.committed = shardCommitted(sh, oldCommitted)
+			}
 			return 0, err
 		}
 	}
+	st.committedAtomic.Store(last)
+	st.gen.Store(st.generation)
 	return common.ImageID(first), nil
 }
 
@@ -84,22 +100,46 @@ func (st *Store) ensureShardsLocked(lastShard uint64) error {
 	return nil
 }
 
-// writeRecordsLocked writes the append batch with arithmetic addressing only;
-// no per-record shard discovery or validation.
+// writeRecordsLocked writes the append batch with arithmetic addressing only.
+// Dense append IDs stay within one hash page for almost every batch, so it
+// processes contiguous runs per page and hoists the column bases once per run
+// instead of recomputing them per record.
+//
+// The records are not yet reader-visible, so pHash and PDQ use plain stores.
+// Quality still uses the aligned 8-byte atomic read-modify-write: an
+// unpublished slot can share its quality word with a published neighbour that a
+// concurrent Quality read loads atomically.
 func (st *Store) writeRecordsLocked(first uint64, recs []Record) {
+	i := 0
 	id := first
-	for i := range recs {
+	for i < len(recs) {
 		page := hashPageOf(id)
 		sh := st.shards[page/st.pagesPerShard]
 		pi := page - sh.firstPage
 		slot := slotOf(id)
-		words := hashWords(&recs[i].PDQ)
-		*sh.phash(pi, slot) = recs[i].PHash
-		for k := 0; k < 4; k++ {
-			*sh.pdqWord(pi, slot, k) = words[k]
+		run := slotsPerHashPage - slot
+		if run > len(recs)-i {
+			run = len(recs) - i
 		}
-		st.storeQuality(sh, pi, slot, recs[i].Quality)
-		id++
+		base := sh.base(pi)
+		pdqBase := base + pdqColumnOffset
+		qBase := base + qualityColumnOffset
+		for k := 0; k < run; k++ {
+			s := slot + k
+			rec := &recs[i+k]
+			*(*uint64)(unsafe.Pointer(&sh.arena[base+uint64(s)*8])) = rec.PHash
+			w := hashWords(&rec.PDQ)
+			off := pdqBase + uint64(s)*32
+			*(*uint64)(unsafe.Pointer(&sh.arena[off])) = w[0]
+			*(*uint64)(unsafe.Pointer(&sh.arena[off+8])) = w[1]
+			*(*uint64)(unsafe.Pointer(&sh.arena[off+16])) = w[2]
+			*(*uint64)(unsafe.Pointer(&sh.arena[off+24])) = w[3]
+			shift := uint(s&7) * 8
+			word := (*uint64)(unsafe.Pointer(&sh.arena[qBase+uint64(s&^7)]))
+			atomic.StoreUint64(word, (atomic.LoadUint64(word)&^(0xff<<shift))|(uint64(rec.Quality)<<shift))
+		}
+		i += run
+		id += uint64(run)
 	}
 }
 
@@ -210,17 +250,6 @@ func (st *Store) applyBlockGroupLocked(group []Update) {
 	for k := range group {
 		st.applyPointNoSeq(sh, pi, slotOf(uint64(group[k].ImageID)), group[k].Record)
 	}
-	atomic.AddUint64(seq, 1) // even
-}
-
-// applyPointLocked updates one record in place under its block seqlock.
-func (st *Store) applyPointLocked(id uint64, rec Record) {
-	page := hashPageOf(id)
-	sh := st.shards[page/st.pagesPerShard]
-	pi := page - sh.firstPage
-	seq := sh.seqPtr(pi, st.geo.blockOf(slotOf(id)))
-	atomic.AddUint64(seq, 1) // odd
-	st.applyPointNoSeq(sh, pi, slotOf(id), rec)
 	atomic.AddUint64(seq, 1) // even
 }
 

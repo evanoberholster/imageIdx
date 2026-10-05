@@ -78,7 +78,7 @@ func TestManifestNewerThanShardCorrupt(t *testing.T) {
 	}
 	data := encodeManifest(manifest{
 		pagesPerShard:   st.pagesPerShard,
-		seqBlockRecords: uint64(cfg.SeqBlockRecords),
+		seqBlockRecords: uint64(defaultSeqBlockRecords),
 		committed:       100_000,
 		generation:      gen + 1,
 		shardCount:      1,
@@ -115,6 +115,44 @@ func TestCorruptShardSuperblockSlot(t *testing.T) {
 	defer reopened.Close()
 	if reopened.Len() != 100 {
 		t.Fatalf("reopened Len = %d, want 100", reopened.Len())
+	}
+}
+
+func writeManifestForTest(t *testing.T, dir string, mf manifest) {
+	t.Helper()
+	if err := storage.WriteFileAtomic(dir, "manifest.tmp", "manifest", encodeManifest(mf), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+}
+
+func TestCorruptManifestGeometry(t *testing.T) {
+	cfg := testConfig()
+	valid := manifest{pagesPerShard: 1, seqBlockRecords: uint64(defaultSeqBlockRecords)}
+	cases := []struct {
+		name string
+		mf   manifest
+	}{
+		{"pages-zero", manifest{pagesPerShard: 0, seqBlockRecords: uint64(defaultSeqBlockRecords)}},
+		{"bad-seq", manifest{pagesPerShard: 1, seqBlockRecords: 1000}},
+		{"committed-exceeds-capacity", manifest{pagesPerShard: 1, seqBlockRecords: uint64(defaultSeqBlockRecords), committed: 1 << 40, shardCount: 0}},
+		{"shard-count-zero-with-committed", manifest{pagesPerShard: 1, seqBlockRecords: uint64(defaultSeqBlockRecords), committed: 5, shardCount: 0}},
+		{"shard-count-too-big", manifest{pagesPerShard: 1, seqBlockRecords: uint64(defaultSeqBlockRecords), committed: 0, shardCount: ^uint64(0)}},
+		{"size-overflow", manifest{pagesPerShard: 1 << 40, seqBlockRecords: uint64(defaultSeqBlockRecords)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeManifestForTest(t, dir, tc.mf)
+			if _, err := Open(dir, cfg); err == nil {
+				t.Fatalf("Open accepted manifest %+v", tc.mf)
+			}
+		})
+	}
+	// A valid manifest passes validation.
+	dir := t.TempDir()
+	writeManifestForTest(t, dir, valid)
+	if _, err := Open(dir, cfg); err != nil {
+		t.Fatalf("Open rejected a valid manifest: %v", err)
 	}
 }
 
