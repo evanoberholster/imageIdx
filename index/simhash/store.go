@@ -182,11 +182,14 @@ func Open(dir string, config Config) (*Store, error) {
 			return nil, err
 		}
 	}
-	st.resetSequences()
 	if err := st.recoverJournal(); err != nil {
 		_ = st.closeShards()
 		return nil, err
 	}
+	// Sequence counters are ephemeral: after journal recovery, reset every
+	// counter to an even value so a crash that left one odd cannot make a
+	// reader spin forever.
+	st.resetSequences()
 	st.publishLocked()
 	return st, nil
 }

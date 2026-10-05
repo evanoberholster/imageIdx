@@ -3,10 +3,70 @@ package simhash
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	bench "github.com/evanoberholster/imageIdx/internal/bench"
 )
+
+// BenchmarkSeqRetry compares reader retry policies under a writer that holds the
+// sequence odd in short bursts. The loops are inlined so the result measures the
+// policy, not function-call overhead.
+func BenchmarkSeqRetry(b *testing.B) {
+	var seq uint64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			atomic.StoreUint64(&seq, 1)
+			for i := 0; i < 32; i++ {
+				runtime.Gosched()
+			}
+			atomic.StoreUint64(&seq, 0)
+			for i := 0; i < 32; i++ {
+				runtime.Gosched()
+			}
+		}
+	}()
+	b.Run("immediateSpin", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for atomic.LoadUint64(&seq)&1 != 0 {
+			}
+		}
+	})
+	b.Run("boundedSpin", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			spin := 0
+			for atomic.LoadUint64(&seq)&1 != 0 {
+				spin++
+				if spin >= seqSpinLimit {
+					runtime.Gosched()
+				}
+			}
+		}
+	})
+	b.Run("immediateGosched", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for atomic.LoadUint64(&seq)&1 != 0 {
+				runtime.Gosched()
+			}
+		}
+	})
+	close(stop)
+	wg.Wait()
+}
 
 func benchSetup(b *testing.B, n, seq int) (*Store, []Record) {
 	b.Helper()
