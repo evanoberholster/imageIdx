@@ -262,6 +262,45 @@ shard mapping). Recovery `Open` replay: 0 updates 83 µs, 1 156 µs, 64 156 µs,
 - **Search consistency is per sequence block**, not whole-query snapshot
   isolation.
 
+## Allocation budget
+
+Steady-state allocation (M4 Pro, `-benchmem`):
+
+| operation | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `Get` | 9 | 0 | 0 |
+| `SearchPHash` | 0.61 ms / 1M | 0 | 0 |
+| `SearchPDQ` | 1.02 ms / 1M | 0 | 0 |
+| `SearchCombined` | 0.78 ms / 1M | 0 | 0 |
+| `Upsert` | ~2.4 µs | 0 | 0 |
+| `UpsertBatch/64` | 5.1 µs (79 ns/update) | 0 | 0 |
+| `Append` | 123 | 0 | 0 |
+| `AppendBatch/64` | 346 (5.4 ns/record) | 0 | 0 |
+
+Searches are measured with caller-preallocated result buffers; the `B/op` seen
+at d = 32/64 is caller result growth, not the store. Escape analysis
+(`go test -gcflags=-m`) shows no per-operation heap escapes in `Append`,
+`AppendBatch`, `Upsert`, `UpsertBatch`, `Get`, or the searches; the remaining
+escapes are `Open`, checkpoint, shard creation (rare), and caller result slices.
+The 64-update WAL frame is encoded directly into reusable WAL scratch, so a
+transaction allocates no intermediate representation. Recovery reuses one header
+and one payload buffer and decodes updates by value.
+
+The implementation deliberately uses **arithmetic addressing** (`id → hash page →
+slot → shard`), **fixed arrays and bounded slices**, and **linear scans over ≤64
+items** instead of maps, because the workload is small and bounded. There are no
+maps, no `sync.Pool`, no reflection, and no interfaces in the scan/update loops.
+Larger batches run through the same single linear pass (one WAL frame up to
+`maxBatchRecords`); ≤64 is the tuned fast path. A benchmark-only fixed-array
+insertion sort for block grouping was measured and rejected: consecutive-run
+grouping was faster both locally (5222 vs 5491 ns/op) and at random (5819 vs 6718
+ns/op).
+
+`AppendBatch` preflights the whole batch before touching canonical state: the
+required shards form a contiguous range derived arithmetically from the first and
+last ImageIDs, and all are ensured before the first record is written, so a
+preflight failure leaves logical state unchanged (no map of required shards).
+
 ## Correctness / race
 
 Tests cover direct ImageID↔hashPage/slot mapping and the `0xffff/0x10000`

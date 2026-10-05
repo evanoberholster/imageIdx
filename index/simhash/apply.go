@@ -7,33 +7,56 @@ import (
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-// Append appends one record and returns its assigned ImageID.
+// Append appends one record and returns its assigned ImageID. It shares the
+// append path without constructing a one-element heap slice.
 func (st *Store) Append(rec Record) (common.ImageID, error) {
-	return st.appendBatch([]Record{rec})
-}
-
-// AppendBatch appends records densely and returns the first assigned ImageID.
-// The assigned IDs are first..first+len(records)-1. New slots are not yet
-// visible, so appends do not use the update WAL.
-func (st *Store) AppendBatch(recs []Record) (common.ImageID, error) {
-	return st.appendBatch(recs)
-}
-
-func (st *Store) appendBatch(recs []Record) (common.ImageID, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.closed.Load() {
 		return 0, ErrClosed
 	}
+	st.singleRec[0] = rec
+	return st.appendBatchLocked(st.singleRec[:])
+}
+
+// AppendBatch appends records densely and returns the first assigned ImageID.
+// The assigned IDs are first..first+len(records)-1. New slots are not yet
+// visible, so appends do not use the update WAL. The batch is preflighted before
+// any canonical write, so a failure leaves logical state unchanged.
+func (st *Store) AppendBatch(recs []Record) (common.ImageID, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.closed.Load() {
+		return 0, ErrClosed
+	}
+	return st.appendBatchLocked(recs)
+}
+
+func (st *Store) appendBatchLocked(recs []Record) (common.ImageID, error) {
 	if len(recs) == 0 {
 		return common.ImageID(st.committed + 1), nil
 	}
-	first, err := st.applyLocked(recs)
-	if err != nil {
+	if st.committed > ^uint64(0)-uint64(len(recs)) || st.generation == ^uint64(0) {
+		return 0, ErrOverflow
+	}
+	first := st.committed + 1
+	last := st.committed + uint64(len(recs))
+	firstShard := hashPageOf(first) / st.pagesPerShard
+	lastShard := hashPageOf(last) / st.pagesPerShard
+
+	// Preflight: ensure every required shard exists before touching canonical
+	// state. ImageIDs are dense, so the required shards form a contiguous range.
+	if err := st.ensureShardsLocked(lastShard); err != nil {
 		return 0, err
 	}
+	st.writeRecordsLocked(first, recs)
+	for si := firstShard; si <= lastShard; si++ {
+		sh := st.shards[si]
+		sh.committed = shardCommitted(sh, last)
+	}
+	st.committed = last
+	st.committedAtomic.Store(last)
 	st.generation++
-	st.publishLocked()
 	st.gen.Store(st.generation)
 	if st.config.Durability == common.DurabilitySync {
 		if err := st.persistLocked(); err != nil {
@@ -43,19 +66,32 @@ func (st *Store) appendBatch(recs []Record) (common.ImageID, error) {
 	return common.ImageID(first), nil
 }
 
-// applyLocked writes the columns for a dense append batch and advances the
-// high-water mark. New slots are invisible until the caller publishes the view,
-// so their column writes need neither a WAL nor sequence protection.
-func (st *Store) applyLocked(recs []Record) (uint64, error) {
-	first := st.committed + 1
-	for i := range recs {
-		id := st.committed + 1
-		hashPage := hashPageOf(id)
-		sh, err := st.ensureShardLocked(hashPage)
+// ensureShardsLocked creates every shard up to lastShard and publishes the new
+// shard set before any committed mark advances.
+func (st *Store) ensureShardsLocked(lastShard uint64) error {
+	created := false
+	for uint64(len(st.shards)) <= lastShard {
+		sh, err := st.createShardLocked(uint64(len(st.shards)))
 		if err != nil {
-			return 0, err
+			return err
 		}
-		pi := hashPage - sh.firstPage
+		st.shards = append(st.shards, sh)
+		created = true
+	}
+	if created {
+		st.publishLocked()
+	}
+	return nil
+}
+
+// writeRecordsLocked writes the append batch with arithmetic addressing only;
+// no per-record shard discovery or validation.
+func (st *Store) writeRecordsLocked(first uint64, recs []Record) {
+	id := first
+	for i := range recs {
+		page := hashPageOf(id)
+		sh := st.shards[page/st.pagesPerShard]
+		pi := page - sh.firstPage
 		slot := slotOf(id)
 		words := hashWords(&recs[i].PDQ)
 		*sh.phash(pi, slot) = recs[i].PHash
@@ -63,13 +99,25 @@ func (st *Store) applyLocked(recs []Record) (uint64, error) {
 			*sh.pdqWord(pi, slot, k) = words[k]
 		}
 		st.storeQuality(sh, pi, slot, recs[i].Quality)
-		st.committed = id
-		sh.committed = id - (sh.firstPage << 16) + 1
-		if sh.committed > sh.hashPageCount*slotsPerHashPage {
-			sh.committed = sh.hashPageCount * slotsPerHashPage
-		}
+		id++
 	}
-	return first, nil
+}
+
+// shardCommitted returns the number of valid records in shard sh up to lastID.
+func shardCommitted(sh *shard, lastID uint64) uint64 {
+	firstID := sh.firstPage << 16
+	capacity := sh.hashPageCount * slotsPerHashPage
+	if lastID >= firstID+capacity {
+		return capacity
+	}
+	low := firstID
+	if low < 1 {
+		low = 1
+	}
+	if lastID < low {
+		return 0
+	}
+	return lastID - low + 1
 }
 
 // Upsert updates one existing record. It shares the batch implementation and
@@ -101,8 +149,12 @@ func (st *Store) upsertLocked(updates []Update) error {
 	if len(updates) > maxBatchRecords {
 		return ErrBatchTooLarge
 	}
+	if st.generation == ^uint64(0) {
+		return ErrOverflow
+	}
+	committed := st.committedAtomic.Load()
 	for i := range updates {
-		if updates[i].ImageID == 0 || uint64(updates[i].ImageID) > st.committed {
+		if updates[i].ImageID == 0 || uint64(updates[i].ImageID) > committed {
 			return ErrInvalidID
 		}
 	}
@@ -127,16 +179,17 @@ func (st *Store) upsertLocked(updates []Update) error {
 // by ImageID helps only already-local batches (roughly 8%) and costs ~34% on
 // random batches, where every record is in a different block and grouping buys
 // nothing. Consecutive-run grouping captures local and sequential batches at no
-// cost and never regresses random ones.
+// cost and never regresses random ones. It is a single linear pass with no
+// allocation, map, or temporary index.
 func (st *Store) applyBatchLocked(updates []Update) {
 	i := 0
 	for i < len(updates) {
 		page := hashPageOf(uint64(updates[i].ImageID))
-		block := slotOf(uint64(updates[i].ImageID)) / st.geo.seqBlockRecords
+		block := st.geo.blockOf(slotOf(uint64(updates[i].ImageID)))
 		j := i + 1
 		for j < len(updates) {
 			id := uint64(updates[j].ImageID)
-			if hashPageOf(id) != page || slotOf(id)/st.geo.seqBlockRecords != block {
+			if hashPageOf(id) != page || st.geo.blockOf(slotOf(id)) != block {
 				break
 			}
 			j++
@@ -152,8 +205,7 @@ func (st *Store) applyBlockGroupLocked(group []Update) {
 	page := hashPageOf(uint64(group[0].ImageID))
 	sh := st.shards[page/st.pagesPerShard]
 	pi := page - sh.firstPage
-	slot := slotOf(uint64(group[0].ImageID))
-	seq := sh.seqPtr(pi, slot/st.geo.seqBlockRecords)
+	seq := sh.seqPtr(pi, st.geo.blockOf(slotOf(uint64(group[0].ImageID))))
 	atomic.AddUint64(seq, 1) // odd
 	for k := range group {
 		st.applyPointNoSeq(sh, pi, slotOf(uint64(group[k].ImageID)), group[k].Record)
@@ -166,7 +218,7 @@ func (st *Store) applyPointLocked(id uint64, rec Record) {
 	page := hashPageOf(id)
 	sh := st.shards[page/st.pagesPerShard]
 	pi := page - sh.firstPage
-	seq := sh.seqPtr(pi, slotOf(id)/st.geo.seqBlockRecords)
+	seq := sh.seqPtr(pi, st.geo.blockOf(slotOf(id)))
 	atomic.AddUint64(seq, 1) // odd
 	st.applyPointNoSeq(sh, pi, slotOf(id), rec)
 	atomic.AddUint64(seq, 1) // even
@@ -205,7 +257,6 @@ func (st *Store) applyJournalUpdate(id, phash uint64, pdq *PDQHash, quality uint
 }
 
 // Sync publishes and flushes the durable state, then truncates the journal.
-// See persistLocked for the ordering.
 func (st *Store) Sync() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -226,37 +277,30 @@ func (st *Store) Sync() error {
 //	    -> reset the WAL
 //
 // The manifest is the final durable commit marker, so it can never claim a
-// generation whose canonical data or shard metadata is not durable. The WAL is
-// discarded only after both are durable.
+// generation whose canonical data or shard metadata is not durable.
 func (st *Store) persistLocked() error {
-	// 1. Flush canonical column bytes.
 	for _, sh := range st.shards {
 		if err := sh.mapped.Sync(); err != nil {
 			return err
 		}
 	}
-	// 2. Write new shard superblocks into the inactive slots.
 	for _, sh := range st.shards {
 		sh.generation = st.generation
 		if err := sh.writeMeta(); err != nil {
 			return err
 		}
 	}
-	// 3. Flush shard metadata.
 	for _, sh := range st.shards {
 		if err := sh.mapped.Sync(); err != nil {
 			return err
 		}
 	}
-	// 4. Publish the manifest last.
 	if err := st.writeManifestLocked(); err != nil {
 		return err
 	}
-	// 5. fsync the directory.
 	if err := storage.SyncDir(st.dir); err != nil {
 		return err
 	}
-	// 6. Reset the WAL now that canonical data and metadata are durable.
 	if st.journal != nil {
 		return st.journal.reset()
 	}

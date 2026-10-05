@@ -37,6 +37,16 @@ func waitSeqEven(seq *uint64) uint64 {
 	}
 }
 
+// clampCommitted limits a reader's committed high-water mark to what its
+// snapshot's shard set can address, so a reader that sees a newer committed mark
+// than its view scans a consistent older snapshot instead of a missing shard.
+func clampCommitted(committed, capacity uint64) uint64 {
+	if committed > capacity {
+		return capacity
+	}
+	return committed
+}
+
 // In the middle of the PDQ distance range the first-word reject branch is close
 // to 50/50 and mispredicts badly, so a two-word prefix (still branchy but
 // predictable) is faster. Early rejection wins when the threshold is far below
@@ -53,31 +63,51 @@ func useEarlyReject(limit int) bool {
 // SearchPHash appends every committed record whose 64-bit pHash is within
 // maxDistance to dst, with the exact distance.
 func (st *Store) SearchPHash(dst []PHashMatch, query uint64, maxDistance int) []PHashMatch {
+	if st.closed.Load() {
+		return dst
+	}
 	token := st.tracker.Acquire()
 	defer st.tracker.Release(token)
-	return st.view.Load().searchPHash(dst, query, maxDistance)
+	if st.closed.Load() {
+		return dst
+	}
+	v := st.view.Load()
+	return v.searchPHash(dst, query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
 }
 
 // SearchPDQ appends every committed record whose 256-bit PDQ hash is within
 // maxDistance to dst, with the exact distance. PDQ is evaluated independently
 // of pHash.
 func (st *Store) SearchPDQ(dst []PDQMatch, query PDQHash, maxDistance uint16) []PDQMatch {
+	if st.closed.Load() {
+		return dst
+	}
 	token := st.tracker.Acquire()
 	defer st.tracker.Release(token)
-	return st.view.Load().searchPDQ(dst, &query, maxDistance)
+	if st.closed.Load() {
+		return dst
+	}
+	v := st.view.Load()
+	return v.searchPDQ(dst, &query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
 }
 
 // SearchCombined appends every committed record that satisfies both the pHash
 // and PDQ thresholds, with both exact distances. order selects which column is
 // evaluated first; the AND semantics are identical.
 func (st *Store) SearchCombined(dst []CombinedMatch, phashQuery uint64, maxPHashDistance int, pdqQuery PDQHash, maxPDQDistance uint16, order Order) []CombinedMatch {
+	if st.closed.Load() {
+		return dst
+	}
 	token := st.tracker.Acquire()
 	defer st.tracker.Release(token)
-	return st.view.Load().searchCombined(dst, phashQuery, maxPHashDistance, &pdqQuery, maxPDQDistance, order)
+	if st.closed.Load() {
+		return dst
+	}
+	v := st.view.Load()
+	return v.searchCombined(dst, phashQuery, maxPHashDistance, &pdqQuery, maxPDQDistance, order, clampCommitted(st.committedAtomic.Load(), v.capacity))
 }
 
-func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int) []PHashMatch {
-	last := v.committed
+func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int, last uint64) []PHashMatch {
 	if last == 0 {
 		return dst
 	}
@@ -119,8 +149,7 @@ func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int) []PH
 	return dst
 }
 
-func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16) []PDQMatch {
-	last := v.committed
+func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16, last uint64) []PDQMatch {
 	if last == 0 {
 		return dst
 	}
@@ -170,9 +199,6 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16) []P
 						dst = append(dst, PDQMatch{ImageID: id, Distance: uint16(d)})
 						continue
 					}
-					// Two-word prefix: for mid-range thresholds the first
-					// check almost always rejects, so the branch is
-					// predictable and half the popcounts are skipped.
 					d := bits.OnesCount64(qw[0]^atomic.LoadUint64(sh.pdqWord(pi, slot, 0))) +
 						bits.OnesCount64(qw[1]^atomic.LoadUint64(sh.pdqWord(pi, slot, 1)))
 					if d <= limit {
@@ -193,8 +219,7 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16) []P
 	return dst
 }
 
-func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash int, pdqQuery *PDQHash, maxPDQ uint16, order Order) []CombinedMatch {
-	last := v.committed
+func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash int, pdqQuery *PDQHash, maxPDQ uint16, order Order, last uint64) []CombinedMatch {
 	if last == 0 {
 		return dst
 	}
@@ -296,16 +321,23 @@ func pdqDistanceAt(sh *shard, pi uint64, slot int, qw *[4]uint64, limit int) (ui
 
 // Quality returns the PDQ quality byte for id, validated by the block sequence.
 func (st *Store) Quality(id common.ImageID) (uint8, bool) {
+	if st.closed.Load() {
+		return 0, false
+	}
 	token := st.tracker.Acquire()
 	defer st.tracker.Release(token)
+	if st.closed.Load() {
+		return 0, false
+	}
 	v := st.view.Load()
-	if id == 0 || uint64(id) > v.committed {
+	committed := clampCommitted(st.committedAtomic.Load(), v.capacity)
+	if id == 0 || uint64(id) > committed {
 		return 0, false
 	}
 	hashPage := hashPageOf(uint64(id))
 	slot := slotOf(uint64(id))
 	sh, pi := v.shardForHashPage(hashPage)
-	seq := sh.seqPtr(pi, slot/v.geo.seqBlockRecords)
+	seq := sh.seqPtr(pi, v.geo.blockOf(slot))
 	for {
 		a := waitSeqEven(seq)
 		q := uint8(atomic.LoadUint64(sh.qualityWord(pi, slot)) >> qualityShift(slot))

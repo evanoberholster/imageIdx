@@ -95,13 +95,15 @@ func shardFileSize(pagesPerShard uint64, geo geometry) (uint64, bool) {
 	return uint64(headerBytes) + pagesPerShard*geo.hashPageStride, true
 }
 
-// view is one immutable, atomically published reader view: the committed
-// high-water mark, the format geometry, and the mapped shards. Sequence
-// counters are runtime-only and are reset on open. The published generation is
-// tracked separately (Store.gen) so an in-place point update advances the
-// logical version without allocating a replacement view.
+// view is one immutable, atomically published reader view: the format geometry
+// and the mapped shards. Sequence counters are runtime-only and are reset on
+// open. The committed high-water mark and the published generation live in
+// atomics on the Store, so appends and updates advance them without allocating
+// a replacement view. capacity is the largest ImageID the shard set can
+// represent; a reader that sees a newer committed mark than its view clamps to
+// this so it scans a consistent older snapshot instead of a missing shard.
 type view struct {
-	committed     uint64
+	capacity      uint64
 	pagesPerShard uint64
 	geo           geometry
 	shards        []*shard
@@ -123,9 +125,11 @@ type Store struct {
 	mu     sync.Mutex
 	view   atomic.Pointer[view]
 	closed atomic.Bool
-	// gen is the published logical version. It is separate from view so an
-	// in-place Upsert can advance it without allocating a new view.
-	gen atomic.Uint64
+	// gen is the published logical version and committedAtomic is the
+	// reader-visible high-water mark. Both are atomics separate from view so
+	// appends and updates advance them without allocating a new view.
+	gen             atomic.Uint64
+	committedAtomic atomic.Uint64
 	// tracker pins readers against shard unmap during Close.
 	tracker storage.ReaderTracker
 
@@ -134,8 +138,10 @@ type Store struct {
 	committed  uint64
 	generation uint64
 	journal    *journal
-	// singleWire lets Upsert share the batch path without allocating.
+	// singleWire / singleRec let the single-record APIs share the batch path
+	// without constructing one-element heap slices.
 	singleWire [1]Update
+	singleRec  [1]Record
 }
 
 // Open opens or creates a store in dir. If dir has no manifest, an empty store
@@ -197,6 +203,7 @@ func Open(dir string, config Config) (*Store, error) {
 	// reader spin forever.
 	st.resetSequences()
 	st.gen.Store(st.generation)
+	st.committedAtomic.Store(st.committed)
 	st.publishLocked()
 	return st, nil
 }
@@ -341,7 +348,7 @@ func (st *Store) publishLocked() {
 		shards = append([]*shard(nil), st.shards...)
 	}
 	st.view.Store(&view{
-		committed:     st.committed,
+		capacity:      uint64(len(st.shards)) * st.pagesPerShard * slotsPerHashPage,
 		pagesPerShard: st.pagesPerShard,
 		geo:           st.geo,
 		shards:        shards,
@@ -376,15 +383,12 @@ func (st *Store) recoverJournal() error {
 		if base != expected || next != base+1 {
 			return fmt.Errorf("%w: journal generation %d->%d, want base %d", ErrCorrupt, base, next, expected)
 		}
-		var applyErr error
-		forEachUpdate(payload, func(id, phash uint64, pdq *PDQHash, quality uint8) {
-			if applyErr != nil {
-				return
+		count := int(binary.LittleEndian.Uint32(payload[16:20]))
+		for i := 0; i < count; i++ {
+			id, phash, pdq, quality := decodeUpdate(payload, i)
+			if err := st.applyJournalUpdate(id, phash, &pdq, quality); err != nil {
+				return err
 			}
-			applyErr = st.applyJournalUpdate(id, phash, pdq, quality)
-		})
-		if applyErr != nil {
-			return applyErr
 		}
 		expected = next
 		return nil
@@ -412,7 +416,7 @@ func (st *Store) closeShards() error {
 }
 
 // Len returns the committed high-water mark: valid ImageIDs are 1..Len.
-func (st *Store) Len() uint64 { return st.view.Load().committed }
+func (st *Store) Len() uint64 { return st.committedAtomic.Load() }
 
 // Generation returns the current published logical store version.
 func (st *Store) Generation() uint64 { return st.gen.Load() }
@@ -452,18 +456,29 @@ func (st *Store) Close() error {
 	return err
 }
 
-// Get returns the canonical record for id, validated by the block sequence.
+// Get returns the canonical record for id, validated by the block sequence. It
+// returns false for a closed store or an id beyond the committed mark.
 func (st *Store) Get(id common.ImageID) (Record, bool) {
+	if st.closed.Load() {
+		return Record{}, false
+	}
 	token := st.tracker.Acquire()
 	defer st.tracker.Release(token)
+	if st.closed.Load() {
+		return Record{}, false
+	}
 	v := st.view.Load()
-	if id == 0 || uint64(id) > v.committed {
+	committed := st.committedAtomic.Load()
+	if committed > v.capacity {
+		committed = v.capacity
+	}
+	if id == 0 || uint64(id) > committed {
 		return Record{}, false
 	}
 	hashPage := hashPageOf(uint64(id))
 	slot := slotOf(uint64(id))
 	sh, pi := v.shardForHashPage(hashPage)
-	seq := sh.seqPtr(pi, slot/v.geo.seqBlockRecords)
+	seq := sh.seqPtr(pi, v.geo.blockOf(slot))
 	for {
 		a := waitSeqEven(seq)
 		var rec Record

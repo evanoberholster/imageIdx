@@ -18,6 +18,9 @@ var (
 	ErrCorrupt = errors.New("simhash: corrupt store")
 	// ErrBatchTooLarge reports an update batch above maxBatchRecords.
 	ErrBatchTooLarge = errors.New("simhash: update batch too large")
+	// ErrOverflow reports an arithmetic overflow that would wrap the committed
+	// high-water mark or generation.
+	ErrOverflow = errors.New("simhash: arithmetic overflow")
 )
 
 // PDQHash is a 256-bit PDQ perceptual hash. The persistent representation is

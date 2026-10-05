@@ -1,8 +1,12 @@
 package simhash
 
-import "github.com/evanoberholster/imageIdx/internal/storage"
+import (
+	"math/bits"
 
-// A hash page (the unit the brief calls a logical page) holds exactly 65,536
+	"github.com/evanoberholster/imageIdx/internal/storage"
+)
+
+// A hash page (the brief calls it a logical page) holds exactly 65,536
 // ImageIDs: the low 16 bits of the ImageID are the slot, the high bits are the
 // hash page index.
 const (
@@ -31,6 +35,11 @@ const (
 
 	minSeqBlockRecords = 256
 	maxSeqBlockRecords = 4096
+
+	// optimizedBatchRecords is the batch size the update and append paths are
+	// tuned for. Larger batches are processed as consecutive chunks of this
+	// size, so the common path never allocates dynamic working structures.
+	optimizedBatchRecords = 64
 )
 
 // validSeqBlockRecords reports whether n is a supported sequence block size: a
@@ -41,9 +50,11 @@ func validSeqBlockRecords(n int) bool {
 
 // geometry is the byte geometry derived from the sequence block size. Column
 // offsets are fixed; only the trailing sequence region, and therefore the hash
-// page stride, depend on the block size.
+// page stride, depend on the block size. seqBlockShift lets the hot paths
+// compute a sequence block with a shift instead of a division.
 type geometry struct {
 	seqBlockRecords  int
+	seqBlockShift    uint
 	seqBlocksPerPage int
 	seqBytesPerPage  uint64
 	hashPageStride   uint64
@@ -53,11 +64,15 @@ func newGeometry(seqBlockRecords int) geometry {
 	blocks := slotsPerHashPage / seqBlockRecords
 	return geometry{
 		seqBlockRecords:  seqBlockRecords,
+		seqBlockShift:    uint(bits.TrailingZeros(uint(seqBlockRecords))),
 		seqBlocksPerPage: blocks,
 		seqBytesPerPage:  uint64(blocks) * 8,
 		hashPageStride:   seqOffset + uint64(blocks)*8,
 	}
 }
+
+// blockOf returns the sequence block for a slot.
+func (g geometry) blockOf(slot int) int { return slot >> g.seqBlockShift }
 
 // slotOf returns the slot within the hash page for id.
 func slotOf(id uint64) int { return int(id & slotMask) }

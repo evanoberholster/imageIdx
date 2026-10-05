@@ -2,6 +2,9 @@ package simhash
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
+	"os"
 
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
@@ -13,11 +16,10 @@ import (
 // Protocol (writer serialized by the store mutex):
 //
 //  1. validate the whole batch
-//  2. encode one complete batch frame (base generation, new generation,
-//     fixed-width updates, CRC)
+//  2. encode one complete batch frame directly into reusable scratch
 //  3. append the frame; fsync it under DurabilitySync
 //  4. group affected sequence blocks and apply in place (seq odd -> updates
-//     -> seq even per block)
+//     -> seq even per run)
 //  5. advance and publish the generation once
 //  6. Checkpoint flushes canonical data, shard metadata, then the manifest,
 //     and only then truncates the journal
@@ -52,7 +54,7 @@ type journal struct {
 }
 
 func openJournal(path string) (*journal, error) {
-	w, err := storage.OpenWAL(path, journalHeaderBytes+2*batchUpdateBytes)
+	w, err := storage.OpenWAL(path, journalHeaderBytes+optimizedBatchRecords*batchUpdateBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +72,8 @@ func (j *journal) close() error {
 // columns and authoritative metadata durable first.
 func (j *journal) reset() error { return j.wal.RepairTail(0) }
 
-// appendBatch writes one redo batch frame. It allocates nothing in steady state.
+// appendBatch writes one redo batch frame directly into reusable WAL scratch. It
+// allocates nothing in steady state.
 func (j *journal) appendBatch(base, next uint64, updates []Update, sync bool) error {
 	payloadLen := batchFixedBytes + len(updates)*batchUpdateBytes + batchCRCBytes
 	buf := j.wal.Scratch(journalHeaderBytes + payloadLen)
@@ -121,45 +124,75 @@ func batchGenerations(payload []byte) (base, next uint64) {
 	return binary.LittleEndian.Uint64(payload[0:8]), binary.LittleEndian.Uint64(payload[8:16])
 }
 
-// forEachUpdate iterates the fixed-width updates in a validated payload.
-func forEachUpdate(payload []byte, fn func(imageID, phash uint64, pdq *PDQHash, quality uint8)) {
-	count := int(binary.LittleEndian.Uint32(payload[16:20]))
-	off := batchFixedBytes
-	for i := 0; i < count; i++ {
-		id := binary.LittleEndian.Uint64(payload[off : off+8])
-		off += 8
-		ph := binary.LittleEndian.Uint64(payload[off : off+8])
-		off += 8
-		var pdq PDQHash
-		copy(pdq[:], payload[off:off+32])
-		off += 32
-		q := payload[off]
-		off++
-		fn(id, ph, &pdq, q)
-	}
+// decodeUpdate decodes update i of a validated payload by value; no allocation.
+func decodeUpdate(payload []byte, i int) (imageID, phash uint64, pdq PDQHash, quality uint8) {
+	off := batchFixedBytes + i*batchUpdateBytes
+	imageID = binary.LittleEndian.Uint64(payload[off : off+8])
+	off += 8
+	phash = binary.LittleEndian.Uint64(payload[off : off+8])
+	off += 8
+	copy(pdq[:], payload[off:off+32])
+	off += 32
+	quality = payload[off]
+	return
 }
 
-func journalPayloadLen(header []byte) (uint64, error) {
-	if len(header) < journalHeaderBytes {
-		return 0, ErrCorrupt
-	}
-	return uint64(binary.LittleEndian.Uint32(header[8:12])), nil
-}
-
-// replayJournal visits every complete, well-formed batch frame in order and
-// returns the exclusive end offset of the last complete frame.
+// replayJournal walks every complete, well-formed batch frame in order and
+// returns the exclusive end offset of the last complete frame. It reuses one
+// header and one payload buffer, so it does not allocate per frame or per
+// update.
 func replayJournal(path string, visit func(base, next uint64, payload []byte) error) (int64, error) {
-	return storage.ReplayEnd(path, 0, storage.FrameSpec{
-		HeaderSize: journalHeaderBytes,
-		Magic:      journalMagic,
-		Version:    journalVersion,
-		Corrupt:    ErrCorrupt,
-		MaxPayload: maxBatchPayloadBytes,
-	}, journalPayloadLen, func(header, payload []byte) error {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	header := make([]byte, journalHeaderBytes)
+	var payload []byte
+	var offset int64
+	for {
+		if _, err := io.ReadFull(file, header); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return offset, nil
+			}
+			return offset, err
+		}
+		if binary.LittleEndian.Uint32(header[0:4]) != journalMagic ||
+			binary.LittleEndian.Uint16(header[4:6]) != journalVersion {
+			return offset, ErrCorrupt
+		}
+		size := int(binary.LittleEndian.Uint32(header[8:12]))
+		if size < batchFixedBytes+batchUpdateBytes+batchCRCBytes || size > maxBatchPayloadBytes {
+			return offset, ErrCorrupt
+		}
+		if int64(size) > info.Size()-offset-int64(journalHeaderBytes) {
+			return offset, nil // truncated payload tail
+		}
+		if cap(payload) < size {
+			payload = make([]byte, size)
+		} else {
+			payload = payload[:size]
+		}
+		if _, err := io.ReadFull(file, payload); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return offset, nil
+			}
+			return offset, err
+		}
 		if _, ok := batchCount(payload); !ok {
-			return ErrCorrupt
+			return offset, ErrCorrupt
 		}
 		base, next := batchGenerations(payload)
-		return visit(base, next, payload)
-	})
+		if err := visit(base, next, payload); err != nil {
+			return offset, err
+		}
+		offset += int64(journalHeaderBytes) + int64(size)
+	}
 }
