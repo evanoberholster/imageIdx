@@ -411,6 +411,97 @@ func TestPartitionSlotsContiguousStable(t *testing.T) {
 	}
 }
 
+// TestDirectLeafMergeOrdering exercises the direct SoA->SoA leaf rewrite:
+// insertions at the low/middle/high end, existing and in-batch duplicates,
+// multiple IDs for one tail, and a uint32 -> uint64 id widening, then verifies
+// the encoded leaf is strictly (tail, ImageID) ascending.
+func TestDirectLeafMergeOrdering(t *testing.T) {
+	index := newTestIndex(t, testArenaBytes, Config{PromotionBytes: 1 << 30})
+	defer index.Close()
+
+	model := make(map[Hash][]ImageID)
+	apply := func(entries []Entry) {
+		t.Helper()
+		for _, e := range entries {
+			model[e.Hash] = append(model[e.Hash], e.ImageID)
+		}
+		if err := index.Apply(entries); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+	}
+
+	var seed []Entry
+	for i := 1; i <= 120; i++ {
+		h := hashWithPrefix([]byte{7}, uint64(i))
+		seed = append(seed, Entry{Hash: h, ImageID: ImageID(i)})
+	}
+	apply(seed)
+
+	// Low-end new record plus a duplicate of an existing one.
+	apply([]Entry{{Hash: hashWithPrefix([]byte{7}, 0), ImageID: 5000}, {Hash: hashWithPrefix([]byte{7}, 1), ImageID: 1}})
+	// High-end new record.
+	apply([]Entry{{Hash: hashWithPrefix([]byte{7}, 500), ImageID: 6000}})
+	// Middle insert plus multiple IDs for one tail.
+	hMid := hashWithPrefix([]byte{7}, 60)
+	apply([]Entry{{Hash: hMid, ImageID: 7001}, {Hash: hMid, ImageID: 7002}})
+	// Duplicate within a single batch.
+	apply([]Entry{{Hash: hashWithPrefix([]byte{7}, 90), ImageID: 9000}, {Hash: hashWithPrefix([]byte{7}, 90), ImageID: 9000}})
+	// Widen the ID width from uint32 to uint64.
+	wide := ImageID(1) << 40
+	apply([]Entry{{Hash: hashWithPrefix([]byte{7}, 45), ImageID: wide}})
+
+	for h, ids := range model {
+		if got := index.Lookup(nil, h); !equalIDs(got, uniqueSorted(ids)) {
+			t.Fatalf("Lookup(%x) = %v, want %v", h[:4], got, uniqueSorted(ids))
+		}
+	}
+	view := index.view.Load()
+	ref, _, ok := index.traverse(view, hashWithPrefix([]byte{7}, 1))
+	if !ok {
+		t.Fatal("traverse miss")
+	}
+	slots, header, err := readLeafSlotsInto(nil, view.arena, ref)
+	if err != nil {
+		t.Fatalf("readLeafSlotsInto: %v", err)
+	}
+	if header.idBytes != id64Bytes {
+		t.Fatalf("leaf id width = %d, want 64-bit after wide id", header.idBytes)
+	}
+	for i := 1; i < len(slots); i++ {
+		if compareSlot(&slots[i-1], &slots[i], tailLenFor(1)) >= 0 {
+			t.Fatalf("leaf not strictly ascending at %d (ids %d,%d)", i, slots[i-1].id, slots[i].id)
+		}
+	}
+	if uint64(len(slots)) != index.Metadata().Entries {
+		t.Fatalf("leaf count %d != entries %d", len(slots), index.Metadata().Entries)
+	}
+}
+
+// TestDirectLeafMergeNoOp verifies that an Apply whose incoming records all
+// already exist rewrites nothing: no generation, no retirement, no duplicates.
+func TestDirectLeafMergeNoOp(t *testing.T) {
+	index := newTestIndex(t, testArenaBytes, Config{})
+	defer index.Close()
+	h := hashWithPrefix([]byte{3, 3}, 3)
+	if err := index.Apply([]Entry{{Hash: h, ImageID: 1}, {Hash: h, ImageID: 2}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	gen := index.Generation()
+	retired := index.Metadata().RetiredExtents
+	if err := index.Apply([]Entry{{Hash: h, ImageID: 2}, {Hash: h, ImageID: 1}, {Hash: h, ImageID: 1}}); err != nil {
+		t.Fatalf("no-op Apply: %v", err)
+	}
+	if got := index.Generation(); got != gen {
+		t.Fatalf("no-op Apply advanced generation %d -> %d", gen, got)
+	}
+	if got := index.Metadata().RetiredExtents; got != retired {
+		t.Fatalf("no-op Apply retired %d extents, want %d", got, retired)
+	}
+	if got := index.Count(h); got != 2 {
+		t.Fatalf("Count = %d, want 2", got)
+	}
+}
+
 // TestMergeSlotsLinearDedup exercises the linear merge against duplicates in
 // both the existing leaf and the incoming group.
 func TestMergeSlotsLinearDedup(t *testing.T) {

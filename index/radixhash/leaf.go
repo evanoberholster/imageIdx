@@ -93,6 +93,26 @@ func capacityForSize(depth, idBytes int, extentBytes uint32) int {
 	return capacity
 }
 
+// encodeLeafHeader writes the fixed leaf header for count records of idBytes
+// width in a capacity-slot extent. Offsets are derived from depth and capacity
+// so the header always matches what readLeafHeader recomputes.
+func encodeLeafHeader(extent []byte, depth, idBytes, count, capacity int) {
+	binary.LittleEndian.PutUint32(extent[0:4], leafMagic)
+	binary.LittleEndian.PutUint16(extent[4:6], leafVersion)
+	extent[6] = byte(depth)
+	if idBytes == id32Bytes {
+		extent[7] = leafFlagID32
+	} else {
+		extent[7] = 0
+	}
+	binary.LittleEndian.PutUint32(extent[8:12], uint32(count))
+	binary.LittleEndian.PutUint32(extent[12:16], uint32(capacity))
+	binary.LittleEndian.PutUint32(extent[16:20], uint32(leafHeaderSize))
+	binary.LittleEndian.PutUint32(extent[20:24], uint32(idsOffsetFor(tailLenFor(depth), capacity)))
+	binary.LittleEndian.PutUint32(extent[24:28], uint32(len(extent)))
+	binary.LittleEndian.PutUint32(extent[28:32], 0)
+}
+
 // encodeLeaf writes slots into a leaf extent at the given depth. The extent
 // must be exactly one pagealloc extent and may be larger than the payload.
 func encodeLeaf(extent []byte, depth int, slots []slot) error {
@@ -106,19 +126,7 @@ func encodeLeaf(extent []byte, depth int, slots []slot) error {
 	}
 	tailLen := tailLenFor(depth)
 	idsOffset := idsOffsetFor(tailLen, capacity)
-	binary.LittleEndian.PutUint32(extent[0:4], leafMagic)
-	binary.LittleEndian.PutUint16(extent[4:6], leafVersion)
-	extent[6] = byte(depth)
-	extent[7] = 0
-	if idBytes == id32Bytes {
-		extent[7] = leafFlagID32
-	}
-	binary.LittleEndian.PutUint32(extent[8:12], uint32(len(slots)))
-	binary.LittleEndian.PutUint32(extent[12:16], uint32(capacity))
-	binary.LittleEndian.PutUint32(extent[16:20], uint32(leafHeaderSize))
-	binary.LittleEndian.PutUint32(extent[20:24], uint32(idsOffset))
-	binary.LittleEndian.PutUint32(extent[24:28], uint32(len(extent)))
-	binary.LittleEndian.PutUint32(extent[28:32], 0)
+	encodeLeafHeader(extent, depth, idBytes, len(slots), capacity)
 	for i := range slots {
 		copy(extent[leafHeaderSize+tailLen*i:], slots[i].tail[:tailLen])
 		if idBytes == id32Bytes {
@@ -128,6 +136,121 @@ func encodeLeaf(extent []byte, depth int, slots []slot) error {
 		}
 	}
 	return nil
+}
+
+// leafRecordTail returns the encoded tail bytes of record i of a validated
+// leaf without copying.
+func leafRecordTail(arena []byte, recordsOffset uint64, tailLen, i int) []byte {
+	start := recordsOffset + uint64(leafHeaderSize+tailLen*i)
+	return arena[start : start+uint64(tailLen)]
+}
+
+// leafRecordID reads the ImageID of encoded record i using the leaf's id width.
+func leafRecordID(arena []byte, recordsOffset uint64, idsOffset, idBytes, i int) uint64 {
+	if idBytes == id32Bytes {
+		return uint64(binary.LittleEndian.Uint32(arena[recordsOffset+uint64(idsOffset+4*i):]))
+	}
+	return binary.LittleEndian.Uint64(arena[recordsOffset+uint64(idsOffset+8*i):])
+}
+
+// leafRecordCompareAdded orders encoded record i against added[t]. Both are
+// already sorted by (tail, ImageID), so the sign is enough to drive the merge.
+func leafRecordCompareAdded(arena []byte, recordsOffset uint64, tailLen, idsOffset, idBytes, i int, added *slot) int {
+	if c := bytes.Compare(leafRecordTail(arena, recordsOffset, tailLen, i), added.tail[:tailLen]); c != 0 {
+		return c
+	}
+	id := leafRecordID(arena, recordsOffset, idsOffset, idBytes, i)
+	switch {
+	case id < added.id:
+		return -1
+	case id > added.id:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// leafMergedCount merges a validated encoded leaf with an already-sorted,
+// deduplicated incoming group without writing anything. It returns the exact
+// resulting record count and how many incoming records are new; newCount == 0
+// means every incoming record already exists (a no-op rewrite).
+func leafMergedCount(arena []byte, recordsOffset uint64, header leafHeader, tailLen int, added []slot) (resultCount, newCount int) {
+	i, j := 0, 0
+	for i < header.count || j < len(added) {
+		switch {
+		case j >= len(added):
+			i++
+		case i >= header.count:
+			j++
+			newCount++
+		default:
+			cmp := leafRecordCompareAdded(arena, recordsOffset, tailLen, header.idsOffset, header.idBytes, i, &added[j])
+			switch {
+			case cmp < 0:
+				i++
+			case cmp == 0:
+				i++
+				j++
+			default:
+				j++
+				newCount++
+			}
+		}
+		resultCount++
+	}
+	return resultCount, newCount
+}
+
+// writeMergedLeafRecords merges a validated encoded leaf with an
+// already-sorted, deduplicated incoming group directly into a replacement
+// extent's SoA tail and ID arrays. It never materializes the existing leaf as
+// []slot. count must be the exact leafMergedCount result and capacity the
+// replacement extent's slot capacity.
+func writeMergedLeafRecords(extent []byte, depth, idBytes, count, capacity int, arena []byte, recordsOffset uint64, header leafHeader, added []slot) {
+	tailLen := tailLenFor(depth)
+	idsOffset := idsOffsetFor(tailLen, capacity)
+	i, j, out := 0, 0, 0
+	for out < count {
+		switch {
+		case j >= len(added):
+			writeLeafRecord(extent, out, tailLen, idsOffset, idBytes,
+				leafRecordTail(arena, recordsOffset, tailLen, i),
+				leafRecordID(arena, recordsOffset, header.idsOffset, header.idBytes, i))
+			i++
+		case i >= header.count:
+			writeLeafRecord(extent, out, tailLen, idsOffset, idBytes, added[j].tail[:tailLen], added[j].id)
+			j++
+		default:
+			cmp := leafRecordCompareAdded(arena, recordsOffset, tailLen, header.idsOffset, header.idBytes, i, &added[j])
+			switch {
+			case cmp < 0:
+				writeLeafRecord(extent, out, tailLen, idsOffset, idBytes,
+					leafRecordTail(arena, recordsOffset, tailLen, i),
+					leafRecordID(arena, recordsOffset, header.idsOffset, header.idBytes, i))
+				i++
+			case cmp == 0:
+				writeLeafRecord(extent, out, tailLen, idsOffset, idBytes,
+					leafRecordTail(arena, recordsOffset, tailLen, i),
+					leafRecordID(arena, recordsOffset, header.idsOffset, header.idBytes, i))
+				i++
+				j++
+			default:
+				writeLeafRecord(extent, out, tailLen, idsOffset, idBytes, added[j].tail[:tailLen], added[j].id)
+				j++
+			}
+		}
+		out++
+	}
+}
+
+// writeLeafRecord writes one (tail, ImageID) pair into a replacement leaf.
+func writeLeafRecord(extent []byte, out, tailLen, idsOffset, idBytes int, tail []byte, id uint64) {
+	copy(extent[leafHeaderSize+tailLen*out:], tail)
+	if idBytes == id32Bytes {
+		binary.LittleEndian.PutUint32(extent[idsOffset+4*out:], uint32(id))
+	} else {
+		binary.LittleEndian.PutUint64(extent[idsOffset+8*out:], id)
+	}
 }
 
 // readLeafHeader validates and decodes a leaf header. Array offsets are
