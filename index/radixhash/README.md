@@ -45,9 +45,13 @@ Leaf
 
 - A leaf larger than `Config.PromotionBytes` (or `Config.MaxLeafSlots`)
   is promoted in place to the next radix level and redistributed, recursively.
-- Readers binary-search the sorted tails and walk only the equal run.
-- `Apply` groups a batch by radix path and rewrites each affected leaf once,
-  path-copies nodes, and publishes one new immutable root.
+- Readers binary-search the sorted tails and walk only the equal run. The
+  lookup path is lock-free and allocation-free.
+- `Apply` counting-sorts a batch into one reusable scratch by `Hash[0]`, rebuilds
+  each affected leaf once with a linear merge of the already-sorted leaf and the
+  small incoming group, path-copies nodes, and publishes one new immutable root.
+  The normal ≤64-record batch takes a serial, allocation-light path with no map,
+  goroutine, or channel.
 
 Storage is a caller-owned arena managed by `internal/pagealloc`: exact
 512-byte runs (no power-of-two rounding), `Retire`/`Reclaim` for
@@ -157,7 +161,8 @@ ids := reopened.Lookup(nil, digest)
 ```
 
 `Checkpoint` is a no-op for a heap arena; `OpenMmap` requires a file previously
-created by `NewMmap`.
+created by `NewMmap`. The dual-superblock envelope uses CRC32C (Castagnoli)
+checksums from `internal/storage`.
 
 ### Reclamation and compaction
 
@@ -172,6 +177,17 @@ peak compaction memory is independent of index size.
 _ = index.Reclaim()
 _ = index.Compact()
 ```
+
+`Compact` publishes the replacement as a single logical generation: it always
+advances the generation by exactly one, however many internal batches the
+streaming rebuild used. The walker reports any corrupt node or leaf as
+`ErrCorrupt`; `Compact` then aborts without publishing, so a damaged old tree
+can never silently lose records. A release error after publication is returned
+without rolling back the already-published index.
+
+The streaming batch defaults to 16K entries: `BenchmarkCompactBatch` shows 16K
+captures most of the 64K throughput with a quarter of the temporary memory.
+This is a maintenance workload, independent of the small ingestion batch.
 
 ### Combined search
 
@@ -190,7 +206,7 @@ ids, err := plan.Search(ctx, nil, &ws)
 
 | Field | Meaning |
 |---|---|
-| `PromotionBytes` | Promote a leaf to the next radix level past this encoded size. Default 96 KiB, retained after sweeping 8 KiB–256 KiB: 64–128 KiB is a broad plateau, while 256 KiB skips promotion and hurts lookup, and 8–32 KiB raises COW allocation. |
+| `PromotionBytes` | Promote a leaf to the next radix level past this encoded size. Default 96 KiB, retained after both threshold sweeps. Bulk: 64–128 KiB is a broad plateau; 256 KiB skips promotion and hurts lookup, and 8–32 KiB raises COW allocation. Small writes (batch 1–64): 32 KiB promotes aggressively and fragments space, while everything from 64 KiB up is equivalent at these sizes. |
 | `MaxLeafSlots` | Optional record-count promotion cap; benchmark it — a low cap fragments space. |
 | `AutoReclaimBytes` | Reclaim retired space automatically once retired bytes reach this. |
 
@@ -210,18 +226,22 @@ ids, err := plan.Search(ctx, nil, &ws)
 
 ## Lookup kernels
 
-Leaves are sorted, so lookup binary-searches the tails — the correctness
-reference. Small leaves (≤ 64 slots) instead scan linearly with
-`internal/tailkernel`, which compares 16-byte prefixes on NEON (arm64) or AVX2
-(amd64) and confirms each hit with a full-tail compare; the scalar reference is
-used everywhere else.
+Leaves are sorted, so lookup binary-searches the tails; this is the only
+production strategy. `BenchmarkLeafSearchCrossover` compares it against the
+SIMD 16-byte prefix scan in `internal/tailkernel` (NEON on arm64, AVX2 on amd64,
+scalar reference): binary search wins at every occupancy up to the kernel's
+64-slot limit, and the SIMD path also allocates because the query prefix is
+passed through an indirect kernel call. The SIMD scan is kept as an internal
+reference exercised by the crossover benchmark and is deliberately not on the
+lookup hot path, which stays allocation-free, lock-free, and mmap-friendly.
 
 ## Scope
 
 Implemented: the exact-fit allocator, the byte-oriented radix engine, adaptive
-promotion (default 96 KiB retained after a threshold sweep), batched COW
-commits, generation-gated readers, streaming compaction, the file-backed mmap
-arena with superblock reopen/checkpoint over the shared `internal/storage`
-envelope, and SIMD tail kernels. Follow-ups: WAL durability modes, shard
-rollover and parallel lookup, and registering RadixHash in the unified
-`index.Store` schema.
+promotion (default 96 KiB retained after bulk and small-write sweeps), batched
+COW commits with a small-batch serial Apply path, generation-gated readers,
+corruption-checked streaming compaction that preserves logical generation,
+allocation-free binary-search lookup, the file-backed mmap arena with a shared
+CRC32C superblock envelope, and the SIMD tail kernels behind a benchmarked
+reference. Follow-ups: WAL durability modes, shard rollover and parallel lookup,
+and registering RadixHash in the unified `index.Store` schema.

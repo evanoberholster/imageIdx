@@ -60,6 +60,42 @@ func TestApplySmallBatchSizesIdempotent(t *testing.T) {
 	}
 }
 
+// TestApplyLargeParallelBatch drives a batch at or above parallelMinEntries
+// across many root buckets so the fan-out path is exercised, then checks the
+// result and idempotency.
+func TestApplyLargeParallelBatch(t *testing.T) {
+	index := newTestIndex(t, 64<<20, Config{PromotionBytes: 4096})
+	defer index.Close()
+
+	const total = 8192
+	entries := make([]Entry, 0, total)
+	model := make(map[Hash][]ImageID)
+	for i := 0; i < total; i++ {
+		h := hashWithPrefix([]byte{byte(i % 200), byte((i / 200) % 200)}, uint64(i+1))
+		entries = append(entries, Entry{Hash: h, ImageID: ImageID(i + 1)})
+		model[h] = append(model[h], ImageID(i+1))
+	}
+	if err := index.Apply(entries); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	genBefore := index.Generation()
+	entriesBefore := index.Metadata().Entries
+	if err := index.Apply(entries); err != nil {
+		t.Fatalf("re-Apply: %v", err)
+	}
+	if got := index.Generation(); got != genBefore {
+		t.Fatalf("idempotent large re-apply advanced generation %d -> %d", genBefore, got)
+	}
+	if got := index.Metadata().Entries; got != entriesBefore {
+		t.Fatalf("idempotent large re-apply changed entries %d -> %d", entriesBefore, got)
+	}
+	for h, ids := range model {
+		if got := index.Lookup(nil, h); !equalIDs(got, uniqueSorted(ids)) {
+			t.Fatalf("Lookup(%x) = %v, want %v", h[:4], got, uniqueSorted(ids))
+		}
+	}
+}
+
 // TestCompactGenerationIndependentOfBatchSize verifies compaction is one
 // logical publication: the generation advances by exactly one no matter how
 // many internal Apply calls or which compaction batch size is used.

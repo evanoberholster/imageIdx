@@ -413,12 +413,17 @@ that are not tombstoned.
 
 The leaf tails are sorted, so lookup binary-searches for the lower bound and
 walks the short equal run rather than scanning the whole leaf. This keeps
-latency close to O(log n) even for large two-level leaves and removes most of
-the motivation for promoting solely to shorten a scan.
+latency close to O(log n) even for large two-level leaves. The path is
+allocation-free, lock-free, and mmap-friendly, with no interfaces or callbacks.
 
-Implement scalar first, then architecture-specific AVX2/AVX-512/NEON tail
-comparison kernels behind the same interface. The persistent layout must not
-depend on CPU architecture.
+A SIMD 16-byte tail-prefix kernel (NEON/AVX2, scalar reference) exists in
+`internal/tailkernel` and is benchmarked by `BenchmarkLeafSearchCrossover`.
+Measured on arm64, binary search beats the SIMD linear scan at every occupancy
+up to the kernel's 64-slot limit, and the linear path allocates because the
+query prefix is passed through an indirect kernel call. The SIMD scan is kept as
+a reference but is deliberately not dispatched on the lookup hot path.
+
+The persistent layout never depends on CPU architecture.
 
 ---
 
@@ -477,10 +482,13 @@ mechanism so recovery can select the newest valid committed generation.
 The reusable part of this envelope lives in `internal/storage`
 (`SuperblockHeader`, `EncodeSuperblock`, `DecodeSuperblock`,
 `SelectSuperblock`): magic, version, flags, generation, payload length, and a
-payload CRC plus a header CRC. An index package owns only its payload; RadixHash
-stores record counts, depth, and its root CRC in a version-2 payload and keeps
-its per-slot root in the arena. Any mmap index can reuse the envelope and
-selection without depending on RadixHash.
+payload CRC32C plus a header CRC32C. Decoding requires a complete
+`SuperblockSlotBytes` slot, so a truncated buffer is rejected rather than
+validated against the 512-byte constant. There is one package-level Castagnoli
+table; no checksum table is built on a hot path. An index package owns only its
+payload; RadixHash stores record counts, depth, and its root CRC32C in a
+version-2 payload and keeps its per-slot root in the arena. Any mmap index can
+reuse the envelope and selection without depending on RadixHash.
 
 ---
 
@@ -564,17 +572,34 @@ Measured (uniform, per `index/radixhash` `BenchmarkPromotionSweep`): a broad
 lookup) and 8–32 KiB raising COW allocation. The default stays **96 KiB**;
 adaptive promotion is unchanged.
 
+`BenchmarkPromotionSmallWrites` re-judges the threshold on repeated small
+updates (batch 1/8/32/64, uniform and skewed). It confirms the default: 32 KiB
+promotes aggressively at 200K uniform entries (65K leaves, tiny occupancy,
+higher index bytes/entry), while 64 KiB and above are equivalent at that size
+and skewed buckets are threshold-insensitive. The application workload does not
+justify moving off 96 KiB.
+
 ### Compaction
 
 `BenchmarkCompact` streams the old tree in bounded batches. Benchmark
 throughput, peak temporary memory, allocations, and total bytes allocated at
 100K/1M/10M. Compaction never builds an `[]Entry` proportional to index size.
 
+`BenchmarkCompactBatch` compares 4K/16K/64K internal streaming batches. At 1M
+entries 16K reaches ~82% of the 64K throughput (16.8M vs 20.6M entries/s) with a
+quarter of the temporary memory (0.625 MiB vs 2.5 MiB), and 4K is far behind, so
+the smallest batch on the plateau — **16K** — is the default. The walker reports
+corruption as `ErrCorrupt` and `Compact` aborts without publishing; the
+replacement always takes generation `current+1`, independent of batch count.
+
 ### Insert
 
-Measure single-entry append, batches of 100/1K/10K, page seal cost, WAL cost,
-checkpoint throughput, splits/promotions per batch, and bytes written per
-logical entry.
+Measure single-entry append, small batches 1/8/16/32/64 (the normal ImageIdx
+sizes, via `BenchmarkApplySmallBatch`), page seal cost, WAL cost, checkpoint
+throughput, splits/promotions per batch, and bytes written per logical entry.
+Include uniform, same-root, same-deeper-prefix, and mixed write patterns; the
+same-prefix case is the worst COW grouping. Normal ingestion does not use the
+1K–64K batches that only compaction/rebuild issues.
 
 ### Negative and duplicate lookup
 
