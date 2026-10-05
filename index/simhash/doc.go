@@ -103,13 +103,19 @@
 // The store owns no deletion state. Tombstoning and liveness are authoritative
 // in BitmapIdx, which filters the results of a scan.
 //
-// # SIMD
+// # Kernels and SIMD
 //
-// The scalar scans use atomic loads so they are correct against concurrent
-// in-place updates. A future AVX2/AVX-512/NEON kernel cannot use plain wide
-// loads for the same guarantee, because a 32-byte PDQ store is not atomic. SIMD
-// may be enabled only after a design proves one of: sequence validation around
-// SIMD reads is safe with a concurrent writer, SIMD scans run in a quiescent
-// update epoch, or the scanned memory is immutable. The scalar path is the
-// reference implementation.
+// The Hamming distance kernels live in index/simhash/internal/hashkernel behind
+// one dispatch point: a portable scalar reference (math/bits; POPCNT on amd64)
+// and a NEON block kernel on arm64. The scalar reference is the correctness
+// oracle.
+//
+// The concurrent-safe scans (SearchPHash, SearchPDQ, SearchCombined) use atomic
+// loads and the scalar kernel, because a 32-byte PDQ store is not atomic and a
+// wide SIMD load cannot provide the same guarantee against an in-place writer.
+// SearchPDQBulk uses the NEON block kernel on plain memory and is therefore only
+// safe on a quiescent store (no concurrent writer); it is intended for scans
+// after ingest or on a read-only replica. It is 1.6-2.5x faster than the scalar
+// scan. Never replace the concurrent scalar path with wide loads merely for
+// benchmark numbers.
 package simhash

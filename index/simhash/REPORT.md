@@ -301,6 +301,45 @@ required shards form a contiguous range derived arithmetically from the first an
 last ImageIDs, and all are ensured before the first record is written, so a
 preflight failure leaves logical state unchanged (no map of required shards).
 
+## Kernel package (SIMD and scalar)
+
+`index/simhash/internal/hashkernel` holds the distance kernels behind one
+dispatch point:
+
+- **Scalar reference** (`math/bits`) — the correctness oracle and the
+  concurrent-safe implementation. On amd64 it lowers to POPCNT.
+- **NEON block kernel** (arm64) — loads two 16-byte vectors per record, XORs
+  against the preloaded query, popcounts with `VCNT`, and reduces with
+  `VUADDLV`, rejecting after the first 16 bytes when the partial count exceeds
+  the limit.
+
+Kernel microbenchmarks (arm64):
+
+| kernel | ns/op | speedup |
+|---|---:|---:|
+| PDQ distance, scalar | 1.38 | — |
+| PDQ distance, NEON | 1.58 | 0.9× |
+| PDQ 64-record block mask, scalar | 70.2 | — |
+| PDQ 64-record block mask, NEON | 37.4 | **1.9×** |
+
+The single-pair kernel is not where SIMD wins (one vector operation vs an
+inlined popcount); the block kernel is.
+
+Store-level `SearchPDQBulk` (NEON block kernel over the canonical PDQ column)
+versus the concurrent-safe scalar `SearchPDQ`, 1M records, 0 allocs/op:
+
+| threshold | scalar | bulk |
+|---:|---:|---:|
+| 0 | 1.00 ms | 0.61 ms (1.6×) |
+| 16 | 1.00 ms | 0.63 ms (1.6×) |
+| 31 | 1.61 ms | 0.63 ms (2.5×) |
+
+`SearchPDQBulk` reads plain memory and is documented as requiring a quiescent
+store (no concurrent writer); `SearchPDQ` remains the concurrent-safe scalar
+path. The tests compare the NEON kernel against the scalar reference for random
+pairs and every block-count boundary, and `SearchPDQBulk` against `SearchPDQ`
+and the oracle.
+
 ## Correctness / race
 
 Tests cover direct ImageID↔hashPage/slot mapping and the `0xffff/0x10000`
