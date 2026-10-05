@@ -163,8 +163,8 @@ func TestBatchRewritesBucketOnce(t *testing.T) {
 	if err := index.Apply(first); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if err := index.ReclaimAll(); err != nil {
-		t.Fatalf("ReclaimAll: %v", err)
+	if err := index.Reclaim(); err != nil {
+		t.Fatalf("Reclaim: %v", err)
 	}
 	var second []Entry
 	for id := ImageID(11); id <= 60; id++ {
@@ -173,11 +173,10 @@ func TestBatchRewritesBucketOnce(t *testing.T) {
 	if err := index.Apply(second); err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
-	// One 50-entry batch targeting a single bucket must replace exactly one
-	// leaf and one L1 node -- not one leaf per entry. (The root is view-local,
-	// so it is not an arena page.)
-	if retired := index.Metadata().RetiredExtents; retired != 2 {
-		t.Fatalf("retired after second batch = %d, want 2", retired)
+	// One 50-entry batch targeting a single small bucket rewrites exactly one
+	// leaf: a sparse Root -> Leaf bucket has no intermediate radix node.
+	if retired := index.Metadata().RetiredExtents; retired != 1 {
+		t.Fatalf("retired after second batch = %d, want 1", retired)
 	}
 	if got := index.Count(h); got != 60 {
 		t.Fatalf("Count = %d, want 60", got)
@@ -199,8 +198,8 @@ func TestPromotionCreatesThirdLevel(t *testing.T) {
 	if err := index.Apply(seed(0, 10)); err != nil {
 		t.Fatalf("small Apply: %v", err)
 	}
-	if depth := index.Metadata().Depth; depth != 2 {
-		t.Fatalf("depth after small batch = %d, want 2", depth)
+	if depth := index.Metadata().Depth; depth != 1 {
+		t.Fatalf("depth after small batch = %d, want 1 (sparse Root->Leaf)", depth)
 	}
 	if err := index.Apply(seed(10, 600)); err != nil {
 		t.Fatalf("promoting Apply: %v", err)
@@ -245,28 +244,23 @@ func TestReclaimFreesRetiredExtents(t *testing.T) {
 	if err := index.Apply([]Entry{{Hash: h, ImageID: 1}}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if index.Metadata().RetiredExtents != 0 {
-		t.Fatalf("retired after first batch = %d, want 0", index.Metadata().RetiredExtents)
+	if retired := index.Metadata().RetiredExtents; retired != 0 {
+		t.Fatalf("retired after first batch = %d, want 0", retired)
 	}
-	// The second batch replaces the leaf and its L1 node at generation 2.
+	// The second batch replaces the sparse leaf, retiring one extent.
 	if err := index.Apply([]Entry{{Hash: h, ImageID: 2}}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if index.Metadata().RetiredExtents != 2 {
-		t.Fatalf("retired = %d, want 2", index.Metadata().RetiredExtents)
+	if retired := index.Metadata().RetiredExtents; retired == 0 {
+		t.Fatalf("retired after second batch = 0, want > 0")
 	}
-	// A reader still pinned at generation 2 keeps the replaced pages alive.
-	if err := index.Reclaim(2); err != nil {
+	// Reclaim uses the reader tracker as the lifetime authority: with no active
+	// reader the grace period completes and the retired extents are freed.
+	if err := index.Reclaim(); err != nil {
 		t.Fatalf("Reclaim: %v", err)
 	}
-	if index.Metadata().RetiredExtents != 2 {
-		t.Fatalf("retired after early reclaim = %d, want 2", index.Metadata().RetiredExtents)
-	}
-	if err := index.Reclaim(3); err != nil {
-		t.Fatalf("Reclaim: %v", err)
-	}
-	if index.Metadata().RetiredExtents != 0 {
-		t.Fatalf("retired after reclaim = %d, want 0", index.Metadata().RetiredExtents)
+	if retired := index.Metadata().RetiredExtents; retired != 0 {
+		t.Fatalf("retired after Reclaim = %d, want 0", retired)
 	}
 	if got := index.Lookup(nil, h); !equalIDs(got, []ImageID{1, 2}) {
 		t.Fatalf("Lookup after reclaim = %v", got)
@@ -298,36 +292,38 @@ func TestCorruptLeafIsDetected(t *testing.T) {
 	if err := index.Apply([]Entry{{Hash: h, ImageID: 1}}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	ref, _, ok := index.traverse(index.view.Load(), h)
+	view := index.view.Load()
+	arena := view.arena
+	ref, _, ok := index.traverse(view, h)
 	if !ok {
 		t.Fatalf("traverse miss")
 	}
 	offset := extentOffset(ref)
-	before := append([]byte(nil), index.arena[offset:offset+leafHeaderSize]...)
+	before := append([]byte(nil), arena[offset:offset+leafHeaderSize]...)
 
 	// Corrupt magic.
-	index.arena[offset] = 0
-	if _, _, err := readLeafSlots(index.arena, ref); err == nil {
+	arena[offset] = 0
+	if _, _, err := readLeafSlots(arena, ref); err == nil {
 		t.Fatalf("readLeafSlots accepted a bad magic")
 	}
-	copy(index.arena[offset:offset+leafHeaderSize], before)
+	copy(arena[offset:offset+leafHeaderSize], before)
 
 	// Corrupt depth.
-	index.arena[offset+6] = 0
-	if _, _, err := readLeafSlots(index.arena, ref); err == nil {
+	arena[offset+6] = 0
+	if _, _, err := readLeafSlots(arena, ref); err == nil {
 		t.Fatalf("readLeafSlots accepted a bad depth")
 	}
-	copy(index.arena[offset:offset+leafHeaderSize], before)
+	copy(arena[offset:offset+leafHeaderSize], before)
 
 	// A reader against a corrupt leaf returns no results rather than panicking.
-	index.arena[offset+6] = 0
+	arena[offset+6] = 0
 	if got := index.Lookup(nil, h); len(got) != 0 {
 		t.Fatalf("Lookup of corrupt leaf = %v, want empty", got)
 	}
 }
 
 func TestApplyRollbackOnOutOfSpace(t *testing.T) {
-	// Root node (1024) plus a few two-level buckets, then an oversized batch.
+	// A few sparse Root->Leaf buckets, then a batch that cannot fit.
 	index, err := New(16*512, Config{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -344,7 +340,7 @@ func TestApplyRollbackOnOutOfSpace(t *testing.T) {
 	before := index.Metadata()
 
 	var overflowing []Entry
-	for b := byte(20); b < 30; b++ {
+	for b := byte(20); b < 45; b++ {
 		overflowing = append(overflowing, Entry{Hash: hashWithPrefix([]byte{b, 1}, 1), ImageID: ImageID(b)})
 	}
 	if err := index.Apply(overflowing); err == nil {
@@ -433,8 +429,8 @@ func TestConcurrentReadersAndWriter(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("concurrent run: %v", runErr)
 	}
-	if err := index.ReclaimAll(); err != nil {
-		t.Fatalf("ReclaimAll: %v", err)
+	if err := index.Reclaim(); err != nil {
+		t.Fatalf("Reclaim: %v", err)
 	}
 }
 
@@ -492,7 +488,7 @@ func BenchmarkApplyBatch(b *testing.B) {
 		if err := index.Apply(batch); err != nil {
 			b.Fatal(err)
 		}
-		if err := index.ReclaimAll(); err != nil {
+		if err := index.Reclaim(); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -595,8 +591,8 @@ func TestCompactPreservesEntriesAndReclaims(t *testing.T) {
 			t.Fatalf("Lookup(%x) after compact = %v, want %v", h[:4], got, uniqueSorted(want))
 		}
 	}
-	if err := index.ReclaimAll(); err != nil {
-		t.Fatalf("ReclaimAll: %v", err)
+	if err := index.Reclaim(); err != nil {
+		t.Fatalf("Reclaim: %v", err)
 	}
 }
 

@@ -99,6 +99,9 @@ type Allocator struct {
 	freeCount   uint64
 	cursor      uint64
 	retired     []retiredExtent
+	// allocated accumulates the capacity of every successful Alloc, so callers
+	// can measure write amplification independently of reclamation.
+	allocated uint64
 }
 
 // New returns an allocator that manages arenaBytes of address space. The size
@@ -158,7 +161,19 @@ func (a *Allocator) Alloc(size uint32) (Ref, uint32, error) {
 	if a.cursor >= a.totalBlocks {
 		a.cursor = 1
 	}
-	return Ref(start), blocks * MinBlockSize, nil
+	capacity := blocks * MinBlockSize
+	a.allocated += uint64(capacity)
+	return Ref(start), capacity, nil
+}
+
+// AllocatedBytes returns the cumulative capacity handed out by Alloc since the
+// allocator was created or decoded. It is a monotonic write-amplification
+// counter and is not persisted.
+func (a *Allocator) AllocatedBytes() uint64 {
+	if a == nil {
+		return 0
+	}
+	return a.allocated
 }
 
 // Free immediately returns an extent to the free bitmap without retirement.

@@ -69,9 +69,12 @@ func newMappedIndex(mapped *storage.MappedFile, config Config) (*Index, error) {
 }
 
 // load validates the superblocks and root, reconstructs allocator state from
-// the reachable tree, and publishes the recovered view.
+// the reachable tree, and publishes the recovered view. The mapped arena comes
+// from the view newIndex already published, so reconstruction and the final
+// view agree by construction.
 func (i *Index) load() error {
-	if uint64(len(i.arena)) < rootOffset(superblockSlots-1)+uint64(radixNodeBytes) {
+	arena := i.view.Load().arena
+	if uint64(len(arena)) < rootOffset(superblockSlots-1)+uint64(radixNodeBytes) {
 		return fmt.Errorf("%w: arena too small for header", ErrCorrupt)
 	}
 	var (
@@ -80,11 +83,11 @@ func (i *Index) load() error {
 	)
 	for candidate := 0; candidate < superblockSlots; candidate++ {
 		offset := superblockOffset(candidate)
-		if offset+uint64(superblockBytes) > uint64(len(i.arena)) {
+		if offset+uint64(superblockBytes) > uint64(len(arena)) {
 			continue
 		}
-		root := i.arena[rootOffset(candidate) : rootOffset(candidate)+uint64(radixNodeBytes)]
-		sb, ok := decodeSuperblock(i.arena[offset:offset+uint64(superblockBytes)], root)
+		root := arena[rootOffset(candidate) : rootOffset(candidate)+uint64(radixNodeBytes)]
+		sb, ok := decodeSuperblock(arena[offset:offset+uint64(superblockBytes)], root)
 		if !ok {
 			continue
 		}
@@ -97,10 +100,10 @@ func (i *Index) load() error {
 	}
 
 	var root [radixFanout]uint32
-	if err := decodeRoot(i.arena[rootOffset(slot):rootOffset(slot)+uint64(radixNodeBytes)], &root); err != nil {
+	if err := decodeRoot(arena[rootOffset(slot):rootOffset(slot)+uint64(radixNodeBytes)], &root); err != nil {
 		return err
 	}
-	entries, buckets, depth, err := i.markReachable(&root)
+	entries, buckets, depth, err := i.markReachable(arena, &root)
 	if err != nil {
 		return err
 	}
@@ -111,7 +114,7 @@ func (i *Index) load() error {
 	i.view.Store(&indexView{
 		generation:  best.generation,
 		root:        &root,
-		arena:       i.arena,
+		arena:       arena,
 		entries:     entries,
 		rootBuckets: buckets,
 		depth:       depth,
@@ -122,7 +125,7 @@ func (i *Index) load() error {
 // markReachable reserves every extent reachable from root and recomputes the
 // entry count, root-bucket count, and maximum leaf depth. This is how reopen
 // reclaims space that was retired before the previous checkpoint.
-func (i *Index) markReachable(root *[radixFanout]uint32) (entries, buckets uint64, depth uint8, err error) {
+func (i *Index) markReachable(arena []byte, root *[radixFanout]uint32) (entries, buckets uint64, depth uint8, err error) {
 	for index := 0; index < radixFanout; index++ {
 		child := root[index]
 		if child == 0 {
@@ -131,9 +134,9 @@ func (i *Index) markReachable(root *[radixFanout]uint32) (entries, buckets uint6
 		buckets++
 		ref, isNode := decodeChild(child)
 		if isNode {
-			err = i.markNode(ref, 1, &entries, &depth)
+			err = i.markNode(arena, ref, 1, &entries, &depth)
 		} else {
-			err = i.markLeaf(ref, 1, &entries, &depth)
+			err = i.markLeaf(arena, ref, 1, &entries, &depth)
 		}
 		if err != nil {
 			return 0, 0, 0, err
@@ -142,24 +145,24 @@ func (i *Index) markReachable(root *[radixFanout]uint32) (entries, buckets uint6
 	return entries, buckets, depth, nil
 }
 
-func (i *Index) markNode(ref pagealloc.Ref, level int, entries *uint64, depth *uint8) error {
-	if level >= maxDepth || !validExtent(i.arena, ref, radixNodeBytes) {
+func (i *Index) markNode(arena []byte, ref pagealloc.Ref, level int, entries *uint64, depth *uint8) error {
+	if level >= maxDepth || !validExtent(arena, ref, radixNodeBytes) {
 		return fmt.Errorf("%w: node outside arena", ErrCorrupt)
 	}
 	if err := i.alloc.Reserve(ref, radixNodeBytes); err != nil {
 		return err
 	}
 	for index := 0; index < radixFanout; index++ {
-		child := nodeChild(i.arena, ref, byte(index))
+		child := nodeChild(arena, ref, byte(index))
 		if child == 0 {
 			continue
 		}
 		childRef, isNode := decodeChild(child)
 		var err error
 		if isNode {
-			err = i.markNode(childRef, level+1, entries, depth)
+			err = i.markNode(arena, childRef, level+1, entries, depth)
 		} else {
-			err = i.markLeaf(childRef, level+1, entries, depth)
+			err = i.markLeaf(arena, childRef, level+1, entries, depth)
 		}
 		if err != nil {
 			return err
@@ -168,8 +171,8 @@ func (i *Index) markNode(ref pagealloc.Ref, level int, entries *uint64, depth *u
 	return nil
 }
 
-func (i *Index) markLeaf(ref pagealloc.Ref, leafDepth int, entries *uint64, depth *uint8) error {
-	header, err := readLeafHeader(i.arena, ref)
+func (i *Index) markLeaf(arena []byte, ref pagealloc.Ref, leafDepth int, entries *uint64, depth *uint8) error {
+	header, err := readLeafHeader(arena, ref)
 	if err != nil {
 		return err
 	}
@@ -193,13 +196,14 @@ func (i *Index) writeSuperblock(slot int) error {
 		return nil
 	}
 	view := i.view.Load()
-	root := i.arena[rootOffset(slot) : rootOffset(slot)+uint64(radixNodeBytes)]
+	arena := view.arena
+	root := arena[rootOffset(slot) : rootOffset(slot)+uint64(radixNodeBytes)]
 	encodeRoot(root, view.root)
 	offset := superblockOffset(slot)
-	if offset+uint64(superblockBytes) > uint64(len(i.arena)) {
+	if offset+uint64(superblockBytes) > uint64(len(arena)) {
 		return fmt.Errorf("%w: superblock outside arena", ErrCorrupt)
 	}
-	encodeSuperblock(i.arena[offset:offset+uint64(superblockBytes)], superblock{
+	encodeSuperblock(arena[offset:offset+uint64(superblockBytes)], superblock{
 		generation:  view.generation,
 		entries:     view.entries,
 		rootBuckets: view.rootBuckets,
@@ -217,7 +221,7 @@ func (i *Index) writeSuperblock(slot int) error {
 func (i *Index) Checkpoint() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
 	if !i.persistent {

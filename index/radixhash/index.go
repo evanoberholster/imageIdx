@@ -36,7 +36,6 @@ type indexView struct {
 // An Index is safe for concurrent use by any number of readers and one writer.
 type Index struct {
 	alloc   *pagealloc.Allocator
-	arena   []byte
 	config  Config
 	tracker storage.ReaderTracker
 
@@ -51,7 +50,7 @@ type Index struct {
 
 	mu     sync.Mutex
 	view   atomic.Pointer[indexView]
-	closed bool
+	closed atomic.Bool
 }
 
 // New allocates a heap-backed arena of approximately arenaBytes and returns an
@@ -81,7 +80,7 @@ func NewWithArena(arena []byte, config Config) (*Index, error) {
 // lookup saves one random dereference; persistence will move it to the
 // superblock.
 func newIndex(allocator *pagealloc.Allocator, arena []byte, config Config) (*Index, error) {
-	index := &Index{alloc: allocator, arena: arena, config: config.withDefaults()}
+	index := &Index{alloc: allocator, config: config.withDefaults()}
 	index.view.Store(&indexView{generation: 1, root: &[radixFanout]uint32{}, arena: arena})
 	return index, nil
 }
@@ -99,6 +98,7 @@ type extent struct {
 // parallel while the allocator stays single-owner.
 type txn struct {
 	index       *Index
+	arena       []byte
 	generation  uint64
 	mu          sync.Mutex
 	newExtents  []extent
@@ -153,7 +153,7 @@ func (i *Index) Apply(entries []Entry) error {
 	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
 
@@ -172,7 +172,7 @@ func (i *Index) Apply(entries []Entry) error {
 	current := i.view.Load()
 	oldRoot := current.root
 
-	batch := &txn{index: i, generation: current.generation}
+	batch := &txn{index: i, arena: current.arena, generation: current.generation}
 	nextRoot := *oldRoot // copy-on-write the 1 KiB root
 	workers := 1
 	if len(entries) >= parallelMinEntries && len(groups) > 1 {
@@ -227,7 +227,7 @@ func (i *Index) Apply(entries []Entry) error {
 	i.view.Store(&indexView{
 		generation:  current.generation + 1,
 		root:        &nextRoot,
-		arena:       i.arena,
+		arena:       current.arena,
 		entries:     uint64(int64(current.entries) + batch.delta.Load()),
 		rootBuckets: countRootBuckets(&nextRoot),
 		depth:       maxUint8(current.depth, uint8(batch.maxDepth.Load())),
@@ -257,7 +257,7 @@ func (t *txn) rebuildChild(oldChild uint32, level int, records []slot) (uint32, 
 		return t.rebuildNode(ref, level, records)
 	}
 
-	existing, header, err := readLeafSlots(t.index.arena, ref)
+	existing, header, err := readLeafSlots(t.arena, ref)
 	if err != nil {
 		return 0, err
 	}
@@ -281,11 +281,11 @@ func (t *txn) rebuildChild(oldChild uint32, level int, records []slot) (uint32, 
 // of records to the matching child. It returns the old reference unchanged when
 // no child changes.
 func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32, error) {
-	if !validExtent(t.index.arena, ref, radixNodeBytes) {
+	if !validExtent(t.arena, ref, radixNodeBytes) {
 		return 0, fmt.Errorf("%w: node extent outside arena", ErrCorrupt)
 	}
 	var old [radixFanout]uint32
-	readNode(t.index.arena, ref, &old)
+	readNode(t.arena, ref, &old)
 
 	groups := partitionSlots(records, tailLenFor(level))
 	var next [radixFanout]uint32
@@ -310,7 +310,7 @@ func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32,
 	if err != nil {
 		return 0, err
 	}
-	if err := writeNode(t.index.arena, newRef, &next); err != nil {
+	if err := writeNode(t.arena, newRef, &next); err != nil {
 		return 0, err
 	}
 	t.retire(ref, radixNodeBytes)
@@ -318,12 +318,16 @@ func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32,
 }
 
 // newSubtreeFromRecords builds a fresh subtree for a child that does not exist
-// yet. Level one is always a radix node so the normal shape is
-// Root[Hash[0]] -> Radix[Hash[1]] -> leaf; deeper absences become leaves unless
-// the records are large enough to promote immediately.
+// yet. A small bucket becomes a leaf directly (Root[Hash[0]] -> leaf); once the
+// records cross the promotion threshold the leaf is replaced by a radix node
+// (Root[Hash[0]] -> Radix[Hash[1]] -> leaves), and the same adaptive promotion
+// applies at deeper levels.
 func (t *txn) newSubtreeFromRecords(level int, records []slot) (uint32, error) {
 	records = dedupeSlots(records, tailLenFor(level))
-	if level != 1 && (level >= maxDepth || t.fits(level, idBytesForSlots(records), len(records))) {
+	if level == 1 && t.index.config.forceRootRadix {
+		return t.buildNodeFromRecords(level, records)
+	}
+	if level >= maxDepth || t.fits(level, idBytesForSlots(records), len(records)) {
 		return t.writeLeaf(level, records, 0, 0, 0)
 	}
 	return t.buildNodeFromRecords(level, records)
@@ -378,7 +382,7 @@ func (t *txn) writeLeaf(level int, slots []slot, oldRef pagealloc.Ref, oldBytes 
 		return 0, err
 	}
 	offset := extentOffset(ref)
-	if err := encodeLeaf(t.index.arena[offset:offset+uint64(capacity)], level, slots); err != nil {
+	if err := encodeLeaf(t.arena[offset:offset+uint64(capacity)], level, slots); err != nil {
 		return 0, err
 	}
 	if oldRef != 0 {
@@ -395,7 +399,7 @@ func (t *txn) writeNewNode(children *[radixFanout]uint32) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := writeNode(t.index.arena, ref, children); err != nil {
+	if err := writeNode(t.arena, ref, children); err != nil {
 		return 0, err
 	}
 	return encodeChild(ref, true), nil
@@ -505,11 +509,16 @@ func (i *Index) Contains(h Hash) bool {
 	return found
 }
 
-// withView runs fn while pinning the current published view so that Reclaim
-// cannot reuse a page the reader may still touch.
+// withView runs fn while pinning the current published view so that Reclaim,
+// Compact, and Close cannot reuse or unmap an arena the reader may still touch.
+// The closed flag is set by Close before it waits for prior readers, so a
+// reader that observes closed skips the view and never faults on a released
+// arena.
 func (i *Index) withView(fn func(*indexView)) {
 	token := i.tracker.Acquire()
-	fn(i.view.Load())
+	if !i.closed.Load() {
+		fn(i.view.Load())
+	}
 	i.tracker.Release(token)
 }
 
@@ -534,38 +543,31 @@ func (i *Index) Metadata() Metadata {
 	}
 }
 
-// Reclaim returns retired extents to the allocator once every reader still
-// pinning a generation below oldestReaderGeneration has released its view.
-// Callers that never call Reclaim retain replaced extents until Close.
-func (i *Index) Reclaim(oldestReaderGeneration uint64) error {
+// Reclaim returns every retired extent to the allocator. The ReaderTracker is
+// the sole authority for memory lifetime: the writer waits for all readers that
+// could still reference a retired page to drain and then frees them, so callers
+// never track reader generations.
+func (i *Index) Reclaim() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
-	return i.alloc.Reclaim(oldestReaderGeneration)
-}
-
-// ReclaimAll frees every retired extent. It is safe only when no reader can
-// still hold an older view, such as after all reader activity has stopped.
-func (i *Index) ReclaimAll() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.closed {
-		return ErrClosed
-	}
+	i.tracker.WaitForPriorReaders()
 	return i.alloc.ReclaimAll()
 }
 
 // Compact rebuilds the tree into a fresh, tightly packed arena and atomically
 // publishes it, reclaiming dead space and fragmentation. The index is briefly
-// double-resident while the replacement is built. A file-backed index is
+// double-resident while the replacement is built. It follows the arena lifetime
+// invariant: build -> publish -> wait for prior readers -> release the old
+// arena, so no reader can observe an unmapped arena. A file-backed index is
 // compacted into a heap arena and loses its file backing, so callers that need
 // persistence should checkpoint instead.
 func (i *Index) Compact() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
 	current := i.view.Load()
@@ -591,11 +593,11 @@ func (i *Index) Compact() error {
 		}
 	}
 
-	// Drain readers pinned to the old arena, then swap in the replacement.
-	i.tracker.WaitForPriorReaders()
+	// Build is complete. Publish the replacement view first, then run the
+	// reader grace period, and only after prior readers drain release the old
+	// arena. Unmapping before publication + grace would fault a live reader.
 	release := i.release
 	i.alloc = fresh.alloc
-	i.arena = fresh.arena
 	i.release = fresh.release
 	i.sync = fresh.sync
 	i.persistent = false
@@ -604,6 +606,7 @@ func (i *Index) Compact() error {
 	fresh.alloc = nil
 	fresh.release = nil
 	fresh.sync = nil
+	i.tracker.WaitForPriorReaders()
 	if release != nil {
 		_ = release()
 	}
@@ -676,7 +679,7 @@ func (i *Index) extractLeaf(arena []byte, ref pagealloc.Ref, depth int, prefix *
 func (i *Index) Sync() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
 	if i.sync == nil {
@@ -685,15 +688,19 @@ func (i *Index) Sync() error {
 	return i.sync()
 }
 
-// Close marks the index closed and releases retired extents and any file-backed
-// arena. Published views remain readable by concurrent readers during the call.
+// Close marks the index closed, waits for in-flight readers to drain, then
+// reclaims retired extents and unmaps any file-backed arena. It follows the
+// arena lifetime invariant: prevent new operations -> wait for prior readers ->
+// reclaim -> release. The closed flag is set before the grace period so readers
+// that begin after Close returns never touch the released arena.
 func (i *Index) Close() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return nil
 	}
-	i.closed = true
+	i.closed.Store(true)
+	i.tracker.WaitForPriorReaders()
 	err := i.alloc.ReclaimAll()
 	if i.release != nil {
 		if releaseErr := i.release(); err == nil {

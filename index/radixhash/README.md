@@ -14,11 +14,22 @@ Consumes one hash byte per radix level. Every node is a fixed 256-way
 `[256]uint32` (1024 bytes, two 512-byte allocator blocks); a zero child is a
 miss, and the low tag bit distinguishes a leaf from another radix node.
 
+A small bucket is a **direct root-to-leaf** child:
+
 ```text
 Hash[0] -> root node
-Hash[1] -> L1 node (allocated lazily per Hash[0])
-        -> leaf
-Hash[2] -> optional L2 node, only after a leaf is promoted
+        -> leaf                       // sparse: small bucket
+```
+
+When that leaf grows past `Config.PromotionBytes` (or `Config.MaxLeafSlots`) it
+is promoted to a radix node and its records are redistributed, recursively, so
+there is no fixed L0/L1/L2 depth:
+
+```text
+Hash[0] -> root node
+Hash[1] -> radix node
+        -> leaves
+Hash[2] -> optional deeper radix node, only after that leaf is promoted
 ```
 
 Leaves are **structure-of-arrays**: the consumed prefix is implicit in the
@@ -28,7 +39,7 @@ path, so a leaf stores only the unconsumed tail and the IDs, sorted by
 ```text
 Leaf
 ├── Header (magic, version, depth, id width, count, capacity)
-├── HashTail[]   Hash[depth:32]   // 30 bytes at the normal depth 2
+├── HashTail[]   Hash[depth:32]   // 31 bytes at depth 1, 30 bytes at depth 2, ...
 └── IndexID[]    uint32 or uint64 // 32-bit unless an id exceeds 2^32
 ```
 
@@ -42,6 +53,27 @@ Storage is a caller-owned arena managed by `internal/pagealloc`: exact
 512-byte runs (no power-of-two rounding), `Retire`/`Reclaim` for
 copy-on-write, and a free bitmap. The arena can be a heap slice or a sparse
 mmap file.
+
+## Memory lifetime (RCU)
+
+Everything reachable from a published `indexView` is immutable, and the view is
+the complete reader snapshot: generation, root, and arena travel together. A
+transaction reads existing nodes and leaves through the arena of its starting
+view, so a root from one view can never be combined with an arena from another.
+
+The arena lifetime invariant is:
+
+```text
+build -> publish -> wait for prior readers -> reclaim / unmap
+```
+
+`ReaderTracker` is the sole authority. `Reclaim` waits for every reader that
+could still hold a retired page before freeing it; readers never track
+generations. `Compact` builds the replacement arena fully, publishes it, runs
+the grace period, and only then releases the old arena. `Close` sets a closed
+flag (so new readers skip the arena), waits for in-flight readers, reclaims
+retired extents, and finally unmaps.
+
 
 ## Usage
 
@@ -129,12 +161,13 @@ created by `NewMmap`.
 
 ### Reclamation and compaction
 
-Replaced pages are retired until no reader can reference them. Reclaim with
-the oldest reader generation, or let `AutoReclaimBytes` do it, and use
-`Compact` to rebuild into a freshly packed arena.
+Replaced pages are retired until no reader can reference them. `Reclaim` waits
+for prior readers through the `ReaderTracker` and frees every retired extent;
+`AutoReclaimBytes` does it automatically once retired bytes cross the threshold,
+and `Compact` rebuilds into a freshly packed arena.
 
 ```go
-_ = index.Reclaim(oldestReaderGeneration)
+_ = index.Reclaim()
 _ = index.Compact()
 ```
 

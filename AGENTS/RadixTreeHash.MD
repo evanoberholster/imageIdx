@@ -156,10 +156,21 @@ exact-hash lookup path.
 Do **not** preallocate a flat 65,536-entry directory.
 
 - The initial root is one 256-entry radix node indexed by `hash[0]`.
-- Second-level radix nodes are allocated lazily and indexed by `hash[1]`.
-- Only allocate radix nodes that contain data.
+- Radix nodes are allocated lazily and only where data requires them.
+- A small `Hash[0]` bucket is a **direct root-to-leaf child**; it does not
+  allocate a `Hash[1]` node up front.
 
-The normal structure is therefore:
+```text
+Root[hash[0]]
+       |
+       v
+     Leaf              // sparse bucket
+```
+
+When that leaf exceeds `PromotionBytes` or `MaxLeafSlots` it is promoted to a
+radix node and its records are redistributed, recursively, so the shape grows to
+`Root -> Radix -> Leaf` and beyond only when it pays off. There is no fixed
+L0/L1/L2 depth.
 
 ```text
 Root[hash[0]]
@@ -168,13 +179,14 @@ Root[hash[0]]
 Radix[hash[1]]
        |
        v
-Leaf
+     Leaf
 ```
 
 Root and interior nodes are stored in the pagealloc arena. Path copying
 allocates a replacement node only when a node on an affected path changes, so
 an insert that touches one leaf copies only the nodes on that leaf's path (and
-one root node per publishing batch).
+one root node per publishing batch). The root itself is carried in the
+published view, not the arena.
 
 ---
 
@@ -293,15 +305,22 @@ Readers remain lock-free and operate against a stable generation.
 
 Use **many lock-free mmap readers and a serialized batch commit path**.
 
-Readers pin a root generation, follow only references belonging to that
-generation, and release the generation when the lookup completes. They do not
-acquire leaf locks.
+Readers acquire a `ReaderTracker` token, load one immutable `indexView`
+(generation, root, and arena together), and release the token when the lookup
+completes. They take no locks and never track generations.
 
 Writers build replacement pages without modifying pages visible to existing
-readers. Publication switches the current root state only after all new pages
-are complete. Replaced pages enter `pagealloc`'s retired set and may be
-coalesced/reused only after the oldest active reader generation has advanced
-beyond them.
+readers, then publish the new view. The arena lifetime invariant is:
+
+```text
+build -> publish -> wait for prior readers -> reclaim / unmap
+```
+
+`ReaderTracker` is the sole authority for page lifetime. `Reclaim` waits for
+prior readers and frees retired extents; `Compact` builds a replacement arena,
+publishes it, waits, and only then releases the old arena; `Close` sets a closed
+flag, waits for in-flight readers, reclaims, and unmaps. An arena is never
+unmapped before its replacement is published and the grace period completes.
 
 ---
 

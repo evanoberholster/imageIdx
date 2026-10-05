@@ -258,3 +258,67 @@ func idsRange(first, last ImageID) []ImageID {
 	}
 	return out
 }
+
+// TestMmapReopenAfterSparsePromotion checkpoints a sparse Root->Leaf bucket,
+// reopens it, grows it past the promotion threshold, and reopens the promoted
+// Root->Radix->Leaf tree.
+func TestMmapReopenAfterSparsePromotion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "idx.bin")
+	config := Config{PromotionBytes: 2048}
+
+	index, err := NewMmap(path, 8<<20, config)
+	if err != nil {
+		t.Fatalf("NewMmap: %v", err)
+	}
+	seed := func(from, to int) []Entry {
+		var entries []Entry
+		for i := from; i < to; i++ {
+			entries = append(entries, Entry{Hash: hashWithPrefix([]byte{7, 9}, uint64(i+1)), ImageID: ImageID(i + 1)})
+		}
+		return entries
+	}
+	if err := index.Apply(seed(0, 10)); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+	if depth := index.Metadata().Depth; depth != 1 {
+		t.Fatalf("depth = %d, want 1 (sparse)", depth)
+	}
+	if err := index.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := OpenMmap(path, config)
+	if err != nil {
+		t.Fatalf("OpenMmap (sparse): %v", err)
+	}
+	if depth := reopened.Metadata().Depth; depth != 1 {
+		t.Fatalf("reopened depth = %d, want 1", depth)
+	}
+	if err := reopened.Apply(seed(10, 600)); err != nil {
+		t.Fatalf("promoting Apply: %v", err)
+	}
+	if depth := reopened.Metadata().Depth; depth < 2 {
+		t.Fatalf("depth after promotion = %d, want >= 2", depth)
+	}
+	if err := reopened.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	promoted, err := OpenMmap(path, config)
+	if err != nil {
+		t.Fatalf("OpenMmap (promoted): %v", err)
+	}
+	defer promoted.Close()
+	for i := 0; i < 600; i++ {
+		h := hashWithPrefix([]byte{7, 9}, uint64(i+1))
+		if got := promoted.Lookup(nil, h); !equalIDs(got, []ImageID{ImageID(i + 1)}) {
+			t.Fatalf("Lookup(%d) after promotion reopen = %v", i, got)
+		}
+	}
+}
