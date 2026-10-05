@@ -13,12 +13,6 @@ import (
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-// smallLeafLimit is the slot count below which scanLeaf scans linearly with the
-// tail kernel instead of binary-searching. The SIMD prefix compare beats a
-// branchy binary search only for small leaves; larger leaves use the sorted
-// binary search, which is the correctness reference.
-const smallLeafLimit = 64
-
 const (
 	// leafMagic identifies a leaf extent.
 	leafMagic uint32 = 0x524c4846 // "RLHF"
@@ -254,8 +248,13 @@ func parseLeafHeader(arena []byte, ref pagealloc.Ref) (leafHeader, error) {
 }
 
 // scanLeaf invokes visit for every slot whose tail equals query[depth:32]. It
-// binary-searches the sorted tail array for the lower bound and then walks the
-// (usually short) equal run, reading ids through zero-copy typed views.
+// always binary-searches the sorted tail array.
+//
+// BenchmarkLeafSearchCrossover shows binary search beats the SIMD linear scan at
+// every occupancy up to the kernel's 64-slot limit, and the linear path also
+// allocates because the prefix is passed through an indirect kernel call, which
+// violates the allocation-free lookup requirement. scanLeafLinear is retained as
+// the reference/benchmark alternative and is deliberately not on the hot path.
 func scanLeaf(arena []byte, ref pagealloc.Ref, query Hash, depth int, visit func(ImageID) bool) error {
 	header, err := parseLeafHeader(arena, ref)
 	if err != nil {
@@ -264,34 +263,24 @@ func scanLeaf(arena []byte, ref pagealloc.Ref, query Hash, depth int, visit func
 	if header.depth != depth {
 		return fmt.Errorf("%w: leaf depth %d reached at depth %d", ErrCorrupt, header.depth, depth)
 	}
+	return scanLeafBinary(arena, ref, query, depth, header, visit)
+}
+
+// scanLeafLinear compares the 16-byte tail prefix of every slot with the SIMD
+// mask kernel; each set bit is confirmed with a full-tail compare before
+// visiting. It is used for small leaves where the vector scan beats a branchy
+// binary search.
+func scanLeafLinear(arena []byte, ref pagealloc.Ref, query Hash, depth int, header leafHeader, visit func(ImageID) bool) error {
 	tailLen := tailLenFor(depth)
 	want := query[depth:]
 	base := extentOffset(ref) + uint64(leafHeaderSize)
-
-	// Small leaves: SIMD prefix scan. The mask compares 16-byte prefixes; each
-	// set bit is confirmed with a full-tail compare before visiting.
-	if header.count <= smallLeafLimit && tailLen >= 16 {
-		mask := tailkernel.MatchMask(arena[base:], tailLen, header.count, want)
-		if mask == 0 {
-			return nil
-		}
-		idsBase := extentOffset(ref) + uint64(header.idsOffset)
-		if header.idBytes == id32Bytes {
-			ids, err := storage.View[uint32](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
-			if err != nil {
-				return err
-			}
-			for mask != 0 {
-				i := bits.TrailingZeros64(mask)
-				mask &= mask - 1
-				off := base + uint64(tailLen*i)
-				if bytes.Equal(arena[off:off+uint64(tailLen)], want) && !visit(ImageID(ids[i])) {
-					return nil
-				}
-			}
-			return nil
-		}
-		ids, err := storage.View[uint64](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
+	mask := tailkernel.MatchMask(arena[base:], tailLen, header.count, want)
+	if mask == 0 {
+		return nil
+	}
+	idsBase := extentOffset(ref) + uint64(header.idsOffset)
+	if header.idBytes == id32Bytes {
+		ids, err := storage.View[uint32](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
 		if err != nil {
 			return err
 		}
@@ -305,7 +294,28 @@ func scanLeaf(arena []byte, ref pagealloc.Ref, query Hash, depth int, visit func
 		}
 		return nil
 	}
+	ids, err := storage.View[uint64](arena, idsBase, uint64(header.count), ErrCorrupt, ErrCorrupt)
+	if err != nil {
+		return err
+	}
+	for mask != 0 {
+		i := bits.TrailingZeros64(mask)
+		mask &= mask - 1
+		off := base + uint64(tailLen*i)
+		if bytes.Equal(arena[off:off+uint64(tailLen)], want) && !visit(ImageID(ids[i])) {
+			return nil
+		}
+	}
+	return nil
+}
 
+// scanLeafBinary lower-bounds the sorted tail array and walks the equal run,
+// reading ids through zero-copy typed views. It is the correctness reference
+// for every leaf size.
+func scanLeafBinary(arena []byte, ref pagealloc.Ref, query Hash, depth int, header leafHeader, visit func(ImageID) bool) error {
+	tailLen := tailLenFor(depth)
+	want := query[depth:]
+	base := extentOffset(ref) + uint64(leafHeaderSize)
 	lo, hi := 0, header.count
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -363,12 +373,29 @@ func partitionSlots(slots []slot, tailLen int) map[byte][]slot {
 	return groups
 }
 
+// compareSlot orders by tail then ImageID, returning -1, 0, or 1.
+func compareSlot(a, b *slot, tailLen int) int {
+	if comparison := bytes.Compare(a.tail[:tailLen], b.tail[:tailLen]); comparison != 0 {
+		return comparison
+	}
+	switch {
+	case a.id < b.id:
+		return -1
+	case a.id > b.id:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // lessSlot orders by tail then ImageID.
 func lessSlot(a, b *slot, tailLen int) bool {
-	if comparison := bytes.Compare(a.tail[:tailLen], b.tail[:tailLen]); comparison != 0 {
-		return comparison < 0
-	}
-	return a.id < b.id
+	return compareSlot(a, b, tailLen) < 0
+}
+
+// sameSlot reports whether two slots are the same (tail, ImageID) pair.
+func sameSlot(a, b *slot, tailLen int) bool {
+	return a.id == b.id && bytes.Equal(a.tail[:tailLen], b.tail[:tailLen])
 }
 
 // sortSlots orders slots by (tail, ImageID). Small leaves use insertion sort to
@@ -406,10 +433,31 @@ func dedupeSlots(slots []slot, tailLen int) []slot {
 	return unique
 }
 
-// mergeSlots returns the sorted, deduplicated union of existing and added.
+// mergeSlots returns the sorted, deduplicated union of existing (already
+// sorted) and added. Only the small incoming group is sorted; the two sorted
+// runs are then merged linearly, so a small update never re-sorts the existing
+// leaf and the replacement is built with a single allocation.
 func mergeSlots(existing, added []slot, tailLen int) []slot {
+	if len(added) == 0 {
+		return existing
+	}
+	sortSlots(added, tailLen)
 	merged := make([]slot, 0, len(existing)+len(added))
-	merged = append(merged, existing...)
-	merged = append(merged, added...)
-	return dedupeSlots(merged, tailLen)
+	i, j := 0, 0
+	for i < len(existing) || j < len(added) {
+		var next slot
+		switch {
+		case j >= len(added) || (i < len(existing) && compareSlot(&existing[i], &added[j], tailLen) <= 0):
+			next = existing[i]
+			i++
+		default:
+			next = added[j]
+			j++
+		}
+		if len(merged) > 0 && sameSlot(&merged[len(merged)-1], &next, tailLen) {
+			continue
+		}
+		merged = append(merged, next)
+	}
+	return merged
 }

@@ -50,6 +50,11 @@ type Index struct {
 	mu     sync.Mutex
 	view   atomic.Pointer[indexView]
 	closed atomic.Bool
+
+	// records is the writer-owned grouping scratch used by Apply. It is only
+	// touched under mu, grows once, and is reused so a small batch allocates
+	// nothing to group records by root bucket.
+	records []slot
 }
 
 // New allocates a heap-backed arena of approximately arenaBytes and returns an
@@ -146,6 +151,12 @@ func (t *txn) rollback() {
 // once, merged, and rewritten into a fresh extent; interior nodes on the changed
 // paths (and the root) are path-copied once. Duplicate (hash, image) pairs
 // collapse, and a batch that changes nothing publishes no generation.
+//
+// ImageIdx normally applies at most about 64 records per batch, so the common
+// path is deliberately serial and allocation-light: records are counting-sorted
+// into one reusable scratch and each affected root bucket is rebuilt once. No
+// map, goroutine, channel, or worker pool is created for a small batch. Larger
+// batches (compaction/rebuild) may still fan out across buckets.
 func (i *Index) Apply(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
@@ -155,69 +166,25 @@ func (i *Index) Apply(entries []Entry) error {
 	if i.closed.Load() {
 		return ErrClosed
 	}
-
-	// Group mutations by root byte; the carried tail starts at Hash[1].
-	groups := make(map[byte][]slot, len(entries))
 	for _, entry := range entries {
 		if entry.ImageID == 0 {
 			return ErrInvalidEntry
 		}
-		var record slot
-		copy(record.tail[:], entry.Hash[1:])
-		record.id = entry.ImageID
-		groups[entry.Hash[0]] = append(groups[entry.Hash[0]], record)
 	}
+
+	// Group mutations by root byte; the carried tail starts at Hash[1].
+	var counts [radixFanout]int
+	records := i.groupByRoot(entries, &counts)
 
 	current := i.view.Load()
 	oldRoot := current.root
-
 	batch := &txn{index: i, arena: current.arena, generation: current.generation}
 	nextRoot := *oldRoot // copy-on-write the 1 KiB root
-	workers := 1
-	if len(entries) >= parallelMinEntries && len(groups) > 1 {
-		workers = min(runtime.GOMAXPROCS(0), len(groups), 8)
-	}
-	if workers <= 1 {
-		for key, records := range groups {
-			updated, err := batch.rebuildChild(oldRoot[key], 1, records)
-			if err != nil {
-				batch.rollback()
-				return err
-			}
-			nextRoot[key] = updated
-		}
-	} else {
-		jobs := make(chan byte, len(groups))
-		for key := range groups {
-			jobs <- key
-		}
-		close(jobs)
-		var wait sync.WaitGroup
-		var errMu sync.Mutex
-		var firstErr error
-		for w := 0; w < workers; w++ {
-			wait.Add(1)
-			go func() {
-				defer wait.Done()
-				for key := range jobs {
-					updated, err := batch.rebuildChild(oldRoot[key], 1, groups[key])
-					if err != nil {
-						errMu.Lock()
-						if firstErr == nil {
-							firstErr = err
-						}
-						errMu.Unlock()
-						continue
-					}
-					nextRoot[key] = updated
-				}
-			}()
-		}
-		wait.Wait()
-		if firstErr != nil {
-			batch.rollback()
-			return firstErr
-		}
+
+	parallel := len(entries) >= parallelMinEntries
+	if err := batch.applyBuckets(records, &counts, oldRoot, &nextRoot, parallel); err != nil {
+		batch.rollback()
+		return err
 	}
 	if nextRoot == *oldRoot {
 		return nil
@@ -242,6 +209,103 @@ func (i *Index) Apply(entries []Entry) error {
 		_ = i.alloc.Reclaim()
 	}
 	return nil
+}
+
+// groupByRoot copies entries into the reusable writer scratch ordered by
+// Hash[0] and fills counts with the per-bucket record count. Each root bucket
+// is then one contiguous run, so the caller never builds a map and never grows
+// a per-bucket slice. The scratch only grows, so the common small batch
+// allocates nothing.
+func (i *Index) groupByRoot(entries []Entry, counts *[radixFanout]int) []slot {
+	for _, entry := range entries {
+		counts[entry.Hash[0]]++
+	}
+	var starts [radixFanout]int
+	sum := 0
+	for key := 0; key < radixFanout; key++ {
+		starts[key] = sum
+		sum += counts[key]
+	}
+	if cap(i.records) < len(entries) {
+		i.records = make([]slot, len(entries))
+	}
+	records := i.records[:len(entries)]
+	for _, entry := range entries {
+		key := entry.Hash[0]
+		rec := &records[starts[key]]
+		starts[key]++
+		*rec = slot{id: entry.ImageID}
+		copy(rec.tail[:], entry.Hash[1:])
+	}
+	return records
+}
+
+// applyBuckets rebuilds each affected root bucket exactly once. Small batches
+// run serially; large batches fan out across disjoint root buckets. Every leaf
+// and node is still built copy-on-write and the caller publishes one view.
+func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, nextRoot *[radixFanout]uint32, parallel bool) error {
+	var starts [radixFanout]int
+	sum := 0
+	for key := 0; key < radixFanout; key++ {
+		starts[key] = sum
+		sum += counts[key]
+	}
+	rebuild := func(key int) error {
+		n := counts[key]
+		if n == 0 {
+			return nil
+		}
+		updated, err := t.rebuildChild(oldRoot[key], 1, records[starts[key]:starts[key]+n])
+		if err != nil {
+			return err
+		}
+		nextRoot[key] = updated
+		return nil
+	}
+
+	if !parallel {
+		for key := 0; key < radixFanout; key++ {
+			if err := rebuild(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	workers := min(runtime.GOMAXPROCS(0), sum, 8)
+	if workers < 2 {
+		for key := 0; key < radixFanout; key++ {
+			if err := rebuild(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var next atomic.Int32
+	var wait sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	for w := 0; w < workers; w++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for {
+				key := int(next.Add(1)) - 1
+				if key >= radixFanout {
+					return
+				}
+				if err := rebuild(key); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	return firstErr
 }
 
 // rebuildChild returns the replacement child reference for the subtree rooted
@@ -566,6 +630,13 @@ func (i *Index) Reclaim() error {
 // arena, so no reader can observe an unmapped arena. A file-backed index is
 // compacted into a heap arena and loses its file backing, so callers that need
 // persistence should checkpoint instead.
+//
+// Compaction is one logical publication regardless of how many internal Apply
+// calls the streaming rebuild needs, so the replacement generation is always
+// the current generation plus one. A corruption failure aborts before
+// publication and leaves the live index unchanged. After publication the new
+// index is authoritative; a release error means cleanup of the old backing
+// resource failed and is returned without rolling the publication back.
 func (i *Index) Compact() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -579,15 +650,24 @@ func (i *Index) Compact() error {
 
 	// Stream the old immutable tree into the fresh arena in bounded batches, so
 	// peak compaction memory is independent of index size and no []Entry
-	// proportional to the index is ever built.
+	// proportional to the index is ever built. Any corruption the walker finds
+	// aborts the rebuild without publishing it.
+	batchEntries := compactBatchEntries
+	if batchEntries < 1 {
+		batchEntries = 1
+	}
 	fresh, err := New(i.alloc.TotalBytes(), i.config)
 	if err != nil {
 		return err
 	}
-	batch := make([]Entry, compactBatchEntries)
+	batch := make([]Entry, batchEntries)
 	walker := newEntryWalker(current)
 	for {
-		written, more := walker.next(batch)
+		written, more, walkErr := walker.Next(batch)
+		if walkErr != nil {
+			_ = fresh.Close()
+			return walkErr
+		}
 		if written > 0 {
 			if err := fresh.Apply(batch[:written]); err != nil {
 				_ = fresh.Close()
@@ -602,19 +682,32 @@ func (i *Index) Compact() error {
 	// Build is complete. Publish the replacement view first, then run the
 	// reader grace period, and only after prior readers drain release the old
 	// arena. Unmapping before publication + grace would fault a live reader.
+	// The temporary index advanced its own generation once per internal Apply;
+	// that is implementation work, not publication, so override it with the
+	// single logical generation this compaction represents.
 	release := i.release
+	built := fresh.view.Load()
 	i.alloc = fresh.alloc
 	i.release = fresh.release
 	i.sync = fresh.sync
 	i.persistent = false
 	i.slot = 0
-	i.view.Store(fresh.view.Load())
+	i.view.Store(&indexView{
+		generation:  current.generation + 1,
+		root:        built.root,
+		arena:       built.arena,
+		entries:     built.entries,
+		rootBuckets: built.rootBuckets,
+		depth:       built.depth,
+	})
 	fresh.alloc = nil
 	fresh.release = nil
 	fresh.sync = nil
 	i.tracker.WaitForPriorReaders()
 	if release != nil {
-		_ = release()
+		if releaseErr := release(); releaseErr != nil {
+			return releaseErr
+		}
 	}
 	return nil
 }

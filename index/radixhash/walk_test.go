@@ -71,7 +71,10 @@ func TestEntryWalkerStreamsSortedEntries(t *testing.T) {
 	buf := make([]Entry, 3)
 	var got []Entry
 	for {
-		n, more := walker.next(buf)
+		n, more, err := walker.Next(buf)
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
 		got = append(got, buf[:n]...)
 		if !more {
 			break
