@@ -474,6 +474,14 @@ Shard
 Use dual/checksummed superblocks or an equivalent atomic-generation publication
 mechanism so recovery can select the newest valid committed generation.
 
+The reusable part of this envelope lives in `internal/storage`
+(`SuperblockHeader`, `EncodeSuperblock`, `DecodeSuperblock`,
+`SelectSuperblock`): magic, version, flags, generation, payload length, and a
+payload CRC plus a header CRC. An index package owns only its payload; RadixHash
+stores record counts, depth, and its root CRC in a version-2 payload and keeps
+its per-slot root in the arena. Any mmap index can reuse the envelope and
+selection without depending on RadixHash.
+
 ---
 
 ## Space and Memory Optimizations
@@ -537,6 +545,8 @@ from it.
 Sweep configurable thresholds:
 
 ```text
+8 KiB
+16 KiB
 32 KiB
 64 KiB
 96 KiB
@@ -544,8 +554,21 @@ Sweep configurable thresholds:
 256 KiB
 ```
 
-Measure lookup latency, leaf scan length, promotion frequency, and storage
-amplification for each.
+Measure lookup latency, leaf scan length, promotion frequency, COW allocation
+volume, index bytes/entry, tree depth, leaf count/occupancy, and compaction
+throughput for each, for both uniform and skewed hashes. Benchmarks live in
+`BenchmarkPromotionSweep` / `BenchmarkPromotionSweep10M`.
+
+Measured (uniform, per `index/radixhash` `BenchmarkPromotionSweep`): a broad
+64–128 KiB plateau, with 256 KiB skipping promotion (large leaves, slower
+lookup) and 8–32 KiB raising COW allocation. The default stays **96 KiB**;
+adaptive promotion is unchanged.
+
+### Compaction
+
+`BenchmarkCompact` streams the old tree in bounded batches. Benchmark
+throughput, peak temporary memory, allocations, and total bytes allocated at
+100K/1M/10M. Compaction never builds an `[]Entry` proportional to index size.
 
 ### Insert
 

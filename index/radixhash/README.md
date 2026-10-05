@@ -163,8 +163,10 @@ created by `NewMmap`.
 
 Replaced pages are retired until no reader can reference them. `Reclaim` waits
 for prior readers through the `ReaderTracker` and frees every retired extent;
-`AutoReclaimBytes` does it automatically once retired bytes cross the threshold,
-and `Compact` rebuilds into a freshly packed arena.
+`AutoReclaimBytes` does it automatically once retired bytes cross the threshold.
+`Compact` rebuilds into a freshly packed arena by **streaming** bounded entry
+batches from the old immutable view through an internal walker (`walk.go`), so
+peak compaction memory is independent of index size.
 
 ```go
 _ = index.Reclaim()
@@ -188,7 +190,7 @@ ids, err := plan.Search(ctx, nil, &ws)
 
 | Field | Meaning |
 |---|---|
-| `PromotionBytes` | Promote a leaf to the next radix level past this encoded size (default 96 KiB). |
+| `PromotionBytes` | Promote a leaf to the next radix level past this encoded size. Default 96 KiB, retained after sweeping 8 KiB–256 KiB: 64–128 KiB is a broad plateau, while 256 KiB skips promotion and hurts lookup, and 8–32 KiB raises COW allocation. |
 | `MaxLeafSlots` | Optional record-count promotion cap; benchmark it — a low cap fragments space. |
 | `AutoReclaimBytes` | Reclaim retired space automatically once retired bytes reach this. |
 
@@ -200,9 +202,11 @@ ids, err := plan.Search(ctx, nil, &ws)
 | `node.go` | 256-way radix node encoding and child tagging. |
 | `leaf.go` | SoA leaf codec, sorted-tail search, promotion partitioning. |
 | `index.go` | Arena, views, copy-on-write `Apply`, lookup, reclaim, compact. |
-| `superblock.go` | Dual-superblock and root encoding with CRCs. |
+| `walk.go` | Bounded tree iterator used by streaming compaction. |
+| `superblock.go` | Radix payload + per-slot root over the common envelope. |
 | `persist.go` | `NewMmap`/`OpenMmap`, `Checkpoint`, and reopen reconstruction. |
 | `internal/tailkernel` | Scalar reference + NEON/AVX2 16-byte tail-prefix kernels. |
+| `internal/storage` | mmap, `ReaderTracker`, and the dual-superblock envelope (header, generation, CRC, slot selection). |
 
 ## Lookup kernels
 
@@ -215,7 +219,9 @@ used everywhere else.
 ## Scope
 
 Implemented: the exact-fit allocator, the byte-oriented radix engine, adaptive
-promotion, batched COW commits, generation-gated readers, the file-backed mmap
-arena with superblock reopen/checkpoint, and SIMD tail kernels. Follow-ups: WAL
-durability modes, shard rollover and parallel lookup, and registering RadixHash
-in the unified `index.Store` schema.
+promotion (default 96 KiB retained after a threshold sweep), batched COW
+commits, generation-gated readers, streaming compaction, the file-backed mmap
+arena with superblock reopen/checkpoint over the shared `internal/storage`
+envelope, and SIMD tail kernels. Follow-ups: WAL durability modes, shard
+rollover and parallel lookup, and registering RadixHash in the unified
+`index.Store` schema.
