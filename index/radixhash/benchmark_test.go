@@ -804,6 +804,150 @@ func BenchmarkLeafSearchCrossover(b *testing.B) {
 	}
 }
 
+// buildMergeLeaf encodes a depth-1 leaf of n distinct records at pagealloc
+// reference 1, optionally with 64-bit IDs, and returns it with its header.
+func buildMergeLeaf(n int, id64 bool) (arena []byte, ref pagealloc.Ref, header leafHeader) {
+	slots := make([]slot, n)
+	for i := 0; i < n; i++ {
+		h := layoutHash(uint64(i) + 1)
+		copy(slots[i].tail[:], h[1:])
+		slots[i].id = uint64(i + 1)
+		if id64 {
+			slots[i].id <<= 33
+		}
+	}
+	sortSlots(slots, tailLenFor(1))
+	idBytes := idBytesForSlots(slots)
+	size := sizeForCapacity(1, idBytes, n)
+	extentBytes := uint32(((size + 511) / 512) * 512)
+	arena = make([]byte, int(pagealloc.MinBlockSize)+int(extentBytes))
+	if err := encodeLeaf(arena[int(pagealloc.MinBlockSize):], 1, slots); err != nil {
+		panic(err)
+	}
+	ref = pagealloc.Ref(1)
+	var err error
+	header, err = readLeafHeader(arena, ref)
+	if err != nil {
+		panic(err)
+	}
+	return arena, ref, header
+}
+
+// buildAddedSlots builds one incoming group for a leaf-merge scenario.
+func buildAddedSlots(scenario string, n, m int) []slot {
+	added := make([]slot, 0, m)
+	mk := func(seed, id uint64) slot {
+		h := layoutHash(seed)
+		var s slot
+		copy(s.tail[:], h[1:])
+		s.id = id
+		return s
+	}
+	switch scenario {
+	case "dup":
+		for k := 0; k < m; k++ {
+			seed := uint64((k % n) + 1)
+			added = append(added, mk(seed, seed))
+		}
+	case "mixed":
+		for k := 0; k < m; k++ {
+			if k%2 == 0 {
+				seed := uint64((k/2)%n) + 1
+				added = append(added, mk(seed, seed))
+			} else {
+				seed := uint64(n + k + 1)
+				added = append(added, mk(seed, seed))
+			}
+		}
+	case "widen":
+		for k := 0; k < m; k++ {
+			seed := uint64(n + k + 1)
+			id := seed
+			if k == 0 {
+				id = uint64(1) << 40
+			}
+			added = append(added, mk(seed, id))
+		}
+	case "sametail":
+		h := layoutHash(uint64(n + 1))
+		for k := 0; k < m; k++ {
+			var s slot
+			copy(s.tail[:], h[1:])
+			s.id = uint64(100000 + k)
+			added = append(added, s)
+		}
+	default: // "new", "existing64"
+		for k := 0; k < m; k++ {
+			seed := uint64(n + k + 1)
+			added = append(added, mk(seed, seed))
+		}
+	}
+	return added
+}
+
+// benchLeafMerge compares the direct encoded-SoA merge against the old
+// decode+merge+encode path for one leaf size and incoming batch size.
+func benchLeafMerge(b *testing.B, scenario string, n, m int) {
+	arena, ref, header := buildMergeLeaf(n, scenario == "existing64")
+	tailLen := tailLenFor(1)
+	records := dedupeSlots(buildAddedSlots(scenario, n, m), tailLen)
+	idBytes := header.idBytes
+	if idBytes == id32Bytes && idBytesForSlots(records) == id64Bytes {
+		idBytes = id64Bytes
+	}
+	resultCount, _ := leafMergedCount(arena, extentOffset(ref), header, tailLen, records)
+	extentBytes := sizeForCapacity(1, idBytes, resultCount)
+	capacity := capacityForSize(1, idBytes, uint32(extentBytes))
+	recordsOffset := extentOffset(ref)
+
+	b.Run("direct", func(b *testing.B) {
+		buf := make([]byte, extentBytes)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			encodeLeafHeader(buf, 1, idBytes, resultCount, capacity)
+			writeMergedLeafRecords(buf, 1, idBytes, resultCount, capacity, arena, recordsOffset, header, records)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*m), "ns/inc-entry")
+	})
+	b.Run("decode", func(b *testing.B) {
+		buf := make([]byte, extentBytes)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			existing, _, err := readLeafSlotsInto(nil, arena, ref)
+			if err != nil {
+				b.Fatal(err)
+			}
+			merged := mergeSlotsInto(nil, existing, records, tailLen)
+			if err := encodeLeaf(buf, 1, merged); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*m), "ns/inc-entry")
+	})
+}
+
+// BenchmarkLeafMerge compares direct SoA->SoA leaf rewrites against the old
+// decode+merge+encode path across leaf sizes, incoming batch sizes, and
+// duplicate/id-width scenarios.
+func BenchmarkLeafMerge(b *testing.B) {
+	sizes := []int{16, 64, 256, 1024, 2048}
+	incoming := []int{1, 8, 16, 32, 64}
+	for _, n := range sizes {
+		for _, m := range incoming {
+			b.Run(fmt.Sprintf("mixed/size=%d/inc=%d", n, m), func(b *testing.B) {
+				benchLeafMerge(b, "mixed", n, m)
+			})
+		}
+	}
+	for _, scenario := range []string{"new", "dup", "widen", "sametail", "existing64"} {
+		for _, m := range []int{8, 64} {
+			b.Run(fmt.Sprintf("%s/size=256/inc=%d", scenario, m), func(b *testing.B) {
+				benchLeafMerge(b, scenario, 256, m)
+			})
+		}
+	}
+}
+
 // partitionSlotsMap is the previous map-based 256-way partition, kept only for
 // the BenchmarkPartition comparison.
 func partitionSlotsMap(slots []slot, tailLen int) map[byte][]slot {

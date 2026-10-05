@@ -50,12 +50,14 @@
 // # Copy-on-write publication
 //
 // A batch groups mutations by radix path and rewrites each affected leaf at
-// most once. Every replacement leaf and interior node is built in a first
-// phase; only then is the new root published and the replaced pages retired.
-// A failure while building frees the fresh extents and leaves the published
-// view untouched, so a mid-batch out-of-space can never retire a page the live
-// view still references. Readers load the atomic view and only touch pages
-// belonging to it.
+// most once. An affected leaf is merged directly from its encoded SoA form into
+// the replacement extent, and only a promotion falls back to decoding. Every
+// replacement leaf and interior node is built in a first phase; only then is
+// the new root published and the replaced pages retired. A failure while
+// building frees the fresh extents and leaves the published view untouched, so
+// a mid-batch out-of-space can never retire a page the live view still
+// references. Readers load the atomic view and only touch pages belonging to
+// it.
 //
 // # Deletion
 //

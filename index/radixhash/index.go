@@ -110,7 +110,6 @@ type extent struct {
 type txn struct {
 	index       *Index
 	arena       []byte
-	generation  uint64
 	mu          sync.Mutex
 	newExtents  []extent
 	retirements []extent
@@ -185,7 +184,7 @@ func (i *Index) Apply(entries []Entry) error {
 
 	current := i.view.Load()
 	oldRoot := current.root
-	batch := &txn{index: i, arena: current.arena, generation: current.generation}
+	batch := &txn{index: i, arena: current.arena}
 	nextRoot := *oldRoot // copy-on-write the 1 KiB root
 
 	parallel := len(entries) >= parallelMinEntries
@@ -328,7 +327,8 @@ func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, ne
 
 // rebuildChild returns the replacement child reference for the subtree rooted
 // at oldChild (level is the child's radix level). records carry the unconsumed
-// tail starting at Hash[level].
+// tail starting at Hash[level]. An existing leaf is updated by merging directly
+// from its encoded SoA form; only a promotion falls back to decoded scratch.
 func (t *txn) rebuildChild(oldChild uint32, level int, records []slot, scratch *partitionScratch) (uint32, error) {
 	if oldChild == 0 {
 		return t.newSubtreeFromRecords(level, records, scratch)
@@ -338,24 +338,62 @@ func (t *txn) rebuildChild(oldChild uint32, level int, records []slot, scratch *
 		return t.rebuildNode(ref, level, records, scratch)
 	}
 
-	existing, header, err := readLeafSlots(t.arena, ref)
+	header, err := readLeafHeader(t.arena, ref)
 	if err != nil {
 		return 0, err
 	}
 	if header.depth != level {
 		return 0, fmt.Errorf("%w: leaf depth %d reached at level %d", ErrCorrupt, header.depth, level)
 	}
-	merged := mergeSlots(existing, records, tailLenFor(level))
-	if len(merged) == len(existing) {
-		return oldChild, nil // every record was already present
+	// Sort and deduplicate only the small incoming group, then merge it directly
+	// with the encoded leaf. The existing leaf is never materialized as []slot.
+	tailLen := tailLenFor(level)
+	records = dedupeSlots(records, tailLen)
+	idBytes := header.idBytes
+	if idBytes == id32Bytes && idBytesForSlots(records) == id64Bytes {
+		idBytes = id64Bytes
 	}
-	if level >= maxDepth || t.fits(level, idBytesForSlots(merged), len(merged)) {
-		return t.writeLeaf(level, merged, ref, header.extentBytes, len(existing))
+	resultCount, newCount := leafMergedCount(t.arena, extentOffset(ref), header, tailLen, records)
+	if newCount == 0 {
+		return oldChild, nil // every incoming record already present
 	}
-	// Promote this individual leaf to a radix node consuming Hash[level].
+	if level < maxDepth && t.fits(level, idBytes, resultCount) {
+		return t.writeMergedLeaf(ref, header, level, records, resultCount, idBytes)
+	}
+	// The merged leaf would exceed the promotion threshold: fall back to the
+	// decode+merge scratch and repartition. Promotion is rare, so materializing
+	// here is acceptable.
+	existing, _, err := readLeafSlotsInto(scratch.existing[:0], t.arena, ref)
+	if err != nil {
+		return 0, err
+	}
+	scratch.existing = existing
+	merged := mergeSlotsInto(scratch.merged[:0], existing, records, tailLen)
+	scratch.merged = merged
 	t.retire(ref, header.extentBytes)
 	t.addDelta(-int64(len(existing)))
 	return t.buildNodeFromSlots(level, merged, scratch)
+}
+
+// writeMergedLeaf allocates a replacement leaf extent, writes the direct
+// SoA -> SoA merge of the old leaf and the incoming group into it, then retires
+// the old leaf and accounts for the entry delta. added must already be sorted
+// and deduplicated at tailLen and count must be the exact merged count.
+func (t *txn) writeMergedLeaf(oldRef pagealloc.Ref, header leafHeader, level int, added []slot, count, idBytes int) (uint32, error) {
+	size := uint32(sizeForCapacity(level, idBytes, count))
+	ref, capacity, err := t.alloc(size)
+	if err != nil {
+		return 0, err
+	}
+	offset := extentOffset(ref)
+	extent := t.arena[offset : offset+uint64(capacity)]
+	slotCapacity := capacityForSize(level, idBytes, capacity)
+	encodeLeafHeader(extent, level, idBytes, count, slotCapacity)
+	writeMergedLeafRecords(extent, level, idBytes, count, slotCapacity, t.arena, extentOffset(oldRef), header, added)
+	t.retire(oldRef, header.extentBytes)
+	t.addDelta(int64(count - header.count))
+	t.noteDepth(level)
+	return encodeChild(ref, false), nil
 }
 
 // rebuildNode path-copies the radix node at ref, applying each per-byte group
