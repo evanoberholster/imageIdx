@@ -156,10 +156,21 @@ exact-hash lookup path.
 Do **not** preallocate a flat 65,536-entry directory.
 
 - The initial root is one 256-entry radix node indexed by `hash[0]`.
-- Second-level radix nodes are allocated lazily and indexed by `hash[1]`.
-- Only allocate radix nodes that contain data.
+- Radix nodes are allocated lazily and only where data requires them.
+- A small `Hash[0]` bucket is a **direct root-to-leaf child**; it does not
+  allocate a `Hash[1]` node up front.
 
-The normal structure is therefore:
+```text
+Root[hash[0]]
+       |
+       v
+     Leaf              // sparse bucket
+```
+
+When that leaf exceeds `PromotionBytes` or `MaxLeafSlots` it is promoted to a
+radix node and its records are redistributed, recursively, so the shape grows to
+`Root -> Radix -> Leaf` and beyond only when it pays off. There is no fixed
+L0/L1/L2 depth.
 
 ```text
 Root[hash[0]]
@@ -168,13 +179,14 @@ Root[hash[0]]
 Radix[hash[1]]
        |
        v
-Leaf
+     Leaf
 ```
 
 Root and interior nodes are stored in the pagealloc arena. Path copying
 allocates a replacement node only when a node on an affected path changes, so
 an insert that touches one leaf copies only the nodes on that leaf's path (and
-one root node per publishing batch).
+one root node per publishing batch). The root itself is carried in the
+published view, not the arena.
 
 ---
 
@@ -293,15 +305,22 @@ Readers remain lock-free and operate against a stable generation.
 
 Use **many lock-free mmap readers and a serialized batch commit path**.
 
-Readers pin a root generation, follow only references belonging to that
-generation, and release the generation when the lookup completes. They do not
-acquire leaf locks.
+Readers acquire a `ReaderTracker` token, load one immutable `indexView`
+(generation, root, and arena together), and release the token when the lookup
+completes. They take no locks and never track generations.
 
 Writers build replacement pages without modifying pages visible to existing
-readers. Publication switches the current root state only after all new pages
-are complete. Replaced pages enter `pagealloc`'s retired set and may be
-coalesced/reused only after the oldest active reader generation has advanced
-beyond them.
+readers, then publish the new view. The arena lifetime invariant is:
+
+```text
+build -> publish -> wait for prior readers -> reclaim / unmap
+```
+
+`ReaderTracker` is the sole authority for page lifetime. `Reclaim` waits for
+prior readers and frees retired extents; `Compact` builds a replacement arena,
+publishes it, waits, and only then releases the old arena; `Close` sets a closed
+flag, waits for in-flight readers, reclaims, and unmaps. An arena is never
+unmapped before its replacement is published and the grace period completes.
 
 ---
 
@@ -394,12 +413,17 @@ that are not tombstoned.
 
 The leaf tails are sorted, so lookup binary-searches for the lower bound and
 walks the short equal run rather than scanning the whole leaf. This keeps
-latency close to O(log n) even for large two-level leaves and removes most of
-the motivation for promoting solely to shorten a scan.
+latency close to O(log n) even for large two-level leaves. The path is
+allocation-free, lock-free, and mmap-friendly, with no interfaces or callbacks.
 
-Implement scalar first, then architecture-specific AVX2/AVX-512/NEON tail
-comparison kernels behind the same interface. The persistent layout must not
-depend on CPU architecture.
+A SIMD 16-byte tail-prefix kernel (NEON/AVX2, scalar reference) exists in
+`internal/tailkernel` and is benchmarked by `BenchmarkLeafSearchCrossover`.
+Measured on arm64, binary search beats the SIMD linear scan at every occupancy
+up to the kernel's 64-slot limit, and the linear path allocates because the
+query prefix is passed through an indirect kernel call. The SIMD scan is kept as
+a reference but is deliberately not dispatched on the lookup hot path.
+
+The persistent layout never depends on CPU architecture.
 
 ---
 
@@ -455,6 +479,17 @@ Shard
 Use dual/checksummed superblocks or an equivalent atomic-generation publication
 mechanism so recovery can select the newest valid committed generation.
 
+The reusable part of this envelope lives in `internal/storage`
+(`SuperblockHeader`, `EncodeSuperblock`, `DecodeSuperblock`,
+`SelectSuperblock`): magic, version, flags, generation, payload length, and a
+payload CRC32C plus a header CRC32C. Decoding requires a complete
+`SuperblockSlotBytes` slot, so a truncated buffer is rejected rather than
+validated against the 512-byte constant. There is one package-level Castagnoli
+table; no checksum table is built on a hot path. An index package owns only its
+payload; RadixHash stores record counts, depth, and its root CRC32C in a
+version-2 payload and keeps its per-slot root in the arena. Any mmap index can
+reuse the envelope and selection without depending on RadixHash.
+
 ---
 
 ## Space and Memory Optimizations
@@ -470,6 +505,10 @@ small:
 - **Automatic reclamation.** `Config.AutoReclaimBytes` bounds retired space:
   once retired bytes reach the threshold, the writer drains prior readers and
   reclaims automatically instead of holding up to 2× live data as dead pages.
+- **Fixed 256-way partition.** Interior radix grouping uses fixed
+  `[256]uint32` counts, `[257]uint32` offsets, and one contiguous per-level
+  scratch buffer, so there is no `map[byte][]slot` and no per-child slice
+  allocation on the write path.
 - **File-backed mmap arena.** `NewMmap` maps a sparse file as the arena, so a
   large logical arena consumes disk and resident memory only for touched pages;
   `Sync` flushes and `Close` unmaps.
@@ -518,6 +557,8 @@ from it.
 Sweep configurable thresholds:
 
 ```text
+8 KiB
+16 KiB
 32 KiB
 64 KiB
 96 KiB
@@ -525,14 +566,44 @@ Sweep configurable thresholds:
 256 KiB
 ```
 
-Measure lookup latency, leaf scan length, promotion frequency, and storage
-amplification for each.
+Measure lookup latency, leaf scan length, promotion frequency, COW allocation
+volume, index bytes/entry, tree depth, leaf count/occupancy, and compaction
+throughput for each, for both uniform and skewed hashes. Benchmarks live in
+`BenchmarkPromotionSweep` / `BenchmarkPromotionSweep10M`.
+
+Measured (uniform, per `index/radixhash` `BenchmarkPromotionSweep`): a broad
+64–128 KiB plateau, with 256 KiB skipping promotion (large leaves, slower
+lookup) and 8–32 KiB raising COW allocation. The default stays **96 KiB**;
+adaptive promotion is unchanged.
+
+`BenchmarkPromotionSmallWrites` re-judges the threshold on repeated small
+updates (batch 1/8/32/64, uniform and skewed). It confirms the default: 32 KiB
+promotes aggressively at 200K uniform entries (65K leaves, tiny occupancy,
+higher index bytes/entry), while 64 KiB and above are equivalent at that size
+and skewed buckets are threshold-insensitive. The application workload does not
+justify moving off 96 KiB.
+
+### Compaction
+
+`BenchmarkCompact` streams the old tree in bounded batches. Benchmark
+throughput, peak temporary memory, allocations, and total bytes allocated at
+100K/1M/10M. Compaction never builds an `[]Entry` proportional to index size.
+
+`BenchmarkCompactBatch` compares 4K/16K/64K internal streaming batches. At 1M
+entries 16K reaches ~82% of the 64K throughput (16.8M vs 20.6M entries/s) with a
+quarter of the temporary memory (0.625 MiB vs 2.5 MiB), and 4K is far behind, so
+the smallest batch on the plateau — **16K** — is the default. The walker reports
+corruption as `ErrCorrupt` and `Compact` aborts without publishing; the
+replacement always takes generation `current+1`, independent of batch count.
 
 ### Insert
 
-Measure single-entry append, batches of 100/1K/10K, page seal cost, WAL cost,
-checkpoint throughput, splits/promotions per batch, and bytes written per
-logical entry.
+Measure single-entry append, small batches 1/8/16/32/64 (the normal ImageIdx
+sizes, via `BenchmarkApplySmallBatch`), page seal cost, WAL cost, checkpoint
+throughput, splits/promotions per batch, and bytes written per logical entry.
+Include uniform, same-root, same-deeper-prefix, and mixed write patterns; the
+same-prefix case is the worst COW grouping. Normal ingestion does not use the
+1K–64K batches that only compaction/rebuild issues.
 
 ### Negative and duplicate lookup
 

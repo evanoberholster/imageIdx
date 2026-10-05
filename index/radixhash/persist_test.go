@@ -258,3 +258,134 @@ func idsRange(first, last ImageID) []ImageID {
 	}
 	return out
 }
+
+// TestMmapReopenAfterSparsePromotion checkpoints a sparse Root->Leaf bucket,
+// reopens it, grows it past the promotion threshold, and reopens the promoted
+// Root->Radix->Leaf tree.
+func TestMmapReopenAfterSparsePromotion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "idx.bin")
+	config := Config{PromotionBytes: 2048}
+
+	index, err := NewMmap(path, 8<<20, config)
+	if err != nil {
+		t.Fatalf("NewMmap: %v", err)
+	}
+	seed := func(from, to int) []Entry {
+		var entries []Entry
+		for i := from; i < to; i++ {
+			entries = append(entries, Entry{Hash: hashWithPrefix([]byte{7, 9}, uint64(i+1)), ImageID: ImageID(i + 1)})
+		}
+		return entries
+	}
+	if err := index.Apply(seed(0, 10)); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+	if depth := index.Metadata().Depth; depth != 1 {
+		t.Fatalf("depth = %d, want 1 (sparse)", depth)
+	}
+	if err := index.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := OpenMmap(path, config)
+	if err != nil {
+		t.Fatalf("OpenMmap (sparse): %v", err)
+	}
+	if depth := reopened.Metadata().Depth; depth != 1 {
+		t.Fatalf("reopened depth = %d, want 1", depth)
+	}
+	if err := reopened.Apply(seed(10, 600)); err != nil {
+		t.Fatalf("promoting Apply: %v", err)
+	}
+	if depth := reopened.Metadata().Depth; depth < 2 {
+		t.Fatalf("depth after promotion = %d, want >= 2", depth)
+	}
+	if err := reopened.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	promoted, err := OpenMmap(path, config)
+	if err != nil {
+		t.Fatalf("OpenMmap (promoted): %v", err)
+	}
+	defer promoted.Close()
+	for i := 0; i < 600; i++ {
+		h := hashWithPrefix([]byte{7, 9}, uint64(i+1))
+		if got := promoted.Lookup(nil, h); !equalIDs(got, []ImageID{ImageID(i + 1)}) {
+			t.Fatalf("Lookup(%d) after promotion reopen = %v", i, got)
+		}
+	}
+}
+
+// TestDecodeRadixSuperblockRejectsShortSlot verifies a truncated slot slice is
+// rejected instead of being validated against the full 512-byte size.
+func TestDecodeRadixSuperblockRejectsShortSlot(t *testing.T) {
+	if _, ok := decodeRadixSuperblock(make([]byte, superblockBytes-1), nil); ok {
+		t.Fatal("short superblock slot accepted")
+	}
+	if _, ok := decodeRadixSuperblock(nil, nil); ok {
+		t.Fatal("nil superblock slot accepted")
+	}
+}
+
+// TestMmapCorruptNewestSlotFallsBack corrupts the newest checkpoint's payload
+// and verifies reopen selects the older valid generation instead of failing.
+func TestMmapCorruptNewestSlotFallsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "idx.bin")
+	index, err := NewMmap(path, 1<<20, Config{})
+	if err != nil {
+		t.Fatalf("NewMmap: %v", err)
+	}
+	h := hashWithPrefix([]byte{1, 2}, 3)
+	if err := index.Apply([]Entry{{Hash: h, ImageID: 1}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := index.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	olderGen := index.Generation()
+	if err := index.Apply([]Entry{{Hash: h, ImageID: 2}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := index.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	newestGen := index.Generation()
+	newestSlot := index.slot
+	if newestGen == olderGen {
+		t.Fatalf("checkpoints did not advance generation: %d", newestGen)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Flip a payload byte in the newest slot so its CRC fails.
+	if _, err := file.WriteAt([]byte{0xff}, int64(superblockBytes*newestSlot)+32); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenMmap(path, Config{})
+	if err != nil {
+		t.Fatalf("OpenMmap(fallback): %v", err)
+	}
+	defer reopened.Close()
+	if got := reopened.Generation(); got != olderGen {
+		t.Fatalf("fallback generation = %d, want %d", got, olderGen)
+	}
+	if got := reopened.Lookup(nil, h); !equalIDs(got, []ImageID{1}) {
+		t.Fatalf("fallback lookup = %v, want [1]", got)
+	}
+}

@@ -2,10 +2,9 @@ package radixhash
 
 import (
 	"encoding/binary"
-	"fmt"
-	"hash/crc32"
 
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // On-disk arena header layout (per slot, so a crash mid-checkpoint leaves the
@@ -21,27 +20,20 @@ import (
 // switches the active slot. Reopen reads both slots, keeps the valid one with
 // the highest generation, and reconstructs allocation state by walking the
 // tree, so no free-space bitmap is persisted.
+//
+// The superblock envelope, CRCs, version check, and slot selection live in
+// internal/storage; radixhash owns only its payload and its per-slot root.
 const (
 	superblockMagic   uint32 = 0x52485342 // RHSB
-	superblockVersion uint16 = 1
-	superblockBytes          = uint32(pagealloc.MinBlockSize)
-	superblockSlots          = 2
+	superblockVersion uint16 = 2
+	superblockBytes          = storage.SuperblockSlotBytes
+	superblockSlots          = storage.SuperblockSlots
 	rootBlocks               = radixNodeBytes / pagealloc.MinBlockSize
 	headerBlocks             = superblockSlots + superblockSlots*rootBlocks
-)
 
-// Superblock field offsets within a 512-byte slot.
-const (
-	sbMagic       = 0
-	sbVersion     = 4
-	sbFlags       = 6
-	sbGeneration  = 8
-	sbEntries     = 16
-	sbRootBuckets = 24
-	sbDepth       = 32
-	sbRootCRC     = 36
-	sbHeaderCRC   = 40
-	sbHeaderEnd   = 44
+	// radixPayloadBytes is the radix checkpoint payload: entries(8) +
+	// rootBuckets(8) + depth(1) + root CRC32C(4).
+	radixPayloadBytes = 21
 )
 
 // superblock is the persisted root metadata for one arena generation.
@@ -62,42 +54,37 @@ func rootOffset(slot int) uint64 {
 	return uint64(superblockSlots+slot*int(rootBlocks)) * uint64(pagealloc.MinBlockSize)
 }
 
-// encodeSuperblock writes sb and the CRC of root into dst.
-func encodeSuperblock(dst []byte, sb superblock, root []byte) {
-	clear(dst[:superblockBytes])
-	binary.LittleEndian.PutUint32(dst[sbMagic:], superblockMagic)
-	binary.LittleEndian.PutUint16(dst[sbVersion:], superblockVersion)
-	binary.LittleEndian.PutUint64(dst[sbGeneration:], sb.generation)
-	binary.LittleEndian.PutUint64(dst[sbEntries:], sb.entries)
-	binary.LittleEndian.PutUint64(dst[sbRootBuckets:], sb.rootBuckets)
-	dst[sbDepth] = sb.depth
-	binary.LittleEndian.PutUint32(dst[sbRootCRC:], crc32.ChecksumIEEE(root))
-	binary.LittleEndian.PutUint32(dst[sbHeaderCRC:], crc32.ChecksumIEEE(dst[:sbHeaderCRC]))
+// encodeRadixSuperblock writes the radix payload and common envelope into one
+// slot. The payload binds the root bytes with a CRC, so a torn root is rejected
+// together with its slot.
+func encodeRadixSuperblock(dst []byte, sb superblock, root []byte) error {
+	var payload [radixPayloadBytes]byte
+	binary.LittleEndian.PutUint64(payload[0:8], sb.entries)
+	binary.LittleEndian.PutUint64(payload[8:16], sb.rootBuckets)
+	payload[16] = sb.depth
+	binary.LittleEndian.PutUint32(payload[17:21], storage.Checksum(root))
+	return storage.EncodeSuperblock(dst, storage.SuperblockHeader{
+		Magic:      superblockMagic,
+		Version:    superblockVersion,
+		Generation: sb.generation,
+	}, payload[:])
 }
 
-// decodeSuperblock validates a slot and its root, returning ok=false for an
-// empty or corrupt slot.
-func decodeSuperblock(src, root []byte) (superblock, bool) {
-	if len(src) < sbHeaderEnd || len(root) < radixNodeBytes {
+// decodeRadixSuperblock validates the envelope, the radix payload, and the root
+// it describes. ok is false for an empty, wrong-version, or corrupt slot.
+func decodeRadixSuperblock(src, root []byte) (superblock, bool) {
+	header, payload, ok := storage.DecodeSuperblock(src, superblockMagic, superblockVersion)
+	if !ok || len(payload) < radixPayloadBytes {
 		return superblock{}, false
 	}
-	if binary.LittleEndian.Uint32(src[sbMagic:]) != superblockMagic {
-		return superblock{}, false
-	}
-	if binary.LittleEndian.Uint16(src[sbVersion:]) != superblockVersion {
-		return superblock{}, false
-	}
-	if binary.LittleEndian.Uint32(src[sbHeaderCRC:]) != crc32.ChecksumIEEE(src[:sbHeaderCRC]) {
-		return superblock{}, false
-	}
-	if binary.LittleEndian.Uint32(src[sbRootCRC:]) != crc32.ChecksumIEEE(root) {
+	if binary.LittleEndian.Uint32(payload[17:21]) != storage.Checksum(root) {
 		return superblock{}, false
 	}
 	return superblock{
-		generation:  binary.LittleEndian.Uint64(src[sbGeneration:]),
-		entries:     binary.LittleEndian.Uint64(src[sbEntries:]),
-		rootBuckets: binary.LittleEndian.Uint64(src[sbRootBuckets:]),
-		depth:       src[sbDepth],
+		generation:  header.Generation,
+		entries:     binary.LittleEndian.Uint64(payload[0:8]),
+		rootBuckets: binary.LittleEndian.Uint64(payload[8:16]),
+		depth:       payload[16],
 	}, true
 }
 
@@ -119,7 +106,7 @@ func encodeRoot(dst []byte, root *[radixFanout]uint32) {
 // decodeRoot deserializes the root node from src.
 func decodeRoot(src []byte, root *[radixFanout]uint32) error {
 	if uint64(len(src)) < uint64(radixNodeBytes) {
-		return fmt.Errorf("%w: short root", ErrCorrupt)
+		return ErrCorrupt
 	}
 	for i := range root {
 		root[i] = binary.LittleEndian.Uint32(src[i*4:])

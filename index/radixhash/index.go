@@ -1,7 +1,6 @@
 package radixhash
 
 import (
-	"encoding/binary"
 	"fmt"
 	"runtime"
 	"sync"
@@ -36,7 +35,6 @@ type indexView struct {
 // An Index is safe for concurrent use by any number of readers and one writer.
 type Index struct {
 	alloc   *pagealloc.Allocator
-	arena   []byte
 	config  Config
 	tracker storage.ReaderTracker
 
@@ -51,7 +49,19 @@ type Index struct {
 
 	mu     sync.Mutex
 	view   atomic.Pointer[indexView]
-	closed bool
+	closed atomic.Bool
+
+	// records is the writer-owned grouping scratch used by Apply. It is only
+	// touched under mu, grows once, and is reused so a small batch allocates
+	// nothing to group records by root bucket.
+	records []slot
+	// partition holds the reusable per-level 256-way partition buffers. Like
+	// records it is writer-owned and only touched under mu.
+	partition partitionScratch
+	// workScratch holds per-worker partition buffers for the large-batch
+	// fan-out, reused across Apply calls. It is writer-owned and only touched
+	// under mu.
+	workScratch []partitionScratch
 }
 
 // New allocates a heap-backed arena of approximately arenaBytes and returns an
@@ -81,7 +91,7 @@ func NewWithArena(arena []byte, config Config) (*Index, error) {
 // lookup saves one random dereference; persistence will move it to the
 // superblock.
 func newIndex(allocator *pagealloc.Allocator, arena []byte, config Config) (*Index, error) {
-	index := &Index{alloc: allocator, arena: arena, config: config.withDefaults()}
+	index := &Index{alloc: allocator, config: config.withDefaults()}
 	index.view.Store(&indexView{generation: 1, root: &[radixFanout]uint32{}, arena: arena})
 	return index, nil
 }
@@ -99,6 +109,7 @@ type extent struct {
 // parallel while the allocator stays single-owner.
 type txn struct {
 	index       *Index
+	arena       []byte
 	generation  uint64
 	mu          sync.Mutex
 	newExtents  []extent
@@ -147,78 +158,40 @@ func (t *txn) rollback() {
 // once, merged, and rewritten into a fresh extent; interior nodes on the changed
 // paths (and the root) are path-copied once. Duplicate (hash, image) pairs
 // collapse, and a batch that changes nothing publishes no generation.
+//
+// ImageIdx normally applies at most about 64 records per batch, so the common
+// path is deliberately serial and allocation-light: records are counting-sorted
+// into one reusable scratch and each affected root bucket is rebuilt once. No
+// map, goroutine, channel, or worker pool is created for a small batch. Larger
+// batches (compaction/rebuild) may still fan out across buckets.
 func (i *Index) Apply(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
-
-	// Group mutations by root byte; the carried tail starts at Hash[1].
-	groups := make(map[byte][]slot, len(entries))
 	for _, entry := range entries {
 		if entry.ImageID == 0 {
 			return ErrInvalidEntry
 		}
-		var record slot
-		copy(record.tail[:], entry.Hash[1:])
-		record.id = entry.ImageID
-		groups[entry.Hash[0]] = append(groups[entry.Hash[0]], record)
 	}
+
+	// Group mutations by root byte; the carried tail starts at Hash[1].
+	var counts [radixFanout]int
+	records := i.groupByRoot(entries, &counts)
 
 	current := i.view.Load()
 	oldRoot := current.root
-
-	batch := &txn{index: i, generation: current.generation}
+	batch := &txn{index: i, arena: current.arena, generation: current.generation}
 	nextRoot := *oldRoot // copy-on-write the 1 KiB root
-	workers := 1
-	if len(entries) >= parallelMinEntries && len(groups) > 1 {
-		workers = min(runtime.GOMAXPROCS(0), len(groups), 8)
-	}
-	if workers <= 1 {
-		for key, records := range groups {
-			updated, err := batch.rebuildChild(oldRoot[key], 1, records)
-			if err != nil {
-				batch.rollback()
-				return err
-			}
-			nextRoot[key] = updated
-		}
-	} else {
-		jobs := make(chan byte, len(groups))
-		for key := range groups {
-			jobs <- key
-		}
-		close(jobs)
-		var wait sync.WaitGroup
-		var errMu sync.Mutex
-		var firstErr error
-		for w := 0; w < workers; w++ {
-			wait.Add(1)
-			go func() {
-				defer wait.Done()
-				for key := range jobs {
-					updated, err := batch.rebuildChild(oldRoot[key], 1, groups[key])
-					if err != nil {
-						errMu.Lock()
-						if firstErr == nil {
-							firstErr = err
-						}
-						errMu.Unlock()
-						continue
-					}
-					nextRoot[key] = updated
-				}
-			}()
-		}
-		wait.Wait()
-		if firstErr != nil {
-			batch.rollback()
-			return firstErr
-		}
+
+	parallel := len(entries) >= parallelMinEntries
+	if err := batch.applyBuckets(records, &counts, oldRoot, &nextRoot, parallel); err != nil {
+		batch.rollback()
+		return err
 	}
 	if nextRoot == *oldRoot {
 		return nil
@@ -227,7 +200,7 @@ func (i *Index) Apply(entries []Entry) error {
 	i.view.Store(&indexView{
 		generation:  current.generation + 1,
 		root:        &nextRoot,
-		arena:       i.arena,
+		arena:       current.arena,
 		entries:     uint64(int64(current.entries) + batch.delta.Load()),
 		rootBuckets: countRootBuckets(&nextRoot),
 		depth:       maxUint8(current.depth, uint8(batch.maxDepth.Load())),
@@ -235,29 +208,137 @@ func (i *Index) Apply(entries []Entry) error {
 	// Retirements happen after publication under the writer lock; the extents
 	// remain allocated until a later Reclaim proves no reader needs them.
 	for _, replaced := range batch.retirements {
-		_ = i.alloc.Retire(replaced.ref, replaced.bytes, current.generation)
+		_ = i.alloc.Retire(replaced.ref, replaced.bytes)
 	}
 	// Optional prompt reclamation bounds dead space during sustained writes.
 	if i.config.AutoReclaimBytes > 0 && i.alloc.RetiredBytes() >= i.config.AutoReclaimBytes {
 		i.tracker.WaitForPriorReaders()
-		_ = i.alloc.ReclaimAll()
+		_ = i.alloc.Reclaim()
 	}
 	return nil
+}
+
+// groupByRoot copies entries into the reusable writer scratch ordered by
+// Hash[0] and fills counts with the per-bucket record count. Each root bucket
+// is then one contiguous run, so the caller never builds a map and never grows
+// a per-bucket slice. The scratch only grows, so the common small batch
+// allocates nothing.
+func (i *Index) groupByRoot(entries []Entry, counts *[radixFanout]int) []slot {
+	for _, entry := range entries {
+		counts[entry.Hash[0]]++
+	}
+	var starts [radixFanout]int
+	sum := 0
+	for key := 0; key < radixFanout; key++ {
+		starts[key] = sum
+		sum += counts[key]
+	}
+	if cap(i.records) < len(entries) {
+		i.records = make([]slot, len(entries))
+	}
+	records := i.records[:len(entries)]
+	for _, entry := range entries {
+		key := entry.Hash[0]
+		rec := &records[starts[key]]
+		starts[key]++
+		*rec = slot{id: entry.ImageID}
+		copy(rec.tail[:], entry.Hash[1:])
+	}
+	return records
+}
+
+// applyBuckets rebuilds each affected root bucket exactly once. Small batches
+// run serially; large batches fan out across disjoint root buckets. Every leaf
+// and node is still built copy-on-write and the caller publishes one view.
+func (t *txn) applyBuckets(records []slot, counts *[radixFanout]int, oldRoot, nextRoot *[radixFanout]uint32, parallel bool) error {
+	var starts [radixFanout]int
+	sum := 0
+	for key := 0; key < radixFanout; key++ {
+		starts[key] = sum
+		sum += counts[key]
+	}
+	rebuild := func(key int, scratch *partitionScratch) error {
+		n := counts[key]
+		if n == 0 {
+			return nil
+		}
+		updated, err := t.rebuildChild(oldRoot[key], 1, records[starts[key]:starts[key]+n], scratch)
+		if err != nil {
+			return err
+		}
+		nextRoot[key] = updated
+		return nil
+	}
+
+	if !parallel {
+		scratch := &t.index.partition
+		for key := 0; key < radixFanout; key++ {
+			if err := rebuild(key, scratch); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	workers := min(runtime.GOMAXPROCS(0), sum, 8)
+	if workers < 2 {
+		scratch := &t.index.partition
+		for key := 0; key < radixFanout; key++ {
+			if err := rebuild(key, scratch); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Each worker owns a scratch so concurrent subtree rebuilds never share a
+	// partition buffer. The buffers are reused across Apply calls. This fan-out
+	// is only for large maintenance batches; the common <=64-record path stays
+	// serial on the writer's scratch.
+	if cap(t.index.workScratch) < workers {
+		t.index.workScratch = make([]partitionScratch, workers)
+	}
+	scratches := t.index.workScratch[:workers]
+	var next atomic.Int32
+	var wait sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	for w := 0; w < workers; w++ {
+		wait.Add(1)
+		go func(w int) {
+			defer wait.Done()
+			scratch := &scratches[w]
+			for {
+				key := int(next.Add(1)) - 1
+				if key >= radixFanout {
+					return
+				}
+				if err := rebuild(key, scratch); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+				}
+			}
+		}(w)
+	}
+	wait.Wait()
+	return firstErr
 }
 
 // rebuildChild returns the replacement child reference for the subtree rooted
 // at oldChild (level is the child's radix level). records carry the unconsumed
 // tail starting at Hash[level].
-func (t *txn) rebuildChild(oldChild uint32, level int, records []slot) (uint32, error) {
+func (t *txn) rebuildChild(oldChild uint32, level int, records []slot, scratch *partitionScratch) (uint32, error) {
 	if oldChild == 0 {
-		return t.newSubtreeFromRecords(level, records)
+		return t.newSubtreeFromRecords(level, records, scratch)
 	}
 	ref, isNode := decodeChild(oldChild)
 	if isNode {
-		return t.rebuildNode(ref, level, records)
+		return t.rebuildNode(ref, level, records, scratch)
 	}
 
-	existing, header, err := readLeafSlots(t.index.arena, ref)
+	existing, header, err := readLeafSlots(t.arena, ref)
 	if err != nil {
 		return 0, err
 	}
@@ -274,24 +355,31 @@ func (t *txn) rebuildChild(oldChild uint32, level int, records []slot) (uint32, 
 	// Promote this individual leaf to a radix node consuming Hash[level].
 	t.retire(ref, header.extentBytes)
 	t.addDelta(-int64(len(existing)))
-	return t.buildNodeFromSlots(level, merged)
+	return t.buildNodeFromSlots(level, merged, scratch)
 }
 
 // rebuildNode path-copies the radix node at ref, applying each per-byte group
 // of records to the matching child. It returns the old reference unchanged when
 // no child changes.
-func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32, error) {
-	if !validExtent(t.index.arena, ref, radixNodeBytes) {
+func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot, scratch *partitionScratch) (uint32, error) {
+	if !validExtent(t.arena, ref, radixNodeBytes) {
 		return 0, fmt.Errorf("%w: node extent outside arena", ErrCorrupt)
 	}
 	var old [radixFanout]uint32
-	readNode(t.index.arena, ref, &old)
+	readNode(t.arena, ref, &old)
 
-	groups := partitionSlots(records, tailLenFor(level))
+	var counts [radixFanout]uint32
+	var offsets [radixFanout + 1]uint32
+	out := scratch.buffer(level, len(records))
+	partitionSlots(out, records, tailLenFor(level), &counts, &offsets)
+
 	var next [radixFanout]uint32
 	changed := false
-	for key, group := range groups {
-		updated, err := t.rebuildChild(old[key], level+1, group)
+	for key := 0; key < radixFanout; key++ {
+		if counts[key] == 0 {
+			continue
+		}
+		updated, err := t.rebuildChild(old[key], level+1, out[offsets[key]:offsets[key+1]], scratch)
 		if err != nil {
 			return 0, err
 		}
@@ -310,7 +398,7 @@ func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32,
 	if err != nil {
 		return 0, err
 	}
-	if err := writeNode(t.index.arena, newRef, &next); err != nil {
+	if err := writeNode(t.arena, newRef, &next); err != nil {
 		return 0, err
 	}
 	t.retire(ref, radixNodeBytes)
@@ -318,24 +406,35 @@ func (t *txn) rebuildNode(ref pagealloc.Ref, level int, records []slot) (uint32,
 }
 
 // newSubtreeFromRecords builds a fresh subtree for a child that does not exist
-// yet. Level one is always a radix node so the normal shape is
-// Root[Hash[0]] -> Radix[Hash[1]] -> leaf; deeper absences become leaves unless
-// the records are large enough to promote immediately.
-func (t *txn) newSubtreeFromRecords(level int, records []slot) (uint32, error) {
+// yet. A small bucket becomes a leaf directly (Root[Hash[0]] -> leaf); once the
+// records cross the promotion threshold the leaf is replaced by a radix node
+// (Root[Hash[0]] -> Radix[Hash[1]] -> leaves), and the same adaptive promotion
+// applies at deeper levels.
+func (t *txn) newSubtreeFromRecords(level int, records []slot, scratch *partitionScratch) (uint32, error) {
 	records = dedupeSlots(records, tailLenFor(level))
-	if level != 1 && (level >= maxDepth || t.fits(level, idBytesForSlots(records), len(records))) {
+	if level == 1 && t.index.config.forceRootRadix {
+		return t.buildNodeFromRecords(level, records, scratch)
+	}
+	if level >= maxDepth || t.fits(level, idBytesForSlots(records), len(records)) {
 		return t.writeLeaf(level, records, 0, 0, 0)
 	}
-	return t.buildNodeFromRecords(level, records)
+	return t.buildNodeFromRecords(level, records, scratch)
 }
 
 // buildNodeFromRecords creates a new radix node from records whose tail starts
 // at level, distributing them across child subtrees.
-func (t *txn) buildNodeFromRecords(level int, records []slot) (uint32, error) {
-	groups := partitionSlots(records, tailLenFor(level))
+func (t *txn) buildNodeFromRecords(level int, records []slot, scratch *partitionScratch) (uint32, error) {
+	var counts [radixFanout]uint32
+	var offsets [radixFanout + 1]uint32
+	out := scratch.buffer(level, len(records))
+	partitionSlots(out, records, tailLenFor(level), &counts, &offsets)
+
 	var children [radixFanout]uint32
-	for key, group := range groups {
-		child, err := t.newSubtreeFromRecords(level+1, group)
+	for key := 0; key < radixFanout; key++ {
+		if counts[key] == 0 {
+			continue
+		}
+		child, err := t.newSubtreeFromRecords(level+1, out[offsets[key]:offsets[key+1]], scratch)
 		if err != nil {
 			return 0, err
 		}
@@ -347,11 +446,18 @@ func (t *txn) buildNodeFromRecords(level int, records []slot) (uint32, error) {
 // buildNodeFromSlots is the promotion path: it turns an oversized leaf into a
 // radix node and redistributes the leaf's slots, which already have their next
 // unconsumed byte at tail[0].
-func (t *txn) buildNodeFromSlots(level int, slots []slot) (uint32, error) {
-	groups := partitionSlots(slots, tailLenFor(level))
+func (t *txn) buildNodeFromSlots(level int, slots []slot, scratch *partitionScratch) (uint32, error) {
+	var counts [radixFanout]uint32
+	var offsets [radixFanout + 1]uint32
+	out := scratch.buffer(level, len(slots))
+	partitionSlots(out, slots, tailLenFor(level), &counts, &offsets)
+
 	var children [radixFanout]uint32
-	for key, group := range groups {
-		child, err := t.newSubtreeFromSlots(level+1, group)
+	for key := 0; key < radixFanout; key++ {
+		if counts[key] == 0 {
+			continue
+		}
+		child, err := t.newSubtreeFromSlots(level+1, out[offsets[key]:offsets[key+1]], scratch)
 		if err != nil {
 			return 0, err
 		}
@@ -362,11 +468,11 @@ func (t *txn) buildNodeFromSlots(level int, slots []slot) (uint32, error) {
 
 // newSubtreeFromSlots creates a leaf, or recurses into another promotion when
 // the child would still exceed the threshold.
-func (t *txn) newSubtreeFromSlots(level int, slots []slot) (uint32, error) {
+func (t *txn) newSubtreeFromSlots(level int, slots []slot, scratch *partitionScratch) (uint32, error) {
 	if level >= maxDepth || t.fits(level, idBytesForSlots(slots), len(slots)) {
 		return t.writeLeaf(level, slots, 0, 0, 0)
 	}
-	return t.buildNodeFromSlots(level, slots)
+	return t.buildNodeFromSlots(level, slots, scratch)
 }
 
 // writeLeaf allocates and encodes a leaf, retires the replaced leaf when one is
@@ -378,7 +484,7 @@ func (t *txn) writeLeaf(level int, slots []slot, oldRef pagealloc.Ref, oldBytes 
 		return 0, err
 	}
 	offset := extentOffset(ref)
-	if err := encodeLeaf(t.index.arena[offset:offset+uint64(capacity)], level, slots); err != nil {
+	if err := encodeLeaf(t.arena[offset:offset+uint64(capacity)], level, slots); err != nil {
 		return 0, err
 	}
 	if oldRef != 0 {
@@ -395,7 +501,7 @@ func (t *txn) writeNewNode(children *[radixFanout]uint32) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := writeNode(t.index.arena, ref, children); err != nil {
+	if err := writeNode(t.arena, ref, children); err != nil {
 		return 0, err
 	}
 	return encodeChild(ref, true), nil
@@ -505,11 +611,19 @@ func (i *Index) Contains(h Hash) bool {
 	return found
 }
 
-// withView runs fn while pinning the current published view so that Reclaim
-// cannot reuse a page the reader may still touch.
+// withView runs fn while pinning the current published view so that Reclaim,
+// Compact, and Close cannot reuse or unmap an arena the reader may still touch.
+//
+// The order is strict: Acquire -> check closed -> load/use the view -> Release.
+// Checking closed before Acquire is unsafe: the reader could observe false,
+// Close could then set the flag, complete its grace period, and unmap before
+// the Acquire registers the reader, letting the reader touch released memory.
+// Acquiring first makes Close's WaitForPriorReaders wait for this reader.
 func (i *Index) withView(fn func(*indexView)) {
 	token := i.tracker.Acquire()
-	fn(i.view.Load())
+	if !i.closed.Load() {
+		fn(i.view.Load())
+	}
 	i.tracker.Release(token)
 }
 
@@ -534,149 +648,114 @@ func (i *Index) Metadata() Metadata {
 	}
 }
 
-// Reclaim returns retired extents to the allocator once every reader still
-// pinning a generation below oldestReaderGeneration has released its view.
-// Callers that never call Reclaim retain replaced extents until Close.
-func (i *Index) Reclaim(oldestReaderGeneration uint64) error {
+// Reclaim returns every retired extent to the allocator. The ReaderTracker is
+// the sole authority for memory lifetime: the writer waits for all readers that
+// could still reference a retired page to drain and then frees them, so callers
+// never track reader generations.
+func (i *Index) Reclaim() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
-	return i.alloc.Reclaim(oldestReaderGeneration)
-}
-
-// ReclaimAll frees every retired extent. It is safe only when no reader can
-// still hold an older view, such as after all reader activity has stopped.
-func (i *Index) ReclaimAll() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.closed {
-		return ErrClosed
-	}
-	return i.alloc.ReclaimAll()
+	i.tracker.WaitForPriorReaders()
+	return i.alloc.Reclaim()
 }
 
 // Compact rebuilds the tree into a fresh, tightly packed arena and atomically
 // publishes it, reclaiming dead space and fragmentation. The index is briefly
-// double-resident while the replacement is built. A file-backed index is
+// double-resident while the replacement is built. It follows the arena lifetime
+// invariant: build -> publish -> wait for prior readers -> release the old
+// arena, so no reader can observe an unmapped arena. A file-backed index is
 // compacted into a heap arena and loses its file backing, so callers that need
 // persistence should checkpoint instead.
+//
+// Compaction is one logical publication regardless of how many internal Apply
+// calls the streaming rebuild needs, so the replacement generation is always
+// the current generation plus one. A corruption failure aborts before
+// publication and leaves the live index unchanged. After publication the new
+// index is authoritative; a release error means cleanup of the old backing
+// resource failed and is returned without rolling the publication back.
 func (i *Index) Compact() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
 	current := i.view.Load()
 	if current.entries == 0 {
 		return nil
 	}
-	entries := make([]Entry, 0, current.entries)
-	i.collectEntries(current, &entries)
 
+	// Stream the old immutable tree into the fresh arena in bounded batches, so
+	// peak compaction memory is independent of index size and no []Entry
+	// proportional to the index is ever built. Any corruption the walker finds
+	// aborts the rebuild without publishing it.
+	batchEntries := compactBatchEntries
+	if batchEntries < 1 {
+		batchEntries = 1
+	}
 	fresh, err := New(i.alloc.TotalBytes(), i.config)
 	if err != nil {
 		return err
 	}
-	const chunk = 1 << 20
-	for start := 0; start < len(entries); start += chunk {
-		end := start + chunk
-		if end > len(entries) {
-			end = len(entries)
-		}
-		if err := fresh.Apply(entries[start:end]); err != nil {
+	batch := make([]Entry, batchEntries)
+	walker := newEntryWalker(current)
+	for {
+		written, more, walkErr := walker.Next(batch)
+		if walkErr != nil {
 			_ = fresh.Close()
-			return err
+			return walkErr
+		}
+		if written > 0 {
+			if err := fresh.Apply(batch[:written]); err != nil {
+				_ = fresh.Close()
+				return err
+			}
+		}
+		if !more {
+			break
 		}
 	}
 
-	// Drain readers pinned to the old arena, then swap in the replacement.
-	i.tracker.WaitForPriorReaders()
+	// Build is complete. Publish the replacement view first, then run the
+	// reader grace period, and only after prior readers drain release the old
+	// arena. Unmapping before publication + grace would fault a live reader.
+	// The temporary index advanced its own generation once per internal Apply;
+	// that is implementation work, not publication, so override it with the
+	// single logical generation this compaction represents.
 	release := i.release
+	built := fresh.view.Load()
 	i.alloc = fresh.alloc
-	i.arena = fresh.arena
 	i.release = fresh.release
 	i.sync = fresh.sync
 	i.persistent = false
 	i.slot = 0
-	i.view.Store(fresh.view.Load())
+	i.view.Store(&indexView{
+		generation:  current.generation + 1,
+		root:        built.root,
+		arena:       built.arena,
+		entries:     built.entries,
+		rootBuckets: built.rootBuckets,
+		depth:       built.depth,
+	})
 	fresh.alloc = nil
 	fresh.release = nil
 	fresh.sync = nil
+	i.tracker.WaitForPriorReaders()
 	if release != nil {
-		_ = release()
+		if releaseErr := release(); releaseErr != nil {
+			return releaseErr
+		}
 	}
 	return nil
-}
-
-// collectEntries walks the published tree and reconstructs every full hash.
-func (i *Index) collectEntries(view *indexView, out *[]Entry) {
-	var prefix [hashBytes]byte
-	for index := 0; index < radixFanout; index++ {
-		child := view.root[index]
-		if child == 0 {
-			continue
-		}
-		prefix[0] = byte(index)
-		ref, isNode := decodeChild(child)
-		if isNode {
-			i.walkNode(view.arena, ref, 1, &prefix, out)
-			continue
-		}
-		i.extractLeaf(view.arena, ref, 1, &prefix, out)
-	}
-}
-
-// walkNode appends the entries below a node at level to out, tracking the
-// consumed radix prefix so leaf tails can be reassembled into full hashes.
-func (i *Index) walkNode(arena []byte, ref pagealloc.Ref, level int, prefix *[hashBytes]byte, out *[]Entry) {
-	if level >= maxDepth || !validExtent(arena, ref, radixNodeBytes) {
-		return
-	}
-	for index := 0; index < radixFanout; index++ {
-		child := nodeChild(arena, ref, byte(index))
-		if child == 0 {
-			continue
-		}
-		prefix[level] = byte(index)
-		childRef, childIsNode := decodeChild(child)
-		if childIsNode {
-			i.walkNode(arena, childRef, level+1, prefix, out)
-			continue
-		}
-		i.extractLeaf(arena, childRef, level+1, prefix, out)
-	}
-}
-
-// extractLeaf appends every entry of the leaf at depth, rebuilding each full
-// hash from the consumed prefix and the stored tail.
-func (i *Index) extractLeaf(arena []byte, ref pagealloc.Ref, depth int, prefix *[hashBytes]byte, out *[]Entry) {
-	header, err := readLeafHeader(arena, ref)
-	if err != nil || header.depth != depth {
-		return
-	}
-	tailLen := tailLenFor(depth)
-	offset := extentOffset(ref)
-	for s := 0; s < header.count; s++ {
-		var hash Hash
-		copy(hash[:depth], prefix[:depth])
-		copy(hash[depth:], arena[offset+uint64(leafHeaderSize+tailLen*s):])
-		var id uint64
-		if header.idBytes == id32Bytes {
-			id = uint64(binary.LittleEndian.Uint32(arena[offset+uint64(header.idsOffset+4*s):]))
-		} else {
-			id = binary.LittleEndian.Uint64(arena[offset+uint64(header.idsOffset+8*s):])
-		}
-		*out = append(*out, Entry{Hash: hash, ImageID: id})
-	}
 }
 
 // Sync flushes a file-backed arena to disk. It is a no-op for heap arenas.
 func (i *Index) Sync() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return ErrClosed
 	}
 	if i.sync == nil {
@@ -685,16 +764,21 @@ func (i *Index) Sync() error {
 	return i.sync()
 }
 
-// Close marks the index closed and releases retired extents and any file-backed
-// arena. Published views remain readable by concurrent readers during the call.
+// Close marks the index closed, waits for in-flight readers to drain, then
+// reclaims retired extents and unmaps any file-backed arena. It follows the
+// arena lifetime invariant: prevent new operations -> wait for prior readers ->
+// reclaim -> release. The closed flag is set before the grace period, and
+// readers Acquire before checking it; checking closed before Acquire would let
+// a reader register after the grace period and touch the released arena.
 func (i *Index) Close() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed {
+	if i.closed.Load() {
 		return nil
 	}
-	i.closed = true
-	err := i.alloc.ReclaimAll()
+	i.closed.Store(true)
+	i.tracker.WaitForPriorReaders()
+	err := i.alloc.Reclaim()
 	if i.release != nil {
 		if releaseErr := i.release(); err == nil {
 			err = releaseErr

@@ -119,6 +119,11 @@ type Config struct {
 	PromotionBytes   uint32
 	MaxLeafSlots     uint32
 	AutoReclaimBytes uint64
+
+	// forceRootRadix keeps the pre-sparse shape for layout comparison: every
+	// populated Hash[0] bucket owns a Hash[1] radix node instead of a direct
+	// Root->Leaf bucket. It is unexported and only used by benchmarks.
+	forceRootRadix bool
 }
 
 // withDefaults fills zero values with the documented defaults.

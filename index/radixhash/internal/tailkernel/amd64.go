@@ -15,4 +15,8 @@ func matchMaskAVX2(tails []byte, stride, count int, want []byte) uint64 {
 	return matchMaskAVX2Asm(&tails[0], stride, count, &want[0])
 }
 
+// matchMaskAVX2Asm is implemented in assembly; it does not retain either
+// pointer, so the compiler can keep the caller's query prefix on the stack.
+
+//go:noescape
 func matchMaskAVX2Asm(base *byte, stride, count int, want *byte) uint64
