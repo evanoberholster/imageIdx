@@ -1,7 +1,6 @@
 package radixhash
 
 import (
-	"encoding/binary"
 	"fmt"
 	"runtime"
 	"sync"
@@ -577,25 +576,26 @@ func (i *Index) Compact() error {
 	if current.entries == 0 {
 		return nil
 	}
-	// TODO: compaction currently materializes the whole index as []Entry.
-	// Stream bounded entry batches from the old tree directly into the new
-	// arena so peak compaction memory is independent of index size.
-	entries := make([]Entry, 0, current.entries)
-	i.collectEntries(current, &entries)
 
+	// Stream the old immutable tree into the fresh arena in bounded batches, so
+	// peak compaction memory is independent of index size and no []Entry
+	// proportional to the index is ever built.
 	fresh, err := New(i.alloc.TotalBytes(), i.config)
 	if err != nil {
 		return err
 	}
-	const chunk = 1 << 20
-	for start := 0; start < len(entries); start += chunk {
-		end := start + chunk
-		if end > len(entries) {
-			end = len(entries)
+	batch := make([]Entry, compactBatchEntries)
+	walker := newEntryWalker(current)
+	for {
+		written, more := walker.next(batch)
+		if written > 0 {
+			if err := fresh.Apply(batch[:written]); err != nil {
+				_ = fresh.Close()
+				return err
+			}
 		}
-		if err := fresh.Apply(entries[start:end]); err != nil {
-			_ = fresh.Close()
-			return err
+		if !more {
+			break
 		}
 	}
 
@@ -617,68 +617,6 @@ func (i *Index) Compact() error {
 		_ = release()
 	}
 	return nil
-}
-
-// collectEntries walks the published tree and reconstructs every full hash.
-func (i *Index) collectEntries(view *indexView, out *[]Entry) {
-	var prefix [hashBytes]byte
-	for index := 0; index < radixFanout; index++ {
-		child := view.root[index]
-		if child == 0 {
-			continue
-		}
-		prefix[0] = byte(index)
-		ref, isNode := decodeChild(child)
-		if isNode {
-			i.walkNode(view.arena, ref, 1, &prefix, out)
-			continue
-		}
-		i.extractLeaf(view.arena, ref, 1, &prefix, out)
-	}
-}
-
-// walkNode appends the entries below a node at level to out, tracking the
-// consumed radix prefix so leaf tails can be reassembled into full hashes.
-func (i *Index) walkNode(arena []byte, ref pagealloc.Ref, level int, prefix *[hashBytes]byte, out *[]Entry) {
-	if level >= maxDepth || !validExtent(arena, ref, radixNodeBytes) {
-		return
-	}
-	for index := 0; index < radixFanout; index++ {
-		child := nodeChild(arena, ref, byte(index))
-		if child == 0 {
-			continue
-		}
-		prefix[level] = byte(index)
-		childRef, childIsNode := decodeChild(child)
-		if childIsNode {
-			i.walkNode(arena, childRef, level+1, prefix, out)
-			continue
-		}
-		i.extractLeaf(arena, childRef, level+1, prefix, out)
-	}
-}
-
-// extractLeaf appends every entry of the leaf at depth, rebuilding each full
-// hash from the consumed prefix and the stored tail.
-func (i *Index) extractLeaf(arena []byte, ref pagealloc.Ref, depth int, prefix *[hashBytes]byte, out *[]Entry) {
-	header, err := readLeafHeader(arena, ref)
-	if err != nil || header.depth != depth {
-		return
-	}
-	tailLen := tailLenFor(depth)
-	offset := extentOffset(ref)
-	for s := 0; s < header.count; s++ {
-		var hash Hash
-		copy(hash[:depth], prefix[:depth])
-		copy(hash[depth:], arena[offset+uint64(leafHeaderSize+tailLen*s):])
-		var id uint64
-		if header.idBytes == id32Bytes {
-			id = uint64(binary.LittleEndian.Uint32(arena[offset+uint64(header.idsOffset+4*s):]))
-		} else {
-			id = binary.LittleEndian.Uint64(arena[offset+uint64(header.idsOffset+8*s):])
-		}
-		*out = append(*out, Entry{Hash: hash, ImageID: id})
-	}
 }
 
 // Sync flushes a file-backed arena to disk. It is a no-op for heap arenas.
