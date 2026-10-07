@@ -107,7 +107,7 @@ func BenchmarkSearchPDQ(b *testing.B) {
 	for _, n := range searchBenchSizes(b) {
 		st, records := benchSetup(b, n, defaultSeqBlockRecords)
 		queries := benchQueries(records, 64, 12)
-		for _, maxD := range []uint8{16, 31, 32, 50} {
+		for _, maxD := range []uint8{0, 8, 16, 31, 32, 40, 50, 64, 96, 128} {
 			b.Run(fmt.Sprintf("n=%d/d=%d", n, maxD), func(b *testing.B) {
 				dst := make([]Result, 0, n)
 				b.ReportAllocs()
@@ -468,7 +468,7 @@ func BenchmarkSearchPDQBulkVsScalar(b *testing.B) {
 	st, records := benchSetup(b, 1_000_000, defaultSeqBlockRecords)
 	defer st.Close()
 	queries := benchQueries(records, 64, 12)
-	for _, maxD := range []uint8{0, 8, 16, 31, 32, 50, 255} {
+	for _, maxD := range []uint8{0, 8, 16, 31, 32, 40, 50, 64, 96, 128} {
 		b.Run(fmt.Sprintf("scalar/d=%d", maxD), func(b *testing.B) {
 			dst := make([]Result, 0, len(records))
 			b.ReportAllocs()

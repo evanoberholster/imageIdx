@@ -128,12 +128,19 @@
 // caller knows which search produced it. No score, normalized distance, hash
 // type, quality, Top-K, sorting, or count-only variant is provided.
 //
-// Search thresholds are uint8. pHash distance is exactly 0..64. PDQ distance is
-// mathematically 0..256, so the supported search threshold is 0..255 and the
-// internal distance primitive stays uint16; a pair at distance 256 is excluded
-// by every threshold rather than wrapping to 0. The distance is never narrowed
-// to uint8 before the threshold test. SearchPDQBulk is the quiescent SIMD
-// variant and must return exactly the same results as SearchPDQ.
+// Search thresholds are uint8. pHash distance is exactly 0..64. PDQ is 256 bits,
+// so its mathematical distance is 0..256, but the public search radius is
+// bounded by MaxPDQSearchDistance (128): a larger threshold is clamped rather
+// than rejected. The internal distance primitive stays uint16 and the running
+// distance is never narrowed to uint8 before the threshold test, so every
+// emitted Result.Distance is exact. SearchPDQBulk is the quiescent SIMD variant
+// and must return exactly the same results as SearchPDQ, including for clamped
+// thresholds.
+//
+// The distance split is:
+//
+//	pHash: mathematical 0..64,  search threshold 0..64,  Result.Distance uint8
+//	PDQ:   mathematical 0..256, search threshold 0..128, Result.Distance uint8
 //
 // # Kernels and SIMD
 //

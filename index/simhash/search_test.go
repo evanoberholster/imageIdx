@@ -54,11 +54,27 @@ func TestSearchPHashBoundaries(t *testing.T) {
 	}
 }
 
+// TestDistancePDQMathematicalRange keeps the low-level primitive honest: it
+// returns the exact uint16 distance over the complete 0..256 range, independently
+// of the uint8-limited search representation.
+func TestDistancePDQMathematicalRange(t *testing.T) {
+	base := randRecords(59, 1)[0]
+	rng := rand.New(rand.NewSource(59))
+	for _, d := range []int{0, 1, 31, 32, 64, 127, 128, 129, 254, 255, 256} {
+		h := flipPDQ(rng, base.PDQ, d)
+		if got := DistancePDQ(&base.PDQ, &h); got != uint16(d) {
+			t.Fatalf("DistancePDQ distance %d: got %d, want %d", d, got, d)
+		}
+	}
+}
+
+// TestSearchPDQThresholds covers the useful similarity range up to the supported
+// radius of MaxPDQSearchDistance.
 func TestSearchPDQThresholds(t *testing.T) {
 	st := openStore(t, testConfig())
 	base := randRecords(12, 1)[0]
 	rng := rand.New(rand.NewSource(12))
-	ladder := []int{0, 1, 2, 4, 8, 16, 30, 31, 32, 40, 50, 128, 254, 255}
+	ladder := []int{0, 1, 8, 16, 31, 32, 40, 50, 64, 96, 127, 128}
 	records := make([]Record, 0, len(ladder)+1)
 	records = append(records, base)
 	for _, d := range ladder {
@@ -76,81 +92,77 @@ func TestSearchPDQThresholds(t *testing.T) {
 			t.Fatalf("record %d: exact distance %d, want %d", i+1, got, d)
 		}
 	}
-	for _, maxD := range []uint8{0, 1, 4, 8, 16, 31, 32, 40, 50, 128, 254, 255} {
+	for _, maxD := range []uint8{0, 1, 8, 16, 31, 32, 40, 50, 64, 96, 127, 128} {
 		got := st.SearchPDQ(nil, &base.PDQ, maxD)
 		want := oraclePDQ(records, base.PDQ, maxD)
 		if !equalResults(got, want) {
 			t.Fatalf("SearchPDQ maxD=%d: got %d, want %d", maxD, len(got), len(want))
 		}
 	}
-	// Threshold 31 explicitly: the distance-31 record must be included and the
-	// distance-32 record excluded.
-	got31 := st.SearchPDQ(nil, &base.PDQ, 31)
-	seen31, seen32 := false, false
-	for _, m := range got31 {
-		if m.Distance == 31 {
-			seen31 = true
-		}
-		if m.Distance == 32 {
-			seen32 = true
-		}
-	}
-	if !seen31 {
-		t.Fatal("distance-31 record missing at threshold 31")
-	}
-	if seen32 {
-		t.Fatal("distance-32 record present at threshold 31")
-	}
 }
 
-// TestSearchPDQDistance255Boundary is the regression test against a uint16 ->
-// uint8 conversion before the threshold test: exact distances 254, 255, and 256
-// must be handled distinctly, and distance 256 must be excluded at 255 rather
-// than wrapping to Distance=0.
-func TestSearchPDQDistance255Boundary(t *testing.T) {
+// TestSearchPDQRadiusBoundary pins the top of the supported search radius:
+// distance 127 is included at 127, distance 128 is included at 128, and distance
+// 129 is excluded at 128.
+func TestSearchPDQRadiusBoundary(t *testing.T) {
 	st := openStore(t, testConfig())
 	base := randRecords(60, 1)[0]
 	rng := rand.New(rand.NewSource(60))
 	records := []Record{
 		base,
-		{PHash: rng.Uint64(), PDQ: flipPDQ(rng, base.PDQ, 254), Quality: 1},
-		{PHash: rng.Uint64(), PDQ: flipPDQ(rng, base.PDQ, 255), Quality: 2},
-		{PHash: rng.Uint64(), PDQ: flipPDQ(rng, base.PDQ, 256), Quality: 3},
+		{PHash: rng.Uint64(), PDQ: flipPDQ(rng, base.PDQ, 127), Quality: 1},
+		{PHash: rng.Uint64(), PDQ: flipPDQ(rng, base.PDQ, 128), Quality: 2},
+		{PHash: rng.Uint64(), PDQ: flipPDQ(rng, base.PDQ, 129), Quality: 3},
 	}
 	if _, err := st.AppendBatch(records); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
-	// Exact internal widths: 0, 254, 255, 256.
-	for i, want := range []uint16{0, 254, 255, 256} {
+	for i, want := range []uint16{0, 127, 128, 129} {
 		if got := DistancePDQ(&base.PDQ, &records[i].PDQ); got != want {
 			t.Fatalf("record %d: exact distance %d, want %d", i, got, want)
 		}
 	}
 
-	// maxDistance 254: base (0) and the 254 record, nothing else.
-	got254 := st.SearchPDQ(nil, &base.PDQ, 254)
-	if len(got254) != 2 || got254[0].ImageID != 1 || got254[0].Distance != 0 ||
-		got254[1].ImageID != 2 || got254[1].Distance != 254 {
-		t.Fatalf("maxDistance=254: got %+v, want [{1 0} {2 254}]", got254)
+	got127 := st.SearchPDQ(nil, &base.PDQ, 127)
+	if len(got127) != 2 || got127[0].ImageID != 1 || got127[0].Distance != 0 ||
+		got127[1].ImageID != 2 || got127[1].Distance != 127 {
+		t.Fatalf("maxDistance=127: got %+v, want [{1 0} {2 127}]", got127)
 	}
 
-	// maxDistance 255: also the 255 record; the 256 record stays excluded.
-	got255 := st.SearchPDQ(nil, &base.PDQ, 255)
-	if len(got255) != 3 {
-		t.Fatalf("maxDistance=255: got %+v, want 3 results", got255)
+	got128 := st.SearchPDQ(nil, &base.PDQ, 128)
+	if len(got128) != 3 || got128[2].ImageID != 3 || got128[2].Distance != 128 {
+		t.Fatalf("maxDistance=128: got %+v, want 3 results with {3 128} last", got128)
 	}
-	if got255[2].ImageID != 3 || got255[2].Distance != 255 {
-		t.Fatalf("maxDistance=255: distance-255 record = %+v", got255[2])
-	}
-	for _, m := range got255 {
-		if m.ImageID == 4 || m.Distance == 0 && m.ImageID != 1 {
-			t.Fatalf("maxDistance=255: distance-256 record leaked or wrapped: %+v", got255)
+	for _, m := range got128 {
+		if m.ImageID == 4 {
+			t.Fatalf("maxDistance=128: distance-129 record leaked: %+v", got128)
 		}
 	}
 
-	// The bulk kernel must agree exactly on the same boundary.
-	if bulk := st.SearchPDQBulk(nil, &base.PDQ, 255); !equalResults(bulk, got255) {
-		t.Fatalf("bulk maxDistance=255: got %+v, want %+v", bulk, got255)
+	if bulk := st.SearchPDQBulk(nil, &base.PDQ, 128); !equalResults(bulk, got128) {
+		t.Fatalf("bulk maxDistance=128: got %+v, want %+v", bulk, got128)
+	}
+}
+
+// TestSearchPDQClampThreshold verifies that any threshold above
+// MaxPDQSearchDistance behaves exactly like MaxPDQSearchDistance, for both the
+// concurrent-safe scalar scan and the bulk scan.
+func TestSearchPDQClampThreshold(t *testing.T) {
+	st := openStore(t, testConfig())
+	records := randRecords(61, 2000)
+	if _, err := st.AppendBatch(records); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	query := flipPDQ(rand.New(rand.NewSource(62)), records[0].PDQ, 100)
+	atMaxScalar := st.SearchPDQ(nil, &query, MaxPDQSearchDistance)
+	atMaxBulk := st.SearchPDQBulk(nil, &query, MaxPDQSearchDistance)
+	for _, maxD := range []uint8{129, 200, 255} {
+		if got := st.SearchPDQ(nil, &query, maxD); !equalResults(got, atMaxScalar) {
+			t.Fatalf("SearchPDQ maxD=%d: got %d, want %d (clamped)", maxD, len(got), len(atMaxScalar))
+		}
+		if got := st.SearchPDQBulk(nil, &query, maxD); !equalResults(got, atMaxBulk) {
+			t.Fatalf("SearchPDQBulk maxD=%d: got %d, want %d (clamped)", maxD, len(got), len(atMaxBulk))
+		}
 	}
 }
 
@@ -186,7 +198,7 @@ func TestSearchEmptyStore(t *testing.T) {
 // TestSearchDifferential compares both searches against brute-force exact
 // Hamming distance over deterministic random datasets, requiring identical
 // ImageIDs, distances, and ordering. It also requires SearchPDQBulk to match
-// SearchPDQ exactly on a quiescent store.
+// SearchPDQ exactly on a quiescent store, including for clamped thresholds.
 func TestSearchDifferential(t *testing.T) {
 	st := openStore(t, testConfig())
 	records := randRecords(700, 8000)
@@ -208,7 +220,7 @@ func TestSearchDifferential(t *testing.T) {
 		}
 	}
 
-	pdqThresholds := []uint8{0, 1, 16, 31, 32, 50, 128, 254, 255}
+	pdqThresholds := []uint8{0, 1, 8, 16, 31, 32, 40, 50, 64, 96, 127, 128, 129, 200, 255}
 	for k := 0; k < 24; k++ {
 		query := flipPDQ(rng, records[k*11%len(records)].PDQ, (k*37)%256)
 		for _, maxD := range pdqThresholds {
@@ -245,7 +257,7 @@ func TestSearchPDQBulkMatchesSearchPDQ(t *testing.T) {
 	rng := rand.New(rand.NewSource(401))
 	for k := 0; k < 40; k++ {
 		q := flipPDQ(rng, records[k*7%len(records)].PDQ, k%25)
-		for _, maxD := range []uint8{0, 4, 8, 16, 31, 32, 50, 128, 255} {
+		for _, maxD := range []uint8{0, 4, 8, 16, 31, 32, 50, 96, 128, 200, 255} {
 			bulk := st.SearchPDQBulk(nil, &q, maxD)
 			scalar := st.SearchPDQ(nil, &q, maxD)
 			if !equalResults(bulk, scalar) {
@@ -267,7 +279,7 @@ func TestSearchPDQBulkBoundaries(t *testing.T) {
 		t.Helper()
 		for _, slot := range slots {
 			q := records[slot].PDQ
-			for _, maxD := range []uint8{0, 1, 8, 16, 31} {
+			for _, maxD := range []uint8{0, 1, 8, 16, 31, 32} {
 				bulk := st.SearchPDQBulk(nil, &q, maxD)
 				scalar := st.SearchPDQ(nil, &q, maxD)
 				if !equalResults(bulk, scalar) {

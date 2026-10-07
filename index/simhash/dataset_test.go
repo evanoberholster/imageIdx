@@ -74,14 +74,18 @@ func oraclePHash(records []Record, query uint64, maxDistance uint8) []Result {
 }
 
 // oraclePDQ is the brute-force reference for SearchPDQ. It computes the exact
-// distance as uint16 (0..256) and only emits records whose distance is at most
-// uint16(maxDistance); a pair at distance 256 is excluded rather than wrapping
-// to 0. This is the regression guard for the uint16 -> uint8 conversion.
+// distance as uint16 (0..256), clamps the threshold to MaxPDQSearchDistance to
+// mirror the public API, and only then emits; every emitted distance is <= 128
+// and fits uint8 exactly.
 func oraclePDQ(records []Record, query PDQHash, maxDistance uint8) []Result {
+	limit := maxDistance
+	if limit > MaxPDQSearchDistance {
+		limit = MaxPDQSearchDistance
+	}
 	out := make([]Result, 0)
 	for i := range records {
 		d := DistancePDQ(&query, &records[i].PDQ)
-		if d > uint16(maxDistance) {
+		if d > uint16(limit) {
 			continue
 		}
 		out = append(out, Result{ImageID: uint64(i + 1), Distance: uint8(d)})

@@ -51,7 +51,7 @@ if err := store.UpsertBatch([]simhash.Update{
 }
 
 // Exact radius queries; dst is caller-owned and reused, 0 allocs.
-// Distance is the exact Hamming distance as uint8 (pHash 0..64, PDQ 0..255).
+// Distance is the exact Hamming distance as uint8 (pHash 0..64, PDQ 0..128).
 var phMatches, pdqMatches []simhash.Result
 phMatches = store.SearchPHash(phMatches[:0], ph, 8)
 pdqMatches = store.SearchPDQ(pdqMatches[:0], &pdq, 31)
@@ -133,15 +133,24 @@ func (s *Store) SearchPDQ(dst []Result, query *PDQHash, maxDistance uint8) []Res
 the caller knows which search produced it. Distance is not normalized and no
 score, Top-K, sorting, heap, `CandidateSet`, or count-only API is provided.
 
-pHash distance is exactly 0..64. PDQ distance is mathematically 0..256, so the
-search threshold is 0..255 and the internal primitive stays `uint16`: a pair 256
-bits apart is excluded by every threshold rather than wrapping to `Distance=0`.
-The distance is never narrowed to `uint8` before the threshold test. Search
-consistency is per sequence block, not whole-generation MVCC.
+| | mathematical distance | search threshold | `Result.Distance` |
+|---|---:|---:|---:|
+| pHash | 0..64 | 0..64 | `uint8` |
+| PDQ | 0..256 | 0..`MaxPDQSearchDistance` (128) | `uint8` |
+
+PDQ is 256 bits, but useful similarity searches stay far below half the hash.
+`SearchPDQ` and `SearchPDQBulk` treat `maxDistance` as a similarity radius in
+`0..128`: a larger value is clamped to `MaxPDQSearchDistance`, not rejected.
+Because only `distance <= threshold <= 128` can be returned, every `Distance` is
+exact and fits `uint8` — there is no `255` sentinel, `256` special case, or
+saturation. `DistancePDQ` is unaffected and still returns the exact mathematical
+`0..256` for callers and tests that need it. Search consistency is per sequence
+block, not whole-generation MVCC.
 
 `SearchPDQBulk` uses the SIMD block kernel; it reads plain memory, is
 **quiescent-only** (no concurrent writer), and on a quiescent store returns
-exactly the same ImageIDs, distances, and order as `SearchPDQ`.
+exactly the same ImageIDs, distances, and order as `SearchPDQ`, with the same
+clamping.
 
 ## Kernels
 
@@ -167,9 +176,17 @@ are 0 for every row.
 |---|---:|---:|
 | pHash scan d = 8 / 16 | ~0.78 ms | 0.78 |
 | pHash scan d = 32 (≈half the DB) | ~5.8 ms | 5.83 |
-| PDQ scan d = 16 | ~0.96 ms | 0.96 |
-| PDQ scan d = 31 / 32 | ~1.45–1.48 ms | 1.45–1.48 |
-| PDQ scan d = 50 | ~1.44 ms | 1.44 |
+| PDQ scan d = 16 | ~0.95 ms | 0.95 |
+| PDQ scan d = 31 / 32 | ~1.44–1.45 ms | 1.44 |
+| PDQ scan d = 40 / 50 | ~1.44–1.52 ms | 1.43–1.52 |
+| PDQ scan d = 64 | ~6.6 ms | 6.64 |
+| PDQ scan d = 96 | ~7.2 ms | 7.24 |
+| PDQ scan d = 128 | ~7.7 ms | 7.74 |
+
+The scalar PDQ scan slows sharply once the threshold approaches an intermediate
+word-partial mean (≈64, ≈96) because the reject branch becomes unpredictable;
+that regime is far from realistic thresholds. `SearchPDQBulk` avoids most of it
+(see below).
 
 ### Updates (1M, relaxed)
 
@@ -205,18 +222,20 @@ update) versus 5696 B for 64 individual frames.
 
 | threshold | scalar | bulk | speedup |
 |---:|---:|---:|---:|
-| 0 | 962 µs | 631 µs | 1.53× |
-| 16 | 955 µs | 637 µs | 1.50× |
-| 31 | 1461 µs | 638 µs | 2.29× |
-| 32 | 1449 µs | 638 µs | 2.27× |
-| 50 | 1435 µs | 705 µs | 2.04× |
-| 255 | 2581 µs | 3054 µs | 0.85× |
+| 0 | 958 µs | 585 µs | 1.64× |
+| 8 | 973 µs | 629 µs | 1.55× |
+| 16 | 956 µs | 644 µs | 1.48× |
+| 31 | 1448 µs | 642 µs | 2.25× |
+| 32 | 1450 µs | 644 µs | 2.25× |
+| 40 | 1515 µs | 641 µs | 2.36× |
+| 50 | 1451 µs | 719 µs | 2.02× |
+| 64 | 6659 µs | 5313 µs | 1.25× |
+| 96 | 7228 µs | 904 µs | 7.99× |
+| 128 | 7691 µs | 6666 µs | 1.15× |
 
-Every threshold is `uint8` (0..255). The old d=256 case is no longer a search
-threshold: an exact distance of 256 is excluded rather than represented, and the
-bulk kernel simply never sets its mask bit for it. At d=255 essentially every
-record matches, so the bulk path's second exact pass dominates; that is far above
-any real threshold and remains correct.
+Every threshold is `uint8` in `0..MaxPDQSearchDistance` (128); larger values are
+clamped, so there is no `255`/`256` search case. In the realistic band
+(16–50) bulk is 1.5–2.4× faster than the concurrent-safe scalar scan.
 
 ## Allocation budget
 
@@ -234,9 +253,10 @@ COW, MVCC, or B-trees.
 ## Testing
 
 `go test ./index/simhash/...` covers exactness against an oracle, pHash and PDQ
-boundary thresholds (including pHash 0/63/64 and PDQ 254/255/256 with 256
-excluded at threshold 255), page/shard boundaries, quality persistence, reopen
-and generation selection, arithmetic boundaries including `MaxUint64`, manifest
+boundary thresholds (pHash 0/63/64; PDQ up to 128 plus the clamp equivalence of
+129/200/255), the exact PDQ mathematical range 0..256 on `DistancePDQ`
+(including 254/255/256), page/shard boundaries, quality persistence, reopen and
+generation selection, arithmetic boundaries including `MaxUint64`, manifest
 corruption, journal recovery at every stage, persistence failure injection at
 every commit stage, stale WAL after commit, batch atomic recovery, closed-store
 safety and Close-vs-reader stress, and randomized differential tests against

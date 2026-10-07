@@ -89,11 +89,15 @@ func (st *Store) SearchPHash(dst []Result, query uint64, maxDistance uint8) []Re
 // of pHash, and the comparison is inclusive. Results are emitted in ascending
 // ImageID order.
 //
-// maxDistance is uint8, so the supported range is 0..255. The exact distance is
-// computed internally with full precision and only converted to uint8 after the
-// threshold test, so a pair at distance 256 is excluded rather than wrapping to
-// 0.
+// maxDistance is a similarity radius in 0..MaxPDQSearchDistance. A larger value
+// is clamped to MaxPDQSearchDistance rather than rejected: PDQ is 256 bits, but
+// meaningful searches stay at or below 128. The exact distance is computed with
+// full precision and narrowed to uint8 only after the threshold test, so every
+// emitted distance is exact.
 func (st *Store) SearchPDQ(dst []Result, query *PDQHash, maxDistance uint8) []Result {
+	if maxDistance > MaxPDQSearchDistance {
+		maxDistance = MaxPDQSearchDistance
+	}
 	if st.closed.Load() {
 		return dst
 	}
@@ -158,8 +162,9 @@ func (v *view) searchPDQ(dst []Result, query *PDQHash, maxDistance uint8, last u
 	lastPage := hashPageOf(last)
 	lastSlot := slotOf(last)
 	blockRecords := v.geo.seqBlockRecords
-	// limit is 0..255. The per-record distance stays a full-width int (0..256)
-	// until after it has passed the threshold test; only then is it narrowed.
+	// limit is 0..128, clamped by the public entry points. The per-record
+	// distance stays a full-width int until after it has passed the threshold
+	// test; only then is it narrowed to uint8 (safe because d <= 128).
 	limit := int(maxDistance)
 	early := useEarlyReject(limit)
 	qw := hashWords(query)
@@ -228,7 +233,9 @@ func (v *view) searchPDQ(dst []Result, query *PDQHash, maxDistance uint8, last u
 
 // SearchPDQBulk appends every committed record whose 256-bit PDQ hash is within
 // maxDistance to dst, using the internal block kernel (NEON on arm64, scalar
-// elsewhere). It is a drop-in replacement for SearchPDQ on a quiescent store.
+// elsewhere). It is a drop-in replacement for SearchPDQ on a quiescent store,
+// with identical maxDistance semantics, including the clamp to
+// MaxPDQSearchDistance.
 //
 // It reads canonical columns with wide, plain loads, so it is NOT safe to run
 // concurrently with a writer (Append/AppendBatch/Upsert/UpsertBatch). Use
@@ -236,6 +243,9 @@ func (v *view) searchPDQ(dst []Result, query *PDQHash, maxDistance uint8, last u
 // results are identical to SearchPDQ's, including ImageIDs, distances, and
 // ascending order.
 func (st *Store) SearchPDQBulk(dst []Result, query *PDQHash, maxDistance uint8) []Result {
+	if maxDistance > MaxPDQSearchDistance {
+		maxDistance = MaxPDQSearchDistance
+	}
 	if st.closed.Load() {
 		return dst
 	}
@@ -249,7 +259,8 @@ func (st *Store) SearchPDQBulk(dst []Result, query *PDQHash, maxDistance uint8) 
 	if last == 0 {
 		return dst
 	}
-	// limit is 0..255, so the kernel never matches an exact distance of 256.
+	// limit is 0..128, clamped by the public entry point, so the kernel never
+	// matches beyond MaxPDQSearchDistance and every selected distance fits uint8.
 	limit := int(maxDistance)
 	qp := (*[32]byte)(unsafe.Pointer(query))
 	lastPage := hashPageOf(last)

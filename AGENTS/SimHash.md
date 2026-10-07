@@ -257,10 +257,21 @@ temporary result arrays. Higher-level code may sort by `Distance`.
 Matches are emitted in ascending `ImageID` order (natural scan order); they are
 not sorted by distance. The comparison is inclusive.
 
-pHash distance is exactly 0..64. PDQ distance is mathematically 0..256, so the
-supported search threshold is 0..255 and `DistancePDQ` stays `uint16`. The exact
-distance is never narrowed to `uint8` before the threshold test, so a pair 256
-bits apart is excluded by every threshold instead of wrapping to 0.
+pHash distance is exactly 0..64. PDQ is 256 bits, so its mathematical distance
+is 0..256, but the supported similarity-search radius is bounded by
+`MaxPDQSearchDistance = 128`: a `maxDistance` above 128 is clamped, not rejected.
+Only `distance <= threshold <= 128` can be returned, so every `Result.Distance`
+is exact and fits `uint8`; there is no sentinel, `256` special case, or
+saturation. `DistancePDQ` stays `uint16` and still returns the exact
+mathematical 0..256. The running distance is never narrowed to `uint8` before
+the threshold test.
+
+The distinction is:
+
+```text
+pHash: mathematical 0..64,  search threshold 0..64,  Result.Distance uint8
+PDQ:   mathematical 0..256, search threshold 0..128, Result.Distance uint8
+```
 
 A search samples an immutable shard-set view, the committed high-water at that
 moment, and **per-sequence-block** tuple consistency. It does **not** provide
@@ -272,7 +283,8 @@ two-word prefix for the mid range (`20 < d < 40`) where a single-word reject
 branch is ~50/50 and mispredicts. The concurrent-safe searches use atomic scalar
 loads; `SearchPDQBulk` uses the SIMD block kernel on plain memory and is
 **quiescent-only** (no concurrent writer). On a quiescent store it returns
-exactly the same ImageIDs, distances, and order as `SearchPDQ`.
+exactly the same ImageIDs, distances, and order as `SearchPDQ`, including the
+clamp.
 
 ## Kernels
 
@@ -313,14 +325,16 @@ published append batch.
 ## Testing
 
 Oracle-based exactness for pHash and PDQ radius queries (including the inclusive
-boundary thresholds and the PDQ distance-254/255/256 regression against
-`uint16 -> uint8` wrapping), page/shard boundaries, tombstones (external, via
-filtering), quality persistence, reopen and generation selection, arithmetic
-boundaries including `MaxUint64`, corrupt manifest geometry, journal recovery at
-every stage, persistence failure injection at every commit stage, stale WAL
-after commit, batch atomic recovery, closed-store safety and Close-vs-reader
-stress, randomized differential tests against brute-force Hamming distance for
-both searches, and `SearchPDQ == SearchPDQBulk` on quiescent stores. All pass
-under `-race`.
+boundary thresholds, the PDQ radius edge at distance 127/128/129, and the clamp
+equivalence of thresholds 129/200/255 to `MaxPDQSearchDistance`), a separate
+`DistancePDQ` test over the full mathematical 0..256 range (including
+254/255/256), page/shard boundaries, tombstones (external, via filtering),
+quality persistence, reopen and generation selection, arithmetic boundaries
+including `MaxUint64`, corrupt manifest geometry, journal recovery at every
+stage, persistence failure injection at every commit stage, stale WAL after
+commit, batch atomic recovery, closed-store safety and Close-vs-reader stress,
+randomized differential tests against brute-force Hamming distance for both
+searches, and `SearchPDQ == SearchPDQBulk` on quiescent stores. All pass under
+`-race`.
 
 Benchmarks and measured results live in `index/simhash/README.md`.
