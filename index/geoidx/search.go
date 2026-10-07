@@ -27,6 +27,7 @@ func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bo
 	if len(ranges) == 0 {
 		return true
 	}
+	hasMutations := len(v.muts) != 0
 	position := 0
 	for _, r := range ranges {
 		position += sort.Search(len(v.keys)-position, func(k int) bool {
@@ -35,7 +36,11 @@ func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bo
 		for position < len(v.keys) && v.keys[position] <= r.End {
 			id := v.ids[position]
 			if id != 0 {
-				if _, mutated := mutationIndex(v.muts, id); !mutated {
+				if !hasMutations {
+					if !fn(v.keys[position], id) {
+						return false
+					}
+				} else if _, mutated := mutationIndex(v.muts, id); !mutated {
 					if !fn(v.keys[position], id) {
 						return false
 					}
@@ -44,11 +49,13 @@ func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bo
 			position++
 		}
 	}
-	for n := range v.muts {
-		m := &v.muts[n]
-		if m.add && keyInRanges(ranges, m.key) {
-			if !fn(m.key, m.id) {
-				return false
+	if hasMutations {
+		for n := range v.muts {
+			m := &v.muts[n]
+			if m.add && keyInRanges(ranges, m.key) {
+				if !fn(m.key, m.id) {
+					return false
+				}
 			}
 		}
 	}
@@ -70,6 +77,20 @@ func normalizeResult(stack *[DefaultMaxCells]Range, ranges []Range) []Range {
 	return normalizeRanges(append([]Range(nil), ranges...), 0)
 }
 
+// appendBaseRanges appends the base ImageIDs covered by normalized ranges using
+// a bulk copy per range. The base has no mutations, so no per-entry filtering is
+// needed.
+func appendBaseRanges(dst []common.ImageID, v *view, ranges []Range) []common.ImageID {
+	for _, r := range ranges {
+		low := sort.Search(len(v.keys), func(i int) bool { return v.keys[i] >= r.Start })
+		high := sort.Search(len(v.keys), func(i int) bool { return v.keys[i] > r.End })
+		if high > low {
+			dst = append(dst, v.ids[low:high]...)
+		}
+	}
+	return dst
+}
+
 // SearchRanges appends the ImageIDs whose key falls in ranges, in ascending
 // ImageID order. ranges need not be sorted; they are normalized first. The
 // result is a superset of the exact cells by construction (a cover may include
@@ -82,12 +103,25 @@ func (i *Index) SearchRanges(dst []common.ImageID, ranges []Range) []common.Imag
 			return
 		}
 		mark := len(dst)
-		scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
-			dst = append(dst, id)
-			return true
-		})
-		slices.Sort(dst[mark:])
-		dst = compactSorted(dst, mark)
+		if len(v.muts) == 0 {
+			// Fast path: no delta, so a range is a contiguous base run.
+			dst = appendBaseRanges(dst, v, normalized)
+		} else {
+			scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
+				dst = append(dst, id)
+				return true
+			})
+		}
+		tail := dst[mark:]
+		// Repeated keys leave the IDs already ascending, so avoid re-sorting a
+		// large ordered run. A base-only scan yields unique IDs, so dedup is
+		// only needed when a mutation delta is present.
+		if !slices.IsSorted(tail) {
+			slices.Sort(tail)
+		}
+		if len(v.muts) != 0 {
+			dst = compactSorted(dst, mark)
+		}
 	})
 	return dst
 }
