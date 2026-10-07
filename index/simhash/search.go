@@ -67,8 +67,11 @@ func loadU64(arena []byte, off uint64) uint64 {
 }
 
 // SearchPHash appends every committed record whose 64-bit pHash is within
-// maxDistance to dst, with the exact distance.
-func (st *Store) SearchPHash(dst []PHashMatch, query uint64, maxDistance int) []PHashMatch {
+// maxDistance to dst, with the exact distance. The comparison is inclusive.
+//
+// maxDistance is uint8 (0..64 is meaningful; larger values simply match every
+// record). Results are emitted in ascending ImageID order.
+func (st *Store) SearchPHash(dst []Result, query uint64, maxDistance uint8) []Result {
 	if st.closed.Load() {
 		return dst
 	}
@@ -83,8 +86,18 @@ func (st *Store) SearchPHash(dst []PHashMatch, query uint64, maxDistance int) []
 
 // SearchPDQ appends every committed record whose 256-bit PDQ hash is within
 // maxDistance to dst, with the exact distance. PDQ is evaluated independently
-// of pHash.
-func (st *Store) SearchPDQ(dst []PDQMatch, query PDQHash, maxDistance uint16) []PDQMatch {
+// of pHash, and the comparison is inclusive. Results are emitted in ascending
+// ImageID order.
+//
+// maxDistance is a similarity radius in 0..MaxPDQSearchDistance. A larger value
+// is clamped to MaxPDQSearchDistance rather than rejected: PDQ is 256 bits, but
+// meaningful searches stay at or below 128. The exact distance is computed with
+// full precision and narrowed to uint8 only after the threshold test, so every
+// emitted distance is exact.
+func (st *Store) SearchPDQ(dst []Result, query *PDQHash, maxDistance uint8) []Result {
+	if maxDistance > MaxPDQSearchDistance {
+		maxDistance = MaxPDQSearchDistance
+	}
 	if st.closed.Load() {
 		return dst
 	}
@@ -94,29 +107,14 @@ func (st *Store) SearchPDQ(dst []PDQMatch, query PDQHash, maxDistance uint16) []
 		return dst
 	}
 	v := st.view.Load()
-	return v.searchPDQ(dst, &query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
+	return v.searchPDQ(dst, query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
 }
 
-// SearchCombined appends every committed record that satisfies both the pHash
-// and PDQ thresholds, with both exact distances. order selects which column is
-// evaluated first; the AND semantics are identical.
-func (st *Store) SearchCombined(dst []CombinedMatch, phashQuery uint64, maxPHashDistance int, pdqQuery PDQHash, maxPDQDistance uint16, order Order) []CombinedMatch {
-	if st.closed.Load() {
-		return dst
-	}
-	token := st.tracker.Acquire()
-	defer st.tracker.Release(token)
-	if st.closed.Load() {
-		return dst
-	}
-	v := st.view.Load()
-	return v.searchCombined(dst, phashQuery, maxPHashDistance, &pdqQuery, maxPDQDistance, order, clampCommitted(st.committedAtomic.Load(), v.capacity))
-}
-
-func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int, last uint64) []PHashMatch {
+func (v *view) searchPHash(dst []Result, query uint64, maxDistance uint8, last uint64) []Result {
 	if last == 0 {
 		return dst
 	}
+	limit := int(maxDistance)
 	lastPage := hashPageOf(last)
 	lastSlot := slotOf(last)
 	blockRecords := v.geo.seqBlockRecords
@@ -143,8 +141,8 @@ func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int, last
 						continue
 					}
 					d := bits.OnesCount64(query ^ loadU64(sh.arena, pHashBase+uint64(slot)*8))
-					if d <= maxDistance {
-						dst = append(dst, PHashMatch{ImageID: id, Distance: d})
+					if d <= limit {
+						dst = append(dst, Result{ImageID: id, Distance: uint8(d)})
 					}
 				}
 				if atomic.LoadUint64(seq) == a {
@@ -157,13 +155,16 @@ func (v *view) searchPHash(dst []PHashMatch, query uint64, maxDistance int, last
 	return dst
 }
 
-func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16, last uint64) []PDQMatch {
+func (v *view) searchPDQ(dst []Result, query *PDQHash, maxDistance uint8, last uint64) []Result {
 	if last == 0 {
 		return dst
 	}
 	lastPage := hashPageOf(last)
 	lastSlot := slotOf(last)
 	blockRecords := v.geo.seqBlockRecords
+	// limit is 0..128, clamped by the public entry points. The per-record
+	// distance stays a full-width int until after it has passed the threshold
+	// test; only then is it narrowed to uint8 (safe because d <= 128).
 	limit := int(maxDistance)
 	early := useEarlyReject(limit)
 	qw := hashWords(query)
@@ -207,7 +208,7 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16, las
 						if d > limit {
 							continue
 						}
-						dst = append(dst, PDQMatch{ImageID: id, Distance: uint16(d)})
+						dst = append(dst, Result{ImageID: id, Distance: uint8(d)})
 						continue
 					}
 					d := bits.OnesCount64(qw[0]^loadU64(sh.arena, rec)) +
@@ -216,7 +217,7 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16, las
 						d += bits.OnesCount64(qw[2]^loadU64(sh.arena, rec+16)) +
 							bits.OnesCount64(qw[3]^loadU64(sh.arena, rec+24))
 						if d <= limit {
-							dst = append(dst, PDQMatch{ImageID: id, Distance: uint16(d)})
+							dst = append(dst, Result{ImageID: id, Distance: uint8(d)})
 						}
 					}
 				}
@@ -228,117 +229,23 @@ func (v *view) searchPDQ(dst []PDQMatch, query *PDQHash, maxDistance uint16, las
 		}
 	}
 	return dst
-}
-
-func (v *view) searchCombined(dst []CombinedMatch, phashQuery uint64, maxPHash int, pdqQuery *PDQHash, maxPDQ uint16, order Order, last uint64) []CombinedMatch {
-	if last == 0 {
-		return dst
-	}
-	lastPage := hashPageOf(last)
-	lastSlot := slotOf(last)
-	blockRecords := v.geo.seqBlockRecords
-	limit := int(maxPDQ)
-	early := useEarlyReject(limit)
-	qw := hashWords(pdqQuery)
-	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
-		sh, pi := v.shardForHashPage(hashPage)
-		pageIDBase := hashPage << 16
-		base := sh.base(pi)
-		pHashBase := base
-		pdqBase := base + pdqColumnOffset
-		maxSlot := slotsPerHashPage - 1
-		if hashPage == lastPage {
-			maxSlot = lastSlot
-		}
-		for s0 := 0; s0 <= maxSlot; s0 += blockRecords {
-			s1 := s0 + blockRecords - 1
-			if s1 > maxSlot {
-				s1 = maxSlot
-			}
-			seq := sh.seqPtr(pi, s0/blockRecords)
-			mark := len(dst)
-			for {
-				a := waitSeqEven(seq)
-				for slot := s0; slot <= s1; slot++ {
-					id := pageIDBase | uint64(slot)
-					if id == 0 {
-						continue
-					}
-					if order == PHashFirst {
-						ph := bits.OnesCount64(phashQuery ^ loadU64(sh.arena, pHashBase+uint64(slot)*8))
-						if ph > maxPHash {
-							continue
-						}
-						d, ok := pdqWithin(sh.arena, pdqBase, slot, qw, limit, early)
-						if !ok {
-							continue
-						}
-						dst = append(dst, CombinedMatch{ImageID: id, PHashDistance: ph, PDQDistance: d})
-						continue
-					}
-					d, ok := pdqWithin(sh.arena, pdqBase, slot, qw, limit, early)
-					if !ok {
-						continue
-					}
-					ph := bits.OnesCount64(phashQuery ^ loadU64(sh.arena, pHashBase+uint64(slot)*8))
-					if ph > maxPHash {
-						continue
-					}
-					dst = append(dst, CombinedMatch{ImageID: id, PHashDistance: ph, PDQDistance: d})
-				}
-				if atomic.LoadUint64(seq) == a {
-					break
-				}
-				dst = dst[:mark]
-			}
-		}
-	}
-	return dst
-}
-
-// pdqWithin computes the exact PDQ distance for one record whose four words
-// start at byte offset pdqBase+slot*32. ok is false when the distance exceeds
-// limit. It uses word-at-a-time early rejection for low/high thresholds and a
-// two-word prefix for the mid range, matching the standalone scan.
-func pdqWithin(arena []byte, pdqBase uint64, slot int, qw *[4]uint64, limit int, early bool) (uint16, bool) {
-	rec := pdqBase + uint64(slot)*32
-	if early {
-		d := bits.OnesCount64(qw[0] ^ loadU64(arena, rec))
-		if d > limit {
-			return 0, false
-		}
-		d += bits.OnesCount64(qw[1] ^ loadU64(arena, rec+8))
-		if d > limit {
-			return 0, false
-		}
-		d += bits.OnesCount64(qw[2] ^ loadU64(arena, rec+16))
-		if d > limit {
-			return 0, false
-		}
-		d += bits.OnesCount64(qw[3] ^ loadU64(arena, rec+24))
-		if d > limit {
-			return 0, false
-		}
-		return uint16(d), true
-	}
-	d := bits.OnesCount64(qw[0]^loadU64(arena, rec)) +
-		bits.OnesCount64(qw[1]^loadU64(arena, rec+8))
-	if d > limit {
-		return 0, false
-	}
-	d += bits.OnesCount64(qw[2]^loadU64(arena, rec+16)) +
-		bits.OnesCount64(qw[3]^loadU64(arena, rec+24))
-	return uint16(d), d <= limit
 }
 
 // SearchPDQBulk appends every committed record whose 256-bit PDQ hash is within
-// maxDistance to dst, using the internal block kernel (NEON on arm64).
+// maxDistance to dst, using the internal block kernel (NEON on arm64, scalar
+// elsewhere). It is a drop-in replacement for SearchPDQ on a quiescent store,
+// with identical maxDistance semantics, including the clamp to
+// MaxPDQSearchDistance.
 //
 // It reads canonical columns with wide, plain loads, so it is NOT safe to run
 // concurrently with a writer (Append/AppendBatch/Upsert/UpsertBatch). Use
-// SearchPDQ for the concurrent-safe scalar path. Bulk is intended for quiescent
-// scans, for example after ingest or on a read-only replica.
-func (st *Store) SearchPDQBulk(dst []PDQMatch, query PDQHash, maxDistance uint16) []PDQMatch {
+// SearchPDQ for the concurrent-safe scalar path. On a quiescent store its
+// results are identical to SearchPDQ's, including ImageIDs, distances, and
+// ascending order.
+func (st *Store) SearchPDQBulk(dst []Result, query *PDQHash, maxDistance uint8) []Result {
+	if maxDistance > MaxPDQSearchDistance {
+		maxDistance = MaxPDQSearchDistance
+	}
 	if st.closed.Load() {
 		return dst
 	}
@@ -352,8 +259,10 @@ func (st *Store) SearchPDQBulk(dst []PDQMatch, query PDQHash, maxDistance uint16
 	if last == 0 {
 		return dst
 	}
+	// limit is 0..128, clamped by the public entry point, so the kernel never
+	// matches beyond MaxPDQSearchDistance and every selected distance fits uint8.
 	limit := int(maxDistance)
-	qp := (*[32]byte)(unsafe.Pointer(&query))
+	qp := (*[32]byte)(unsafe.Pointer(query))
 	lastPage := hashPageOf(last)
 	lastSlot := slotOf(last)
 	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
@@ -379,7 +288,7 @@ func (st *Store) SearchPDQBulk(dst []PDQMatch, query PDQHash, maxDistance uint16
 					continue
 				}
 				d := hashkernel.PDQDistance(qp, (*[32]byte)(unsafe.Pointer(&sh.arena[pageBase+uint64(slot)*32])))
-				dst = append(dst, PDQMatch{ImageID: id, Distance: d})
+				dst = append(dst, Result{ImageID: id, Distance: uint8(d)})
 			}
 		}
 	}

@@ -119,6 +119,29 @@
 // The store owns no deletion state. Tombstoning and liveness are authoritative
 // in BitmapIdx, which filters the results of a scan.
 //
+// # Similarity search
+//
+// Two exact radius queries are supported: SearchPHash (64-bit pHash Hamming
+// distance) and SearchPDQ (256-bit PDQ distance). Both append matches to a
+// caller-owned []Result and return them in ascending ImageID order. Result
+// carries only the ImageID and the exact Hamming distance as a uint8; the
+// caller knows which search produced it. No score, normalized distance, hash
+// type, quality, Top-K, sorting, or count-only variant is provided.
+//
+// Search thresholds are uint8. pHash distance is exactly 0..64. PDQ is 256 bits,
+// so its mathematical distance is 0..256, but the public search radius is
+// bounded by MaxPDQSearchDistance (128): a larger threshold is clamped rather
+// than rejected. The internal distance primitive stays uint16 and the running
+// distance is never narrowed to uint8 before the threshold test, so every
+// emitted Result.Distance is exact. SearchPDQBulk is the quiescent SIMD variant
+// and must return exactly the same results as SearchPDQ, including for clamped
+// thresholds.
+//
+// The distance split is:
+//
+//	pHash: mathematical 0..64,  search threshold 0..64,  Result.Distance uint8
+//	PDQ:   mathematical 0..256, search threshold 0..128, Result.Distance uint8
+//
 // # Kernels and SIMD
 //
 // The Hamming distance kernels live in index/simhash/internal/hashkernel behind
@@ -126,9 +149,9 @@
 // and a NEON block kernel on arm64. The scalar reference is the correctness
 // oracle.
 //
-// The concurrent-safe scans (SearchPHash, SearchPDQ, SearchCombined) use atomic
-// loads and the scalar kernel, because a 32-byte PDQ store is not atomic and a
-// wide SIMD load cannot provide the same guarantee against an in-place writer.
+// The concurrent-safe scans (SearchPHash, SearchPDQ) use atomic loads and the
+// scalar kernel, because a 32-byte PDQ store is not atomic and a wide SIMD load
+// cannot provide the same guarantee against an in-place writer.
 // SearchPDQBulk uses the NEON block kernel on plain memory and is therefore only
 // safe on a quiescent store (no concurrent writer); it is intended for scans
 // after ingest or on a read-only replica. It is 1.5-2.2x faster than the scalar

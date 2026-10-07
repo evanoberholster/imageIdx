@@ -30,8 +30,7 @@ func TestConcurrentReadersDuringUpdate(t *testing.T) {
 				default:
 				}
 				_ = st.SearchPHash(nil, records[0].PHash, 8)
-				_ = st.SearchPDQ(nil, records[0].PDQ, 16)
-				_ = st.SearchCombined(nil, records[0].PHash, 8, records[0].PDQ, 16, PHashFirst)
+				_ = st.SearchPDQ(nil, &records[0].PDQ, 16)
 				_, _ = st.Get(1)
 			}
 		}()

@@ -47,34 +47,27 @@ type Update struct {
 	Record  Record
 }
 
-// PHashMatch is one pHash-similar result.
-type PHashMatch struct {
+// Result is one exact similarity-search match. Distance is the exact Hamming
+// distance: 0..64 for a pHash search and 0..MaxPDQSearchDistance (128) for a PDQ
+// search. The caller knows which search produced the result, so no hash
+// discriminator is stored.
+type Result struct {
 	ImageID  common.ImageID
-	Distance int
+	Distance uint8
 }
 
-// PDQMatch is one PDQ-similar result.
-type PDQMatch struct {
-	ImageID  common.ImageID
-	Distance uint16
-}
-
-// CombinedMatch is one result of an explicit pHash AND PDQ search.
-type CombinedMatch struct {
-	ImageID       common.ImageID
-	PHashDistance int
-	PDQDistance   uint16
-}
-
-// Order selects the evaluation order of a combined search.
-type Order uint8
-
-const (
-	// PHashFirst filters on pHash, then verifies PDQ.
-	PHashFirst Order = iota
-	// PDQFirst filters on PDQ, then verifies pHash.
-	PDQFirst
-)
+// MaxPDQSearchDistance bounds the supported PDQ similarity-search radius.
+//
+// PDQ is 256 bits, so the mathematical Hamming distance is 0..256, but useful
+// similarity searches stay far below half the hash. The public PDQ search API
+// therefore supports 0..128 and clamps a larger threshold to
+// MaxPDQSearchDistance; an excessive threshold is not an error. Every returned
+// PDQ distance is exact and, because distance <= threshold <= 128, fits in
+// uint8 with no sentinel or saturation.
+//
+// This is a search radius, not the metric: DistancePDQ still returns the exact
+// mathematical 0..256.
+const MaxPDQSearchDistance uint8 = 128
 
 // Config describes one store. The zero value of every field selects a default.
 type Config struct {
@@ -110,10 +103,13 @@ func (c Config) withDefaults() (Config, error) {
 func hashWords(h *PDQHash) *[4]uint64 { return (*[4]uint64)(unsafe.Pointer(h)) }
 
 // DistancePHash returns the exact 64-bit Hamming distance between two pHashes.
-func DistancePHash(a, b uint64) int { return hashkernel.PHashDistance(a, b) }
+// The range is 0..64, so uint8 holds it exactly.
+func DistancePHash(a, b uint64) uint8 { return uint8(hashkernel.PHashDistance(a, b)) }
 
 // DistancePDQ returns the exact 256-bit Hamming distance between two PDQ
-// hashes. On arm64 this is the NEON kernel.
+// hashes. The mathematical range is 0..256, so the primitive stays uint16; the
+// search API instead uses uint8 thresholds in 0..MaxPDQSearchDistance and
+// returns exact uint8 Result distances.
 func DistancePDQ(a, b *PDQHash) uint16 {
 	return hashkernel.PDQDistance((*[32]byte)(unsafe.Pointer(a)), (*[32]byte)(unsafe.Pointer(b)))
 }

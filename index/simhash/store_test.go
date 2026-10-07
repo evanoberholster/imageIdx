@@ -105,7 +105,7 @@ func TestReopen(t *testing.T) {
 	if q, _ := reopened.Quality(7); q != wantQuality {
 		t.Fatalf("reopened Quality(7) = %d, want %d", q, wantQuality)
 	}
-	got := reopened.SearchPDQ(nil, records[0].PDQ, 0)
+	got := reopened.SearchPDQ(nil, &records[0].PDQ, 0)
 	if len(got) != 1 || got[0].ImageID != 1 {
 		t.Fatalf("reopened SearchPDQ = %+v", got)
 	}
@@ -201,11 +201,9 @@ func TestClosedStoreReads(t *testing.T) {
 	if got := st.SearchPHash(nil, 0, 8); len(got) != 0 {
 		t.Fatalf("SearchPHash after Close = %+v", got)
 	}
-	if got := st.SearchPDQ(nil, PDQHash{}, 8); len(got) != 0 {
+	var zeroPDQ PDQHash
+	if got := st.SearchPDQ(nil, &zeroPDQ, 8); len(got) != 0 {
 		t.Fatalf("SearchPDQ after Close = %+v", got)
-	}
-	if got := st.SearchCombined(nil, 0, 8, PDQHash{}, 8, PHashFirst); len(got) != 0 {
-		t.Fatalf("SearchCombined after Close = %+v", got)
 	}
 	if _, ok := st.Quality(1); ok {
 		t.Fatal("Quality after Close returned a value")
@@ -222,6 +220,7 @@ func TestConcurrentSearchClose(t *testing.T) {
 	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var zeroPDQ PDQHash
 	for r := 0; r < 4; r++ {
 		wg.Add(1)
 		go func() {
@@ -233,8 +232,7 @@ func TestConcurrentSearchClose(t *testing.T) {
 				default:
 				}
 				_ = st.SearchPHash(nil, 0x1234, 8)
-				_ = st.SearchPDQ(nil, PDQHash{}, 8)
-				_ = st.SearchCombined(nil, 0x1234, 8, PDQHash{}, 8, PHashFirst)
+				_ = st.SearchPDQ(nil, &zeroPDQ, 8)
 				_, _ = st.Get(1)
 			}
 		}()

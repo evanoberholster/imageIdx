@@ -232,17 +232,46 @@ at `G+2`).
 
 ## Search
 
-Exact, independent, and combined:
+Exactly two radius queries are supported:
 
-- `SearchPHash(dst, query, maxDistance)` — 64-bit Hamming distance.
-- `SearchPDQ(dst, query, maxDistance)` — 256-bit distance, evaluated
-  independently of pHash.
-- `SearchCombined(dst, pHashQuery, maxPHash, pdqQuery, maxPDQ, order)` — AND
-  semantics with both distances; `order` selects pHash-first or PDQ-first.
+- `SearchPHash(dst, query uint64, maxDistance uint8)` — 64-bit Hamming distance.
+- `SearchPDQ(dst, query *PDQHash, maxDistance uint8)` — 256-bit distance,
+  evaluated independently of pHash.
 
-A PDQ-only query never consults pHash; pHash is used only as an explicit
-prefilter in a combined query. All scans take a caller-owned destination slice
-and allocate nothing when its capacity is sufficient.
+Both take a caller-owned destination slice and a single result type:
+
+```go
+type Result struct {
+    ImageID  common.ImageID
+    Distance uint8
+}
+```
+
+`Distance` is the exact Hamming distance and the only similarity score. There is
+no `Score`, `Similarity`, `NormalizedDistance`, `HashType`, or `Quality` field,
+and no `CombinedMatch`, `SearchCombined`, `Order`, `PHashFirst`, `PDQFirst`,
+`PHashMatch`, or `PDQMatch`. SimHash is not a generalized query engine: no
+Top-K, `CandidateSet`, count-only API, sorting, heap, ranking workspace, or
+temporary result arrays. Higher-level code may sort by `Distance`.
+
+Matches are emitted in ascending `ImageID` order (natural scan order); they are
+not sorted by distance. The comparison is inclusive.
+
+pHash distance is exactly 0..64. PDQ is 256 bits, so its mathematical distance
+is 0..256, but the supported similarity-search radius is bounded by
+`MaxPDQSearchDistance = 128`: a `maxDistance` above 128 is clamped, not rejected.
+Only `distance <= threshold <= 128` can be returned, so every `Result.Distance`
+is exact and fits `uint8`; there is no sentinel, `256` special case, or
+saturation. `DistancePDQ` stays `uint16` and still returns the exact
+mathematical 0..256. The running distance is never narrowed to `uint8` before
+the threshold test.
+
+The distinction is:
+
+```text
+pHash: mathematical 0..64,  search threshold 0..64,  Result.Distance uint8
+PDQ:   mathematical 0..256, search threshold 0..128, Result.Distance uint8
+```
 
 A search samples an immutable shard-set view, the committed high-water at that
 moment, and **per-sequence-block** tuple consistency. It does **not** provide
@@ -253,7 +282,9 @@ PDQ distance uses word-at-a-time early rejection for low thresholds and a
 two-word prefix for the mid range (`20 < d < 40`) where a single-word reject
 branch is ~50/50 and mispredicts. The concurrent-safe searches use atomic scalar
 loads; `SearchPDQBulk` uses the SIMD block kernel on plain memory and is
-**quiescent-only** (no concurrent writer).
+**quiescent-only** (no concurrent writer). On a quiescent store it returns
+exactly the same ImageIDs, distances, and order as `SearchPDQ`, including the
+clamp.
 
 ## Kernels
 
@@ -281,7 +312,7 @@ Steady-state targets, guarded by `testing.AllocsPerRun`:
 ```text
 Get, Quality                       0 B/op   0 allocs/op
 SearchPHash, SearchPDQ,
-SearchCombined, SearchPDQBulk      0 B/op   0 allocs/op  (caller capacity)
+SearchPDQBulk                       0 B/op   0 allocs/op  (caller capacity)
 Append, AppendBatch/64             0 B/op   0 allocs/op
 Upsert, UpsertBatch/64             0 B/op   0 allocs/op
 ```
@@ -293,12 +324,17 @@ published append batch.
 
 ## Testing
 
-Oracle-based exactness for pHash/PDQ/combined, threshold 31, page/shard
-boundaries, tombstones (external, via filtering), quality persistence, reopen and
-generation selection, arithmetic boundaries including `MaxUint64`, corrupt
-manifest geometry, journal recovery at every stage, persistence failure injection
-at every commit stage, stale WAL after commit, batch atomic recovery, closed-store
-safety and Close-vs-reader stress, exact SIMD distance ladder and random
-differential kernel tests. All pass under `-race`.
+Oracle-based exactness for pHash and PDQ radius queries (including the inclusive
+boundary thresholds, the PDQ radius edge at distance 127/128/129, and the clamp
+equivalence of thresholds 129/200/255 to `MaxPDQSearchDistance`), a separate
+`DistancePDQ` test over the full mathematical 0..256 range (including
+254/255/256), page/shard boundaries, tombstones (external, via filtering),
+quality persistence, reopen and generation selection, arithmetic boundaries
+including `MaxUint64`, corrupt manifest geometry, journal recovery at every
+stage, persistence failure injection at every commit stage, stale WAL after
+commit, batch atomic recovery, closed-store safety and Close-vs-reader stress,
+randomized differential tests against brute-force Hamming distance for both
+searches, and `SearchPDQ == SearchPDQBulk` on quiescent stores. All pass under
+`-race`.
 
 Benchmarks and measured results live in `index/simhash/README.md`.
