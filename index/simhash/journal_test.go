@@ -409,8 +409,11 @@ func TestJournalRejectsGenerationGap(t *testing.T) {
 	if err := st.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
-	// A batch whose base does not chain from the manifest generation.
-	if err := st.journal.appendBatch(st.generation+5, st.generation+6, []Update{
+	// A batch must be a single generation step. A forward gap is tolerated
+	// (it can come from uncheckpointed appends), but a two-step batch is
+	// corrupt.
+	base := st.generation
+	if err := st.journal.appendBatch(base, base+2, []Update{
 		{ImageID: 1, Record: randRecords(10, 1)[0]},
 	}, true); err != nil {
 		t.Fatalf("appendBatch: %v", err)
@@ -419,7 +422,7 @@ func TestJournalRejectsGenerationGap(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	if _, err := Open(dir, cfg); err == nil {
-		t.Fatal("Open accepted a broken generation chain")
+		t.Fatal("Open accepted a non-single-step batch")
 	}
 }
 

@@ -111,19 +111,23 @@ func validateManifest(mf manifest, cfg Config) error {
 		return fmt.Errorf("%w: per-shard capacity overflow", ErrCorrupt)
 	}
 	perShard := mf.pagesPerShard * slotsPerHashPage
+	// Shard-count arithmetic must not overflow before it is used.
 	if mf.shardCount != 0 && mf.pagesPerShard > ^uint64(0)/mf.shardCount {
 		return fmt.Errorf("%w: shard count overflow", ErrCorrupt)
+	}
+	if perShard != 0 && mf.shardCount > ^uint64(0)/perShard {
+		return fmt.Errorf("%w: total capacity overflow", ErrCorrupt)
 	}
 	total := mf.shardCount * perShard
 	if mf.committed > total {
 		return fmt.Errorf("%w: committed %d exceeds shard capacity %d", ErrCorrupt, mf.committed, total)
 	}
-	// The committed high-water mark must be representable by exactly the
-	// declared shards: shard for a max ID is id/perShard, so shardCount is
-	// committed/perShard + 1 (0 when nothing is committed).
+	// Number of shards needed to cover the committed high-water mark. The
+	// committed mark is the largest valid ImageID, so committed == C needs one
+	// shard, not two: required = 1 + (committed-1)/C.
 	required := uint64(0)
 	if mf.committed != 0 {
-		required = mf.committed/perShard + 1
+		required = 1 + (mf.committed-1)/perShard
 	}
 	if mf.shardCount != required {
 		return fmt.Errorf("%w: shard count %d inconsistent with committed %d (want %d)", ErrCorrupt, mf.shardCount, mf.committed, required)
@@ -410,12 +414,24 @@ func (st *Store) recoverJournal() error {
 		if next <= expected {
 			return nil // already covered by the durable manifest
 		}
-		if base != expected || next != base+1 {
-			return fmt.Errorf("%w: journal generation %d->%d, want base %d", ErrCorrupt, base, next, expected)
+		if base < expected {
+			return fmt.Errorf("%w: journal generation %d->%d behind committed %d", ErrCorrupt, base, next, expected)
+		}
+		// base > expected is a forward gap from uncheckpointed appends that
+		// advanced the runtime generation without a WAL record; skip it. A
+		// batch must still be a single step.
+		if next != base+1 {
+			return fmt.Errorf("%w: journal generation %d->%d is not a single step", ErrCorrupt, base, next)
 		}
 		count := int(binary.LittleEndian.Uint32(payload[16:20]))
 		for i := 0; i < count; i++ {
 			id, phash, pdq, quality := decodeUpdate(payload, i)
+			// An update to an ID beyond the manifest high-water references a
+			// record whose (uncheckpointed) append was lost; drop it rather
+			// than treating the WAL as corrupt.
+			if id == 0 || id > st.committed {
+				continue
+			}
 			if err := st.applyJournalUpdate(id, phash, &pdq, quality); err != nil {
 				return err
 			}

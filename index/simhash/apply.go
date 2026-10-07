@@ -5,7 +5,6 @@ import (
 	"unsafe"
 
 	common "github.com/evanoberholster/imageIdx/common"
-	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 // Append appends one record and returns its assigned ImageID. It shares the
@@ -63,11 +62,13 @@ func (st *Store) appendBatchLocked(recs []Record) (common.ImageID, error) {
 	st.committed = last
 	st.generation++
 
-	// Under sync durability, do not publish the commit to readers until the
-	// canonical data, shard metadata, and manifest are durable. On failure,
-	// roll back writer state; readers never observed the new IDs.
+	// Under sync durability, make the commit durable before publishing it to
+	// readers. The manifest write is the commit point: a failure before or at
+	// it rolls back writer state (readers never observed the new IDs); a
+	// failure after it (WAL reset) leaves the commit in place and returns the
+	// error so the stale WAL is repaired or skipped on the next Open.
 	if st.config.Durability == common.DurabilitySync {
-		if err := st.persistLocked(); err != nil {
+		if err := st.preCommitLocked(); err != nil {
 			st.committed = oldCommitted
 			st.generation = oldGeneration
 			for si := firstShard; si <= lastShard; si++ {
@@ -79,6 +80,11 @@ func (st *Store) appendBatchLocked(recs []Record) (common.ImageID, error) {
 	}
 	st.committedAtomic.Store(last)
 	st.gen.Store(st.generation)
+	if st.config.Durability == common.DurabilitySync {
+		if err := st.postCommitLocked(); err != nil {
+			return common.ImageID(first), err
+		}
+	}
 	return common.ImageID(first), nil
 }
 
@@ -295,23 +301,48 @@ func (st *Store) Sync() error {
 	return st.persistLocked()
 }
 
-// persistLocked makes the current generation durable in commit order:
+// persistStage names a point in the durable-commit sequence for failure-injection
+// tests. persistentFail is nil in production.
+type persistStage uint8
+
+const (
+	stageCanonicalSync  persistStage = iota // flush canonical column bytes
+	stageShardMetaWrite                     // write new shard superblocks
+	stageShardMetaSync                      // flush shard metadata
+	stageManifest                           // publish the manifest (commit point)
+	stageWALReset                           // truncate the redo journal
+)
+
+// persistentFail is a test seam. It is nil in production and adds only a nil
+// check to the (non-hot) persistence path.
+var persistentFail func(persistStage) error
+
+func (st *Store) persistHook(stage persistStage) error {
+	if persistentFail == nil {
+		return nil
+	}
+	return persistentFail(stage)
+}
+
+// preCommitLocked makes the canonical data, shard metadata, and manifest durable
+// in that order. The manifest write (which internally fsyncs its temp file,
+// renames, and fsyncs the directory) is the durable commit marker.
 //
-//	canonical data (already written in place)
-//	    -> flush canonical mmap
-//	    -> write new shard superblocks
-//	    -> flush shard metadata
-//	    -> publish the manifest LAST
-//	    -> sync the directory
-//	    -> reset the WAL
-//
-// The manifest is the final durable commit marker, so it can never claim a
-// generation whose canonical data or shard metadata is not durable.
-func (st *Store) persistLocked() error {
+//	canonical mmap Sync
+//	-> write shard superblocks
+//	-> shard mmap Sync
+//	-> atomically publish manifest
+func (st *Store) preCommitLocked() error {
+	if err := st.persistHook(stageCanonicalSync); err != nil {
+		return err
+	}
 	for _, sh := range st.shards {
 		if err := sh.mapped.Sync(); err != nil {
 			return err
 		}
+	}
+	if err := st.persistHook(stageShardMetaWrite); err != nil {
+		return err
 	}
 	for _, sh := range st.shards {
 		sh.generation = st.generation
@@ -319,19 +350,37 @@ func (st *Store) persistLocked() error {
 			return err
 		}
 	}
+	if err := st.persistHook(stageShardMetaSync); err != nil {
+		return err
+	}
 	for _, sh := range st.shards {
 		if err := sh.mapped.Sync(); err != nil {
 			return err
 		}
 	}
-	if err := st.writeManifestLocked(); err != nil {
+	if err := st.persistHook(stageManifest); err != nil {
 		return err
 	}
-	if err := storage.SyncDir(st.dir); err != nil {
+	return st.writeManifestLocked()
+}
+
+// postCommitLocked runs after the manifest commit marker is durable: reset the
+// journal. A failure here leaves the commit in place; the stale WAL is skipped
+// (already-committed batches) or repaired on the next Open.
+func (st *Store) postCommitLocked() error {
+	if err := st.persistHook(stageWALReset); err != nil {
 		return err
 	}
 	if st.journal != nil {
 		return st.journal.reset()
 	}
 	return nil
+}
+
+// persistLocked performs a full checkpoint: pre-commit then post-commit.
+func (st *Store) persistLocked() error {
+	if err := st.preCommitLocked(); err != nil {
+		return err
+	}
+	return st.postCommitLocked()
 }

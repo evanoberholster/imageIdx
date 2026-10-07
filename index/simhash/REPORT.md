@@ -295,7 +295,7 @@ Steady-state allocation (M4 Pro, `-benchmem`):
 | `Upsert` | ~2.4 µs | 0 | 0 |
 | `UpsertBatch/64` | 5.1 µs (79 ns/update) | 0 | 0 |
 | `Append` | 123 | 0 | 0 |
-| `AppendBatch/64` | 346 (5.4 ns/record) | 0 | 0 |
+| `AppendBatch/64` | ~273 (~4.3 ns/record) | 0 | 0 |
 
 Searches are measured with caller-preallocated result buffers; the `B/op` seen
 at d = 32/64 is caller result growth, not the store. Escape analysis

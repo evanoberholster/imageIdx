@@ -78,25 +78,36 @@
 //
 // # Durability
 //
-// Runtime atomicity and crash durability are separate. Append and Upsert publish
-// in memory and are visible to readers immediately. Checkpoint/Sync commit in
-// this order:
+// Runtime atomicity and crash durability are separate. Under the default OS
+// durability, Append and Upsert publish in memory and are visible to readers
+// immediately; Checkpoint/Sync makes them durable. Under DurabilitySync a commit
+// is made durable before it is published to readers.
 //
-//	canonical columns (already written in place)
-//	-> flush canonical mmap
-//	-> write new shard superblocks
-//	-> flush shard metadata
-//	-> publish the manifest LAST
-//	-> fsync the directory
-//	-> reset the WAL
+// The durable commit sequence is split at the manifest write, which is the
+// commit marker (it fsyncs its temporary file, renames, and fsyncs the
+// directory):
 //
-// The manifest is the final durable commit marker: it can never claim a
-// generation whose canonical data or shard metadata is not durable, and the WAL
-// is discarded only after both are durable. This matches index/radixhash's
-// explicit checkpoint model: Close does not checkpoint, and pending writes
-// become durable only after Sync/Checkpoint (or per-operation under
-// DurabilitySync). A validated WAL chain replayed on Open may advance the
-// generation beyond the manifest until the next checkpoint.
+//	PRE-COMMIT
+//	  canonical mmap Sync
+//	  -> write new shard superblocks
+//	  -> shard mmap Sync
+//	  -> atomically publish the manifest
+//	COMMITTED
+//	POST-COMMIT
+//	  -> reset the WAL
+//
+// A failure before or at the manifest write returns an error and, under
+// DurabilitySync, rolls back the unpublished AppendBatch writer state; readers
+// never observe the new IDs. A failure after the manifest write (WAL reset)
+// leaves the commit in place and returns the error; the stale WAL is skipped
+// (already-committed batches) or repaired on the next Open. The manifest can
+// never claim a generation whose canonical data or shard metadata is not
+// durable.
+//
+// This matches index/radixhash's explicit checkpoint model: Close does not
+// checkpoint, and pending writes become durable only after Sync/Checkpoint (or
+// per-operation under DurabilitySync). A validated WAL chain replayed on Open
+// may advance the generation beyond the manifest until the next checkpoint.
 //
 // # Deletion
 //
