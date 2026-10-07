@@ -12,7 +12,7 @@ covers usage and measured results.
 
 - **41 bytes/image** canonical storage, no stored `ImageID`, no offset table.
 - **Lock-free readers**, one serialized writer.
-- **Exact** pHash, PDQ, and combined AND queries.
+- **Exact** pHash and PDQ radius queries returning `Result{ImageID, Distance}`.
 - **Zero allocations** on steady-state reads and writes (caller-owned results).
 - **Batch redo WAL** for in-place updates; appends need no WAL.
 - **Manifest is the durable commit marker.**
@@ -50,13 +50,14 @@ if err := store.UpsertBatch([]simhash.Update{
     return err
 }
 
-// Exact queries; dst is caller-owned and reused.
-phMatches := store.SearchPHash(nil, ph, 8)
-pdqMatches := store.SearchPDQ(nil, pdq, 31)
-both := store.SearchCombined(nil, ph, 8, pdq, 31, simhash.PHashFirst)
+// Exact radius queries; dst is caller-owned and reused, 0 allocs.
+// Distance is the exact Hamming distance as uint8 (pHash 0..64, PDQ 0..255).
+var phMatches, pdqMatches []simhash.Result
+phMatches = store.SearchPHash(phMatches[:0], ph, 8)
+pdqMatches = store.SearchPDQ(pdqMatches[:0], &pdq, 31)
 
-// Quiescent-only SIMD scan (no concurrent writer). 0 allocs.
-bulk := store.SearchPDQBulk(nil, pdq, 31)
+// Quiescent-only SIMD scan (no concurrent writer); same results, 0 allocs.
+bulk := store.SearchPDQBulk(nil, &pdq, 31)
 
 // Durable commit point; Close does not checkpoint.
 if err := store.Checkpoint(); err != nil {
@@ -120,13 +121,27 @@ no read touches an unmapped arena.
 
 ## Search
 
-`SearchPHash`, `SearchPDQ`, and `SearchCombined` are exact, independent, and
-concurrent-safe (atomic scalar loads). A PDQ-only query never consults pHash;
-pHash is only an explicit combined prefilter. Search consistency is per sequence
-block, not whole-generation MVCC.
+Two exact, inclusive radius queries are supported; both are concurrent-safe
+(atomic scalar loads) and return results in ascending ImageID order:
 
-`SearchPDQBulk` uses the SIMD block kernel; it reads plain memory and is
-documented as **quiescent-only** (no concurrent writer).
+```go
+func (s *Store) SearchPHash(dst []Result, query uint64, maxDistance uint8) []Result
+func (s *Store) SearchPDQ(dst []Result, query *PDQHash, maxDistance uint8) []Result
+```
+
+`Result` carries only the `ImageID` and the exact Hamming `Distance` (uint8);
+the caller knows which search produced it. Distance is not normalized and no
+score, Top-K, sorting, heap, `CandidateSet`, or count-only API is provided.
+
+pHash distance is exactly 0..64. PDQ distance is mathematically 0..256, so the
+search threshold is 0..255 and the internal primitive stays `uint16`: a pair 256
+bits apart is excluded by every threshold rather than wrapping to `Distance=0`.
+The distance is never narrowed to `uint8` before the threshold test. Search
+consistency is per sequence block, not whole-generation MVCC.
+
+`SearchPDQBulk` uses the SIMD block kernel; it reads plain memory, is
+**quiescent-only** (no concurrent writer), and on a quiescent store returns
+exactly the same ImageIDs, distances, and order as `SearchPDQ`.
 
 ## Kernels
 
@@ -145,14 +160,16 @@ Apple M4 Pro (arm64), Go 1.27, warm mmap-resident data, 0 allocs/op unless noted
 
 ### 1M records
 
-| query | latency |
-|---|---:|
-| pHash scan d ≤ 16 | ~0.77 ms |
-| pHash scan d = 32 (≈half the DB) | ~5.9 ms |
-| PDQ scan d ≤ 16 | ~0.97 ms |
-| PDQ scan d = 31 / 32 | ~1.44 ms |
-| PDQ scan d = 40 / 50 | ~1.5 ms |
-| combined pHash-first / PDQ-first | ~0.7 ms / ~2.4 ms |
+Destination slices are pre-sized to the record count, so `B/op` and `allocs/op`
+are 0 for every row.
+
+| query | latency | ns/hash |
+|---|---:|---:|
+| pHash scan d = 8 / 16 | ~0.78 ms | 0.78 |
+| pHash scan d = 32 (≈half the DB) | ~5.8 ms | 5.83 |
+| PDQ scan d = 16 | ~0.96 ms | 0.96 |
+| PDQ scan d = 31 / 32 | ~1.45–1.48 ms | 1.45–1.48 |
+| PDQ scan d = 50 | ~1.44 ms | 1.44 |
 
 ### Updates (1M, relaxed)
 
@@ -188,22 +205,25 @@ update) versus 5696 B for 64 individual frames.
 
 | threshold | scalar | bulk | speedup |
 |---:|---:|---:|---:|
-| 0 | 976 µs | 587 µs | 1.66× |
-| 16 | 968 µs | 650 µs | 1.49× |
-| 31 | 1463 µs | 652 µs | 2.24× |
-| 32 | 1454 µs | 656 µs | 2.22× |
-| 50 | 1447 µs | 708 µs | 2.04× |
-| 256 | 2945 µs | 3254 µs | 0.90× |
+| 0 | 962 µs | 631 µs | 1.53× |
+| 16 | 955 µs | 637 µs | 1.50× |
+| 31 | 1461 µs | 638 µs | 2.29× |
+| 32 | 1449 µs | 638 µs | 2.27× |
+| 50 | 1435 µs | 705 µs | 2.04× |
+| 255 | 2581 µs | 3054 µs | 0.85× |
 
-At d = 256 essentially every record matches, so the bulk path's second exact pass
-dominates; that is far above any real threshold and remains correct.
+Every threshold is `uint8` (0..255). The old d=256 case is no longer a search
+threshold: an exact distance of 256 is excluded rather than represented, and the
+bulk kernel simply never sets its mask bit for it. At d=255 essentially every
+record matches, so the bulk path's second exact pass dominates; that is far above
+any real threshold and remains correct.
 
 ## Allocation budget
 
 | operation | B/op | allocs/op |
 |---|---:|---:|
 | `Get`, `Quality` | 0 | 0 |
-| `SearchPHash`, `SearchPDQ`, `SearchCombined`, `SearchPDQBulk` | 0 | 0 |
+| `SearchPHash`, `SearchPDQ`, `SearchPDQBulk` | 0 | 0 |
 | `Append`, `AppendBatch/64` | 0 | 0 |
 | `Upsert`, `UpsertBatch/64` | 0 | 0 |
 
@@ -213,9 +233,12 @@ COW, MVCC, or B-trees.
 
 ## Testing
 
-`go test ./index/simhash/...` covers exactness against an oracle, threshold 31,
-page/shard boundaries, quality persistence, reopen and generation selection,
-arithmetic boundaries including `MaxUint64`, manifest corruption, journal
-recovery at every stage, persistence failure injection at every commit stage,
-stale WAL after commit, batch atomic recovery, closed-store safety and
-Close-vs-reader stress, and SIMD differential tests. All pass under `-race`.
+`go test ./index/simhash/...` covers exactness against an oracle, pHash and PDQ
+boundary thresholds (including pHash 0/63/64 and PDQ 254/255/256 with 256
+excluded at threshold 255), page/shard boundaries, quality persistence, reopen
+and generation selection, arithmetic boundaries including `MaxUint64`, manifest
+corruption, journal recovery at every stage, persistence failure injection at
+every commit stage, stale WAL after commit, batch atomic recovery, closed-store
+safety and Close-vs-reader stress, and randomized differential tests against
+brute-force Hamming distance for both searches plus `SearchPDQ == SearchPDQBulk`.
+All pass under `-race`.

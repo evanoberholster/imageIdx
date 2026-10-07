@@ -3,7 +3,6 @@ package simhash
 import (
 	"fmt"
 	common "github.com/evanoberholster/imageIdx/common"
-	bench "github.com/evanoberholster/imageIdx/internal/bench"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -94,18 +93,32 @@ func benchQueries(records []Record, count, distance int) []PDQHash {
 	return out
 }
 
+// searchBenchSizes returns the dataset sizes required for the search latency
+// suite. The standard matrix is covered by the other benchmarks.
+func searchBenchSizes(b *testing.B) []int {
+	b.Helper()
+	if testing.Short() {
+		return []int{10_000, 64_000}
+	}
+	return []int{64_000, 1_000_000}
+}
+
 func BenchmarkSearchPDQ(b *testing.B) {
-	for _, n := range bench.Sizes(b) {
+	for _, n := range searchBenchSizes(b) {
 		st, records := benchSetup(b, n, defaultSeqBlockRecords)
 		queries := benchQueries(records, 64, 12)
-		for _, maxD := range []uint16{0, 4, 8, 16, 20, 31, 32, 40, 50, 64, 256} {
+		for _, maxD := range []uint8{16, 31, 32, 50} {
 			b.Run(fmt.Sprintf("n=%d/d=%d", n, maxD), func(b *testing.B) {
-				dst := make([]PDQMatch, 0, 256)
+				dst := make([]Result, 0, n)
 				b.ReportAllocs()
 				b.ResetTimer()
+				start := time.Now()
 				for i := 0; i < b.N; i++ {
-					dst = st.SearchPDQ(dst[:0], queries[i%len(queries)], maxD)
+					dst = st.SearchPDQ(dst[:0], &queries[i%len(queries)], maxD)
 				}
+				elapsed := time.Since(start)
+				b.StopTimer()
+				b.ReportMetric(float64(elapsed.Nanoseconds())/float64(int64(b.N)*int64(n)), "ns/hash")
 			})
 		}
 		st.Close()
@@ -113,45 +126,25 @@ func BenchmarkSearchPDQ(b *testing.B) {
 }
 
 func BenchmarkSearchPHash(b *testing.B) {
-	for _, n := range bench.Sizes(b) {
+	for _, n := range searchBenchSizes(b) {
 		st, records := benchSetup(b, n, defaultSeqBlockRecords)
 		rng := rand.New(rand.NewSource(7))
 		queries := make([]uint64, 64)
 		for i := range queries {
 			queries[i] = flipPHash(rng, records[(i*7919)%n].PHash, 8)
 		}
-		for _, maxD := range []int{0, 4, 8, 16, 32, 64} {
+		for _, maxD := range []uint8{8, 16, 32} {
 			b.Run(fmt.Sprintf("n=%d/d=%d", n, maxD), func(b *testing.B) {
-				dst := make([]PHashMatch, 0, 256)
+				dst := make([]Result, 0, n)
 				b.ReportAllocs()
 				b.ResetTimer()
+				start := time.Now()
 				for i := 0; i < b.N; i++ {
 					dst = st.SearchPHash(dst[:0], queries[i%len(queries)], maxD)
 				}
-			})
-		}
-		st.Close()
-	}
-}
-
-func BenchmarkSearchCombined(b *testing.B) {
-	for _, n := range bench.Sizes(b) {
-		st, records := benchSetup(b, n, defaultSeqBlockRecords)
-		rng := rand.New(rand.NewSource(17))
-		phashQueries := make([]uint64, 64)
-		pdqQueries := make([]PDQHash, 64)
-		for i := range phashQueries {
-			phashQueries[i] = flipPHash(rng, records[(i*7919)%n].PHash, 6)
-			pdqQueries[i] = flipPDQ(rng, records[(i*7919)%n].PDQ, 12)
-		}
-		for _, order := range []Order{PHashFirst, PDQFirst} {
-			b.Run(fmt.Sprintf("n=%d/order=%d", n, order), func(b *testing.B) {
-				dst := make([]CombinedMatch, 0, 256)
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					dst = st.SearchCombined(dst[:0], phashQueries[i%64], 8, pdqQueries[i%64], 16, order)
-				}
+				elapsed := time.Since(start)
+				b.StopTimer()
+				b.ReportMetric(float64(elapsed.Nanoseconds())/float64(int64(b.N)*int64(n)), "ns/hash")
 			})
 		}
 		st.Close()
@@ -193,11 +186,11 @@ func BenchmarkSeqBlockRecords(b *testing.B) {
 		st, records := benchSetup(b, n, seq)
 		queries := benchQueries(records, 64, 12)
 		b.Run(fmt.Sprintf("seq=%d", seq), func(b *testing.B) {
-			dst := make([]PDQMatch, 0, 256)
+			dst := make([]Result, 0, 256)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				dst = st.SearchPDQ(dst[:0], queries[i%len(queries)], 16)
+				dst = st.SearchPDQ(dst[:0], &queries[i%len(queries)], 16)
 			}
 		})
 		st.Close()
@@ -475,21 +468,21 @@ func BenchmarkSearchPDQBulkVsScalar(b *testing.B) {
 	st, records := benchSetup(b, 1_000_000, defaultSeqBlockRecords)
 	defer st.Close()
 	queries := benchQueries(records, 64, 12)
-	for _, maxD := range []uint16{0, 8, 16, 31, 32, 50, 256} {
+	for _, maxD := range []uint8{0, 8, 16, 31, 32, 50, 255} {
 		b.Run(fmt.Sprintf("scalar/d=%d", maxD), func(b *testing.B) {
-			dst := make([]PDQMatch, 0, 256)
+			dst := make([]Result, 0, len(records))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				dst = st.SearchPDQ(dst[:0], queries[i%len(queries)], maxD)
+				dst = st.SearchPDQ(dst[:0], &queries[i%len(queries)], maxD)
 			}
 		})
 		b.Run(fmt.Sprintf("bulk/d=%d", maxD), func(b *testing.B) {
-			dst := make([]PDQMatch, 0, 256)
+			dst := make([]Result, 0, len(records))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				dst = st.SearchPDQBulk(dst[:0], queries[i%len(queries)], maxD)
+				dst = st.SearchPDQBulk(dst[:0], &queries[i%len(queries)], maxD)
 			}
 		})
 	}
@@ -882,11 +875,11 @@ func BenchmarkConcurrentSearchUpdate(b *testing.B) {
 					}
 				}
 			}()
-			dst := make([]PDQMatch, 0, 64)
+			dst := make([]Result, 0, 64)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				dst = st.SearchPDQ(dst[:0], queries[i%len(queries)], 16)
+				dst = st.SearchPDQ(dst[:0], &queries[i%len(queries)], 16)
 			}
 			b.StopTimer()
 			close(stop)

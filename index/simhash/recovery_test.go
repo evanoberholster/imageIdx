@@ -716,7 +716,7 @@ func TestShardBoundaryConcurrentReaders(t *testing.T) {
 				default:
 				}
 				_ = st.SearchPHash(nil, records[0].PHash, 0)
-				_ = st.SearchPDQ(nil, records[0].PDQ, 0)
+				_ = st.SearchPDQ(nil, &records[0].PDQ, 0)
 				_, _ = st.Get(1)
 			}
 		}()
@@ -784,9 +784,8 @@ func TestZeroAllocationOperations(t *testing.T) {
 	if _, err := st.AppendBatch(records); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
-	phDst := make([]PHashMatch, 0, 8192)
-	pdDst := make([]PDQMatch, 0, 8192)
-	cbDst := make([]CombinedMatch, 0, 8192)
+	phDst := make([]Result, 0, 8192)
+	pdDst := make([]Result, 0, 8192)
 	batch := records[:64]
 	single := records[0]
 	updates := make([]Update, 64)
@@ -807,10 +806,8 @@ func TestZeroAllocationOperations(t *testing.T) {
 	check("Get", func() { _, _ = st.Get(1) })
 	check("Quality", func() { _, _ = st.Quality(1) })
 	check("SearchPHash", func() { phDst = st.SearchPHash(phDst[:0], single.PHash, 0) })
-	check("SearchPDQ", func() { pdDst = st.SearchPDQ(pdDst[:0], single.PDQ, 0) })
-	check("SearchCombined", func() {
-		cbDst = st.SearchCombined(cbDst[:0], single.PHash, 0, single.PDQ, 0, PHashFirst)
-	})
+	check("SearchPDQ", func() { pdDst = st.SearchPDQ(pdDst[:0], &single.PDQ, 0) })
+	check("SearchPDQBulk", func() { pdDst = st.SearchPDQBulk(pdDst[:0], &single.PDQ, 0) })
 }
 
 // TestUpsertBatchDuplicateThreeLastWins checks the documented last-wins rule.
@@ -844,6 +841,7 @@ func TestCloseRaceStress(t *testing.T) {
 		}
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
+		var zeroPDQ PDQHash
 		for r := 0; r < 4; r++ {
 			wg.Add(1)
 			go func() {
@@ -857,8 +855,7 @@ func TestCloseRaceStress(t *testing.T) {
 					_, _ = st.Get(1)
 					_, _ = st.Quality(1)
 					_ = st.SearchPHash(nil, 0x1234, 8)
-					_ = st.SearchPDQ(nil, PDQHash{}, 8)
-					_ = st.SearchCombined(nil, 0x1234, 8, PDQHash{}, 8, PHashFirst)
+					_ = st.SearchPDQ(nil, &zeroPDQ, 8)
 				}
 			}()
 		}

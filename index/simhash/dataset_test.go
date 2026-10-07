@@ -47,7 +47,9 @@ func flipPHash(rng *rand.Rand, h uint64, distance int) uint64 {
 	return bench.Hamming64(rng, h, distance)
 }
 
-func equalPHash(a, b []PHashMatch) bool {
+// equalResults reports whether two result slices are identical, including
+// ImageID, Distance, and order.
+func equalResults(a, b []Result) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -59,62 +61,30 @@ func equalPHash(a, b []PHashMatch) bool {
 	return true
 }
 
-func equalPDQ(a, b []PDQMatch) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func equalCombined(a, b []CombinedMatch) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func oraclePHash(records []Record, query uint64, maxDistance int) []PHashMatch {
-	out := make([]PHashMatch, 0)
+// oraclePHash is the brute-force reference for SearchPHash. The exact distance
+// is 0..64 and is compared before narrowing to uint8.
+func oraclePHash(records []Record, query uint64, maxDistance uint8) []Result {
+	out := make([]Result, 0)
 	for i := range records {
 		if d := DistancePHash(query, records[i].PHash); d <= maxDistance {
-			out = append(out, PHashMatch{ImageID: uint64(i + 1), Distance: d})
+			out = append(out, Result{ImageID: uint64(i + 1), Distance: d})
 		}
 	}
 	return out
 }
 
-func oraclePDQ(records []Record, query PDQHash, maxDistance uint16) []PDQMatch {
-	out := make([]PDQMatch, 0)
+// oraclePDQ is the brute-force reference for SearchPDQ. It computes the exact
+// distance as uint16 (0..256) and only emits records whose distance is at most
+// uint16(maxDistance); a pair at distance 256 is excluded rather than wrapping
+// to 0. This is the regression guard for the uint16 -> uint8 conversion.
+func oraclePDQ(records []Record, query PDQHash, maxDistance uint8) []Result {
+	out := make([]Result, 0)
 	for i := range records {
-		if d := DistancePDQ(&query, &records[i].PDQ); d <= maxDistance {
-			out = append(out, PDQMatch{ImageID: uint64(i + 1), Distance: d})
-		}
-	}
-	return out
-}
-
-func oracleCombined(records []Record, phashQuery uint64, maxPHash int, pdqQuery PDQHash, maxPDQ uint16) []CombinedMatch {
-	out := make([]CombinedMatch, 0)
-	for i := range records {
-		ph := DistancePHash(phashQuery, records[i].PHash)
-		if ph > maxPHash {
+		d := DistancePDQ(&query, &records[i].PDQ)
+		if d > uint16(maxDistance) {
 			continue
 		}
-		d := DistancePDQ(&pdqQuery, &records[i].PDQ)
-		if d > maxPDQ {
-			continue
-		}
-		out = append(out, CombinedMatch{ImageID: uint64(i + 1), PHashDistance: ph, PDQDistance: d})
+		out = append(out, Result{ImageID: uint64(i + 1), Distance: uint8(d)})
 	}
 	return out
 }
