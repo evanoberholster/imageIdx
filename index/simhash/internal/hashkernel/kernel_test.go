@@ -30,6 +30,37 @@ func TestPDQDistanceAgainstScalar(t *testing.T) {
 	}
 }
 
+// TestPDQDistanceLadder compares every implementation at the exact Hamming
+// distances used by the correctness suite.
+func TestPDQDistanceLadder(t *testing.T) {
+	var base [32]byte
+	for i := range base {
+		base[i] = byte(0xA5 ^ (i * 7))
+	}
+	rng := rand.New(rand.NewSource(7))
+	for _, d := range []int{0, 1, 2, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256} {
+		q := base
+		order := rng.Perm(256)
+		for _, bit := range order[:d] {
+			q[bit/8] ^= 1 << uint(bit%8)
+		}
+		if got, want := Current.PDQDistance(&q, &base), Scalar.PDQDistance(&q, &base); got != want || int(got) != d {
+			t.Fatalf("d=%d: Current=%d Scalar=%d", d, got, want)
+		}
+		// Threshold inclusion at d-1, d, d+1.
+		for _, limit := range []int{d - 1, d, d + 1} {
+			if limit < 0 {
+				continue
+			}
+			got := Current.PDQBlockMask(&q, base[:], 1, limit)
+			want := Scalar.PDQBlockMask(&q, base[:], 1, limit)
+			if got != want || (got&1 == 1) != (d <= limit) {
+				t.Fatalf("d=%d limit=%d: Current=%#x Scalar=%#x", d, limit, got, want)
+			}
+		}
+	}
+}
+
 func TestPDQBlockMaskAgainstScalar(t *testing.T) {
 	rng := rand.New(rand.NewSource(3))
 	limits := []int{0, 1, 4, 8, 16, 31, 32, 40, 64, 256}

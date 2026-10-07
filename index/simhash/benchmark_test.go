@@ -97,7 +97,7 @@ func BenchmarkSearchPDQ(b *testing.B) {
 	for _, n := range bench.Sizes(b) {
 		st, records := benchSetup(b, n, defaultSeqBlockRecords)
 		queries := benchQueries(records, 64, 12)
-		for _, maxD := range []uint16{0, 4, 8, 16, 31, 32, 40, 50} {
+		for _, maxD := range []uint16{0, 4, 8, 16, 20, 31, 32, 40, 50, 64, 256} {
 			b.Run(fmt.Sprintf("n=%d/d=%d", n, maxD), func(b *testing.B) {
 				dst := make([]PDQMatch, 0, 256)
 				b.ReportAllocs()

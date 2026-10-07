@@ -38,6 +38,24 @@ func BenchmarkPDQDistanceCurrent(b *testing.B) {
 	}
 }
 
+func BenchmarkPHashScalar(b *testing.B) {
+	rng := rand.New(rand.NewSource(5))
+	q := rng.Uint64()
+	hashes := make([]uint64, BlockRecords)
+	for i := range hashes {
+		hashes[i] = rng.Uint64()
+	}
+	var sink uint64
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sink = 0
+		for j := range hashes {
+			sink += uint64(Scalar.PHashDistance(q, hashes[j]))
+		}
+	}
+	_ = sink
+}
+
 func BenchmarkPDQBlockMaskScalar(b *testing.B) {
 	q, base := benchBlocks(3)
 	b.ReportAllocs()

@@ -150,20 +150,10 @@ func (st *Store) writeRecordsLocked(first uint64, recs []Record) {
 }
 
 // shardCommitted returns the number of valid records in shard sh up to lastID.
+// The shard geometry is validated at Open, so firstID and capacity cannot
+// overflow and committedInShard stays subtraction-based.
 func shardCommitted(sh *shard, lastID uint64) uint64 {
-	firstID := sh.firstPage << 16
-	capacity := sh.hashPageCount * slotsPerHashPage
-	if lastID >= firstID+capacity {
-		return capacity
-	}
-	low := firstID
-	if low < 1 {
-		low = 1
-	}
-	if lastID < low {
-		return 0
-	}
-	return lastID - low + 1
+	return committedInShard(sh.firstPage<<16, sh.hashPageCount*slotsPerHashPage, lastID)
 }
 
 // Upsert updates one existing record. It shares the batch implementation and

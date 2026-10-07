@@ -52,6 +52,36 @@ func TestValidateManifestShardCountBoundaries(t *testing.T) {
 	}
 }
 
+// TestCommittedInShardBoundaries checks the subtraction-based per-shard count,
+// including reserved ImageID 0 and MaxUint64 lastID.
+func TestCommittedInShardBoundaries(t *testing.T) {
+	C := uint64(4) * slotsPerHashPage // one shard, includes reserved ID 0
+	max := ^uint64(0)
+	cases := []struct {
+		firstID, capacity, lastID, want uint64
+	}{
+		{0, C, 0, 0},
+		{0, C, 1, 1},
+		{0, C, C - 1, C - 1},
+		{0, C, C, C - 1}, // ID C lives in the next shard
+		{0, C, C + 1, C - 1},
+		{0, C, max - 1, C - 1},
+		{0, C, max, C - 1},
+		{C, C, C - 1, 0},
+		{C, C, C, 1},
+		{C, C, 2*C - 1, C},
+		{C, C, 2 * C, C},
+		{C, C, max, C},
+		{0, 0, 5, 0},
+		{0, 1, 5, 0}, // capacity 1 is entirely the reserved slot
+	}
+	for _, c := range cases {
+		if got := committedInShard(c.firstID, c.capacity, c.lastID); got != c.want {
+			t.Fatalf("committedInShard(%d,%d,%d)=%d want %d", c.firstID, c.capacity, c.lastID, got, c.want)
+		}
+	}
+}
+
 // TestPersistenceFailureInjection fails AppendBatch at each durability stage and
 // verifies pre-commit failures roll back while post-commit failures keep the new
 // committed state.

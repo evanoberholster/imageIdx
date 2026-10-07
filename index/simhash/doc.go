@@ -126,7 +126,13 @@
 // wide SIMD load cannot provide the same guarantee against an in-place writer.
 // SearchPDQBulk uses the NEON block kernel on plain memory and is therefore only
 // safe on a quiescent store (no concurrent writer); it is intended for scans
-// after ingest or on a read-only replica. It is 1.6-2.5x faster than the scalar
-// scan. Never replace the concurrent scalar path with wide loads merely for
-// benchmark numbers.
+// after ingest or on a read-only replica. It is 1.5-2.2x faster than the scalar
+// scan at realistic thresholds. Never replace the concurrent scalar path with
+// wide loads merely for benchmark numbers.
+//
+// There is no SIMD pHash kernel: one XOR plus hardware POPCNT per record is
+// already ~0.8 ns/hash. An AVX2 PDQ kernel exists for amd64 with runtime CPU
+// detection but is not enabled in the default dispatch until an amd64 benchmark
+// shows it beats four scalar XOR+POPCNT operations end to end. AVX-512 is out
+// of scope.
 package simhash

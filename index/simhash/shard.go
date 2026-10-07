@@ -110,6 +110,30 @@ func decodeShardMeta(src []byte) (shardMeta, bool) {
 	}, true
 }
 
+// committedInShard returns the number of valid records in a shard covering
+// slots [firstID, firstID+capacity) up to and including lastID. ImageID 0 is
+// reserved and never counted. It uses subtraction-based comparisons so it never
+// overflows for lastID up to MaxUint64.
+func committedInShard(firstID, capacity, lastID uint64) uint64 {
+	offset := uint64(0)
+	if firstID == 0 {
+		offset = 1 // ImageID 0 is reserved.
+	}
+	if capacity <= offset {
+		return 0
+	}
+	avail := capacity - offset
+	low := firstID + offset
+	if lastID < low {
+		return 0
+	}
+	rel := lastID - low
+	if rel >= avail {
+		return avail
+	}
+	return rel + 1
+}
+
 // writeMeta publishes the shard metadata into the inactive superblock slot and
 // switches slots. The caller owns durability (Sync).
 func (s *shard) writeMeta() error {

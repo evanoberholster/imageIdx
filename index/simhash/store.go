@@ -257,25 +257,11 @@ func Open(dir string, config Config) (*Store, error) {
 }
 
 // requiredShardCommitted is the number of committed records shard index must
-// contain given the manifest high-water mark.
+// contain given the manifest high-water mark. perShard and the shard count are
+// validated at Open so index*perShard cannot overflow.
 func (st *Store) requiredShardCommitted(index uint64) uint64 {
-	firstID := index * st.pagesPerShard * slotsPerHashPage
-	if firstID >= st.committed {
-		return 0
-	}
-	capacity := st.pagesPerShard * slotsPerHashPage
-	lastID := firstID + capacity - 1
-	if lastID > st.committed {
-		lastID = st.committed
-	}
-	low := firstID
-	if low < 1 {
-		low = 1
-	}
-	if lastID < low {
-		return 0
-	}
-	return lastID - low + 1
+	perShard := st.pagesPerShard * slotsPerHashPage
+	return committedInShard(index*perShard, perShard, st.committed)
 }
 
 // openShard maps an existing shard file and selects the newest superblock whose

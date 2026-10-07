@@ -359,30 +359,52 @@ dispatch point:
 
 Kernel microbenchmarks (arm64):
 
-| kernel | ns/op | speedup |
-|---|---:|---:|
-| PDQ distance, scalar | 1.38 | — |
-| PDQ distance, NEON | 1.58 | 0.9× |
-| PDQ 64-record block mask, scalar | 70.2 | — |
-| PDQ 64-record block mask, NEON | 37.4 | **1.9×** |
+| kernel | ns/op | per hash | speedup | allocs/op |
+|---|---:|---:|---:|---:|
+| PDQ distance, scalar | 1.39 | 1.39 | — | 0 |
+| PDQ distance, NEON | 1.57 | 1.57 | 0.9× | 0 |
+| PDQ 64-record block mask, scalar | 69.4 | 1.08 | — | 0 |
+| PDQ 64-record block mask, NEON | 35.8 | 0.56 | **1.94×** | 0 |
+| pHash, scalar (64 hashes) | 53.3 | 0.83 | — | 0 |
 
-The single-pair kernel is not where SIMD wins (one vector operation vs an
-inlined popcount); the block kernel is.
+The single-pair PDQ kernel is not where SIMD wins (one vector op vs an inlined
+popcount); the block kernel is. **pHash has no SIMD kernel**: one XOR + one
+hardware POPCNT per record at 0.83 ns/hash already beats any vectorized
+alternative, so it is intentionally scalar.
 
 Store-level `SearchPDQBulk` (NEON block kernel over the canonical PDQ column)
 versus the concurrent-safe scalar `SearchPDQ`, 1M records, 0 allocs/op:
 
-| threshold | scalar | bulk |
-|---:|---:|---:|
-| 0 | 1.00 ms | 0.61 ms (1.6×) |
-| 16 | 1.00 ms | 0.63 ms (1.6×) |
-| 31 | 1.61 ms | 0.63 ms (2.5×) |
+| threshold | scalar | bulk | speedup |
+|---:|---:|---:|---:|
+| 0 | 976 µs | 587 µs | 1.66× |
+| 8 | 965 µs | 642 µs | 1.50× |
+| 16 | 968 µs | 650 µs | 1.49× |
+| 31 | 1463 µs | 652 µs | 2.24× |
+| 32 | 1454 µs | 656 µs | 2.22× |
+| 50 | 1447 µs | 708 µs | 2.04× |
+| 256 | 2945 µs | 3254 µs | 0.90× |
 
-`SearchPDQBulk` reads plain memory and is documented as requiring a quiescent
-store (no concurrent writer); `SearchPDQ` remains the concurrent-safe scalar
-path. The tests compare the NEON kernel against the scalar reference for random
-pairs and every block-count boundary, and `SearchPDQBulk` against `SearchPDQ`
-and the oracle.
+At d = 256 essentially every record matches, so the bulk path's second exact
+pass over matched records outweighs the kernel win; that is far above any real
+similarity threshold and the API remains correct. `SearchPDQBulk` reads plain
+memory and is documented as requiring a quiescent store (no concurrent writer);
+`SearchPDQ` remains the concurrent-safe scalar path.
+
+**AVX2 (amd64).** `internal/hashkernel/kernel_amd64.{go,s}` implements Option B
+(AVX2 vector XOR of the 32-byte record + scalar POPCNT) with runtime
+`cpu.X86.HasAVX2` detection. It assembles and vets under `GOARCH=amd64` and has a
+differential test against the scalar reference, but it is **not enabled in the
+default dispatch**: the arm64 dev host cannot benchmark it, and the decision rule
+requires AVX2 to beat four scalar XOR+POPCNT operations end-to-end before
+selection. An amd64 host should run `go test -bench=AVX2 ./index/simhash/internal/hashkernel/`
+and, only if it wins, wire it into the compile-time entry points. AVX-512 is
+explicitly out of scope.
+
+Correctness: the NEON kernel is compared to the scalar reference for random
+pairs and every block-count boundary, and `SearchPDQBulk` against `SearchPDQ` and
+the oracle, including page/shard boundaries. The AVX2 kernel has the same
+differential test on amd64.
 
 ## Correctness / race
 
