@@ -6,8 +6,8 @@ vector search, and one query planner that combines them.
 Every indexed collection is a `common.Namespace` — a unique number and name
 registered in a `common.Schema`. Packages: `common` (shared types),
 `bitmapidx` (enum/bool/text/continuous/geo namespaces), `timeidx` (timestamp
-ranges), `vectoridx` (HNSW ANN), `store` (Pebble key-value collections), and
-`search` (combined queries).
+ranges), `vectoridx` (HNSW ANN), `simhash` (exact pHash64/PDQ256 similarity),
+`store` (Pebble key-value collections), and `search` (combined queries).
 
 ## Open an index
 
@@ -77,11 +77,31 @@ defer vectors.Close()
 Reopen with `vectoridx.OpenStore(path, durability)`; use
 `vectoridx.NewMemory(config)` for an in-memory index.
 
+### Similarity index (pHash64 + PDQ256)
+
+```go
+hashes, err := simhash.Open(
+	"./data/simhash",
+	simhash.Config{
+		MaxShardBytes:   4 << 30,
+		SeqBlockRecords: 1024,
+		Durability:      common.DurabilityOS,
+	},
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer hashes.Close()
+```
+
+Reopen with `simhash.Open(path, config)`. `Close` does not checkpoint; call
+`hashes.Checkpoint()` to make pending writes durable.
+
 ### Key-value store
 
 `store` is a Pebble-backed collection for values that are not bitmap indexes,
-timestamps, or vectors. The schema is persisted on creation and verified on
-every open.
+timestamps, vectors, or similarity hashes. The schema is persisted on creation
+and verified on every open.
 
 ```go
 kv, err := store.Open("./data/kv",
@@ -169,6 +189,25 @@ if err := vectors.Delete(100); err != nil {
 }
 ```
 
+### Similarity hashes
+
+```go
+// AppendBatch assigns dense IDs in order and returns the first one.
+first, err := hashes.AppendBatch([]simhash.Record{
+	{PHash: phash, PDQ: pdq, Quality: quality},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+// UpsertBatch overwrites existing records in place via the batch redo WAL.
+if err := hashes.UpsertBatch([]simhash.Update{
+	{ImageID: first, Record: updated},
+}); err != nil {
+	log.Fatal(err)
+}
+```
+
 ### Key-value store
 
 ```go
@@ -230,6 +269,21 @@ for _, r := range results {
 	log.Println(r.ValueID, r.Score)
 }
 ```
+
+### Similarity (pHash / PDQ)
+
+```go
+phMatches := hashes.SearchPHash(nil, phash, 8) // pHash Hamming distance <= 8
+pdqMatches := hashes.SearchPDQ(nil, &pdq, 31)  // PDQ Hamming distance <= 31
+for _, m := range pdqMatches {
+	log.Println(m.ImageID, m.Distance)
+}
+```
+
+`simhash.Result` carries the exact Hamming `Distance` as `uint8`; results are in
+ascending `ImageID` order. The PDQ search radius is clamped to
+`simhash.MaxPDQSearchDistance` (128). `hashes.SearchPDQBulk(nil, &pdq, 31)` is
+the same query through the SIMD kernel and requires a quiescent store.
 
 ### Key-value store
 
