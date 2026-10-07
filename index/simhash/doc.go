@@ -2,6 +2,9 @@
 // the canonical image-hash tuple: a 64-bit pHash, a 256-bit PDQ hash, and a PDQ
 // quality byte.
 //
+// The full design is documented in AGENTS/SimHash.md; usage and measured results
+// are in index/simhash/README.md.
+//
 // # Addressing
 //
 // There is no stored ImageID and no per-record offset table. ImageIDs are dense,
@@ -11,8 +14,8 @@
 //	slot := uint16(imageID & 0xffff)
 //	hashPage := imageID >> 16
 //
-// A hash page (the brief calls it a logical page) covers exactly 65,536
-// ImageIDs; the ImageID is recovered by hashPage<<16|slot.
+// A hash page covers exactly 65,536 ImageIDs; the ImageID is recovered by
+// hashPage<<16|slot.
 //
 // # Columnar layout
 //
@@ -72,9 +75,11 @@
 //	advance and publish the generation once
 //
 // For 64 updates that is one WAL transaction and one generation step, not 64.
-// Replay is idempotent and validates the generation chain from the manifest
-// generation, rejecting a gap. Duplicate ImageIDs within a batch are allowed and
-// the last update wins.
+// Replay is idempotent and validates a single-step generation chain. A forward
+// gap from uncheckpointed appends is tolerated, and an update whose ImageID is
+// beyond the manifest high-water is dropped (its append was lost) rather than
+// treated as corruption. Duplicate ImageIDs within a batch are allowed and the
+// last update wins.
 //
 // # Durability
 //
