@@ -70,8 +70,6 @@ func bitmapKindCode(kind common.NamespaceKind) byte {
 		return 3
 	case common.KindBitmapContinuous:
 		return 4
-	case common.KindBitmapGeo:
-		return 5
 	default:
 		return 0
 	}
@@ -87,8 +85,6 @@ func bitmapKindFromCode(code byte) common.NamespaceKind {
 		return common.KindBitmapString
 	case 4:
 		return common.KindBitmapContinuous
-	case 5:
-		return common.KindBitmapGeo
 	default:
 		return 0
 	}
@@ -102,8 +98,9 @@ func appendNamespace(out []byte, namespace NamespaceSpec) []byte {
 	out = binary.LittleEndian.AppendUint16(out, namespace.Quant.Version)
 	out = binary.LittleEndian.AppendUint64(out, uint64(namespace.Quant.Scale))
 	out = binary.LittleEndian.AppendUint64(out, uint64(namespace.Quant.Offset))
-	out = binary.LittleEndian.AppendUint16(out, namespace.Geo.Version)
-	out = append(out, namespace.Geo.Level, 0)
+	// Four reserved bytes replace the removed geo codec slot so the persisted
+	// registry layout is unchanged.
+	out = append(out, 0, 0, 0, 0)
 	out = appendCodec(out, namespace.Normalizer)
 	out = appendCodec(out, namespace.Analyzer)
 	return out
@@ -134,10 +131,7 @@ func decodeNamespace(data []byte, offset int) (NamespaceSpec, int, error) {
 			Scale:   int64(binary.LittleEndian.Uint64(data[offset+12 : offset+20])),
 			Offset:  int64(binary.LittleEndian.Uint64(data[offset+20 : offset+28])),
 		},
-		Geo: GeoCodec{
-			Version: binary.LittleEndian.Uint16(data[offset+28 : offset+30]),
-			Level:   data[offset+30],
-		},
+		// Bytes offset+28..31 are the former geo codec slot; reserved now.
 	}
 	normalizer, next, err := decodeCodec(data, offset+32)
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/search"
@@ -40,7 +41,7 @@ type demoService struct {
 	favorites    *bitmapidx.Index
 	namespaceDir string
 	times        *timeidx.Index
-	geo          *bitmapidx.Index
+	geo          *geoidx.Index
 	canonical    map[common.ImageID]uint64
 	demoCell     uint64
 }
@@ -129,7 +130,6 @@ func newDemoService() (*demoService, error) {
 	}
 	namespaces, err := bitmapidx.NewStore(namespaceDir, []bitmapidx.NamespaceSpec{
 		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
-		{Namespace: common.NamespaceLocation, Kind: common.KindBitmapGeo, Geo: bitmapidx.GeoCodec{Version: 1}},
 	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		_ = os.RemoveAll(namespaceDir)
@@ -162,11 +162,11 @@ func newDemoService() (*demoService, error) {
 		_ = os.RemoveAll(namespaceDir)
 		return nil, err
 	}
-	geo, ok := namespaces.Lookup(common.NamespaceLocation)
-	if !ok {
+	geo, err := geoidx.NewMemory(geoidx.Config{Namespace: common.NamespaceLocation})
+	if err != nil {
 		_ = namespaces.Close()
 		_ = os.RemoveAll(namespaceDir)
-		return nil, bitmapidx.ErrInvalidNamespace
+		return nil, err
 	}
 	for _, entry := range []struct {
 		id  common.ImageID
@@ -176,29 +176,33 @@ func newDemoService() (*demoService, error) {
 		{100, 37.7749, -122.4194}, {200, 37.7749, -122.4194},
 		{300, 34.0522, -118.2437}, {400, 40.7128, -74.0060},
 	} {
-		key, err := bitmapidx.KeyFromLatLng(entry.lat, entry.lng)
+		key, err := geoidx.KeyFromLatLng(entry.lat, entry.lng)
 		if err != nil {
+			_ = geo.Close()
 			_ = namespaces.Close()
 			_ = os.RemoveAll(namespaceDir)
 			return nil, err
 		}
-		geoBatch := geo.NewBatch()
-		if err := geoBatch.Move(bitmapidx.Move{ImageID: entry.id, To: int64(key)}); err != nil {
+		if err := geo.Insert(key, entry.id); err != nil {
+			_ = geo.Close()
 			_ = namespaces.Close()
 			_ = os.RemoveAll(namespaceDir)
 			return nil, err
 		}
-		if err := geoBatch.Apply(); err != nil {
-			_ = namespaces.Close()
-			_ = os.RemoveAll(namespaceDir)
-			return nil, err
-		}
-		geoBatch.Close()
-		if err := geo.Barrier(); err != nil {
-			_ = namespaces.Close()
-			_ = os.RemoveAll(namespaceDir)
-			return nil, err
-		}
+	}
+	if err := geo.Compact(); err != nil {
+		_ = geo.Close()
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
+		return nil, err
+	}
+
+	demoCell, err := geoidx.CellIDFromLatLng(37.7749, -122.4194)
+	if err != nil {
+		_ = geo.Close()
+		_ = namespaces.Close()
+		_ = os.RemoveAll(namespaceDir)
+		return nil, err
 	}
 
 	canonical := map[common.ImageID]uint64{
@@ -225,7 +229,7 @@ func newDemoService() (*demoService, error) {
 
 	return &demoService{
 		namespaces: namespaces, favorites: favorites, namespaceDir: namespaceDir, times: times, geo: geo,
-		canonical: canonical, demoCell: bitmapidx.CellIDFromLatLng(37.7749, -122.4194),
+		canonical: canonical, demoCell: demoCell,
 	}, nil
 }
 

@@ -134,7 +134,7 @@ func TestNamespacePersistentCollisions(t *testing.T) {
 }
 
 func TestPersistentNamespacesAllKinds(t *testing.T) {
-	namespaces := []NamespaceSpec{enumNamespace(100), boolNamespace(101), textNamespace(102), continuousNamespace(103), geoNamespaceFor(104)}
+	namespaces := []NamespaceSpec{enumNamespace(100), boolNamespace(101), textNamespace(102), continuousNamespace(103)}
 	for _, checkpoint := range []bool{false, true} {
 		t.Run(fmt.Sprint(checkpoint), func(t *testing.T) {
 			dir := t.TempDir()
@@ -146,7 +146,6 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 			flags, _ := s.Lookup(101)
 			text, _ := s.Lookup(102)
 			numbers, _ := s.Lookup(103)
-			geo, _ := s.Lookup(104)
 			for id := common.ImageID(1); id <= 6; id++ {
 				commit(t, tags, func(bt *Batch) error {
 					return bt.Add(Entry{ImageID: id, Value: EnumStringValue("tag")})
@@ -172,8 +171,6 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 				}
 				return bt.Add(Entry{ImageID: 1, Value: IntValue(0)})
 			})
-			cell := sfKey(t)
-			commit(t, geo, func(bt *Batch) error { return bt.Move(Move{ImageID: 1, To: int64(cell)}) })
 			if checkpoint {
 				if err := s.Checkpoint(); err != nil {
 					t.Fatal(err)
@@ -191,7 +188,6 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 			flags, _ = s.Lookup(101)
 			text, _ = s.Lookup(102)
 			numbers, _ = s.Lookup(103)
-			geo, _ = s.Lookup(104)
 			if got := appendIDs(t, tags, EnumStringValue("tag")); len(got) != 6 {
 				t.Fatal(got)
 			}
@@ -208,9 +204,6 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 				t.Fatal(got, err)
 			}
 			if got, err := numbers.Range(AtMost(0)); err != nil || !slices.Equal(got.AppendTo(nil), []common.ImageID{1}) {
-				t.Fatal(got, err)
-			}
-			if got, err := geo.GeoRanges([]GeoRange{{Start: cell, End: cell}}); err != nil || !got.Contains(1) {
 				t.Fatal(got, err)
 			}
 			query, err := tags.Compile(EnumStringValue("tag"))

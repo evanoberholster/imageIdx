@@ -5,20 +5,20 @@ vector search, and one query planner that combines them.
 
 Every indexed collection is a `common.Namespace` — a unique number and name
 registered in a `common.Schema`. Packages: `common` (shared types),
-`bitmapidx` (enum/bool/text/continuous/geo namespaces), `timeidx` (timestamp
+`bitmapidx` (enum/bool/text/continuous namespaces), `timeidx` (timestamp
 ranges), `vectoridx` (HNSW ANN), `simhash` (exact pHash64/PDQ256 similarity),
-`store` (Pebble key-value collections), and `search` (combined queries).
+`geoidx` (exact S2 geographic search), `store` (Pebble key-value collections),
+and `search` (combined queries).
 
 ## Open an index
 
-### Namespace index (enum, bool, text, continuous, geo)
+### Namespace index (enum, bool, text, continuous)
 
 ```go
 store, err := bitmapidx.NewStore(
 	"./data/namespaces",
 	[]bitmapidx.NamespaceSpec{
 		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
-		{Namespace: common.NamespaceLocation, Kind: common.KindBitmapGeo, Geo: bitmapidx.GeoCodec{Version: 1}},
 		{Namespace: common.Namespace(101), Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}},
 		{Namespace: common.Namespace(102), Kind: common.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion}},
 	},
@@ -31,7 +31,6 @@ if err != nil {
 defer store.Close()
 
 tags, _ := store.Lookup(common.NamespaceTag)
-geo, _ := store.Lookup(common.NamespaceLocation)
 focals, _ := store.Lookup(common.Namespace(101))
 titles, _ := store.Lookup(common.Namespace(102))
 ```
@@ -97,11 +96,28 @@ defer hashes.Close()
 Reopen with `simhash.Open(path, config)`. `Close` does not checkpoint; call
 `hashes.Checkpoint()` to make pending writes durable.
 
+### Geographic index (S2)
+
+```go
+places, err := geoidx.New("./data/geo", geoidx.Config{
+	Namespace: common.NamespaceLocation,
+})
+if err != nil {
+	log.Fatal(err)
+}
+defer places.Close()
+```
+
+Reopen with `geoidx.Open(dir, config)`; use `geoidx.NewMemory(config)` for an
+in-memory index. Geography is stored as fixed level-19 S2 keys (about 20 m
+cells); coordinates become keys with `geoidx.KeyFromLatLng`. `Close` does not
+checkpoint; call `places.Checkpoint()` to persist pending mutations.
+
 ### Key-value store
 
 `store` is a Pebble-backed collection for values that are not bitmap indexes,
-timestamps, vectors, or similarity hashes. The schema is persisted on creation
-and verified on every open.
+timestamps, vectors, similarity hashes, or geographic locations. The schema is
+persisted on creation and verified on every open.
 
 ```go
 kv, err := store.Open("./data/kv",
@@ -139,25 +155,36 @@ if err := tags.Barrier(); err != nil {
 ```
 
 Other value shapes use the same batch: `batch.Remove(...)` for removals,
-`batch.Move(bitmapidx.Move{ImageID, From, To})` for
-continuous and geo values, and `batch.ReplaceText(...)` for text.
-For a continuous value of zero, use `batch.Add` or `batch.Remove`;
-`Move` uses zero to mean no value.
+`batch.Move(bitmapidx.Move{ImageID, From, To})` for continuous values, and
+`batch.ReplaceText(...)` for text. For a continuous value of zero, use
+`batch.Add` or `batch.Remove`; `Move` uses zero to mean no value.
 
 ```go
-key, err := bitmapidx.KeyFromLatLng(37.7749, -122.4194)
-if err != nil {
-	log.Fatal(err)
-}
-batch := geo.NewBatch()
-if err := batch.Move(bitmapidx.Move{ImageID: 300, To: int64(key)}); err != nil { // insert
+batch := focals.NewBatch()
+if err := batch.Move(bitmapidx.Move{ImageID: 300, From: 24, To: 50}); err != nil {
 	log.Fatal(err)
 }
 if err := batch.Apply(); err != nil {
 	log.Fatal(err)
 }
 batch.Close()
-if err := geo.Barrier(); err != nil {
+if err := focals.Barrier(); err != nil {
+	log.Fatal(err)
+}
+```
+
+### Geographic locations
+
+Each `ImageID` has at most one location, stored as a fixed-level S2 key. A move
+is `Delete(oldKey, id)` then `Insert(newKey, id)`; the caller supplies `oldKey`
+from `imagemetadata`, so the index keeps no reverse lookup.
+
+```go
+key, err := geoidx.KeyFromLatLng(37.7749, -122.4194)
+if err != nil {
+	log.Fatal(err)
+}
+if err := places.Insert(key, 300); err != nil {
 	log.Fatal(err)
 }
 ```
@@ -236,13 +263,11 @@ travelers, err := tags.ValueIDs(nil, bitmapidx.EnumStringValue("Travel")) // one
 count, err := tags.CountValues(bitmapidx.EnumStringValue("Trekking"))
 ```
 
-Continuous and geo namespaces use range queries:
+Continuous namespaces use range queries:
 
 ```go
 match, err := focals.Range(bitmapidx.Between(24, 70)) // int64 grid bounds
-ranges, err := bitmapidx.RangesFromCellIDs(nil, cellIDs)
-geoMatch, err := geo.GeoRanges(ranges)
-ids = geoMatch.AppendTo(nil)
+ids = match.AppendTo(nil)
 ```
 
 Text queries analyze the query and AND its tokens:
@@ -269,6 +294,20 @@ for _, r := range results {
 	log.Println(r.ValueID, r.Score)
 }
 ```
+
+### Geographic (S2)
+
+```go
+ids, err := places.SearchRadius(nil, 37.7749, -122.4194, 2000) // within 2 km
+ids = places.SearchRect(nil, rect)                            // bounding box
+ids = places.SearchPolygon(nil, polygon)                      // polygon
+near, err := places.Nearest(nil, 37.7749, -122.4194, 10)       // []geoidx.Result
+```
+
+For precomputed covers, `places.SearchRanges(dst, ranges)` scans normalized
+`geoidx.Range` values. Results are in ascending `ImageID` order.
+`geoidx.Result.Distance` is the approximate great-circle distance in meters from
+the query to the matched cell center; images in the same S2 cell are tied.
 
 ### Similarity (pHash / PDQ)
 
@@ -308,7 +347,7 @@ Clauses are combined with AND semantics and executed in cardinality order:
 plan, err := search.Compile(
 	search.AllValues(tags, bitmapidx.EnumStringValue("Trekking")),
 	search.During(times, start, end),
-	search.InCells(geo, cellIDs...),
+	search.InCells(places, cellIDs...),
 )
 if err != nil {
 	log.Fatal(err)

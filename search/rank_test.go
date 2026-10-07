@@ -8,6 +8,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
 
@@ -64,16 +65,12 @@ func TestPlanRankAndFilter(t *testing.T) {
 	}
 
 	// Geo ranking and filtering.
-	geo, err := bitmapidx.NewGeoNamespace(common.NamespaceLocation, []bitmapidx.GeoEntry{
-		{ImageID: 1, Latitude: 37.7749, Longitude: -122.4194},
-		{ImageID: 2, Latitude: 37.8044, Longitude: -122.2712},
-		{ImageID: 3, Latitude: 34.0522, Longitude: -118.2437},
-		{ImageID: 4, Latitude: 40.7128, Longitude: -74.0060},
-	}, bitmapidx.NamespaceConfig{})
-	if err != nil {
-		t.Fatalf("NewGeoNamespace: %v", err)
-	}
-	t.Cleanup(func() { _ = geo.Close() })
+	geo := newTestGeoNamespace(t, common.NamespaceLocation, []geoEntry{
+		{id: 1, lat: 37.7749, lng: -122.4194},
+		{id: 2, lat: 37.8044, lng: -122.2712},
+		{id: 3, lat: 34.0522, lng: -118.2437},
+		{id: 4, lat: 40.7128, lng: -74.0060},
+	})
 	coordinates := map[ImageID][2]float64{
 		1: {37.7749, -122.4194},
 		2: {37.8044, -122.2712},
@@ -101,7 +98,10 @@ func TestPlanRankAndFilter(t *testing.T) {
 		t.Fatalf("RankGeo k=0 = %+v, want unchanged", got)
 	}
 
-	cell := bitmapidx.CellIDFromLatLng(37.7749, -122.4194)
+	cell, err := geoidx.CellIDFromLatLng(37.7749, -122.4194)
+	if err != nil {
+		t.Fatal(err)
+	}
 	filtered, err := FilterGeo(nil, []ImageID{1, 2, 3, 4}, geo, cell)
 	if err != nil {
 		t.Fatalf("FilterGeo: %v", err)
@@ -109,8 +109,8 @@ func TestPlanRankAndFilter(t *testing.T) {
 	if !slices.Equal(filtered, []ImageID{1}) {
 		t.Fatalf("FilterGeo = %v, want [1]", filtered)
 	}
-	if _, err := FilterGeo(nil, []ImageID{1}, namespaceIndex, cell); err == nil {
-		t.Fatal("FilterGeo on non-geo namespace succeeded")
+	if got, err := FilterGeo(nil, []ImageID{1}, nil, cell); err != nil || len(got) != 0 {
+		t.Fatalf("FilterGeo nil index = %v, %v", got, err)
 	}
 	if got, err := FilterGeo(nil, []ImageID{1}, geo); err != nil || len(got) != 0 {
 		t.Fatalf("FilterGeo empty cells = %v, %v", got, err)

@@ -10,6 +10,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
 
@@ -41,22 +42,25 @@ func TestBulkExecutionReportsStageErrors(t *testing.T) {
 
 func TestPlanGeoEstimateIsOnlyAHint(t *testing.T) {
 	tags := benchmarkEnumNamespace(t, 100, "x", nil)
-	geo, err := bitmapidx.NewGeoNamespace(101, nil, bitmapidx.NamespaceConfig{})
+	geo, err := geoidx.NewMemory(geoidx.Config{Namespace: 101})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer geo.Close()
-	key, _ := bitmapidx.KeyFromLatLng(37, -122)
-	p, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("x")), InCells(geo, bitmapidx.DecodeS2Key(key)))
+	key, _ := geoidx.KeyFromLatLng(37, -122)
+	p, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("x")), InCells(geo, geoidx.DecodeKey(key)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	commitBitmap(t, tags, func(b *bitmapidx.Batch) error {
 		return b.Add(bitmapidx.Entry{ImageID: 1, Value: bitmapidx.EnumStringValue("x")})
 	})
-	commitBitmap(t, geo, func(b *bitmapidx.Batch) error {
-		return b.Move(bitmapidx.Move{ImageID: 1, To: int64(key)})
-	})
+	if err := geo.Insert(key, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := geo.Compact(); err != nil {
+		t.Fatal(err)
+	}
 	if got, err := p.AppendIDs(context.Background(), nil, nil); err != nil || !slices.Equal(got, []ImageID{1}) {
 		t.Fatal(got)
 	}
@@ -266,8 +270,8 @@ func TestExecutorRetentionRefreshAndValidation(t *testing.T) {
 	if !fresh.Stages()[0].CanProbe || !fresh.Stages()[0].OrderedSource {
 		t.Fatal(fresh.Stages())
 	}
-	if _, err := Compile(InCells(a, 1)); err == nil {
-		t.Fatal("invalid geo accepted")
+	if _, err := Compile(InCells(newTestGeoNamespace(t, 113, nil), 0)); err == nil {
+		t.Fatal("invalid geo cell accepted")
 	}
 	if _, err := Compile(AllValues(a)); err == nil {
 		t.Fatal("empty values accepted")

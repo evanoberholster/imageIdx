@@ -149,18 +149,6 @@ func (i *Index) keyForValue(namespace NamespaceSpec, value Value) (NamespaceKey,
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		return continuousKey(namespace.Namespace, value.Int), nil, nil
-	case common.KindBitmapGeo:
-		if value.Kind != common.KindBitmapGeo {
-			return NamespaceKey{}, nil, ErrValueKind
-		}
-		if value.Int < 0 {
-			return NamespaceKey{}, nil, ErrInvalidS2Cell
-		}
-		key := uint64(value.Int)
-		if _, err := CellIDFromKey(key); err != nil {
-			return NamespaceKey{}, nil, err
-		}
-		return NamespaceKey{Hash: key, Namespace: namespace.Namespace}, nil, nil
 	default:
 		return NamespaceKey{}, nil, ErrInvalidNamespace
 	}
@@ -220,11 +208,6 @@ func (i *Index) resolveBatch(current *namespaceView, changes []stagedChange, rep
 	resolved, err = i.resolveChanges(current, changes)
 	if err != nil {
 		return nil, nil, 0, err
-	}
-	if !replay {
-		if err := validateGeoChanges(current, resolved); err != nil {
-			return nil, nil, 0, err
-		}
 	}
 	if i.owner != nil {
 		// Bound and freeze the canonical frame before allocating replacement

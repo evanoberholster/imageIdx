@@ -8,6 +8,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 
 	"github.com/evanoberholster/imageIdx/index/timeidx"
@@ -71,8 +72,8 @@ type stage struct {
 	tsEnd   uint64
 	tsExact timeidx.ExactTimestampFunc
 
-	geoIndex  *bitmapidx.Index
-	geoRanges []bitmapidx.GeoRange
+	geoIndex  *geoidx.Index
+	geoRanges []geoidx.Range
 
 	aclQueries []bitmapidx.Query
 
@@ -97,7 +98,7 @@ func (s *stage) metadata() Stage {
 			meta.Predicate = "numeric-range"
 		}
 	case StageGeo:
-		meta.Namespace = s.geoIndex.Spec().Namespace
+		meta.Namespace = s.geoIndex.Namespace()
 		meta.Predicate = "cell-union"
 	case StageTimestamp:
 		meta.Predicate = "timestamp-range"
@@ -112,10 +113,9 @@ func (s *stage) metadata() Stage {
 
 // canFilter reports whether filter can verify candidates without collecting.
 // Namespace stages always filter via their typed namespace query. Timestamp stages filter
-// only with an exact canonical lookup. Geo stages filter by verifying
-// candidates against covered cells; filter itself falls back to
-// collect+intersect when the covered population is small relative to the
-// candidate set.
+// only with an exact canonical lookup. Geo stages cannot verify a single
+// candidate because geoidx keeps no ImageID -> key reverse index, so they are
+// always collected as an ordered source and intersected.
 func (s *stage) canFilter() bool {
 	switch s.kind {
 	case StageNamespace:
@@ -123,7 +123,7 @@ func (s *stage) canFilter() bool {
 	case StageTimestamp:
 		return s.tsExact != nil
 	case StageGeo:
-		return true
+		return false
 	case StageACL:
 		return true
 	case StageHash:
@@ -156,11 +156,7 @@ func (s *stage) collect(dst []ImageID) ([]ImageID, error) {
 		}
 		return s.tsIndex.Search(dst, s.tsStart, s.tsEnd), nil
 	case StageGeo:
-		match, err := s.geoIndex.GeoRanges(s.geoRanges)
-		if err != nil {
-			return dst, err
-		}
-		return match.AppendTo(dst), nil
+		return s.geoIndex.SearchRanges(dst, s.geoRanges), nil
 	case StageACL:
 		match, err := s.aclBitmap()
 		if err != nil {
@@ -195,7 +191,8 @@ func (s *stage) filter(dst, candidates, scratch []ImageID, ws *Workspace) ([]Ima
 		}
 		return dst, nil
 	case StageGeo:
-		return geoFilter(dst, candidates, scratch, ws, s)
+		// Geo is never a probe stage (canFilter is false); handled by collect.
+		return dst, ErrInvalidClause
 	case StageACL:
 		return s.filterACL(dst, candidates, ws)
 	case StageHash:
@@ -210,38 +207,6 @@ func (s *stage) filter(dst, candidates, scratch []ImageID, ws *Workspace) ([]Ima
 	default:
 		return dst, ErrInvalidClause
 	}
-}
-
-// geoFilterProbeBound bounds the verify-vs-collect decision for geo stages.
-// Verifying costs about one cursor probe per (cell, candidate) pair while
-// collecting costs a materialize plus sort per covered ID. Dense level-16
-// cell measurements put the crossover near probes <= 4*population.
-const geoFilterProbeBound = 4
-
-// geoFilter restricts candidates to the stage's ranges. Candidates must be
-// ascending; the result preserves that order. Few candidates relative to the
-// covered population verify in place against covered cells; otherwise it
-// collects the ranges into scratch through the Search-owned MutableBitmap and
-// intersects as before, so large geo stages keep the workspace-reuse profile.
-func geoFilter(dst, candidates, scratch []ImageID, ws *Workspace, s *stage) ([]ImageID, error) {
-	if s.geoIndex == nil || len(s.geoRanges) == 0 {
-		return dst, nil
-	}
-	if cells := s.geoIndex.CountGeoCells(s.geoRanges); uint64(cells)*uint64(len(candidates)) <= geoFilterProbeBound*s.estimate {
-		filtered, err := s.geoIndex.FilterGeoRanges(dst, candidates, s.geoRanges)
-		return filtered, err
-	}
-	var err error
-	scratch, err = collectStage(scratch[:0], ws, s)
-	if err != nil {
-		return dst, err
-	}
-	if ws != nil {
-		ws.scratch = scratch
-	}
-	start := len(dst)
-	dst = append(dst, candidates...)
-	return intersectSortedSuffix(dst, start, scratch), nil
 }
 
 // Plan is a reusable, cardinality-ordered cross-index query. It holds raw
@@ -413,7 +378,7 @@ func compile(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 			})
 		case geoClause:
 			if len(value.cells) != 0 {
-				ranges, err := bitmapidx.RangesFromCellIDs(nil, value.cells)
+				ranges, err := geoidx.RangesFromCellIDs(nil, value.cells)
 				if err != nil {
 					return Plan{}, errors.Join(ErrInvalidClause, err)
 				}
@@ -422,14 +387,10 @@ func compile(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 			if value.index == nil || len(value.ranges) == 0 {
 				return Plan{}, ErrInvalidClause
 			}
-			estimate, err := value.index.EstimateGeoRanges(value.ranges)
-			if err != nil {
-				return Plan{}, ErrInvalidClause
-			}
 			ordered = append(ordered, orderedStage{
 				s: stage{
 					kind:      StageGeo,
-					estimate:  estimate,
+					estimate:  value.index.EstimateRanges(value.ranges),
 					geoIndex:  value.index,
 					geoRanges: value.ranges,
 				},
@@ -506,7 +467,7 @@ func (plan Plan) Refresh(ctx context.Context) (Plan, error) {
 				st.estimate = st.namespaceQuery.Estimate()
 			}
 		case StageGeo:
-			st.estimate, err = st.geoIndex.EstimateGeoRanges(st.geoRanges)
+			st.estimate = st.geoIndex.EstimateRanges(st.geoRanges)
 		case StageTimestamp:
 			st.estimate = st.tsIndex.EstimateRange(st.tsStart, st.tsEnd)
 		case StageACL:

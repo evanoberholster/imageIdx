@@ -92,15 +92,15 @@ func (b *Batch) Remove(entries ...Entry) error {
 	return nil
 }
 
-// Move stages value transitions for continuous and geo namespaces.
-// Duplicate images in one batch are rejected, no-op moves are dropped,
-// and stale From values fail at commit.
+// Move stages value transitions for continuous namespaces. Duplicate images in
+// one batch are rejected, no-op moves are dropped, and stale From values fail
+// at commit.
 func (b *Batch) Move(moves ...Move) error {
 	if b.sealed.Load() {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind != common.KindBitmapContinuous && namespace.Kind != common.KindBitmapGeo {
+	if namespace.Kind != common.KindBitmapContinuous {
 		return ErrNamespaceMismatch
 	}
 	for _, move := range moves {
@@ -261,11 +261,7 @@ func (b *Batch) Apply() error {
 // validation and analysis order.
 func (b *Batch) expand() (namespaceMutation, error) {
 	mutation := namespaceMutation{Add: b.add, Remove: b.remove}
-	namespace := b.index.spec()
 	value := func(v int64) Value {
-		if namespace.Kind == common.KindBitmapGeo {
-			return GeoValue(uint64(v))
-		}
 		return IntValue(v)
 	}
 	for _, move := range b.moves {

@@ -146,7 +146,6 @@ func TestBitmapKindWireCodes(t *testing.T) {
 		{common.KindBitmapBool, 2},
 		{common.KindBitmapString, 3},
 		{common.KindBitmapContinuous, 4},
-		{common.KindBitmapGeo, 5},
 	} {
 		if got := bitmapKindCode(tc.kind); got != tc.code {
 			t.Errorf("bitmapKindCode(%v) = %d, want %d", tc.kind, got, tc.code)
@@ -157,6 +156,10 @@ func TestBitmapKindWireCodes(t *testing.T) {
 	}
 	if got := bitmapKindFromCode(0); got != 0 {
 		t.Fatalf("bitmapKindFromCode(0) = %v, want invalid kind", got)
+	}
+	// Geography moved to geoidx: the bitmap kind no longer has a wire code.
+	if got := bitmapKindCode(common.KindBitmapGeo); got != 0 {
+		t.Fatalf("bitmapKindCode(geo) = %d, want 0", got)
 	}
 }
 
@@ -735,9 +738,6 @@ func TestNamespaceIndexClose(t *testing.T) {
 	}
 	if count, err := index.CountValues(EnumStringValue("x")); err != nil || count != 0 {
 		t.Fatalf("CountValues after close = %d, %v; want 0, nil", count, err)
-	}
-	if ids := index.AppendTo(nil); len(ids) != 0 {
-		t.Fatalf("AppendTo after close = %v; want empty", ids)
 	}
 	if _, ok := index.LookupValue(nil, NamespaceKey{}); ok {
 		t.Fatal("LookupValue after close reported presence")

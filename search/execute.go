@@ -179,20 +179,13 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 	return dst, nil
 }
 
-// collectStage appends one stage's candidates to dst. Bitmap-backed namespace and
-// geo collects are already ascending and unique, so only timestamp scans need
-// sorting. Geo stages accumulate covered cells into the workspace-owned
-// MutableBitmap and materialize once.
+// collectStage appends one stage's candidates to dst. Bitmap-backed namespace
+// and geo collects are already ascending and unique, so only timestamp scans
+// need sorting.
 func collectStage(dst []ImageID, ws *Workspace, st *stage) ([]ImageID, error) {
 	switch st.kind {
 	case StageGeo:
-		if ws != nil {
-			m := ws.mutableBitmap()
-			m.Reset()
-			st.geoIndex.CollectGeoRanges(m, st.geoRanges)
-			return m.AppendTo(dst), nil
-		}
-		return st.collect(dst)
+		return st.geoIndex.SearchRanges(dst, st.geoRanges), nil
 	case StageTimestamp:
 		start := len(dst)
 		var err error

@@ -51,24 +51,12 @@ func TestStressMixedWorkload(t *testing.T) {
 		enumType       = common.Namespace(100)
 		textType       = common.Namespace(101)
 		continuousType = common.Namespace(102)
-		geoType        = common.Namespace(103)
 	)
-
-	keys := make([]uint64, 0, 32)
-	for lat := -60.0; lat <= 60; lat += 30 {
-		for lng := -120.0; lng <= 120; lng += 60 {
-			key, err := KeyFromLatLng(lat, lng)
-			if err != nil {
-				t.Fatalf("KeyFromLatLng: %v", err)
-			}
-			keys = append(keys, key)
-		}
-	}
 
 	dir := t.TempDir()
 	config := NamespaceConfig{ActiveTarget: 64, HardDeltaLimit: 256, MaxDeltaValues: 32}
 	store, err := NewStore(dir, []NamespaceSpec{
-		enumNamespace(enumType), textNamespace(textType), continuousNamespace(continuousType), geoNamespaceFor(geoType),
+		enumNamespace(enumType), textNamespace(textType), continuousNamespace(continuousType),
 	}, config, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewMemory: %v", err)
@@ -76,12 +64,10 @@ func TestStressMixedWorkload(t *testing.T) {
 	tag, _ := store.Lookup(enumType)
 	title, _ := store.Lookup(textType)
 	iso, _ := store.Lookup(continuousType)
-	loc, _ := store.Lookup(geoType)
 
 	type expect struct {
 		enumValue string
 		cont      int64
-		geo       uint64
 	}
 	reference := make([][]expect, writers)
 
@@ -106,7 +92,6 @@ func TestStressMixedWorkload(t *testing.T) {
 		go func(w int) {
 			defer writersWG.Done()
 			exp := make([]expect, idsPerWriter)
-			curGeo := make([]uint64, idsPerWriter)
 			prevText := make([][]string, idsPerWriter)
 			prevCont := make([]int64, idsPerWriter)
 			tagBatch := tag.NewBatch()
@@ -115,8 +100,6 @@ func TestStressMixedWorkload(t *testing.T) {
 			defer titleBatch.Close()
 			isoBatch := iso.NewBatch()
 			defer isoBatch.Close()
-			locBatch := loc.NewBatch()
-			defer locBatch.Close()
 			apply := func(batch *Batch, stage func(*Batch) error) bool {
 				if err := batch.Reset(); err != nil {
 					fail(err)
@@ -136,7 +119,6 @@ func TestStressMixedWorkload(t *testing.T) {
 				enumAdds := make([]Entry, 0, idsPerWriter)
 				textChanges := make([]TextReplacement, 0, idsPerWriter)
 				contMoves := make([]Move, 0, idsPerWriter)
-				geoMoves := make([]Move, 0, idsPerWriter)
 				for i := 0; i < idsPerWriter; i++ {
 					id := common.ImageID(w*idsPerWriter + i + 1)
 					enumValue := fmt.Sprintf("tag-%d-%d", w, id)
@@ -154,15 +136,7 @@ func TestStressMixedWorkload(t *testing.T) {
 					contMoves = append(contMoves, contMove)
 					prevCont[i] = toCont
 
-					toGeo := keys[(round+i+w)%len(keys)]
-					geoMove := Move{ImageID: id, To: int64(toGeo)}
-					if round > 0 {
-						geoMove.From = int64(curGeo[i])
-					}
-					geoMoves = append(geoMoves, geoMove)
-					curGeo[i] = toGeo
-
-					exp[i] = expect{enumValue: enumValue, cont: toCont, geo: toGeo}
+					exp[i] = expect{enumValue: enumValue, cont: toCont}
 				}
 				if !apply(tagBatch, func(b *Batch) error { return b.Add(enumAdds...) }) {
 					return
@@ -173,10 +147,7 @@ func TestStressMixedWorkload(t *testing.T) {
 				if !apply(isoBatch, func(b *Batch) error { return b.Move(contMoves...) }) {
 					return
 				}
-				if !apply(locBatch, func(b *Batch) error { return b.Move(geoMoves...) }) {
-					return
-				}
-				for _, index := range []*Index{tag, title, iso, loc} {
+				for _, index := range []*Index{tag, title, iso} {
 					if err := index.Barrier(); err != nil {
 						fail(err)
 						return
@@ -261,12 +232,6 @@ func TestStressMixedWorkload(t *testing.T) {
 					fail(err)
 					return
 				}
-				if _, err := loc.GeoRanges([]GeoRange{{Start: keys[0], End: keys[0]}}); err != nil {
-					fail(err)
-					return
-				}
-				loc.EstimateGeoRanges([]GeoRange{{Start: 0, End: ^uint64(0)}})
-				loc.AppendTo(nil)
 				title.Prefix([]byte("shared"), func(NamespaceKey, []byte) bool { return true })
 				if ids := tag.AppendTo(nil); !idsSortedUnique(ids) {
 					fail(errors.New("AppendTo not sorted unique"))
@@ -305,7 +270,6 @@ func TestStressMixedWorkload(t *testing.T) {
 	rtag, _ := reopened.Lookup(enumType)
 	rtitle, _ := reopened.Lookup(textType)
 	riso, _ := reopened.Lookup(continuousType)
-	rloc, _ := reopened.Lookup(geoType)
 
 	total := writers * idsPerWriter
 	for w := 0; w < writers; w++ {
@@ -317,9 +281,6 @@ func TestStressMixedWorkload(t *testing.T) {
 			}
 			if ok, err := riso.Contains(id, IntValue(exp.cont)); err != nil || !ok {
 				t.Fatalf("continuous id=%d value=%d ok=%v err=%v", id, exp.cont, ok, err)
-			}
-			if ok, err := rloc.Contains(id, GeoValue(exp.geo)); err != nil || !ok {
-				t.Fatalf("geo id=%d value=%d ok=%v err=%v", id, exp.geo, ok, err)
 			}
 		}
 	}
@@ -348,74 +309,5 @@ func TestStressMixedWorkload(t *testing.T) {
 	}
 }
 
-// TestStressReaderGuardUnderMaintenance hammers the snapshot readers against
-// continuous checkpoint and vacuum generations. It targets the reader-token
-// lifetime bug: a reader that releases its guard before its last snapshot
-// access can touch an unmapped segment and crash.
-func TestStressReaderGuardUnderMaintenance(t *testing.T) {
-	if testing.Short() {
-		t.Skip("stress test")
-	}
-	dir := t.TempDir()
-	store, err := NewStore(dir, []NamespaceSpec{geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
-	if err != nil {
-		t.Fatalf("NewMemory: %v", err)
-	}
-	loc, _ := store.Lookup(common.NamespaceLocation)
-	key := sfKey(t)
-	seed := loc.NewBatch()
-	for id := 1; id <= 512; id++ {
-		if err := seed.Move(Move{ImageID: common.ImageID(id), To: int64(key)}); err != nil {
-			t.Fatalf("Move: %v", err)
-		}
-	}
-	if err := seed.Apply(); err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	seed.Close()
-	if err := loc.Barrier(); err != nil {
-		t.Fatalf("Barrier: %v", err)
-	}
-	if err := store.Checkpoint(); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
-	}
-	ranges := []GeoRange{{Start: key, End: key}}
-	lookup := func(common.ImageID) (float64, float64, bool) { return 37.7749, -122.4194, true }
-
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	for r := 0; r < 8; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				loc.AppendTo(nil)
-				loc.EstimateGeoRanges(ranges)
-				loc.GeoRanges(ranges)
-				loc.CountGeoRanges(ranges)
-				loc.Nearest(nil, 37.7749, -122.4194, 4, lookup)
-				loc.FilterGeoRanges(nil, []common.ImageID{1, 2, 3}, ranges)
-			}
-		}()
-	}
-	for n := 0; n < 30; n++ {
-		if err := store.Vacuum(); err != nil {
-			t.Errorf("Vacuum: %v", err)
-			break
-		}
-		if err := store.Checkpoint(); err != nil {
-			t.Errorf("Checkpoint: %v", err)
-			break
-		}
-	}
-	close(stop)
-	wg.Wait()
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-}
+// TestStressReaderGuardUnderMaintenance moved to index/geoidx, which owns
+// geographic indexing now.

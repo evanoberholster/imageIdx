@@ -220,8 +220,7 @@ func intersectPostingsCardinality(postings []*posting) uint64 {
 // is heap-owned. All-tiny unions collect IDs into pooled scratch and build
 // once; other unions run the immutable roaring N-way kernel over pooled
 // scratch. A single operand is returned as-is, so its ownership is passed
-// through. Mutable bitmaps are reserved for the caller-owned geo
-// accumulation path (CollectGeoRanges).
+// through.
 func unionPostings(postings []*posting) (roar.Bitmap, bool) {
 	switch len(postings) {
 	case 0:

@@ -103,55 +103,6 @@ func TestTinyPostingTier(t *testing.T) {
 }
 
 func TestTinyPostingTierKinds(t *testing.T) {
-	// Geo: two images in one level-16 bucket stay inline.
-	geo := mustNamespace(t, geoNamespaceFor(common.NamespaceLocation), NamespaceConfig{})
-	key, err := KeyFromLatLng(48.8566, 2.3522)
-	if err != nil {
-		t.Fatalf("KeyFromLatLng: %v", err)
-	}
-	commit(t, geo, func(b *Batch) error {
-		return b.Add(
-			Entry{ImageID: 1, Value: GeoValue(key)},
-			Entry{ImageID: 2, Value: GeoValue(key)},
-		)
-	})
-	if err := geo.Compact(); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
-	geoKey := NamespaceKey{Hash: key, Namespace: common.NamespaceLocation}
-	if p := basePosting(t, geo, geoKey); !p.isTiny() {
-		t.Fatal("geo posting not tiny")
-	}
-	ranges, err := RangesFromCellIDs(nil, []uint64{DecodeS2Key(key)})
-	if err != nil {
-		t.Fatalf("RangesFromCellIDs: %v", err)
-	}
-	match, err := geo.GeoRanges(ranges)
-	if err != nil || !slices.Equal(match.AppendTo(nil), []common.ImageID{1, 2}) {
-		t.Fatalf("GeoRanges = %v, %v", match.AppendTo(nil), err)
-	}
-	filtered, err := geo.FilterGeoRanges(nil, []common.ImageID{1, 2, 3}, ranges)
-	if err != nil || !slices.Equal(filtered, []common.ImageID{1, 2}) {
-		t.Fatalf("FilterGeoRanges = %v, %v", filtered, err)
-	}
-	commit(t, geo, func(b *Batch) error {
-		return b.Add(
-			Entry{ImageID: 3, Value: GeoValue(key)},
-			Entry{ImageID: 4, Value: GeoValue(key)},
-			Entry{ImageID: 5, Value: GeoValue(key)},
-		)
-	})
-	if err := geo.Compact(); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
-	if p := basePosting(t, geo, geoKey); p.isTiny() {
-		t.Fatal("geo posting did not promote")
-	}
-	match, err = geo.GeoRanges(ranges)
-	if err != nil || !slices.Equal(match.AppendTo(nil), []common.ImageID{1, 2, 3, 4, 5}) {
-		t.Fatalf("promoted GeoRanges = %v, %v", match.AppendTo(nil), err)
-	}
-
 	// Continuous: two rare grid values, each with one image, union inline.
 	focals := mustNamespace(t, continuousNamespace(testFocalLength), NamespaceConfig{})
 	commit(t, focals, func(b *Batch) error {
@@ -163,7 +114,7 @@ func TestTinyPostingTierKinds(t *testing.T) {
 	if err := focals.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	match, err = focals.Range(Between(0, 100))
+	match, err := focals.Range(Between(0, 100))
 	if err != nil || !slices.Equal(match.AppendTo(nil), []common.ImageID{1, 2}) {
 		t.Fatalf("Range = %v, %v", match.AppendTo(nil), err)
 	}

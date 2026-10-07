@@ -69,24 +69,16 @@ func TestCountValuesMatchesMaterialized(t *testing.T) {
 // unmap here.
 func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag), geoNamespaceFor(common.NamespaceLocation)}, NamespaceConfig{}, common.DurabilityOS)
+	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewMemory: %v", err)
 	}
 	defer store.Close()
 	tag, _ := store.Lookup(common.NamespaceTag)
-	loc, _ := store.Lookup(common.NamespaceLocation)
 
-	key, err := KeyFromLatLng(37.7749, -122.4194)
-	if err != nil {
-		t.Fatalf("KeyFromLatLng: %v", err)
-	}
 	for id := 1; id <= 128; id++ {
 		commit(t, tag, func(b *Batch) error {
 			return b.Add(Entry{ImageID: common.ImageID(id), Value: EnumStringValue("shared")})
-		})
-		commit(t, loc, func(b *Batch) error {
-			return b.Move(Move{ImageID: common.ImageID(id), To: int64(key)})
 		})
 	}
 	if err := store.Checkpoint(); err != nil {
@@ -98,23 +90,12 @@ func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	baseGeo, err := loc.GeoRanges([]GeoRange{{Start: key, End: key}})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// Mutate so the next results take the corrected, heap-owned path.
 	commit(t, tag, func(b *Batch) error {
 		return b.Add(Entry{ImageID: 500, Value: EnumStringValue("shared")})
 	})
-	commit(t, loc, func(b *Batch) error {
-		return b.Move(Move{ImageID: 500, To: int64(key)})
-	})
 	deltaMatch, err := tag.MatchValues(EnumStringValue("shared"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	deltaGeo, err := loc.GeoRanges([]GeoRange{{Start: key, End: key}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,11 +112,5 @@ func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	}
 	if got := deltaMatch.AppendTo(nil); len(got) != 129 {
 		t.Fatalf("delta enum result = %d ids, want 129", len(got))
-	}
-	if got := baseGeo.AppendTo(nil); len(got) != 128 {
-		t.Fatalf("base geo result = %d ids, want 128", len(got))
-	}
-	if got := deltaGeo.AppendTo(nil); len(got) != 129 {
-		t.Fatalf("delta geo result = %d ids, want 129", len(got))
 	}
 }

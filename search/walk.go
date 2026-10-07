@@ -18,7 +18,7 @@ func (s *stage) bitmap() (roar.Bitmap, error) {
 		return s.aclBitmap()
 	}
 	if s.kind == StageGeo {
-		return s.geoIndex.GeoRanges(s.geoRanges)
+		return roar.FromSorted(s.geoIndex.SearchRanges(nil, s.geoRanges))
 	}
 	if s.namespaceKind == namespaceRange {
 		return s.namespaceIndex.Range(s.namespaceRange)
