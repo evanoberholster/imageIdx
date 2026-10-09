@@ -87,6 +87,55 @@ level-19 cell count, while geoidx stays flat.
   inside the covered cap, which proves no unvisited cell can be closer. Both are
   verified by brute-force differential tests.
 
+## Finalize pass (P0 correctness and bounded writes)
+
+Changes since the first comparison, with the same method/datasets.
+
+### Bounded bitmap collection (collector)
+
+`CollectRanges`/`FilterRanges` accumulate in a stack-backed 256-entry buffer that
+flushes at capacity, so the collector's own memory is bounded by the chunk, not
+the result. Measured over the same native scan (1M, 2 km cover):
+
+| strategy | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| bounded chunked AddMany (chosen) | 42.6 µs | 2,339 | 1 |
+| fully buffered unsorted AddMany | 45.5 µs | 87,299 | 15 |
+| fully buffered sorted AddMany | 48.2 µs | 87,300 | 15 |
+
+Chunked AddMany is both the fastest and the only bounded option; unsorted/sorted
+buffering are slower and allocate a result-sized temporary.
+
+### Delta layers and background compaction
+
+The write path no longer rewrites the whole base synchronously on a small delta.
+Pending mutations live in geometrically merged sorted layers; reaching the
+trigger (≥ base/8) starts a background streaming compaction that snapshots the
+layers, folds them into a new mmap base, and leaves newer mutations in fresh
+layers. Writers are not blocked by the rewrite; a failed compaction retains the
+snapshot and retries; `MaxDelta` provides backpressure.
+
+64-entry insert into a 100k base with rotation active:
+
+| config | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| compaction trigger base/8, large MaxDelta | ~4.6 µs | 29,516 | 4 |
+
+Correctness: `sortIDs` now returns the sorted+deduplicated slice (bitset, radix,
+and comparison paths agree, verified against `Sort`+`Compact` over dense, sparse,
+duplicate-heavy, empty, and single domains), and the bitset is sized from the
+actual maximum so a stale hint cannot overrun it. Radius results require the
+exact cell-center distance; nearest-N uses a bounded top-k heap with a
+provable stopping condition.
+
+### Still deferred (documented follow-up)
+
+Keeping bitmap-backed predicates as bitmaps across consecutive search stages
+(the full "preserve representation across compatible stages" P1) needs a
+planner/executor restructure and is left as an explicit follow-up. The current
+geo FilterBy path avoids the double conversion for the common cases and the
+`search` count path already filters geo against a bitmap directly.
+
 ## Remaining trade-offs
 
 - **Large-candidate FilterBy** (candidates are a superset of the geo set, e.g.

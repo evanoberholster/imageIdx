@@ -201,53 +201,152 @@ func (i *Index) loadLocked() error {
 	return nil
 }
 
-// Compact folds the current mutation delta into a new immutable base. A
-// file-backed index writes and syncs the new base and publishes the manifest; a
-// memory-backed index replaces its heap arrays. The old base is reclaimed after
-// a reader grace period.
-func (i *Index) Compact() error {
+// runCompaction is the background worker: it folds the frozen layer into a new
+// base without holding the writer lock during the rewrite, then publishes. On
+// failure the frozen layer is retained so nothing is lost and a later trigger
+// retries.
+func (i *Index) runCompaction() {
+	i.mu.Lock()
+	snapshot := i.base
+	frozen := i.frozen
+	i.mu.Unlock()
+
+	var newBase base
+	var err error
+	if compactFail != nil {
+		err = compactFail()
+	}
+	if err == nil {
+		adds := sortedByKey(frozen)
+		count := exactCount(snapshot.keys, snapshot.ids, frozen, adds)
+		newBase, err = i.buildBase(snapshot, frozen, adds, count)
+	}
+
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed.Load() {
-		return ErrClosed
+	if err != nil || i.closed.Load() {
+		if newBase.mf != nil {
+			_ = newBase.mf.Close()
+		}
+		i.compactionErr = err
+		i.compacting = false
+		close(i.compactionDone)
+		return
 	}
-	if len(i.muts) == 0 {
-		return nil
-	}
-	return i.compactLocked()
-}
-
-// Checkpoint makes pending mutations durable. It is a no-op for a memory-backed
-// index. Close does not checkpoint.
-func (i *Index) Checkpoint() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.closed.Load() {
-		return ErrClosed
-	}
-	if !i.persistent || len(i.muts) == 0 {
-		return nil
-	}
-	return i.compactLocked()
-}
-
-// Sync is an alias for Checkpoint, matching the other index packages.
-func (i *Index) Sync() error { return i.Checkpoint() }
-
-func (i *Index) compactLocked() error {
-	v := i.view.Load()
-	adds := liveAdds(v.muts)
-	count := exactCount(v, adds)
-	if i.persistent {
-		return i.writeBaseLocked(v, adds, count)
-	}
-	keys := make([]S2Key, count)
-	ids := make([]common.ImageID, count)
-	written := mergeInto(keys, ids, v, adds)
-	i.base = base{keys: keys[:written], ids: ids[:written], gen: i.base.gen + 1, maxID: maxOfIDs(ids[:written])}
-	i.muts = nil
+	old := i.base
+	i.base = newBase
+	i.frozen = nil
+	i.compactionErr = nil
+	i.deltaMax = maxImageID(0, nil, i.layers, i.active)
 	i.publishLocked()
-	return nil
+	i.tracker.WaitForPriorReaders()
+	if old.mf != nil {
+		_ = old.mf.Close()
+	}
+	if old.gen != 0 {
+		_ = storage.RemoveObsolete(i.dir, "base.*.dat", basePath(i.dir, newBase.gen))
+	}
+	i.compacting = false
+	close(i.compactionDone)
+}
+
+// buildBase streams base+delta into a new immutable base. For a file-backed
+// index it writes and syncs a new generation file and publishes the manifest;
+// otherwise it builds heap arrays. It runs without the writer lock.
+func (i *Index) buildBase(snapshot base, shadow, adds []mutation, count uint64) (base, error) {
+	generation := snapshot.gen + 1
+	if !i.persistent {
+		keys := make([]S2Key, count)
+		ids := make([]common.ImageID, count)
+		written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, shadow, adds)
+		return base{keys: keys[:written], ids: ids[:written], gen: generation, maxID: maxOfIDs(ids[:written])}, nil
+	}
+	path := basePath(i.dir, generation)
+	mf, err := storage.CreateMapped(path, int64(baseFileSize(count)))
+	if err != nil {
+		return base{}, err
+	}
+	arena := mf.Bytes()
+	keys, err := storage.View[S2Key](arena, baseHeaderBytes, count, ErrCorrupt, ErrCorrupt)
+	if err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
+	idsOffset := baseIDsOffset(count)
+	ids, err := storage.View[common.ImageID](arena, idsOffset, count, ErrCorrupt, ErrCorrupt)
+	if err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
+	written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, shadow, adds)
+	maxID := maxOfIDs(ids[:written])
+	var slot [storage.SuperblockSlotBytes]byte
+	keyBytes := arena[baseHeaderBytes : baseHeaderBytes+count*8]
+	idBytes := arena[idsOffset : idsOffset+count*8]
+	if err := encodeBaseMeta(slot[:], generation, uint64(written), uint64(maxID), storage.Checksum(keyBytes), storage.Checksum(idBytes)); err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
+	copy(arena[0:storage.SuperblockSlotBytes], slot[:])
+	if err := mf.Sync(); err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
+	if err := writeManifest(i.dir, generation, uint64(written)); err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
+	return base{keys: keys[:written], ids: ids[:written], mf: mf, gen: generation, maxID: maxID}, nil
+}
+
+// Close releases resources. It does not checkpoint; call Checkpoint first to
+// make pending mutations durable.
+func (i *Index) Close() error {
+	i.mu.Lock()
+	if i.closed.Load() {
+		i.mu.Unlock()
+		return nil
+	}
+	i.closed.Store(true)
+	for i.compacting {
+		done := i.compactionDone
+		i.mu.Unlock()
+		<-done
+		i.mu.Lock()
+	}
+	i.tracker.WaitForPriorReaders()
+	var err error
+	if i.base.mf != nil {
+		err = i.base.mf.Close()
+		i.base.mf = nil
+	}
+	if i.lock != nil {
+		if releaseErr := storage.ReleaseLock(i.lock); err == nil {
+			err = releaseErr
+		}
+		i.lock = nil
+	}
+	i.mu.Unlock()
+	return err
+}
+
+// sortedByKey returns a copy of the insert mutations sorted by (key, imageID).
+// Deletes are excluded: they only shadow base and older entries. The input layer
+// is id-sorted and published to readers, so it must not be reordered in place.
+func sortedByKey(muts []mutation) []mutation {
+	out := make([]mutation, 0, len(muts))
+	for n := range muts {
+		if muts[n].add {
+			out = append(out, muts[n])
+		}
+	}
+	slices.SortFunc(out, func(a, b mutation) int {
+		if order := cmp.Compare(a.key, b.key); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.id, b.id)
+	})
+	return out
 }
 
 // maxOfIDs returns the largest ImageID in ids, or 0 when empty.
@@ -261,124 +360,32 @@ func maxOfIDs(ids []common.ImageID) common.ImageID {
 	return best
 }
 
-func (i *Index) writeBaseLocked(v *view, adds []mutation, count uint64) error {
-	generation := i.base.gen + 1
-	path := basePath(i.dir, generation)
-	mf, err := storage.CreateMapped(path, int64(baseFileSize(count)))
-	if err != nil {
-		return err
-	}
-	arena := mf.Bytes()
-	keys, err := storage.View[S2Key](arena, baseHeaderBytes, count, ErrCorrupt, ErrCorrupt)
-	if err != nil {
-		_ = mf.Close()
-		return err
-	}
-	idsOffset := baseIDsOffset(count)
-	ids, err := storage.View[common.ImageID](arena, idsOffset, count, ErrCorrupt, ErrCorrupt)
-	if err != nil {
-		_ = mf.Close()
-		return err
-	}
-	written := mergeInto(keys, ids, v, adds)
-	var slot [storage.SuperblockSlotBytes]byte
-	keyBytes := arena[baseHeaderBytes : baseHeaderBytes+count*8]
-	idBytes := arena[idsOffset : idsOffset+count*8]
-	maxID := maxOfIDs(ids[:written])
-	if err := encodeBaseMeta(slot[:], generation, uint64(written), uint64(maxID), storage.Checksum(keyBytes), storage.Checksum(idBytes)); err != nil {
-		_ = mf.Close()
-		return err
-	}
-	copy(arena[0:storage.SuperblockSlotBytes], slot[:])
-	if err := mf.Sync(); err != nil {
-		_ = mf.Close()
-		return err
-	}
-	if err := writeManifest(i.dir, generation, uint64(written)); err != nil {
-		_ = mf.Close()
-		return err
-	}
-	old := i.base
-	i.base = base{keys: keys[:written], ids: ids[:written], mf: mf, gen: generation, maxID: maxID}
-	i.muts = nil
-	i.publishLocked()
-	i.tracker.WaitForPriorReaders()
-	if old.mf != nil {
-		_ = old.mf.Close()
-	}
-	if old.gen != 0 {
-		_ = storage.RemoveObsolete(i.dir, "base.*.dat", path)
-	}
-	return nil
-}
-
-// Close releases resources. It does not checkpoint; call Checkpoint first to
-// make pending mutations durable.
-func (i *Index) Close() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.closed.Load() {
-		return nil
-	}
-	i.closed.Store(true)
-	i.tracker.WaitForPriorReaders()
-	var err error
-	if i.base.mf != nil {
-		err = i.base.mf.Close()
-		i.base.mf = nil
-	}
-	if i.lock != nil {
-		if releaseErr := storage.ReleaseLock(i.lock); err == nil {
-			err = releaseErr
-		}
-		i.lock = nil
-	}
-	return err
-}
-
-// liveAdds returns the live inserts sorted by (key, imageID).
-func liveAdds(muts []mutation) []mutation {
-	adds := make([]mutation, 0, len(muts))
-	for n := range muts {
-		if muts[n].add {
-			adds = append(adds, muts[n])
-		}
-	}
-	slices.SortFunc(adds, func(a, b mutation) int {
-		if order := cmp.Compare(a.key, b.key); order != 0 {
-			return order
-		}
-		return cmp.Compare(a.id, b.id)
-	})
-	return adds
-}
-
 // exactCount returns the number of live (key, imageID) pairs after applying the
 // delta, matching mergeInto's dedup of an insert that repeats a live base pair.
-func exactCount(v *view, adds []mutation) uint64 {
+func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow, adds []mutation) uint64 {
 	count := uint64(0)
-	for n := range v.keys {
-		if _, mutated := mutationIndex(v.muts, v.ids[n]); !mutated {
+	for n := range baseKeys {
+		if _, touched := mutationIndex(shadow, baseIDs[n]); !touched {
 			count++
 		}
 	}
 	for _, m := range adds {
-		if !baseHasLive(v, m.key, m.id) {
+		if !baseHasLive(baseKeys, baseIDs, shadow, m.key, m.id) {
 			count++
 		}
 	}
 	return count
 }
 
-func baseHasLive(v *view, key S2Key, id common.ImageID) bool {
+func baseHasLive(baseKeys []S2Key, baseIDs []common.ImageID, shadow []mutation, key S2Key, id common.ImageID) bool {
 	index := 0
-	if len(v.keys) > 0 {
-		index = searchKey(v.keys, key)
+	if len(baseKeys) > 0 {
+		index = searchKey(baseKeys, key)
 	}
-	for index < len(v.keys) && v.keys[index] == key {
-		if v.ids[index] == id {
-			_, mutated := mutationIndex(v.muts, id)
-			return !mutated
+	for index < len(baseKeys) && baseKeys[index] == key {
+		if baseIDs[index] == id {
+			_, touched := mutationIndex(shadow, id)
+			return !touched
 		}
 		index++
 	}
@@ -398,30 +405,30 @@ func searchKey(keys []S2Key, key S2Key) int {
 	return low
 }
 
-// mergeInto writes the live base and additions into keys and ids in (key, id)
-// order, skipping shadowed base entries and de-duplicating equal pairs. It
-// returns the number written.
-func mergeInto(keys []S2Key, ids []common.ImageID, v *view, adds []mutation) int {
+// mergeInto writes the retained base entries and additions into keys and ids in
+// (key, id) order, skipping base entries shadowed by the delta and de-duplicating
+// equal pairs. It returns the number written.
+func mergeInto(keys []S2Key, ids []common.ImageID, baseKeys []S2Key, baseIDs []common.ImageID, shadow, adds []mutation) int {
 	baseIndex, addIndex, out := 0, 0, 0
-	for baseIndex < len(v.keys) || addIndex < len(adds) {
-		for baseIndex < len(v.keys) {
-			if _, mutated := mutationIndex(v.muts, v.ids[baseIndex]); mutated {
+	for baseIndex < len(baseKeys) || addIndex < len(adds) {
+		for baseIndex < len(baseKeys) {
+			if _, touched := mutationIndex(shadow, baseIDs[baseIndex]); touched {
 				baseIndex++
 				continue
 			}
 			break
 		}
 		switch {
-		case baseIndex >= len(v.keys):
+		case baseIndex >= len(baseKeys):
 			keys[out], ids[out] = adds[addIndex].key, adds[addIndex].id
 			out++
 			addIndex++
 		case addIndex >= len(adds):
-			keys[out], ids[out] = v.keys[baseIndex], v.ids[baseIndex]
+			keys[out], ids[out] = baseKeys[baseIndex], baseIDs[baseIndex]
 			out++
 			baseIndex++
 		default:
-			baseKey, baseID := v.keys[baseIndex], v.ids[baseIndex]
+			baseKey, baseID := baseKeys[baseIndex], baseIDs[baseIndex]
 			addKey, addID := adds[addIndex].key, adds[addIndex].id
 			switch {
 			case baseKey < addKey || (baseKey == addKey && baseID < addID):

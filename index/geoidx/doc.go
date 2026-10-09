@@ -67,13 +67,20 @@
 //
 // # Mutation
 //
-// One serialized writer maintains a small sorted mutation delta (inserts and
-// deletes) alongside the immutable base. Readers merge base and delta
-// lock-free. Compact folds the delta into a new immutable base with a streaming
-// ordered merge; the old base is reclaimed after a reader grace period. Batches
-// are expected to be small (TargetDelta, default 64), and reaching MaxDelta
-// (default 4096) folds the delta synchronously so an abandoned delta cannot
-// degrade reads without bound.
+// One serialized writer maintains pending inserts and deletes in geometrically
+// merged, sorted layers alongside the immutable mmap base. Readers merge
+// base + layers lock-free; the effective delta is computed once per published
+// view and shared. When the active layer reaches TargetDelta it is frozen into a
+// new layer, so ordinary writes stay O(TargetDelta). When the pending delta
+// reaches the compaction trigger (at least base/8, so write amplification stays
+// bounded), a background worker folds a snapshot of the layers into a new base
+// with a streaming ordered merge; the writer is not blocked by the rewrite and
+// continues accepting mutations into fresh layers. Frozen and active mutations
+// are never lost: a failed compaction retains the snapshot and a later trigger
+// retries. When the pending delta reaches MaxDelta the writer waits for the
+// running compaction (backpressure) rather than growing without bound. Compact
+// and Checkpoint fold everything synchronously; the old base is reclaimed after
+// a reader grace period.
 //
 // # Persistence
 //

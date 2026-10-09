@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s2"
 )
@@ -169,4 +170,86 @@ func BenchmarkGeoScale10M(b *testing.B) {
 			res, _ = index.Nearest(res[:0], geoBenchLat, geoBenchLng, 10)
 		}
 	})
+}
+
+// BenchmarkGeoCollectStrategy compares bitmap collection strategies: bounded
+// chunked AddMany (the collector), a fully buffered unsorted AddMany, and a
+// fully buffered sorted AddMany, over the same native scan.
+func BenchmarkGeoCollectStrategy(b *testing.B) {
+	index, _ := buildGeoNew(b, 1_000_000, geoBenchSpan)
+	ranges := CoverCap(nil, geoNewCap(2000), CoverOptions{MaxCells: 16})
+
+	b.Run("chunked-addmany", func(b *testing.B) {
+		m := roar.NewMutableBitmap()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			m.Reset()
+			index.CollectRanges(m, ranges)
+			_ = m.Cardinality()
+		}
+	})
+	b.Run("buffered-unsorted", func(b *testing.B) {
+		m := roar.NewMutableBitmap()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			m.Reset()
+			var buf []uint64
+			index.withView(func(v *view) {
+				scanRanges(v, ranges, func(_ S2Key, id uint64) bool {
+					buf = append(buf, id)
+					return true
+				})
+			})
+			m.AddMany(buf)
+			_ = m.Cardinality()
+		}
+	})
+	b.Run("buffered-sorted", func(b *testing.B) {
+		m := roar.NewMutableBitmap()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			m.Reset()
+			var buf []uint64
+			maxID := uint64(0)
+			index.withView(func(v *view) {
+				maxID = uint64(v.maxID)
+				scanRanges(v, ranges, func(_ S2Key, id uint64) bool {
+					buf = append(buf, id)
+					return true
+				})
+			})
+			buf = sortIDs(buf, common.ImageID(maxID))
+			m.AddMany(buf)
+			_ = m.Cardinality()
+		}
+	})
+}
+
+// BenchmarkGeoInsertRotation measures 64-entry insert throughput with background
+// compaction active, so writer stall from rotation shows up in ns/op.
+func BenchmarkGeoInsertRotation(b *testing.B) {
+	for _, trigger := range []int{1 << 20, 256} {
+		b.Run(fmt.Sprintf("trigger=%d", trigger), func(b *testing.B) {
+			index, err := NewMemory(Config{TargetDelta: 64, CompactionTrigger: trigger, MaxDelta: 2 * trigger})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer index.Close()
+			insertKeys(b, index, testKeys(100_000), 1)
+			batch := make([]Entry, 64)
+			keys := testKeys(64)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for n := range batch {
+					batch[n] = Entry{Key: keys[n], ImageID: uint64(1_000_000 + i*64 + n)}
+				}
+				if err := index.InsertBatch(batch); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			_ = index.Compact()
+		})
+	}
 }

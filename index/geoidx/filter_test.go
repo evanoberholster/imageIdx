@@ -1,6 +1,7 @@
 package geoidx
 
 import (
+	"cmp"
 	"math/rand"
 	"slices"
 	"testing"
@@ -147,16 +148,27 @@ func TestRadiusResultsAreExactAtCellResolution(t *testing.T) {
 	}
 }
 
-// TestNearestDifferential checks Nearest against a brute-force top-k by cell
-// center distance, which is the authoritative metric.
+// TestNearestDifferential checks Nearest against a brute-force top-k by exact
+// cell-center distance, which is the authoritative metric. Public results round
+// to meters, but ordering is by the precise distance then ImageID.
 func TestNearestDifferential(t *testing.T) {
 	index, entries := testEntries(t, 30_000, testSpan)
 	center := s2.LatLngFromDegrees(testLat, testLng)
-	all := make([]Result, len(entries))
-	for i, e := range entries {
-		all[i] = Result{ImageID: e.ImageID, Distance: metersToUint32(keyDistanceMeters(e.Key, center))}
+	type hit struct {
+		result Result
+		meters float64
 	}
-	slices.SortFunc(all, compareResults)
+	all := make([]hit, len(entries))
+	for i, e := range entries {
+		meters := keyDistanceMeters(e.Key, center)
+		all[i] = hit{result: Result{ImageID: e.ImageID, Distance: metersToUint32(meters)}, meters: meters}
+	}
+	slices.SortFunc(all, func(a, b hit) int {
+		if a.meters != b.meters {
+			return cmp.Compare(a.meters, b.meters)
+		}
+		return cmp.Compare(a.result.ImageID, b.result.ImageID)
+	})
 	for _, k := range []int{1, 10, 100, 1000} {
 		got, err := index.Nearest(nil, testLat, testLng, k)
 		if err != nil {
@@ -165,14 +177,18 @@ func TestNearestDifferential(t *testing.T) {
 		if len(got) != k {
 			t.Fatalf("k=%d: got %d", k, len(got))
 		}
-		if !slices.Equal(got, all[:k]) {
+		want := make([]Result, k)
+		for n := range want {
+			want[n] = all[n].result
+		}
+		if !slices.Equal(got, want) {
 			t.Fatalf("k=%d: Nearest differs from brute force", k)
 		}
 	}
 }
 
 func TestDeltaBounded(t *testing.T) {
-	index, err := NewMemory(Config{TargetDelta: 16, MaxDelta: 64})
+	index, err := NewMemory(Config{TargetDelta: 16, CompactionTrigger: 64, MaxDelta: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,10 +205,22 @@ func TestDeltaBounded(t *testing.T) {
 	if got := index.Len(); got != 1000 {
 		t.Fatalf("Len = %d, want 1000", got)
 	}
+	// Background compaction must keep the pending delta bounded; an explicit
+	// Compact drains it fully without losing data.
+	if err := index.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if got := index.Len(); got != 1000 {
+		t.Fatalf("Len after Compact = %d, want 1000", got)
+	}
 	index.mu.Lock()
-	pending := len(index.muts)
+	pending := index.pendingLocked()
+	generation := index.base.gen
 	index.mu.Unlock()
-	if pending >= index.config.MaxDelta {
-		t.Fatalf("delta %d not folded below MaxDelta %d", pending, index.config.MaxDelta)
+	if pending != 0 {
+		t.Fatalf("pending delta %d not drained by Compact", pending)
+	}
+	if generation < 2 {
+		t.Fatalf("base generation %d, want at least 2 after compaction", generation)
 	}
 }

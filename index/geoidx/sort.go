@@ -14,35 +14,51 @@ const radixSortThreshold = 1 << 13
 // bitsetMaxID caps the dense bitset accelerator (2^27 ids -> 16 MiB of bits).
 const bitsetMaxID = 1 << 27
 
-// sortIDs sorts ids ascending. Small suffixes use the comparison sort; broad
-// results use a dense bitset when the ImageID domain is compact, otherwise an
-// LSD radix sort. The sorted initial-query contract forces this work, so the
-// goal is to keep it far below a general comparison sort.
-func sortIDs(ids []common.ImageID, maxID common.ImageID) {
+// sortIDs sorts ids ascending and removes duplicates, returning the shortened
+// slice. Small suffixes use the comparison sort; broad results use a dense
+// bitset when the ImageID domain is compact, otherwise an LSD radix sort. The
+// sorted initial-query contract forces this work, so the goal is to keep it far
+// below a general comparison sort. The input may alias the destination suffix.
+func sortIDs(ids []common.ImageID, maxID common.ImageID) []common.ImageID {
+	switch len(ids) {
+	case 0, 1:
+		return ids
+	}
 	if len(ids) < radixSortThreshold {
 		slices.Sort(ids)
-		return
+		return slices.Compact(ids)
 	}
-	if sortIDsBitset(ids, maxID) {
-		return
+	if out, ok := sortIDsBitset(ids, maxID); ok {
+		return out
 	}
 	radixSortIDs(ids)
+	return slices.Compact(ids)
 }
 
-// sortIDsBitset sorts ids ascending with a dense bitmap over [0, maxID]. It also
-// de-duplicates. It returns false when the bitset is not worthwhile (small or
-// sparse ID domains, or a too-large maxID).
-func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) bool {
-	if maxID == 0 || uint64(maxID) > bitsetMaxID {
-		return false
+// sortIDsBitset sorts and de-duplicates ids with a dense bitmap over [0, maxID].
+// It returns the shortened slice and true when the bitset was worthwhile (small
+// enough, non-sparse domain), otherwise false. The actual maximum of ids is used
+// so a stale maxID hint can never overrun the bitset.
+func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) ([]common.ImageID, bool) {
+	if maxID == 0 {
+		return ids, false
+	}
+	limit := maxID
+	for _, id := range ids {
+		if id > limit {
+			limit = id
+		}
+	}
+	if uint64(limit) > bitsetMaxID {
+		return ids, false
 	}
 	// Reject sparse ID spaces where scanning the bitset would dominate. The
-	// dense bitset costs maxID/64 words plus len(ids) marks; it wins while that
+	// dense bitset costs limit/64 words plus len(ids) marks; it wins while that
 	// stays within a small multiple of the result size.
-	if uint64(maxID) > 256*uint64(len(ids)) {
-		return false
+	if uint64(limit) > 256*uint64(len(ids)) {
+		return ids, false
 	}
-	words := int(uint64(maxID)>>6) + 1
+	words := int(uint64(limit)>>6) + 1
 	set := make([]uint64, words)
 	for _, id := range ids {
 		set[id>>6] |= 1 << (id & 63)
@@ -56,12 +72,12 @@ func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) bool {
 			word &= word - 1
 		}
 	}
-	return true
+	return ids[:out], true
 }
 
 // radixSortIDs sorts a uint64 slice with an 8-pass, base-256 LSD radix sort. One
 // temp buffer the size of the result is allocated; eight passes guarantee the
-// sorted data lands back in ids.
+// sorted data lands back in ids. Duplicates are preserved; the caller compacts.
 func radixSortIDs(ids []common.ImageID) {
 	const shiftBits = 8
 	const bucketCount = 1 << shiftBits
