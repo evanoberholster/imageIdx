@@ -1,12 +1,15 @@
 package geoidx
 
 import (
+	"cmp"
 	"errors"
 	"math/rand"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -564,5 +567,164 @@ func TestCompactionFailureStages(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestExactCountMatchesMerge drives randomized base/delta combinations, many with
+// repeated keys, and requires the streaming exactCount to equal mergeInto's
+// written count and a naive reference set. It locks down the invariant that
+// sizing and merge output agree exactly.
+func TestExactCountMatchesMerge(t *testing.T) {
+	rng := rand.New(rand.NewSource(97))
+	keyA, _ := KeyFromLatLng(testLat, testLng)
+	keyB, _ := KeyFromLatLng(testLat+0.01, testLng)
+	keyC, _ := KeyFromLatLng(testLat, testLng+0.01)
+	keys := []S2Key{keyA, keyB, keyC}
+
+	type pair struct {
+		key S2Key
+		id  common.ImageID
+	}
+
+	for round := 0; round < 1000; round++ {
+		n := rng.Intn(300)
+		base := make([]pair, n)
+		for i := range base {
+			base[i] = pair{key: keys[rng.Intn(len(keys))], id: common.ImageID(i + 1)}
+		}
+		slices.SortFunc(base, func(a, b pair) int {
+			if order := cmp.Compare(a.key, b.key); order != 0 {
+				return order
+			}
+			return cmp.Compare(a.id, b.id)
+		})
+		baseKeys := make([]S2Key, n)
+		baseIDs := make([]common.ImageID, n)
+		for i := range base {
+			baseKeys[i] = base[i].key
+			baseIDs[i] = base[i].id
+		}
+
+		// An id-unique delta: each named id is an insert, a delete, or untouched,
+		// plus fresh inserts beyond the base.
+		var frozen []mutation
+		for id := common.ImageID(1); id <= common.ImageID(n); id++ {
+			switch rng.Intn(3) {
+			case 0:
+				frozen = append(frozen, mutation{id: id, key: keys[rng.Intn(len(keys))], add: false})
+			case 1:
+				frozen = append(frozen, mutation{id: id, key: keys[rng.Intn(len(keys))], add: true})
+			}
+		}
+		for k := 0; k < rng.Intn(20); k++ {
+			frozen = append(frozen, mutation{id: common.ImageID(n + 1 + k), key: keys[rng.Intn(len(keys))], add: true})
+		}
+		slices.SortFunc(frozen, compareMutationID)
+
+		shadow := newMutationSet(frozen, len(baseKeys))
+		adds := sortedByKey(frozen)
+		count := exactCount(baseKeys, baseIDs, shadow, adds)
+
+		outKeys := make([]S2Key, len(baseKeys)+len(adds))
+		outIDs := make([]common.ImageID, len(baseKeys)+len(adds))
+		written := mergeInto(outKeys, outIDs, baseKeys, baseIDs, shadow, adds)
+		if uint64(written) != count {
+			t.Fatalf("round %d: exactCount=%d, mergeInto=%d", round, count, written)
+		}
+
+		ref := make(map[pair]bool)
+		for i := range baseKeys {
+			if !shadow.touched(baseIDs[i]) {
+				ref[pair{key: baseKeys[i], id: baseIDs[i]}] = true
+			}
+		}
+		for _, m := range adds {
+			ref[pair{key: m.key, id: m.id}] = true
+		}
+		if uint64(len(ref)) != count {
+			t.Fatalf("round %d: reference=%d, exactCount=%d", round, len(ref), count)
+		}
+
+		got := make(map[pair]bool, written)
+		for i := 0; i < written; i++ {
+			p := pair{key: outKeys[i], id: outIDs[i]}
+			if got[p] {
+				t.Fatalf("round %d: duplicate output pair (%d,%d)", round, p.key, p.id)
+			}
+			got[p] = true
+		}
+		if len(got) != len(ref) {
+			t.Fatalf("round %d: output set=%d, reference=%d", round, len(got), len(ref))
+		}
+	}
+}
+
+// TestRepeatedKeyCompaction drives inserts, deletes, and moves among many images
+// that all share one S2Key, then compacts and verifies the effective set. It
+// covers the identical-key run handling in exactCount/mergeInto end to end.
+func TestRepeatedKeyCompaction(t *testing.T) {
+	index, err := NewMemory(Config{TargetDelta: 8, CompactionTrigger: 16, MaxDelta: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	keyA, err := KeyFromLatLng(testLat, testLng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := KeyFromLatLng(testLat+0.01, testLng)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 2000
+	entries := make([]Entry, n)
+	for i := range entries {
+		entries[i] = Entry{Key: keyA, ImageID: common.ImageID(i + 1)}
+	}
+	if err := index.InsertBatch(entries); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete every fifth, move every third, insert n more at keyA.
+	var inserts, deletes []Entry
+	live := make(map[common.ImageID]S2Key, 2*n)
+	for i := 0; i < n; i++ {
+		live[common.ImageID(i+1)] = keyA
+	}
+	for i := 0; i < n; i++ {
+		id := common.ImageID(i + 1)
+		if i%5 == 0 {
+			deletes = append(deletes, Entry{Key: keyA, ImageID: id})
+		}
+		if i%3 == 0 {
+			inserts = append(inserts, Entry{Key: keyB, ImageID: id})
+		}
+	}
+	for k := 0; k < n; k++ {
+		inserts = append(inserts, Entry{Key: keyA, ImageID: common.ImageID(n + 1 + k)})
+	}
+	// Reference: Apply records inserts then deletes, so a later delete wins.
+	for _, e := range inserts {
+		live[e.ImageID] = e.Key
+	}
+	for _, e := range deletes {
+		delete(live, e.ImageID)
+	}
+
+	if err := index.Apply(inserts, deletes); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := index.Len(); got != uint64(len(live)) {
+		t.Fatalf("Len = %d, want %d", got, len(live))
+	}
+	for id, key := range live {
+		if !index.Contains(key, id) {
+			t.Fatalf("image %d missing at its key %d", id, key)
+		}
 	}
 }

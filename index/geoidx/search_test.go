@@ -405,3 +405,82 @@ func TestNearestDuringMutationPublication(t *testing.T) {
 		t.Fatalf("Len = %d, want 1500", got)
 	}
 }
+
+// TestCollectorPoolReusePreservesBitmaps checks that a bitmap materialized from
+// one Collect/Filter call stays valid after the pooled collector is churned by
+// many later calls. The collector stages IDs through MutableBitmap.AddMany,
+// which copies, so reuse must never disturb earlier results.
+func TestCollectorPoolReusePreservesBitmaps(t *testing.T) {
+	index, entries := testEntries(t, 50_000, testSpan)
+	ranges := testCover(5000)
+	want := index.SearchRanges(nil, ranges)
+	if len(want) <= collectChunk {
+		t.Fatalf("test needs > %d matches, got %d", collectChunk, len(want))
+	}
+	candidates := make([]uint64, 0, len(entries))
+	for id := uint64(1); id <= uint64(len(entries)); id++ {
+		candidates = append(candidates, id)
+	}
+	bit := roar.MustFromSorted(candidates)
+
+	first := roar.NewMutableBitmap()
+	index.CollectRanges(first, ranges)
+	if got := first.AppendTo(nil); !slices.Equal(got, want) {
+		t.Fatalf("initial collect mismatch: got %d ids, want %d", len(got), len(want))
+	}
+
+	for i := 0; i < 2000; i++ {
+		m := roar.NewMutableBitmap()
+		if i%2 == 0 {
+			index.CollectRanges(m, ranges)
+		} else {
+			index.FilterRanges(m, bit, ranges)
+		}
+		if got := m.AppendTo(nil); !slices.Equal(got, want) {
+			t.Fatalf("churn %d mismatch: got %d ids, want %d", i, len(got), len(want))
+		}
+	}
+
+	// The bitmap from before the churn must still be intact.
+	if got := first.AppendTo(nil); !slices.Equal(got, want) {
+		t.Fatalf("bitmap corrupted after pool reuse: got %d ids, want %d", len(got), len(want))
+	}
+	if got := first.Cardinality(); got != uint64(len(want)) {
+		t.Fatalf("bitmap cardinality after pool reuse = %d, want %d", got, len(want))
+	}
+}
+
+// TestCollectorPoolConcurrent drives the collector pool from many goroutines and
+// requires every materialized bitmap to be correct. Run with -race.
+func TestCollectorPoolConcurrent(t *testing.T) {
+	index, entries := testEntries(t, 50_000, testSpan)
+	ranges := testCover(5000)
+	want := index.SearchRanges(nil, ranges)
+	candidates := make([]uint64, 0, len(entries))
+	for id := uint64(1); id <= uint64(len(entries)); id++ {
+		candidates = append(candidates, id)
+	}
+	bit := roar.MustFromSorted(candidates)
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		g := g
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 400; i++ {
+				m := roar.NewMutableBitmap()
+				if (g+i)%2 == 0 {
+					index.CollectRanges(m, ranges)
+				} else {
+					index.FilterRanges(m, bit, ranges)
+				}
+				if got := m.AppendTo(nil); !slices.Equal(got, want) {
+					t.Errorf("goroutine %d iter %d: got %d ids, want %d", g, i, len(got), len(want))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}

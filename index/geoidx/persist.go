@@ -512,73 +512,69 @@ func maxOfIDs(ids []common.ImageID) common.ImageID {
 }
 
 // exactCount returns the number of live (key, imageID) pairs after applying the
-// delta, matching mergeInto's dedup of an insert that repeats a live base pair.
-// shadow is the membership set over the id-sorted delta.
+// delta. It mirrors mergeInto's traversal exactly (one pass over the two
+// (key, id)-sorted sequences), so a run of identical S2Keys is walked a single
+// time instead of being rescanned per insertion, and it allocates no index-sized
+// temporary. Keeping the two traversals structurally identical is what makes the
+// count and the merge output agree.
 func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) uint64 {
 	count := uint64(0)
-	for n := range baseKeys {
-		if !shadow.touched(baseIDs[n]) {
-			count++
+	baseIndex, addIndex := 0, 0
+	for baseIndex < len(baseKeys) || addIndex < len(adds) {
+		for baseIndex < len(baseKeys) && shadow.touched(baseIDs[baseIndex]) {
+			baseIndex++
 		}
-	}
-	for _, m := range adds {
-		if !baseHasLive(baseKeys, baseIDs, shadow, m.key, m.id) {
-			count++
+		switch {
+		case baseIndex == len(baseKeys) && addIndex == len(adds):
+			// Both exhausted.
+		case addIndex == len(adds):
+			count++ // remaining live base entry
+			baseIndex++
+		case baseIndex == len(baseKeys):
+			count++ // remaining insertion
+			addIndex++
+		default:
+			baseKey, baseID := baseKeys[baseIndex], baseIDs[baseIndex]
+			addKey, addID := adds[addIndex].key, adds[addIndex].id
+			switch {
+			case baseKey < addKey || (baseKey == addKey && baseID < addID):
+				count++ // live base entry with no matching insertion
+				baseIndex++
+			case addKey < baseKey || (addKey == baseKey && addID < baseID):
+				count++ // insertion not already present as a live base pair
+				addIndex++
+			default:
+				count++ // insertion repeats a live base pair: counted once
+				baseIndex++
+				addIndex++
+			}
 		}
 	}
 	return count
 }
 
-func baseHasLive(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, key S2Key, id common.ImageID) bool {
-	index := 0
-	if len(baseKeys) > 0 {
-		index = searchKey(baseKeys, key)
-	}
-	for index < len(baseKeys) && baseKeys[index] == key {
-		if baseIDs[index] == id {
-			return !shadow.touched(id)
-		}
-		index++
-	}
-	return false
-}
-
-func searchKey(keys []S2Key, key S2Key) int {
-	low, high := 0, len(keys)
-	for low < high {
-		mid := int(uint(low+high) >> 1)
-		if keys[mid] < key {
-			low = mid + 1
-		} else {
-			high = mid
-		}
-	}
-	return low
-}
-
 // mergeInto writes the retained base entries and additions into keys and ids in
-// (key, id) order, skipping base entries shadowed by the delta and de-duplicating
-// equal pairs. It returns the number written. shadow is the membership set over
-// the id-sorted delta.
+// (key, id) order, skipping base entries shadowed by the delta and
+// de-duplicating equal pairs. It mirrors exactCount's traversal exactly, so the
+// number written always equals the count for the same inputs. shadow is the
+// membership set over the id-sorted delta.
 func mergeInto(keys []S2Key, ids []common.ImageID, baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) int {
 	baseIndex, addIndex, out := 0, 0, 0
 	for baseIndex < len(baseKeys) || addIndex < len(adds) {
-		for baseIndex < len(baseKeys) {
-			if shadow.touched(baseIDs[baseIndex]) {
-				baseIndex++
-				continue
-			}
-			break
+		for baseIndex < len(baseKeys) && shadow.touched(baseIDs[baseIndex]) {
+			baseIndex++
 		}
 		switch {
-		case baseIndex >= len(baseKeys):
-			keys[out], ids[out] = adds[addIndex].key, adds[addIndex].id
-			out++
-			addIndex++
-		case addIndex >= len(adds):
+		case baseIndex == len(baseKeys) && addIndex == len(adds):
+			// Both exhausted.
+		case addIndex == len(adds):
 			keys[out], ids[out] = baseKeys[baseIndex], baseIDs[baseIndex]
 			out++
 			baseIndex++
+		case baseIndex == len(baseKeys):
+			keys[out], ids[out] = adds[addIndex].key, adds[addIndex].id
+			out++
+			addIndex++
 		default:
 			baseKey, baseID := baseKeys[baseIndex], baseIDs[baseIndex]
 			addKey, addID := adds[addIndex].key, adds[addIndex].id

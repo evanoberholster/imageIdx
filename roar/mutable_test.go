@@ -128,3 +128,33 @@ func TestMutableZeroValueUsable(t *testing.T) {
 		t.Fatalf("Cardinality = %d, want 4", got)
 	}
 }
+
+// TestAddManyCopiesInput proves AddMany copies the staged IDs rather than
+// retaining or aliasing the caller's slice. This is the invariant that lets a
+// reused staging buffer (for example geoidx's pooled collector) be overwritten
+// immediately after the call without corrupting the bitmap. If AddMany ever
+// starts retaining the slice, this test fails and the pool becomes unsafe.
+func TestAddManyCopiesInput(t *testing.T) {
+	want := []uint64{1, 3, 5, 7}
+	newSource := func() []uint64 { return []uint64{7, 3, 5, 1, 3, 0} }
+
+	m := NewMutableBitmap()
+	source := newSource()
+	m.AddMany(source)
+	for i := range source {
+		source[i] = 999
+	}
+	if got := m.AppendTo(nil); !slices.Equal(got, want) {
+		t.Fatalf("MutableBitmap.AppendTo after source overwrite = %v, want %v", got, want)
+	}
+
+	builder := NewDeltaBuilder()
+	source = newSource()
+	builder.AddMany(source)
+	for i := range source {
+		source[i] = 999
+	}
+	if got := builder.Freeze().AppendTo(nil); !slices.Equal(got, want) {
+		t.Fatalf("DeltaBuilder.Freeze after source overwrite = %v, want %v", got, want)
+	}
+}

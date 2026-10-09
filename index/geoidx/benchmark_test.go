@@ -929,12 +929,22 @@ func buildPageDir(keys []S2Key, pageRecords int) pageDir {
 	return d
 }
 
+// locate returns the first index whose key is >= key. It finds the last page
+// whose first key is <= key and binary-searches within it. That page is the one
+// that can contain the first occurrence even when a repeated key spans several
+// pages: the run may begin in that page's tail, and if it begins at the next
+// page's start the in-page search returns this page's end, which is that start.
 func (d pageDir) locate(keys []S2Key, key S2Key) int {
-	p := sort.Search(len(d.firstKeys), func(i int) bool { return d.firstKeys[i] > key })
-	if p == 0 {
+	if len(d.firstKeys) == 0 {
 		return 0
 	}
-	base := d.offsets[p-1]
+	// First page whose first key is >= key; step back one to cover a run that
+	// starts in the previous page.
+	p := sort.Search(len(d.firstKeys), func(i int) bool { return d.firstKeys[i] >= key })
+	if p > 0 {
+		p--
+	}
+	base := d.offsets[p]
 	end := base + d.pageRecords
 	if end > len(keys) {
 		end = len(keys)
@@ -974,6 +984,56 @@ func flatSearch(keys []S2Key, ids []common.ImageID, ranges []Range, dst []common
 		slices.Sort(tail)
 	}
 	return dst
+}
+
+// TestPageDirLocateMatchesFlat builds a key array whose repeated keys span page
+// boundaries and requires the paged locate/scan to return exactly the flat
+// result for every tested range and page size. It guards the repeated-key case
+// that a naive "last page whose first key <= key" lookup misses.
+func TestPageDirLocateMatchesFlat(t *testing.T) {
+	rng := rand.New(rand.NewSource(23))
+	const runs = 50
+	keys := make([]S2Key, 0, runs*8)
+	ids := make([]common.ImageID, 0, runs*8)
+	nextID := common.ImageID(1)
+	runKeys := make([]S2Key, 0, runs)
+	for r := 0; r < runs; r++ {
+		key := S2Key(1 + uint64(r)*2) // odd keys with an absent even key between runs
+		runKeys = append(runKeys, key)
+		n := 1 + rng.Intn(9) // run length 1..9, not a multiple of the page sizes below
+		for j := 0; j < n; j++ {
+			keys = append(keys, key)
+			ids = append(ids, nextID)
+			nextID++
+		}
+	}
+	if len(keys) == 0 {
+		t.Fatal("no test data")
+	}
+
+	ranges := make([]Range, 0, runs*2+2)
+	for _, key := range runKeys {
+		ranges = append(ranges, Range{Start: key, End: key}) // exact run
+	}
+	for r := 0; r+1 < runs; r++ {
+		// Start on an absent even key between two runs, end inside the next run.
+		ranges = append(ranges, Range{Start: runKeys[r+1] - 1, End: runKeys[r+1]})
+	}
+	ranges = append(ranges,
+		Range{Start: runKeys[0], End: runKeys[len(runKeys)-1]}, // spans every run
+		Range{Start: 0, End: S2Key(^uint64(0))},                // covers everything
+	)
+
+	for _, pageRecords := range []int{1, 2, 3, 4, 5, 7, 8, 16, 31, 32, 64, 128, 256} {
+		dir := buildPageDir(keys, pageRecords)
+		for _, r := range ranges {
+			want := flatSearch(keys, ids, []Range{r}, nil)
+			got := pagedSearch(keys, ids, dir, []Range{r}, nil)
+			if !slices.Equal(got, want) {
+				t.Fatalf("pageRecords=%d range=[%d,%d]: paged=%v flat=%v", pageRecords, r.Start, r.End, got, want)
+			}
+		}
+	}
 }
 
 // BenchmarkPagedLookup compares the flat sorted-array scan with a two-level page
@@ -1095,4 +1155,53 @@ func BenchmarkKeyScan(b *testing.B) {
 		sink = s
 	}
 	_ = sink
+}
+
+// BenchmarkRepeatedKeyCompaction measures one compaction merge when every base
+// image shares a single S2Key and the delta mixes inserts, deletes, and moves.
+// It targets the O(base * log delta) regression where each insertion rescanned
+// the identical-key run; the streaming count/merge walks the run once.
+func BenchmarkRepeatedKeyCompaction(b *testing.B) {
+	for _, n := range []int{1_000, 10_000, 100_000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			keyA, err := KeyFromLatLng(testLat, testLng)
+			if err != nil {
+				b.Fatal(err)
+			}
+			keyB, err := KeyFromLatLng(testLat+0.01, testLng)
+			if err != nil {
+				b.Fatal(err)
+			}
+			baseKeys := make([]S2Key, n)
+			baseIDs := make([]common.ImageID, n)
+			for i := 0; i < n; i++ {
+				baseKeys[i] = keyA
+				baseIDs[i] = common.ImageID(i + 1)
+			}
+			frozen := make([]mutation, 0, 2*n)
+			for i := 0; i < n; i++ {
+				id := common.ImageID(i + 1)
+				switch i % 3 {
+				case 0: // delete
+					frozen = append(frozen, mutation{id: id, key: keyA, add: false})
+				case 1: // move to keyB
+					frozen = append(frozen, mutation{id: id, key: keyB, add: true})
+				}
+			}
+			for k := 0; k < n; k++ { // insert new images at keyA
+				frozen = append(frozen, mutation{id: common.ImageID(n + 1 + k), key: keyA, add: true})
+			}
+			slices.SortFunc(frozen, compareMutationID)
+
+			index := &Index{}
+			base := base{keys: baseKeys, ids: baseIDs, maxID: common.ImageID(n)}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := index.prepareBase(base, frozen); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
