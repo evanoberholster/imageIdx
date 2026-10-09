@@ -68,6 +68,11 @@ func (plan Plan) rankTime(ctx context.Context, dst []Result, workspace *Workspac
 // in metres from the origin, keeping the best k. A negative k ranks every
 // match; a zero k returns dst unchanged. Invalid origins and nil lookups
 // return errors; images without valid coordinates are skipped.
+//
+// lookup supplies canonical coordinates for arbitrary candidate IDs. This is a
+// separate concern from the geoidx store, which is authoritative for S2 cell
+// membership and cell-center distance; RankGeo does not consult geoidx and does
+// not require candidates to be in a geographic index.
 func (plan Plan) RankGeo(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup geoidx.CoordinateLookup, k int) ([]GeoResult, error) {
 	return plan.rankGeo(ctx, dst, workspace, latitude, longitude, lookup, k, nil)
 }

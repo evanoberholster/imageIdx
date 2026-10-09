@@ -306,8 +306,26 @@ near, err := places.Nearest(nil, 37.7749, -122.4194, 10)       // []geoidx.Resul
 
 For precomputed covers, `places.SearchRanges(dst, ranges)` scans normalized
 `geoidx.Range` values. Results are in ascending `ImageID` order.
-`geoidx.Result.Distance` is the approximate great-circle distance in meters from
-the query to the matched cell center; images in the same S2 cell are tied.
+`geoidx.Result.Distance` is the great-circle distance in meters from the query to
+the matched cell center; images in the same S2 cell are tied, and radius results
+require that distance to be within the radius.
+
+When geography filters an existing bitmap, use the FilterBy path so no sorted
+slice is built:
+
+```go
+// Geo ∩ existing candidate bitmap, in native S2 order (no global sort).
+mutable.Reset()
+places.FilterRect(mutable, candidates, rect)
+matched := mutable.AppendTo(matched[:0])
+
+// Direct collection geo → bitmap.
+mutable.Reset()
+_ = places.CollectRadius(mutable, 37.7749, -122.4194, 2000)
+```
+
+The same `Filter*` / `Collect*` pairs exist for cells, ranges, rectangles,
+polygons, and radii.
 
 ### Similarity (pHash / PDQ)
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 	"time"
+
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 // SearchOnce compiles clauses and immediately appends their sorted,
@@ -150,6 +152,26 @@ func (plan Plan) searchInto(ctx context.Context, dst []ImageID, workspace *Works
 		if st.canFilter() {
 			continue
 		}
+		// A geo stage filters an existing candidate set directly through
+		// geoidx's bitmap FilterBy path when the candidates are smaller than the
+		// covered population: geography then never materializes its own set.
+		if st.kind == StageGeo && st.geoIndex != nil && uint64(len(dst)-start) < st.estimate {
+			if metrics != nil {
+				metrics.reach(index, StageModeBufferedFilter)
+			}
+			filtered, filterErr := filterGeoBitmap(st, dst[start:], ws)
+			if filterErr != nil {
+				return dst, filterErr
+			}
+			dst = dst[:start+len(filtered)]
+			if metrics != nil {
+				metrics.Stages[index].Passed = uint64(len(dst) - start)
+			}
+			if len(dst) == start {
+				return dst, nil
+			}
+			continue
+		}
 		if metrics != nil {
 			stage := metrics.reach(index, StageModeCollectIntersect)
 			stage.Input = uint64(len(dst) - start)
@@ -197,6 +219,23 @@ func collectStage(dst []ImageID, ws *Workspace, st *stage) ([]ImageID, error) {
 	default:
 		return st.collect(dst)
 	}
+}
+
+// filterGeoBitmap filters ascending candidates by a geo stage using geoidx's
+// native S2 scan and candidate membership, avoiding materialization of the full
+// geographic set. Matches are written back into candidates' storage.
+func filterGeoBitmap(st *stage, candidates []ImageID, ws *Workspace) ([]ImageID, error) {
+	if st.geoIndex == nil || len(st.geoRanges) == 0 {
+		return candidates, nil
+	}
+	bit, err := roar.FromSorted(candidates)
+	if err != nil || bit.IsEmpty() {
+		return candidates[:0], err
+	}
+	m := ws.mutableBitmap()
+	m.Reset()
+	st.geoIndex.FilterRanges(m, bit, st.geoRanges)
+	return m.AppendTo(candidates[:0]), nil
 }
 
 func sortUnique(values []ImageID) []ImageID {

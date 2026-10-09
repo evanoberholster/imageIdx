@@ -1,91 +1,101 @@
 # geoidx vs bitmapidx geo benchmarks
 
-This compares `index/geoidx` (S2 level 19, this branch) with the former
-`bitmapidx` geo implementation (S2 level 16, removed in this branch).
+Compares `index/geoidx` (S2 level 19) with the removed `bitmapidx` geo
+implementation (S2 level 16).
 
 ## Method
 
-- Old side: the pre-removal commit `15e2e0a` in a separate git worktree, with a
-  harness at `index/bitmapidx/geocompare_benchmark_test.go` (package
-  `bitmapidx_test`). It builds a `KindBitmapGeo` namespace via
-  `bitmapidx.NewGeoNamespace` and queries `GeoRanges`, `FilterGeoRanges`,
-  `Nearest`, `CoverRegion`.
-- New side: `index/geoidx/compare_benchmark_test.go`, the same workloads against
-  `geoidx.Index`.
-- Both use the same deterministic dataset: `geoBenchN = 200_000` images uniform
-  in a 0.4° box around San Francisco (seed 1); sparse/dense use 500_000. All
-  indexes are compacted before timing.
-- Apple M4 Pro (arm64), Go 1.27, `-benchtime=100ms`. `ns/op` / `B/op` /
-  `allocs/op` from `go test -bench`.
+- Old side: pre-removal commit `15e2e0a` in a git worktree, harness at
+  `index/bitmapidx/geocompare_benchmark_test.go` (package `bitmapidx_test`).
+- New side: `index/geoidx/compare_benchmark_test.go` and
+  `index/geoidx/filter_benchmark_test.go`.
+- Identical deterministic datasets and query points; indexes compacted before
+  timing. Datasets: 200k and 1M images uniform in a 0.4° box around San
+  Francisco (seed 1); 1M clustered (8 cities, 0.05° spread + 5% background);
+  10M uniform for scale.
+- Apple M4 Pro (arm64), Go 1.27, `-benchtime=100ms`.
 
-## Results
+## Lookups — 200k uniform
 
 | operation | bitmapidx geo | geoidx | speedup |
 |---|---:|---:|---:|
-| exact cell (1 key, ~1 image) | 66.0 ns, 1 alloc | 26.5 ns, 0 alloc | **2.5×** |
-| single range (one level-14 cell) | 144 ns, 2 allocs | 36.2 ns, 0 alloc | **4.0×** |
-| multi range (2 km cap, 16 cells) | 9.90 µs | 4.96 µs | **2.0×** |
-| bounding box (0.05°) | 23.1 µs | 10.1 µs | **2.3×** |
-| polygon (0.06° square) | 90.7 µs, 1894 allocs | 19.3 µs, 0 alloc | **4.7×** |
-| nearest k=1 | 36.2 ms | 45.2 µs | **800×** |
-| nearest k=10 | 35.9 ms | 90.0 µs | **399×** |
-| nearest k=100 | 36.0 ms | 90.4 µs | **399×** |
-| repeated key (10k images, 1 cell) | 5.07 µs | 5.48 µs | 0.93× |
-| sparse distribution (500k, 500 m cap) | 669 ns | 133 ns | **5.0×** |
-| dense distribution (500k, 500 m cap) | 532 µs | 21.4 ms | 0.025× |
-| global→bitmap filter small / medium / large | 1.90 / 1.43 / 3.06 µs | 1.97 / 1.46 / 3.26 µs | ~1.0× |
-| probe filter small / medium / large | 183 µs / 9.1 ms / 181 ms | n/a (no probe) | — |
-| insert batch 1 / 8 / 32 / 64 | 2213 / 4291 / 10929 / 20248 ns | 123 / 434 / 1500 / 2917 ns | **18× / 9.9× / 7.3× / 6.9×** |
-| compact 200k base | 451 µs | n/a (streaming, see note) | — |
+| exact cell | 63.9 ns, 1 alloc | 27.7 ns, 0 alloc | 2.3× |
+| single level-14 range | 144 ns, 2 allocs | 37.4 ns, 0 alloc | 3.9× |
+| 2 km cover, 16 cells | 9.90 µs | 5.18 µs | 1.9× |
+| bounding box | 23.1 µs | 10.4 µs | 2.2× |
+| polygon | 90.7 µs, 1894 allocs | 19.4 µs, 0 alloc | 4.7× |
+| nearest k=1 / 10 / 100 | 36.8 / 35.9 / 36.4 ms | 44.7 / 90.4 / 288 µs | 823× / 397× / 126× |
+| repeated key (10k at one cell) | 5.07 µs | 4.16 µs | 1.2× |
+| sparse distribution (500k) | 669 ns | 139 ns | 4.8× |
+| dense distribution (500k, ~all match) | 532 µs | 512 µs | 1.04× |
+| insert batch 1 / 8 / 32 / 64 | 2500 / 4946 / 13130 / 21773 ns | 145 / 444 / 1490 / 2952 ns | 17× / 11× / 8.8× / 7.4× |
+| insert allocs 1 / 8 / 32 / 64 | 27 / 61 / 168 / 298 | 4 / 4 / 4 / 4 | — |
 
-### Findings
+## Query modes and FilterBy — 1M uniform
 
-- **Lookups are 2–5× faster and allocation-free.** geoidx's contiguous
-  `(key, id)` arrays turn a cover into binary searches plus bulk contiguous
-  copies, where bitmapidx locates a posting per level-16 key and unions roaring
-  bitmaps. The polygon case is worst for bitmapidx (1894 allocs).
-- **Nearest is the headline.** bitmapidx documented `Nearest` as an O(N log N)
-  full scan; geoidx grows an S2 cap cover until it holds `k`, so `k=1` is ~800×
-  faster and `k` scales sub-linearly.
-- **Small-batch inserts are 7–18× faster** because geoidx appends to two arrays
-  and a small sorted delta, instead of resolving/building postings per cell.
-- **Repeated-key lookups are at parity (~5 µs for 10k images at one cell).** This
-  needed a fast path (below): a range with no delta is a contiguous base run
-  copied in bulk; the earlier per-entry scan was ~9× slower.
-- **Candidate filtering is at parity with bitmapidx's collect path** and avoids
-  its *probe* path entirely. bitmapidx could verify each candidate against a cell
-  (up to 181 ms for the large candidate set); geoidx has no reverse index, so it
-  always collects the cover and intersects, which measures 2–3 µs.
-- **Dense "return almost everything" is ~40× slower.** With 500k of 500k rows
-  returned, geoidx must sort the result to ascending `ImageID`, while bitmapidx
-  returns an already-ordered roaring bitmap. This only bites when a query returns
-  a large fraction of the whole index; realistic radii return a small fraction.
-  It is the main known trade-off of the SoA-by-key representation.
+| operation | bitmapidx geo | geoidx | speedup |
+|---|---:|---:|---:|
+| initial `[]ImageID` | 9.72 µs | 5.14 µs | 1.9× |
+| collect geo→bitmap | 6.92 µs, 0 alloc | 8.18 µs, 3 allocs | 0.85× |
+| FilterBy small candidates (1k) | 8.22 µs | 3.24 µs | 2.5× |
+| FilterBy medium candidates (50k) | 8.49 µs | 2.47 µs | 3.4× |
+| FilterBy large candidates (1M) | 8.79 µs | 11.4 µs | 0.77× |
+| clustered range (2 km) | 246 µs, 866 KB | 41.8 µs, 131 KB | 5.9× |
+| clustered FilterBy (all) | — | 402 µs | — |
+| clustered nearest k=10 | 200.5 ms, 112 MB | 18.9 µs, 12 KB | 10,600× |
 
-### Changes made from this comparison
+## Scale — 10M uniform (geoidx)
 
-- `SearchRanges` bulk-copies contiguous base runs when there are no pending
-  mutations (was a per-entry callback).
-- Sorting is skipped when the result is already ascending, and de-duplication is
-  skipped for a base-only scan. These brought the repeated-key case from ~58 µs
-  to ~5.5 µs.
+| operation | geoidx |
+|---|---:|
+| initial `[]ImageID` (2 km cover) | 633 µs |
+| collect geo→bitmap | 754 µs |
+| nearest k=10 | 15.8 µs |
 
-### Storage
+## Storage — 1M uniform persistent
 
-bitmapidx stores one posting (tiny or roaring) per occupied S2 cell plus a
-dictionary; geoidx stores exactly two `uint64` arrays of length equal to the
-image count (16 B/image), independent of cell fan-out. The level also changed
-from 16 (~142 m cells) to 19 (~18 m cells), so geoidx has ~64× more distinct
-cells but stores them as flat sorted arrays rather than per-cell postings.
+| implementation | bytes | per image |
+|---|---:|---:|
+| geoidx (level 19) | 16,001,050 | 16 B |
+| bitmapidx geo (level 16) | 12,302,064 | 12 B |
 
-## Reproducing
+geoidx stores exactly two `uint64` arrays regardless of cell fan-out (16 B/image).
+bitmapidx stores one posting per occupied level-16 cell; the coarse level
+collapses this grid into fewer, denser cells, so it is 1.3× smaller here. At
+equal precision bitmapidx's per-cell postings would grow with the (4× larger)
+level-19 cell count, while geoidx stays flat.
 
-```sh
-# new side
-go test -run '^$' -bench BenchmarkGeoNew -benchtime=100ms ./index/geoidx/
+## Optimizations made from this comparison
 
-# old side (pre-removal commit)
-git worktree add /tmp/geobench-old 15e2e0a
-# add the bitmapidx harness, then:
-cd /tmp/geobench-old && go test -run '^$' -bench BenchmarkGeoOld -benchtime=100ms ./index/bitmapidx/
-```
+- `FilterRanges`/`FilterCell`/`FilterCover`/`FilterRect`/`FilterPolygon`/
+  `FilterRadius`: geography filters an existing `roar.Bitmap` in native S2 order
+  with a membership test, no sorted `[]ImageID` and no global sort.
+- `CollectRanges` and cover/cell/rect/polygon/radius variants: geography to a
+  `roar.MutableBitmap` directly.
+- The initial-query suffix sort now picks, in order: no sort when already
+  ordered, a bounded dense bitset sort when the ImageID domain is compact, an
+  LSD radix sort otherwise, and a comparison sort only for small results. This
+  removed the broad-query regression: dense 512 µs (parity with bitmapidx) and
+  clustered range 42 µs (5.9× faster than bitmapidx).
+- Bounded write delta: `Config.TargetDelta` (64) and `Config.MaxDelta` (4096).
+  Reaching `MaxDelta` folds the delta synchronously, so a caller that forgets
+  `Compact` never degrades reads without bound. Small batches use stack scratch,
+  so `InsertBatch(1..64)` allocates a constant 4/op.
+- Correctness: `SearchRadius`/`SearchRadiusResults` now require the exact
+  cell-center distance to be within the radius (the cover is only a candidate
+  superset); `Nearest` terminates only when the k-th cell-center distance is
+  inside the covered cap, which proves no unvisited cell can be closer. Both are
+  verified by brute-force differential tests.
+
+## Remaining trade-offs
+
+- **Large-candidate FilterBy** (candidates are a superset of the geo set, e.g.
+  all images): 11.4 µs vs 8.79 µs for bitmapidx's collect+And. The extra work is
+  the per-entry membership test and the result sort. The planner avoids this by
+  keeping geography as the source (or collecting) when its estimate is not
+  smaller than the candidates.
+- **Collect** (geo → bitmap) is 1.18× slower than bitmapidx's pre-sorted
+  per-cell fold, because geoidx must sort the matched IDs once; it stays within a
+  few microseconds and allocates 3 times.
+- Storage is 1.3× larger at this precision due to the finer level-19 keys
+  (16 B/image flat).

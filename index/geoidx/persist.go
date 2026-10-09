@@ -14,12 +14,12 @@ import (
 
 const (
 	baseMagic   uint32 = 0x47454f31 // "GEO1"
-	baseVersion uint16 = 1
+	baseVersion uint16 = 2
 
 	manifestMagic   uint32 = 0x47454f4d // "GEOM"
 	manifestVersion uint16 = 1
 
-	basePayloadBytes = 16 // count(8) + key CRC(4) + id CRC(4)
+	basePayloadBytes = 24 // count(8) + maxID(8) + key CRC(4) + id CRC(4)
 	manifestBytes    = 26 // magic(4)+version(2)+gen(8)+count(8)+crc(4)
 	lockName         = "geoidx.lock"
 )
@@ -76,11 +76,12 @@ func baseFileSize(count uint64) uint64 {
 
 const baseHeaderBytes = uint64(2 * storage.SuperblockSlotBytes)
 
-func encodeBaseMeta(dst []byte, generation, count uint64, keyCRC, idCRC uint32) error {
+func encodeBaseMeta(dst []byte, generation, count, maxID uint64, keyCRC, idCRC uint32) error {
 	var payload [basePayloadBytes]byte
 	binary.LittleEndian.PutUint64(payload[0:8], count)
-	binary.LittleEndian.PutUint32(payload[8:12], keyCRC)
-	binary.LittleEndian.PutUint32(payload[12:16], idCRC)
+	binary.LittleEndian.PutUint64(payload[8:16], maxID)
+	binary.LittleEndian.PutUint32(payload[16:20], keyCRC)
+	binary.LittleEndian.PutUint32(payload[20:24], idCRC)
 	return storage.EncodeSuperblock(dst, storage.SuperblockHeader{
 		Magic:      baseMagic,
 		Version:    baseVersion,
@@ -124,7 +125,7 @@ func (i *Index) createEmptyLocked() error {
 		return err
 	}
 	var slot [storage.SuperblockSlotBytes]byte
-	if err := encodeBaseMeta(slot[:], generation, 0, 0, 0); err != nil {
+	if err := encodeBaseMeta(slot[:], generation, 0, 0, 0, 0); err != nil {
 		_ = mf.Close()
 		return err
 	}
@@ -173,8 +174,9 @@ func (i *Index) loadLocked() error {
 		_ = mf.Close()
 		return ErrCorrupt
 	}
-	keyCRC := binary.LittleEndian.Uint32(payload[8:12])
-	idCRC := binary.LittleEndian.Uint32(payload[12:16])
+	maxID := common.ImageID(binary.LittleEndian.Uint64(payload[8:16]))
+	keyCRC := binary.LittleEndian.Uint32(payload[16:20])
+	idCRC := binary.LittleEndian.Uint32(payload[20:24])
 	keys, err := storage.View[S2Key](arena, baseHeaderBytes, count, ErrCorrupt, ErrCorrupt)
 	if err != nil {
 		_ = mf.Close()
@@ -194,7 +196,7 @@ func (i *Index) loadLocked() error {
 			return ErrCorrupt
 		}
 	}
-	i.base = base{keys: keys, ids: ids, mf: mf, gen: generation}
+	i.base = base{keys: keys, ids: ids, mf: mf, gen: generation, maxID: maxID}
 	i.publishLocked()
 	return nil
 }
@@ -242,10 +244,21 @@ func (i *Index) compactLocked() error {
 	keys := make([]S2Key, count)
 	ids := make([]common.ImageID, count)
 	written := mergeInto(keys, ids, v, adds)
-	i.base = base{keys: keys[:written], ids: ids[:written], gen: i.base.gen + 1}
+	i.base = base{keys: keys[:written], ids: ids[:written], gen: i.base.gen + 1, maxID: maxOfIDs(ids[:written])}
 	i.muts = nil
 	i.publishLocked()
 	return nil
+}
+
+// maxOfIDs returns the largest ImageID in ids, or 0 when empty.
+func maxOfIDs(ids []common.ImageID) common.ImageID {
+	var best common.ImageID
+	for _, id := range ids {
+		if id > best {
+			best = id
+		}
+	}
+	return best
 }
 
 func (i *Index) writeBaseLocked(v *view, adds []mutation, count uint64) error {
@@ -271,7 +284,8 @@ func (i *Index) writeBaseLocked(v *view, adds []mutation, count uint64) error {
 	var slot [storage.SuperblockSlotBytes]byte
 	keyBytes := arena[baseHeaderBytes : baseHeaderBytes+count*8]
 	idBytes := arena[idsOffset : idsOffset+count*8]
-	if err := encodeBaseMeta(slot[:], generation, uint64(written), storage.Checksum(keyBytes), storage.Checksum(idBytes)); err != nil {
+	maxID := maxOfIDs(ids[:written])
+	if err := encodeBaseMeta(slot[:], generation, uint64(written), uint64(maxID), storage.Checksum(keyBytes), storage.Checksum(idBytes)); err != nil {
 		_ = mf.Close()
 		return err
 	}
@@ -285,7 +299,7 @@ func (i *Index) writeBaseLocked(v *view, adds []mutation, count uint64) error {
 		return err
 	}
 	old := i.base
-	i.base = base{keys: keys[:written], ids: ids[:written], mf: mf, gen: generation}
+	i.base = base{keys: keys[:written], ids: ids[:written], mf: mf, gen: generation, maxID: maxID}
 	i.muts = nil
 	i.publishLocked()
 	i.tracker.WaitForPriorReaders()

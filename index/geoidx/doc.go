@@ -38,16 +38,32 @@
 //
 // # Queries
 //
-// A query cover is normalized into sorted, non-overlapping key ranges, and each
-// range is answered by binary searching keys and scanning the covered ImageIDs.
-// Overlapping and adjacent cover cells merge before scanning. There is no
-// per-cell postings table, no hash table, and no per-level materialization: S2
-// already provides the hierarchy, and descendant intervals are key ranges.
+// The fundamental primitive is a native-order scan: it binary-searches the first
+// key of each normalized range, walks the contiguous keys, and reads ImageIDs in
+// (S2Key, ImageID) order. It imposes no ImageID ordering. Overlapping and
+// adjacent cover cells merge before scanning. There is no per-cell postings
+// table, no hash table, and no per-level materialization: S2 already provides
+// the hierarchy, and descendant intervals are key ranges.
 //
-// Search returns results in ascending ImageID order so the higher-level search
-// planner can intersect them with bitmap predicates. Distance-aware results
-// (nearest, radius) carry an approximate great-circle distance derived from the
-// cell center, since coordinates are not stored.
+// Two query modes build on that scan:
+//
+//   - Initial queries (SearchRanges, SearchCell, SearchRect, SearchPolygon,
+//     SearchRadius) return ascending []ImageID for the search planner's ordered
+//     merges/intersections. The appended suffix is sorted only if needed, using
+//     a bounded dense bitset sort when the ImageID domain is compact, an LSD
+//     radix sort otherwise, and a comparison sort only for small results.
+//   - FilterBy queries (FilterRanges, FilterCell, FilterRect, FilterPolygon,
+//     FilterRadius) already hold a candidate roar.Bitmap. They scan in native S2
+//     order, test candidates.Contains(ImageID), and add matches directly to the
+//     destination bitmap: no sorted slice and no global sort. CollectRanges and
+//     its cover variants are the geo -> bitmap counterpart.
+//
+// Distance-aware results (nearest, radius) carry a great-circle distance from
+// the query to the authoritative S2 cell center, since coordinates are not
+// stored. Radius results require the cell-center distance to be within the
+// radius (the cover is only a candidate superset); Nearest expands a cap cover
+// until the k-th cell-center distance is inside the covered radius, which proves
+// no unvisited cell can be closer.
 //
 // # Mutation
 //
@@ -55,7 +71,9 @@
 // deletes) alongside the immutable base. Readers merge base and delta
 // lock-free. Compact folds the delta into a new immutable base with a streaming
 // ordered merge; the old base is reclaimed after a reader grace period. Batches
-// are expected to be small (<= 64 images).
+// are expected to be small (TargetDelta, default 64), and reaching MaxDelta
+// (default 4096) folds the delta synchronously so an abandoned delta cannot
+// degrade reads without bound.
 //
 // # Persistence
 //
