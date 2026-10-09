@@ -2,6 +2,7 @@ package geoidx
 
 import (
 	"cmp"
+	"errors"
 	"os"
 	"slices"
 	"sync"
@@ -95,6 +96,8 @@ type view struct {
 
 	deltaOnce sync.Once
 	delta     []mutation
+	deltaAdds []mutation // effective inserts, sorted by (key, id)
+	deltaSet  []uint64   // membership bitset over delta ids, nil when not built
 }
 
 // Index is a specialized geographic index: lock-free readers and one serialized
@@ -122,9 +125,6 @@ type Index struct {
 	dir        string
 	lock       *os.File
 }
-
-// compactFail is a test seam; production leaves it nil.
-var compactFail func() error
 
 // NewMemory returns an empty heap-backed index.
 func NewMemory(config Config) (*Index, error) {
@@ -167,16 +167,61 @@ func mergeAll(frozen []mutation, layers [][]mutation, active []mutation) []mutat
 }
 
 // viewDelta returns the effective mutation delta, or nil when there are no
-// pending mutations. The merge is computed once per view and shared by all
-// readers of that view.
+// pending mutations. The merge, a key-sorted insert list, and a membership
+// bitset are computed once per view and shared by all readers of that view.
 func viewDelta(v *view) []mutation {
 	if len(v.frozen) == 0 && len(v.layers) == 0 && len(v.active) == 0 {
 		return nil
 	}
 	v.deltaOnce.Do(func() {
 		v.delta = mergeAll(v.frozen, v.layers, v.active)
+		adds := make([]mutation, 0, len(v.delta))
+		for n := range v.delta {
+			if v.delta[n].add {
+				adds = append(adds, v.delta[n])
+			}
+		}
+		slices.SortFunc(adds, func(a, b mutation) int {
+			if order := cmp.Compare(a.key, b.key); order != 0 {
+				return order
+			}
+			return cmp.Compare(a.id, b.id)
+		})
+		v.deltaAdds = adds
+		limit := v.maxID
+		for n := range v.delta {
+			if v.delta[n].id > limit {
+				limit = v.delta[n].id
+			}
+		}
+		// Build a membership bitset when the ImageID domain is compact relative
+		// to the data, so base-range filtering is O(1) per entry instead of a
+		// binary search.
+		if limit != 0 && uint64(limit) <= bitsetMaxID &&
+			uint64(limit) <= 64*uint64(len(v.keys)+len(v.delta)+1) {
+			words := int(uint64(limit)>>6) + 1
+			set := make([]uint64, words)
+			for n := range v.delta {
+				set[v.delta[n].id>>6] |= 1 << (v.delta[n].id & 63)
+			}
+			v.deltaSet = set
+		}
 	})
 	return v.delta
+}
+
+// deltaTouched reports whether id is named by the effective delta, using the
+// cached bitset when available and guarding its bounds.
+func deltaTouched(v *view, id common.ImageID) bool {
+	if v.deltaSet != nil {
+		word := id >> 6
+		if int(word) < len(v.deltaSet) {
+			return v.deltaSet[word]&(1<<(id&63)) != 0
+		}
+		return false
+	}
+	_, touched := mutationIndex(v.delta, id)
+	return touched
 }
 
 func (i *Index) publishLocked() {
@@ -270,25 +315,61 @@ func (i *Index) applyEntries(entries []Entry, add bool) error {
 	return i.apply(ops)
 }
 
+// apply admits and publishes one mutation batch. Admission runs before
+// publication: a batch that would push the pending delta over the hard budget
+// first waits for a compaction (outside the writer mutex); if no compaction can
+// make progress it returns ErrBackpressure without publishing, so a successful
+// return always means the batch was published. A single batch larger than the
+// budget is admitted when the delta is otherwise empty (bulk load), after which
+// compaction bounds growth to one batch.
 func (i *Index) apply(ops []mutation) error {
-	i.mu.Lock()
-	if i.closed.Load() {
-		i.mu.Unlock()
-		return ErrClosed
-	}
 	if len(ops) == 0 {
-		i.mu.Unlock()
 		return nil
 	}
 	for _, op := range ops {
 		if op.id == 0 {
-			i.mu.Unlock()
 			return ErrInvalidID
 		}
 		if _, err := CellIDFromKey(op.key); err != nil {
-			i.mu.Unlock()
 			return err
 		}
+	}
+
+	i.mu.Lock()
+	for {
+		if i.closed.Load() {
+			i.mu.Unlock()
+			return ErrClosed
+		}
+		pending := i.pendingLocked()
+		if pending == 0 || pending+len(ops) <= i.hardDelta() {
+			break
+		}
+		if !i.compacting {
+			if pending == 0 {
+				i.mu.Unlock()
+				return ErrBackpressure
+			}
+			i.startCompactionLocked()
+			if !i.compacting {
+				i.mu.Unlock()
+				return ErrBackpressure
+			}
+		}
+		done := i.compactionDone
+		i.mu.Unlock()
+		<-done
+		i.mu.Lock()
+		if i.compactionErr != nil {
+			err := i.compactionErr
+			i.compactionErr = nil
+			if i.pendingLocked()+len(ops) > i.hardDelta() {
+				i.mu.Unlock()
+				return errors.Join(ErrBackpressure, err)
+			}
+		}
+	}
+	for _, op := range ops {
 		if op.id > i.deltaMax {
 			i.deltaMax = op.id
 		}
@@ -313,19 +394,6 @@ func (i *Index) apply(ops []mutation) error {
 		i.freezeLocked()
 	}
 	i.publishLocked()
-
-	// Backpressure: if the pending delta exceeds the hard bound while a
-	// compaction is running, wait for it rather than growing without bound.
-	for i.pendingLocked() >= i.hardDelta() && i.compacting {
-		done := i.compactionDone
-		i.mu.Unlock()
-		<-done
-		i.mu.Lock()
-		if i.closed.Load() {
-			i.mu.Unlock()
-			return ErrClosed
-		}
-	}
 	if !i.compacting && i.shouldCompactLocked() {
 		i.startCompactionLocked()
 	}

@@ -119,12 +119,14 @@ func TestWritesAfterCompactionBegins(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	compactFail = func() error {
-		once.Do(func() { close(entered) })
-		<-release
+	persistFail = func(stage persistStage) error {
+		if stage == persistCreate {
+			once.Do(func() { close(entered) })
+			<-release
+		}
 		return nil
 	}
-	defer func() { compactFail = nil }()
+	defer func() { persistFail = nil }()
 
 	done := make(chan error, 1)
 	go func() { done <- index.Compact() }()
@@ -161,7 +163,12 @@ func TestCompactionFailureRetainsMutations(t *testing.T) {
 	keys := testKeys(200)
 	insertKeys(t, index, keys, 1)
 
-	compactFail = func() error { return errors.New("boom") }
+	persistFail = func(stage persistStage) error {
+		if stage == persistCreate {
+			return errors.New("boom")
+		}
+		return nil
+	}
 	if err := index.Compact(); err == nil {
 		t.Fatal("Compact succeeded despite injected failure")
 	}
@@ -173,7 +180,7 @@ func TestCompactionFailureRetainsMutations(t *testing.T) {
 			t.Fatalf("image %d lost by failed compaction", i+1)
 		}
 	}
-	compactFail = nil
+	persistFail = nil
 	if err := index.Compact(); err != nil {
 		t.Fatalf("retry Compact: %v", err)
 	}
@@ -193,12 +200,14 @@ func TestCloseDuringCompaction(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	compactFail = func() error {
-		once.Do(func() { close(entered) })
-		<-release
+	persistFail = func(stage persistStage) error {
+		if stage == persistCreate {
+			once.Do(func() { close(entered) })
+			<-release
+		}
 		return nil
 	}
-	defer func() { compactFail = nil }()
+	defer func() { persistFail = nil }()
 	go func() { _ = index.Compact() }()
 	<-entered
 
@@ -327,4 +336,72 @@ func equalIDs(a, b []uint64) bool {
 		}
 	}
 	return true
+}
+
+// TestCompactionFailureStages injects a failure at each persistence stage and
+// checks that no committed data is lost, no mutation is applied twice, the index
+// reopens, and Close completes.
+func TestCompactionFailureStages(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stage persistStage
+	}{
+		{"create", persistCreate},
+		{"write", persistWrite},
+		{"sync", persistSync},
+		{"manifest", persistManifest},
+		{"publish", persistPublish},
+		{"reclaim", persistReclaim},
+		{"remove", persistRemove},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
+			index, err := New(dir, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys := testKeys(300)
+			insertKeys(t, index, keys, 1)
+			if err := index.Checkpoint(); err != nil {
+				t.Fatalf("Checkpoint: %v", err)
+			}
+			extra := testKeys(50)
+			insertKeys(t, index, extra, 1000)
+
+			persistFail = func(stage persistStage) error {
+				if stage == tc.stage {
+					return errors.New("injected")
+				}
+				return nil
+			}
+			_ = index.Compact()
+			persistFail = nil
+
+			if got := index.Len(); got != 350 {
+				t.Fatalf("Len after %s failure = %d, want 350", tc.name, got)
+			}
+			for i := 0; i < 50; i++ {
+				if !index.Contains(extra[i], uint64(1000+i)) {
+					t.Fatalf("post-snapshot image %d lost after %s failure", 1000+i, tc.name)
+				}
+			}
+			if err := index.Close(); err != nil {
+				t.Fatalf("Close after %s failure: %v", tc.name, err)
+			}
+			reopened, err := Open(dir, config)
+			if err != nil {
+				t.Fatalf("Open after %s failure: %v", tc.name, err)
+			}
+			defer reopened.Close()
+			if reopened.Len() < 300 {
+				t.Fatalf("reopened Len = %d after %s failure, want >= 300", reopened.Len(), tc.name)
+			}
+			for i := 0; i < 300; i += 29 {
+				if !reopened.Contains(keys[i], uint64(i+1)) {
+					t.Fatalf("durable image %d lost after %s failure/reopen", i+1, tc.name)
+				}
+			}
+		})
+	}
 }

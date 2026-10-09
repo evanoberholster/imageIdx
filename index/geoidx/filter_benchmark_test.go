@@ -225,8 +225,52 @@ func BenchmarkGeoCollectStrategy(b *testing.B) {
 	})
 }
 
-// BenchmarkGeoInsertRotation measures 64-entry insert throughput with background
-// compaction active, so writer stall from rotation shows up in ns/op.
+// BenchmarkGeoQueryPendingMutations measures steady-state query latency across
+// pending-delta sizes. The effective delta is merged once per view, so the
+// warm-up iteration absorbs the merge and the timed loop measures steady state.
+func BenchmarkGeoQueryPendingMutations(b *testing.B) {
+	ranges := CoverCap(nil, geoNewCap(2000), CoverOptions{MaxCells: 16})
+	for _, pending := range []int{0, 64, 4096, 65536} {
+		b.Run(fmt.Sprintf("pending=%d", pending), func(b *testing.B) {
+			index, err := NewMemory(Config{TargetDelta: 64, CompactionTrigger: 1 << 30, MaxDelta: 1 << 31})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer index.Close()
+			if err := index.InsertBatch(entryBatch(testKeys(200_000), 1)); err != nil {
+				b.Fatal(err)
+			}
+			if err := index.Compact(); err != nil {
+				b.Fatal(err)
+			}
+			keys := testKeys(pending)
+			for n := 0; n < pending; n += 64 {
+				batch := make([]Entry, 0, 64)
+				for k := 0; k < 64 && n+k < pending; k++ {
+					batch = append(batch, Entry{Key: keys[n+k], ImageID: uint64(1_000_000 + n + k)})
+				}
+				if err := index.InsertBatch(batch); err != nil {
+					b.Fatal(err)
+				}
+			}
+			dst := make([]uint64, 0, 4096)
+			dst = index.SearchRanges(dst[:0], ranges) // warm the per-view merge
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				dst = index.SearchRanges(dst[:0], ranges)
+			}
+		})
+	}
+}
+
+func entryBatch(keys []S2Key, base uint64) []Entry {
+	out := make([]Entry, len(keys))
+	for i, key := range keys {
+		out[i] = Entry{Key: key, ImageID: base + uint64(i)}
+	}
+	return out
+}
 func BenchmarkGeoInsertRotation(b *testing.B) {
 	for _, trigger := range []int{1 << 20, 256} {
 		b.Run(fmt.Sprintf("trigger=%d", trigger), func(b *testing.B) {

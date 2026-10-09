@@ -327,6 +327,11 @@ _ = places.CollectRadius(mutable, 37.7749, -122.4194, 2000)
 The same `Filter*` / `Collect*` pairs exist for cells, ranges, rectangles,
 polygons, and radii.
 
+Migration: the old `KindBitmapGeo` bitmap namespace is no longer supported and is
+not readable. Rebuild the geographic index from canonical image metadata —
+`geoidx.KeyFromLatLng` per image, `InsertBatch`, then `Compact`. Non-geographic
+bitmap namespaces are unchanged.
+
 ### Similarity (pHash / PDQ)
 
 ```go

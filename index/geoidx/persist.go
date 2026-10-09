@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,6 +12,30 @@ import (
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
+
+// persistStage identifies a persistence step for the test-only persistFail
+// seam. Production leaves persistFail nil.
+type persistStage uint8
+
+const (
+	persistCreate persistStage = iota
+	persistWrite
+	persistSync
+	persistManifest
+	persistPublish
+	persistReclaim
+	persistRemove
+)
+
+// persistFail is a test seam; production leaves it nil.
+var persistFail func(persistStage) error
+
+func failStage(stage persistStage) error {
+	if persistFail == nil {
+		return nil
+	}
+	return persistFail(stage)
+}
 
 const (
 	baseMagic   uint32 = 0x47454f31 // "GEO1"
@@ -72,6 +97,23 @@ func baseIDsOffset(count uint64) uint64 {
 
 func baseFileSize(count uint64) uint64 {
 	return baseIDsOffset(count) + count*8
+}
+
+// checkedBaseFileSize is baseFileSize with overflow checks so untrusted counts
+// cannot wrap offsets.
+func checkedBaseFileSize(count uint64) (uint64, bool) {
+	if count > (math.MaxUint64-baseHeaderBytes)/8 {
+		return 0, false
+	}
+	end := baseHeaderBytes + count*8
+	ids := storage.Align(end, 64)
+	if ids < end {
+		return 0, false
+	}
+	if count > (math.MaxUint64-ids)/8 {
+		return 0, false
+	}
+	return ids + count*8, true
 }
 
 const baseHeaderBytes = uint64(2 * storage.SuperblockSlotBytes)
@@ -152,12 +194,16 @@ func (i *Index) loadLocked() error {
 	if !ok {
 		return ErrCorrupt
 	}
+	size, ok := checkedBaseFileSize(count)
+	if !ok {
+		return ErrCorrupt
+	}
 	mf, err := storage.OpenMapped(basePath(i.dir, generation))
 	if err != nil {
 		return err
 	}
 	arena := mf.Bytes()
-	if uint64(len(arena)) < baseFileSize(count) {
+	if uint64(len(arena)) < size {
 		_ = mf.Close()
 		return ErrCorrupt
 	}
@@ -196,8 +242,45 @@ func (i *Index) loadLocked() error {
 			return ErrCorrupt
 		}
 	}
+	if err := validateBase(keys, ids, maxID); err != nil {
+		_ = mf.Close()
+		return err
+	}
 	i.base = base{keys: keys, ids: ids, mf: mf, gen: generation, maxID: maxID}
 	i.publishLocked()
+	return nil
+}
+
+// validateBase performs a structural integrity pass over a loaded base: every
+// key is a valid S2Level cell, every ImageID is non-zero, entries are strictly
+// ordered by (key, id), and the recorded maximum ImageID matches. It returns
+// ErrCorrupt on any violation so malformed input never reaches a query.
+func validateBase(keys []S2Key, ids []common.ImageID, maxID common.ImageID) error {
+	if len(keys) != len(ids) {
+		return ErrCorrupt
+	}
+	var prevKey S2Key
+	var prevID common.ImageID
+	var max common.ImageID
+	for n := range keys {
+		key, id := keys[n], ids[n]
+		if id == 0 {
+			return ErrCorrupt
+		}
+		if _, err := CellIDFromKey(key); err != nil {
+			return ErrCorrupt
+		}
+		if n > 0 && (key < prevKey || (key == prevKey && id <= prevID)) {
+			return ErrCorrupt
+		}
+		if id > max {
+			max = id
+		}
+		prevKey, prevID = key, id
+	}
+	if max != maxID {
+		return ErrCorrupt
+	}
 	return nil
 }
 
@@ -213,13 +296,13 @@ func (i *Index) runCompaction() {
 
 	var newBase base
 	var err error
-	if compactFail != nil {
-		err = compactFail()
-	}
-	if err == nil {
+	if err = failStage(persistCreate); err == nil {
 		adds := sortedByKey(frozen)
 		count := exactCount(snapshot.keys, snapshot.ids, frozen, adds)
 		newBase, err = i.buildBase(snapshot, frozen, adds, count)
+	}
+	if err == nil {
+		err = failStage(persistPublish)
 	}
 
 	i.mu.Lock()
@@ -240,10 +323,14 @@ func (i *Index) runCompaction() {
 	i.deltaMax = maxImageID(0, nil, i.layers, i.active)
 	i.publishLocked()
 	i.tracker.WaitForPriorReaders()
+	// Reclamation is best-effort: the commit is already durable and published,
+	// so a cleanup failure must not fail the compaction.
+	_ = failStage(persistReclaim)
 	if old.mf != nil {
 		_ = old.mf.Close()
 	}
 	if old.gen != 0 {
+		_ = failStage(persistRemove)
 		_ = storage.RemoveObsolete(i.dir, "base.*.dat", basePath(i.dir, newBase.gen))
 	}
 	i.compacting = false
@@ -262,7 +349,11 @@ func (i *Index) buildBase(snapshot base, shadow, adds []mutation, count uint64) 
 		return base{keys: keys[:written], ids: ids[:written], gen: generation, maxID: maxOfIDs(ids[:written])}, nil
 	}
 	path := basePath(i.dir, generation)
-	mf, err := storage.CreateMapped(path, int64(baseFileSize(count)))
+	size, ok := checkedBaseFileSize(count)
+	if !ok || size > math.MaxInt64 {
+		return base{}, ErrOverflow
+	}
+	mf, err := storage.CreateMapped(path, int64(size))
 	if err != nil {
 		return base{}, err
 	}
@@ -279,6 +370,10 @@ func (i *Index) buildBase(snapshot base, shadow, adds []mutation, count uint64) 
 		return base{}, err
 	}
 	written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, shadow, adds)
+	if err := failStage(persistWrite); err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
 	maxID := maxOfIDs(ids[:written])
 	var slot [storage.SuperblockSlotBytes]byte
 	keyBytes := arena[baseHeaderBytes : baseHeaderBytes+count*8]
@@ -288,7 +383,15 @@ func (i *Index) buildBase(snapshot base, shadow, adds []mutation, count uint64) 
 		return base{}, err
 	}
 	copy(arena[0:storage.SuperblockSlotBytes], slot[:])
+	if err := failStage(persistSync); err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
 	if err := mf.Sync(); err != nil {
+		_ = mf.Close()
+		return base{}, err
+	}
+	if err := failStage(persistManifest); err != nil {
 		_ = mf.Close()
 		return base{}, err
 	}

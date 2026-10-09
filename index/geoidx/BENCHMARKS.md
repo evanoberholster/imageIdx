@@ -136,6 +136,70 @@ planner/executor restructure and is left as an explicit follow-up. The current
 geo FilterBy path avoids the double conversion for the common cases and the
 `search` count path already filters geo against a bitmap directly.
 
+## Review hardening (P0.1–P0.5)
+
+### Compaction lifecycle
+
+Phases: idle → snapshot frozen → build new generation (off-lock) → sync →
+commit manifest (atomic) → publish in-memory view → drain readers → reclaim old
+generation → idle. Only one compaction publishes at a time (`compacting`).
+The old base stays mapped until prior readers drain (`ReaderTracker`); new writes
+go to fresh layers and remain visible; a failed compaction retains the frozen
+snapshot and a later trigger retries. Cleanup keeps the manifest-referenced
+generation (`RemoveObsolete` with the new path) and is best-effort after commit.
+The writer mutex is not held during file construction.
+
+### Mutation admission
+
+Admission runs before publication: a batch that would push pending over the hard
+budget waits for a running compaction outside the writer mutex, or
+returns `ErrBackpressure` (never silently growing after repeated failures). A
+single batch larger than the budget is admitted only into an empty delta (bulk
+load), after which compaction bounds growth to one batch. A successful return
+always means the batch was published.
+
+### Persistent validation
+
+`loadLocked` uses overflow-checked offsets (`checkedBaseFileSize`), rejects
+truncated/oversized files, and runs `validateBase` (valid S2 cells, non-zero IDs,
+strict `(key,id)` ordering, consistent max ImageID) returning `ErrCorrupt` rather
+than panicking. Corruption tests cover every rule plus malformed manifest/base
+files.
+
+### Failure injection
+
+A `persistFail(stage)` seam covers create, write, sync, manifest, publish,
+reclaim, and remove. `TestCompactionFailureStages` injects each and checks no
+committed data loss, no double-apply, reopen, and non-deadlocking Close.
+
+### Pending-delta read overhead (P1.1)
+
+Queries with pending mutations build a per-view membership bitset and a
+key-sorted insert list once (cached), so base filtering is O(1) and only in-range
+additions are visited. 1M base, 2 km cover:
+
+| pending | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| 0 | 5.8 µs | 0 | 0 |
+| 64 | 7.5 µs | 0 | 0 |
+| 4,096 | 7.8 µs | 0 | 0 |
+| 65,536 | 10.3 µs | 0 | 0 |
+
+10M uniform: initial 666 µs, collect 1.42 ms, nearest k=10 16.5 µs.
+
+### Migration (P1.4)
+
+`KindBitmapGeo` bitmap namespaces are removed and are not readable. Rebuild a
+geographic index from canonical image metadata: open a `geoidx.Index`, compute
+`geoidx.KeyFromLatLng` per image, `InsertBatch`, then `Compact`. Non-geographic
+bitmap namespaces are unaffected.
+
+### Deferred (scope control)
+
+Follow-ups, out of scope for PR #14: bitmap-backed candidate execution across
+all search stages, SIMD geographic kernels, city/named-area lookup, and any new
+persistent allocator or spatial planner.
+
 ## Remaining trade-offs
 
 - **Large-candidate FilterBy** (candidates are a superset of the geo set, e.g.

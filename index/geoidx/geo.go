@@ -25,6 +25,13 @@ var (
 	ErrInvalidCoordinate = errors.New("geoidx: invalid coordinate")
 	// ErrTooManyCells reports a cover that would exceed its cell budget.
 	ErrTooManyCells = errors.New("geoidx: cover exceeds cell budget")
+	// ErrBackpressure reports that pending mutations exceed the configured
+	// budget and a compaction cannot free capacity (for example after repeated
+	// compaction failures). The caller should retry.
+	ErrBackpressure = errors.New("geoidx: pending mutations exceed the configured budget")
+	// ErrOverflow reports arithmetic that would overflow a persisted offset or
+	// count.
+	ErrOverflow = errors.New("geoidx: arithmetic overflow")
 	// ErrInvalidConfig reports an unusable configuration.
 	ErrInvalidConfig = errors.New("geoidx: invalid configuration")
 	// ErrCorrupt reports a corrupt base file, superblock, or manifest.

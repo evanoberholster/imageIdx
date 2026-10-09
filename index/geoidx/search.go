@@ -44,15 +44,31 @@ func viewTouched(v *view, id common.ImageID) (present, touched bool) {
 // with pending additions last. It imposes no ImageID ordering. ranges must be
 // normalized. fn returning false stops the scan.
 func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
-	return scanRangesEff(v, viewDelta(v), ranges, fn)
-}
-
-// scanRangesEff is scanRanges with a precomputed effective delta so callers can
-// reuse it across the base-skip and addition passes.
-func scanRangesEff(v *view, eff []mutation, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
-	if len(ranges) == 0 {
+	if viewDelta(v) == nil {
+		position := 0
+		for _, r := range ranges {
+			position += sort.Search(len(v.keys)-position, func(k int) bool {
+				return v.keys[position+k] >= r.Start
+			})
+			for position < len(v.keys) && v.keys[position] <= r.End {
+				if id := v.ids[position]; id != 0 {
+					if !fn(v.keys[position], id) {
+						return false
+					}
+				}
+				position++
+			}
+		}
 		return true
 	}
+	return scanRangesEff(v, ranges, fn)
+}
+
+// scanRangesEff scans a view with pending mutations. Base entries shadowed by
+// the effective delta are skipped via the cached membership bitset (or a binary
+// search), and additions come from the cached key-sorted insert list so only the
+// adds inside the ranges are visited.
+func scanRangesEff(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
 	position := 0
 	for _, r := range ranges {
 		position += sort.Search(len(v.keys)-position, func(k int) bool {
@@ -60,26 +76,22 @@ func scanRangesEff(v *view, eff []mutation, ranges []Range, fn func(S2Key, commo
 		})
 		for position < len(v.keys) && v.keys[position] <= r.End {
 			id := v.ids[position]
-			if id != 0 {
-				if eff == nil {
-					if !fn(v.keys[position], id) {
-						return false
-					}
-				} else if _, touched := mutationIndex(eff, id); !touched {
-					if !fn(v.keys[position], id) {
-						return false
-					}
+			if id != 0 && !deltaTouched(v, id) {
+				if !fn(v.keys[position], id) {
+					return false
 				}
 			}
 			position++
 		}
 	}
-	for n := range eff {
-		m := &eff[n]
-		if m.add && keyInRanges(ranges, m.key) {
-			if !fn(m.key, m.id) {
+	adds := v.deltaAdds
+	for _, r := range ranges {
+		low := sort.Search(len(adds), func(i int) bool { return adds[i].key >= r.Start })
+		for low < len(adds) && adds[low].key <= r.End {
+			if !fn(adds[low].key, adds[low].id) {
 				return false
 			}
+			low++
 		}
 	}
 	return true
@@ -141,11 +153,10 @@ func (i *Index) SearchRanges(dst []common.ImageID, ranges []Range) []common.Imag
 			return
 		}
 		mark := len(dst)
-		eff := viewDelta(v)
-		if eff == nil {
+		if viewDelta(v) == nil {
 			dst = appendBaseRanges(dst, v, normalized)
 		} else {
-			scanRangesEff(v, eff, normalized, func(_ S2Key, id common.ImageID) bool {
+			scanRangesEff(v, normalized, func(_ S2Key, id common.ImageID) bool {
 				dst = append(dst, id)
 				return true
 			})

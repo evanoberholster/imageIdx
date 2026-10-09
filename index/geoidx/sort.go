@@ -11,8 +11,8 @@ import (
 // replace the comparison sort used for small results.
 const radixSortThreshold = 1 << 13
 
-// bitsetMaxID caps the dense bitset accelerator (2^27 ids -> 16 MiB of bits).
-const bitsetMaxID = 1 << 27
+// bitsetMaxID caps the dense bitset accelerator (2^30 ids -> 128 MiB of bits).
+const bitsetMaxID = 1 << 30
 
 // sortIDs sorts ids ascending and removes duplicates, returning the shortened
 // slice. Small suffixes use the comparison sort; broad results use a dense
