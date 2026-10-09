@@ -338,7 +338,168 @@ func equalIDs(a, b []uint64) bool {
 	return true
 }
 
-// TestCompactionFailureStages injects a failure at each persistence stage and
+// TestCompactionCommitReconcilesAfterRename simulates the manifest rename
+// succeeding but the commit reporting an error (for example a directory-sync
+// failure). The committed generation must be adopted, not discarded.
+func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
+	dir := t.TempDir()
+	config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
+	index, err := New(dir, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertKeys(t, index, testKeys(100), 1)
+	before := index.Generation()
+
+	writeManifestFunc = func(dir string, gen, count uint64) error {
+		if err := writeManifest(dir, gen, count); err != nil {
+			return err
+		}
+		return errors.New("simulated post-rename sync failure")
+	}
+	defer func() { writeManifestFunc = writeManifest }()
+
+	if err := index.Compact(); err != nil {
+		t.Fatalf("Compact returned %v despite a committed manifest", err)
+	}
+	if index.Generation() == before {
+		t.Fatal("generation not advanced after reconciled commit")
+	}
+	if got := index.Len(); got != 100 {
+		t.Fatalf("Len = %d, want 100", got)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir, config)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if got := reopened.Len(); got != 100 {
+		t.Fatalf("reopened Len = %d, want 100", got)
+	}
+}
+
+// TestCloseRacesCommit blocks compaction immediately before the manifest commit,
+// races Close, then releases the commit and requires Close to finish and the
+// committed data to remain readable.
+func TestCloseRacesCommit(t *testing.T) {
+	dir := t.TempDir()
+	config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
+	index, err := New(dir, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertKeys(t, index, testKeys(100), 1)
+
+	commitEntered := make(chan struct{})
+	allowCommit := make(chan struct{})
+	var once sync.Once
+	persistFail = func(stage persistStage) error {
+		if stage == persistCommit {
+			once.Do(func() { close(commitEntered) })
+			<-allowCommit
+		}
+		return nil
+	}
+	defer func() { persistFail = nil }()
+
+	go func() { _ = index.Compact() }()
+	<-commitEntered
+
+	closed := make(chan struct{})
+	go func() { _ = index.Close(); close(closed) }()
+	close(allowCommit)
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung behind commit")
+	}
+
+	reopened, err := Open(dir, config)
+	if err != nil {
+		t.Fatalf("reopen after close/commit race: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.Len() < 100 {
+		t.Fatalf("reopened Len = %d, want >= 100", reopened.Len())
+	}
+}
+
+// TestSlowReaderDelaysReclamation holds a reader view while compaction publishes
+// a new generation, then releases it and requires reclamation to complete. The
+// reader touches the old base to prove it was not unmapped prematurely.
+func TestSlowReaderDelaysReclamation(t *testing.T) {
+	dir := t.TempDir()
+	config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
+	index, err := New(dir, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertKeys(t, index, testKeys(100), 1)
+	if err := index.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	insertKeys(t, index, testKeys(50), 1000)
+
+	readerEntered := make(chan struct{})
+	readerRelease := make(chan struct{})
+	go func() {
+		index.withView(func(v *view) {
+			close(readerEntered)
+			<-readerRelease
+			if len(v.keys) > 0 {
+				_ = v.keys[0]
+				_ = v.ids[0]
+			}
+		})
+	}()
+	<-readerEntered
+
+	reclaimEntered := make(chan struct{})
+	allowReclaim := make(chan struct{})
+	var once sync.Once
+	persistFail = func(stage persistStage) error {
+		if stage == persistReclaim {
+			once.Do(func() { close(reclaimEntered) })
+			<-allowReclaim
+		}
+		return nil
+	}
+	defer func() { persistFail = nil }()
+
+	compacted := make(chan error, 1)
+	go func() { compacted <- index.Compact() }()
+	<-reclaimEntered
+
+	// The new generation is published; reclamation is in progress and the reader
+	// still holds the old view.
+	index.mu.Lock()
+	stillCompacting := index.compacting
+	index.mu.Unlock()
+	if !stillCompacting {
+		t.Fatal("compaction finished before the reader released")
+	}
+
+	close(allowReclaim)
+	close(readerRelease)
+	select {
+	case err := <-compacted:
+		if err != nil {
+			t.Fatalf("Compact: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("compaction did not finish after the reader released")
+	}
+	if got := index.Len(); got != 150 {
+		t.Fatalf("Len = %d, want 150", got)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // checks that no committed data is lost, no mutation is applied twice, the index
 // reopens, and Close completes.
 func TestCompactionFailureStages(t *testing.T) {
@@ -349,7 +510,7 @@ func TestCompactionFailureStages(t *testing.T) {
 		{"create", persistCreate},
 		{"write", persistWrite},
 		{"sync", persistSync},
-		{"manifest", persistManifest},
+		{"commit", persistCommit},
 		{"publish", persistPublish},
 		{"reclaim", persistReclaim},
 		{"remove", persistRemove},

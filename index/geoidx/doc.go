@@ -73,14 +73,19 @@
 // view and shared. When the active layer reaches TargetDelta it is frozen into a
 // new layer, so ordinary writes stay O(TargetDelta). When the pending delta
 // reaches the compaction trigger (at least base/8, so write amplification stays
-// bounded), a background worker folds a snapshot of the layers into a new base
-// with a streaming ordered merge; the writer is not blocked by the rewrite and
-// continues accepting mutations into fresh layers. Frozen and active mutations
-// are never lost: a failed compaction retains the snapshot and a later trigger
-// retries. When the pending delta reaches MaxDelta the writer waits for the
-// running compaction (backpressure) rather than growing without bound. Compact
-// and Checkpoint fold everything synchronously; the old base is reclaimed after
-// a reader grace period.
+// bounded), a background worker runs an explicit prepare → commit → publish →
+// reclaim lifecycle: it writes and syncs a new generation off the writer lock,
+// commits the manifest (the durable linearization point) under the lock, swaps
+// in the new base, then drains readers and reclaims the old generation without
+// the lock. The writer is not blocked by the rewrite and continues accepting
+// mutations into fresh layers. Frozen and active mutations are never lost: a
+// failure before the manifest commit retains the snapshot and a later trigger
+// retries, and once the manifest commits the new generation is always published
+// (a manifest that committed despite a reported sync error is reconciled). When
+// the pending delta reaches MaxDelta the writer waits for the running compaction
+// (backpressure) rather than growing without bound. Compact and Checkpoint fold
+// everything synchronously; the old base is reclaimed after a reader grace
+// period.
 //
 // # Persistence
 //

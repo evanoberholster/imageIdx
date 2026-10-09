@@ -21,7 +21,7 @@ const (
 	persistCreate persistStage = iota
 	persistWrite
 	persistSync
-	persistManifest
+	persistCommit
 	persistPublish
 	persistReclaim
 	persistRemove
@@ -29,6 +29,10 @@ const (
 
 // persistFail is a test seam; production leaves it nil.
 var persistFail func(persistStage) error
+
+// writeManifestFunc is a test seam for the manifest commit; production uses
+// writeManifest directly.
+var writeManifestFunc = writeManifest
 
 func failStage(stage persistStage) error {
 	if persistFail == nil {
@@ -159,6 +163,16 @@ func writeManifest(dir string, generation, count uint64) error {
 	return storage.WriteFileAtomic(dir, "manifest.tmp", "manifest", encodeManifest(generation, count), 0o644)
 }
 
+// readManifest returns the committed (generation, count), or ok=false when the
+// manifest is missing or invalid.
+func readManifest(dir string) (generation, count uint64, ok bool) {
+	data, err := os.ReadFile(filepath.Join(dir, "manifest"))
+	if err != nil {
+		return 0, 0, false
+	}
+	return decodeManifest(data)
+}
+
 func (i *Index) createEmptyLocked() error {
 	const generation = uint64(1)
 	path := basePath(i.dir, generation)
@@ -186,11 +200,7 @@ func (i *Index) createEmptyLocked() error {
 }
 
 func (i *Index) loadLocked() error {
-	data, err := os.ReadFile(filepath.Join(i.dir, "manifest"))
-	if err != nil {
-		return err
-	}
-	generation, count, ok := decodeManifest(data)
+	generation, count, ok := readManifest(i.dir)
 	if !ok {
 		return ErrCorrupt
 	}
@@ -284,76 +294,121 @@ func validateBase(keys []S2Key, ids []common.ImageID, maxID common.ImageID) erro
 	return nil
 }
 
-// runCompaction is the background worker: it folds the frozen layer into a new
-// base without holding the writer lock during the rewrite, then publishes. On
-// failure the frozen layer is retained so nothing is lost and a later trigger
-// retries.
+// runCompaction advances one compaction through its phases:
+//
+//	prepare  (off-lock) write and sync a new generation file, no manifest
+//	commit   (locked)   publish the manifest (the durable linearization point)
+//	publish  (locked)   swap in the new in-memory base
+//	reclaim  (off-lock) drain readers of the old generation, unmap it, clean up
+//
+// The writer mutex is held only for the short commit/publish step and the state
+// transitions; file construction and reader reclamation run outside it. A
+// failure before the manifest commit leaves the previous durable generation
+// authoritative and retains the frozen snapshot. Once the manifest commits the
+// new generation is authoritative and is always published, so a later failure
+// cannot leave the index operating as if it were never committed. compacting
+// stays true through reclamation, so no other compaction can start and reuse a
+// generation name while the old mapping is still referenced.
 func (i *Index) runCompaction() {
 	i.mu.Lock()
 	snapshot := i.base
 	frozen := i.frozen
 	i.mu.Unlock()
 
-	var newBase base
-	var err error
-	if err = failStage(persistCreate); err == nil {
-		adds := sortedByKey(frozen)
-		count := exactCount(snapshot.keys, snapshot.ids, frozen, adds)
-		newBase, err = i.buildBase(snapshot, frozen, adds, count)
-	}
-	if err == nil {
-		err = failStage(persistPublish)
+	prepared, err := i.prepareBase(snapshot, frozen)
+	if err != nil {
+		i.finishCompaction(err)
+		return
 	}
 
 	i.mu.Lock()
-	defer i.mu.Unlock()
-	if err != nil || i.closed.Load() {
-		if newBase.mf != nil {
-			_ = newBase.mf.Close()
+	if i.persistent {
+		if cerr := failStage(persistCommit); cerr != nil {
+			i.mu.Unlock()
+			i.discardPrepared(prepared)
+			i.finishCompaction(cerr)
+			return
 		}
-		i.compactionErr = err
-		i.compacting = false
-		close(i.compactionDone)
-		return
+		if cerr := writeManifestFunc(i.dir, prepared.gen, uint64(len(prepared.keys))); cerr != nil {
+			// The manifest write is atomic, but an error after the rename (for
+			// example a directory sync failure) can still have committed the new
+			// generation. Reconcile with what is actually durable before
+			// treating it as uncommitted, so we never overwrite or discard a
+			// manifest-referenced generation.
+			if gen, _, ok := readManifest(i.dir); !ok || gen != prepared.gen {
+				i.mu.Unlock()
+				i.discardPrepared(prepared)
+				i.finishCompaction(cerr)
+				return
+			}
+		}
 	}
+	// The generation is durable (or the index is memory-backed); publish it.
+	_ = failStage(persistPublish)
 	old := i.base
-	i.base = newBase
+	i.base = prepared
 	i.frozen = nil
 	i.compactionErr = nil
 	i.deltaMax = maxImageID(0, nil, i.layers, i.active)
 	i.publishLocked()
-	i.tracker.WaitForPriorReaders()
-	// Reclamation is best-effort: the commit is already durable and published,
-	// so a cleanup failure must not fail the compaction.
+	i.mu.Unlock()
+
+	// Reclaim without the writer mutex. The reader tracker drains every reader
+	// that pinned the old view; only then is the old mapping unmapped.
 	_ = failStage(persistReclaim)
+	i.tracker.WaitForPriorReaders()
 	if old.mf != nil {
 		_ = old.mf.Close()
 	}
-	if old.gen != 0 {
+	if i.persistent && old.gen != 0 {
 		_ = failStage(persistRemove)
-		_ = storage.RemoveObsolete(i.dir, "base.*.dat", basePath(i.dir, newBase.gen))
+		_ = storage.RemoveObsolete(i.dir, "base.*.dat", basePath(i.dir, prepared.gen))
 	}
+
+	i.mu.Lock()
 	i.compacting = false
 	close(i.compactionDone)
+	i.mu.Unlock()
 }
 
-// buildBase streams base+delta into a new immutable base. For a file-backed
-// index it writes and syncs a new generation file and publishes the manifest;
-// otherwise it builds heap arrays. It runs without the writer lock.
-func (i *Index) buildBase(snapshot base, shadow, adds []mutation, count uint64) (base, error) {
+// discardPrepared closes a prepared but uncommitted generation mapping.
+func (i *Index) discardPrepared(prepared base) {
+	if prepared.mf != nil {
+		_ = prepared.mf.Close()
+	}
+}
+
+// finishCompaction records a pre-commit failure, retains the frozen snapshot so
+// pending mutations are not lost, and releases any writer waiting on compaction.
+func (i *Index) finishCompaction(err error) {
+	i.mu.Lock()
+	i.compactionErr = err
+	i.compacting = false
+	close(i.compactionDone)
+	i.mu.Unlock()
+}
+
+// prepareBase writes and syncs a new generation file (or builds heap arrays for
+// a memory-backed index) without committing the manifest. It runs without the
+// writer lock; the manifest is published separately by the commit phase.
+func (i *Index) prepareBase(snapshot base, frozen []mutation) (base, error) {
+	if err := failStage(persistCreate); err != nil {
+		return base{}, err
+	}
+	adds := sortedByKey(frozen)
+	count := exactCount(snapshot.keys, snapshot.ids, frozen, adds)
 	generation := snapshot.gen + 1
 	if !i.persistent {
 		keys := make([]S2Key, count)
 		ids := make([]common.ImageID, count)
-		written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, shadow, adds)
+		written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, frozen, adds)
 		return base{keys: keys[:written], ids: ids[:written], gen: generation, maxID: maxOfIDs(ids[:written])}, nil
 	}
-	path := basePath(i.dir, generation)
 	size, ok := checkedBaseFileSize(count)
 	if !ok || size > math.MaxInt64 {
 		return base{}, ErrOverflow
 	}
-	mf, err := storage.CreateMapped(path, int64(size))
+	mf, err := storage.CreateMapped(basePath(i.dir, generation), int64(size))
 	if err != nil {
 		return base{}, err
 	}
@@ -369,7 +424,7 @@ func (i *Index) buildBase(snapshot base, shadow, adds []mutation, count uint64) 
 		_ = mf.Close()
 		return base{}, err
 	}
-	written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, shadow, adds)
+	written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, frozen, adds)
 	if err := failStage(persistWrite); err != nil {
 		_ = mf.Close()
 		return base{}, err
@@ -388,14 +443,6 @@ func (i *Index) buildBase(snapshot base, shadow, adds []mutation, count uint64) 
 		return base{}, err
 	}
 	if err := mf.Sync(); err != nil {
-		_ = mf.Close()
-		return base{}, err
-	}
-	if err := failStage(persistManifest); err != nil {
-		_ = mf.Close()
-		return base{}, err
-	}
-	if err := writeManifest(i.dir, generation, uint64(written)); err != nil {
 		_ = mf.Close()
 		return base{}, err
 	}

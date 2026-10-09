@@ -3,6 +3,7 @@ package geoidx
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
 
 	common "github.com/evanoberholster/imageIdx/common"
@@ -270,6 +271,59 @@ func entryBatch(keys []S2Key, base uint64) []Entry {
 		out[i] = Entry{Key: key, ImageID: base + uint64(i)}
 	}
 	return out
+}
+
+// BenchmarkGeoWriterWithReaders measures 64-entry insert throughput while
+// readers continuously pin the current view, checking that a writer never waits
+// on active readers.
+func BenchmarkGeoWriterWithReaders(b *testing.B) {
+	ranges := CoverCap(nil, geoNewCap(2000), CoverOptions{MaxCells: 16})
+	for _, readers := range []int{0, 4} {
+		b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
+			index, err := NewMemory(Config{TargetDelta: 64, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer index.Close()
+			if err := index.InsertBatch(entryBatch(testKeys(100_000), 1)); err != nil {
+				b.Fatal(err)
+			}
+			if err := index.Compact(); err != nil {
+				b.Fatal(err)
+			}
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			for r := 0; r < readers; r++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						_ = index.SearchRanges(nil, ranges)
+					}
+				}()
+			}
+			keys := testKeys(64)
+			batch := make([]Entry, 64)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for n := range batch {
+					batch[n] = Entry{Key: keys[n], ImageID: uint64(1_000_000 + i*64 + n)}
+				}
+				if err := index.InsertBatch(batch); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			close(stop)
+			wg.Wait()
+		})
+	}
 }
 func BenchmarkGeoInsertRotation(b *testing.B) {
 	for _, trigger := range []int{1 << 20, 256} {
