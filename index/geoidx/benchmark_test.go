@@ -2,12 +2,15 @@ package geoidx
 
 import (
 	"fmt"
+	"math/rand"
+	"slices"
+	"sort"
+	"sync"
+	"testing"
+
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s2"
-	"math/rand"
-	"sync"
-	"testing"
 )
 
 const benchLat, benchLng = 37.7749, -122.4194
@@ -881,4 +884,215 @@ func BenchmarkGeoInsertRotation(b *testing.B) {
 			_ = index.Compact()
 		})
 	}
+}
+
+// --- Paging experiment (see PAGING.md) ---
+
+func buildGeoBase(tb testing.TB, n int, spread float64) *Index {
+	tb.Helper()
+	coords := geoBenchCoords(n, spread)
+	index, err := NewMemory(Config{})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	entries := make([]Entry, n)
+	for i, ll := range coords {
+		key, err := KeyFromLatLng(ll.Lat.Degrees(), ll.Lng.Degrees())
+		if err != nil {
+			tb.Fatal(err)
+		}
+		entries[i] = Entry{Key: key, ImageID: uint64(i + 1)}
+	}
+	if err := index.InsertBatch(entries); err != nil {
+		tb.Fatal(err)
+	}
+	if err := index.Compact(); err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { _ = index.Close() })
+	return index
+}
+
+// pageDir is a compact single-level directory over the flat sorted key array.
+type pageDir struct {
+	firstKeys   []S2Key
+	offsets     []int
+	pageRecords int
+}
+
+func buildPageDir(keys []S2Key, pageRecords int) pageDir {
+	d := pageDir{pageRecords: pageRecords}
+	for i := 0; i < len(keys); i += pageRecords {
+		d.firstKeys = append(d.firstKeys, keys[i])
+		d.offsets = append(d.offsets, i)
+	}
+	return d
+}
+
+func (d pageDir) locate(keys []S2Key, key S2Key) int {
+	p := sort.Search(len(d.firstKeys), func(i int) bool { return d.firstKeys[i] > key })
+	if p == 0 {
+		return 0
+	}
+	base := d.offsets[p-1]
+	end := base + d.pageRecords
+	if end > len(keys) {
+		end = len(keys)
+	}
+	return base + sort.Search(end-base, func(i int) bool { return keys[base+i] >= key })
+}
+
+func pagedSearch(keys []S2Key, ids []common.ImageID, d pageDir, ranges []Range, dst []common.ImageID) []common.ImageID {
+	mark := len(dst)
+	for _, r := range ranges {
+		i := d.locate(keys, r.Start)
+		for i < len(keys) && keys[i] <= r.End {
+			dst = append(dst, ids[i])
+			i++
+		}
+	}
+	tail := dst[mark:]
+	if !slices.IsSorted(tail) {
+		slices.Sort(tail)
+	}
+	return dst
+}
+
+// flatSearch mirrors pagedSearch but binary-searches the whole key array, so the
+// only difference is the page directory.
+func flatSearch(keys []S2Key, ids []common.ImageID, ranges []Range, dst []common.ImageID) []common.ImageID {
+	mark := len(dst)
+	for _, r := range ranges {
+		i := sort.Search(len(keys), func(k int) bool { return keys[k] >= r.Start })
+		for i < len(keys) && keys[i] <= r.End {
+			dst = append(dst, ids[i])
+			i++
+		}
+	}
+	tail := dst[mark:]
+	if !slices.IsSorted(tail) {
+		slices.Sort(tail)
+	}
+	return dst
+}
+
+// BenchmarkPagedLookup compares the flat sorted-array scan with a two-level page
+// directory over the same data.
+func BenchmarkPagedLookup(b *testing.B) {
+	index := buildGeoBase(b, 1_000_000, geoBenchSpan)
+	v := index.view.Load()
+	keys, ids := v.keys, v.ids
+	exactKey, _ := KeyFromLatLng(geoBenchLat, geoBenchLng)
+	exact := []Range{{Start: exactKey, End: exactKey}}
+	multi := CoverCap(nil, geoNewCap(2000), CoverOptions{MaxCells: 16})
+
+	b.Run("flat/exact", func(b *testing.B) {
+		dst := make([]common.ImageID, 0, 256)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dst = index.SearchRanges(dst[:0], exact)
+		}
+	})
+	b.Run("flat/multi", func(b *testing.B) {
+		dst := make([]common.ImageID, 0, 4096)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dst = index.SearchRanges(dst[:0], multi)
+		}
+	})
+	b.Run("flat-locate/exact", func(b *testing.B) {
+		dst := make([]common.ImageID, 0, 256)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dst = flatSearch(keys, ids, exact, dst[:0])
+		}
+	})
+	b.Run("flat-locate/multi", func(b *testing.B) {
+		dst := make([]common.ImageID, 0, 4096)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dst = flatSearch(keys, ids, multi, dst[:0])
+		}
+	})
+	for _, pr := range []int{256, 512, 1024, 2048} {
+		d := buildPageDir(keys, pr)
+		b.Run(fmt.Sprintf("paged/size=%d/exact", pr), func(b *testing.B) {
+			dst := make([]common.ImageID, 0, 256)
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				dst = pagedSearch(keys, ids, d, exact, dst[:0])
+			}
+		})
+		b.Run(fmt.Sprintf("paged/size=%d/multi", pr), func(b *testing.B) {
+			dst := make([]common.ImageID, 0, 4096)
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				dst = pagedSearch(keys, ids, d, multi, dst[:0])
+			}
+		})
+	}
+}
+
+// TestPageWriteAmplification models page-level COW: a 64-mutation batch rewrites
+// one page per distinct page touched. It compares that against the flat
+// buffered compaction, which rewrites the whole base every base/8 mutations
+// (~128 bytes per mutation at 16 B/image).
+func TestPageWriteAmplification(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		spread float64
+		mutate float64
+	}{
+		{"clustered", 0.01, 0.02},
+		{"uniform", geoBenchSpan, geoBenchSpan},
+	} {
+		index := buildGeoBase(t, 1_000_000, tc.spread)
+		v := index.view.Load()
+		const (
+			batch   = 64
+			batches = 200
+		)
+		for _, pr := range []int{256, 512, 1024, 2048} {
+			dir := buildPageDir(v.keys, pr)
+			rng := rand.New(rand.NewSource(42))
+			totalPages := 0
+			for b := 0; b < batches; b++ {
+				seen := make(map[int]struct{}, batch)
+				for m := 0; m < batch; m++ {
+					lat := geoBenchLat + (rng.Float64()*2-1)*tc.mutate
+					lng := geoBenchLng + (rng.Float64()*2-1)*tc.mutate
+					key, err := KeyFromLatLng(lat, lng)
+					if err != nil {
+						t.Fatal(err)
+					}
+					seen[dir.locate(v.keys, key)/pr] = struct{}{}
+				}
+				totalPages += len(seen)
+			}
+			avgPages := float64(totalPages) / batches
+			bytesPerMutation := avgPages * float64(pr*16) / batch
+			t.Logf("%-9s pageRecords=%-4d avgPages/batch=%.1f bytes/mutation=%.0f", tc.name, pr, avgPages, bytesPerMutation)
+		}
+	}
+	t.Logf("flat buffered compaction bytes/mutation ~= 128")
+}
+
+// BenchmarkKeyScan measures raw sequential S2Key scan cost; it is the ceiling a
+// SIMD range kernel could approach. ns/key near memory bandwidth means SIMD has
+// little headroom.
+func BenchmarkKeyScan(b *testing.B) {
+	index := buildGeoBase(b, 1_000_000, geoBenchSpan)
+	keys := index.view.Load().keys
+	var sink uint64
+	b.SetBytes(int64(len(keys) * 8))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var s uint64
+		for _, k := range keys {
+			s += uint64(k)
+		}
+		sink = s
+	}
+	_ = sink
 }
