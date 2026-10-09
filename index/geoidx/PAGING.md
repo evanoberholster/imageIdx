@@ -107,6 +107,75 @@ branch. Revisit paging only if a future workload shows strongly clustered,
 page-local updates where `touchedPages · pageBytes / batch` beats `baseBytes /
 (base/8)`.
 
+## Profiling pass (CPU + MEM pprof)
+
+Captured with `go test -run '^$' -bench '...' -cpuprofile -memprofile`.
+`BenchmarkGeoInsertRotation` inserts unbounded new ImageIDs, so `-benchtime=1s`
+makes Go calibrate to an enormous N and the run can take minutes; captures use a
+bounded `-benchtime=Nx`.
+
+### Findings
+
+1. **Compaction was O(base · log Δ).** `prepareBase` called `mutationIndex` (a
+   binary search into the id-sorted layer) once per base entry in `exactCount`
+   and `mergeInto`, and `baseHasLive` rescanned equal keys per add. On clustered
+   data (high key fan-out) a `sample(1)` of a write-heavy run showed the
+   background compaction goroutine pinned in `baseHasLive` for the whole window;
+   the first `-benchtime=1s` capture ran 108 s before being stopped.
+2. **`FilterRanges`/`CollectRanges` heap-allocated a 2 KiB `collector` per
+   query** (28.7% of query alloc_space): `newCollector` returned a pointer and
+   `AddMany` (another package) made its stack buffer escape.
+3. **`sortIDsBitset` allocated a transient dense bitset** (up to ~128 KiB) per
+   broad range query (24% of query alloc_space).
+4. Remaining CPU is inherent: the initial-query ordering contract
+   (`sortIDs` comparison sort, ~14%) and `roar` canonicalization triggered by the
+   benchmark's own `Cardinality()` call (~15%); `scanRanges` and
+   `roar.Bitmap.Contains` dominate the rest.
+
+### Changes
+
+- One `mutationSet` per base rewrite (dense bitset, binary-search fallback for
+  sparse domains) replaces the per-entry binary search; the read path's
+  `deltaSet` and `Len` reuse the same type.
+- `collector` is pooled; `Filter*`/`Collect*` are allocation-free.
+- The `sortIDsBitset` scratch buffer is pooled, bounded to 256 KiB.
+
+### Results (Apple M4 Pro)
+
+A/B at `-benchtime=2000x` (same machine, stashed vs applied):
+
+| benchmark | before | after |
+|---|---:|---:|
+| InsertRotation trigger=1048576 | 2.87 µs / 20,500 B / 4 | 2.78 µs / 20,516 B / 4 |
+| InsertRotation trigger=256 | 49.6 µs / 30,298 B / 4 | **25.2 µs** / 30,419 B / 4 |
+| Filter collect | 7.88 µs / 2,311 B / 1 | **6.72 µs** / 9 B / 0 |
+
+Query set at `-benchtime=200ms` (`ns/op · B/op · allocs/op`):
+
+| benchmark | before | after |
+|---|---|---|
+| MultiRange | 5.33 µs · 0 · 0 | 5.40 µs · 0 · 0 |
+| Nearest k=1 / 10 / 100 | 45.0 / 88.4 / 248 µs | 44.8 / 86.6 / 249 µs |
+| Filter initial | 5.33 µs · 0 · 0 | 5.39 µs · 0 · 0 |
+| Filter collect | 7.09 µs · 2304 B · 1 | 6.72 µs · 0 · 0 |
+| Filter small | 3.10 µs · 2304 B · 1 | 2.80 µs · 0 · 0 |
+| Filter medium | 2.43 µs · 2304 B · 1 | 2.28 µs · 0 · 0 |
+| Filter large | 10.3 µs · 2308 B · 1 | 10.4 µs · 70 B · 0 |
+| Clustered range | 56.8 µs · 131 KB · 1 | 54.7 µs · 53 B · 1 |
+| Clustered nearest10 | 19.5 µs · 12 KB · 194 | 19.0 µs · 12 KB · 194 |
+| Clustered filter/all | 1.23 ms · 2304 B · 1 | 1.20 ms · 21 B · 0 |
+
+Query alloc_space in the aggregate profile: **2041 MB → 985 MB (−52%)**.
+
+### Deferred
+
+- `Nearest` allocates ~29–67 KB / 468–1067 allocs per call, dominated by s2
+  coverer internals across the expanding-cap rounds (55.7% of remaining query
+  alloc_space). Reducing it needs a different cover strategy, out of scope.
+- The comparison sort for small initial results (<8192) is the largest remaining
+  geoidx CPU item; the ordering contract requires it, and the dense bitset does
+  not beat pdqsort at that size once scratch trade-offs are included.
+
 ## Status
 
 - [x] baselines captured
@@ -114,7 +183,7 @@ page-local updates where `touchedPages · pageBytes / batch` beats `baseBytes /
 - [x] page-size / directory-shape comparison
 - [x] page-level COW write-amplification model
 - [x] SIMD (scan-bandwidth) evaluation
-- [x] CPU/memory behavior (0 allocs on the hot paths, measured)
+- [x] CPU + MEM pprof captured and acted on
 - [x] decision recorded (retain flat SoA)
 - [ ] full paged mmap format + pagealloc COW (deferred; not justified by the data)
 

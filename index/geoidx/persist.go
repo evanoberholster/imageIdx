@@ -396,12 +396,13 @@ func (i *Index) prepareBase(snapshot base, frozen []mutation) (base, error) {
 		return base{}, err
 	}
 	adds := sortedByKey(frozen)
-	count := exactCount(snapshot.keys, snapshot.ids, frozen, adds)
+	shadow := newMutationSet(frozen, len(snapshot.keys))
+	count := exactCount(snapshot.keys, snapshot.ids, shadow, adds)
 	generation := snapshot.gen + 1
 	if !i.persistent {
 		keys := make([]S2Key, count)
 		ids := make([]common.ImageID, count)
-		written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, frozen, adds)
+		written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, shadow, adds)
 		return base{keys: keys[:written], ids: ids[:written], gen: generation, maxID: maxOfIDs(ids[:written])}, nil
 	}
 	size, ok := checkedBaseFileSize(count)
@@ -424,7 +425,7 @@ func (i *Index) prepareBase(snapshot base, frozen []mutation) (base, error) {
 		_ = mf.Close()
 		return base{}, err
 	}
-	written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, frozen, adds)
+	written := mergeInto(keys, ids, snapshot.keys, snapshot.ids, shadow, adds)
 	if err := failStage(persistWrite); err != nil {
 		_ = mf.Close()
 		return base{}, err
@@ -512,10 +513,11 @@ func maxOfIDs(ids []common.ImageID) common.ImageID {
 
 // exactCount returns the number of live (key, imageID) pairs after applying the
 // delta, matching mergeInto's dedup of an insert that repeats a live base pair.
-func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow, adds []mutation) uint64 {
+// shadow is the membership set over the id-sorted delta.
+func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) uint64 {
 	count := uint64(0)
 	for n := range baseKeys {
-		if _, touched := mutationIndex(shadow, baseIDs[n]); !touched {
+		if !shadow.touched(baseIDs[n]) {
 			count++
 		}
 	}
@@ -527,15 +529,14 @@ func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow, adds []mutat
 	return count
 }
 
-func baseHasLive(baseKeys []S2Key, baseIDs []common.ImageID, shadow []mutation, key S2Key, id common.ImageID) bool {
+func baseHasLive(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, key S2Key, id common.ImageID) bool {
 	index := 0
 	if len(baseKeys) > 0 {
 		index = searchKey(baseKeys, key)
 	}
 	for index < len(baseKeys) && baseKeys[index] == key {
 		if baseIDs[index] == id {
-			_, touched := mutationIndex(shadow, id)
-			return !touched
+			return !shadow.touched(id)
 		}
 		index++
 	}
@@ -557,12 +558,13 @@ func searchKey(keys []S2Key, key S2Key) int {
 
 // mergeInto writes the retained base entries and additions into keys and ids in
 // (key, id) order, skipping base entries shadowed by the delta and de-duplicating
-// equal pairs. It returns the number written.
-func mergeInto(keys []S2Key, ids []common.ImageID, baseKeys []S2Key, baseIDs []common.ImageID, shadow, adds []mutation) int {
+// equal pairs. It returns the number written. shadow is the membership set over
+// the id-sorted delta.
+func mergeInto(keys []S2Key, ids []common.ImageID, baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) int {
 	baseIndex, addIndex, out := 0, 0, 0
 	for baseIndex < len(baseKeys) || addIndex < len(adds) {
 		for baseIndex < len(baseKeys) {
-			if _, touched := mutationIndex(shadow, baseIDs[baseIndex]); touched {
+			if shadow.touched(baseIDs[baseIndex]) {
 				baseIndex++
 				continue
 			}

@@ -9,6 +9,7 @@ import (
 	"math/bits"
 	"slices"
 	"sort"
+	"sync"
 )
 
 // Result is one distance-aware geographic match. Distance is the great-circle
@@ -384,12 +385,6 @@ type collector struct {
 	stack [collectChunk]common.ImageID
 }
 
-func newCollector(dst *roar.MutableBitmap) *collector {
-	c := &collector{dst: dst}
-	c.buf = c.stack[:0]
-	return c
-}
-
 func (c *collector) add(id common.ImageID) {
 	if len(c.buf) == cap(c.buf) {
 		c.flush()
@@ -405,6 +400,27 @@ func (c *collector) flush() {
 	c.buf = c.buf[:0]
 }
 
+// collectorPool reuses collectors across queries. A fresh collector escapes to
+// the heap (AddMany may retain the slice), so pooling keeps Filter/Collect
+// queries allocation-free on the steady-state path while still bounding the
+// staged buffer to a single chunk.
+var collectorPool = sync.Pool{New: func() any { return new(collector) }}
+
+// acquireCollector returns a pooled collector targeting dst.
+func acquireCollector(dst *roar.MutableBitmap) *collector {
+	c := collectorPool.Get().(*collector)
+	c.dst = dst
+	c.buf = c.stack[:0]
+	return c
+}
+
+// releaseCollector returns c to the pool after the caller has flushed it.
+func releaseCollector(c *collector) {
+	c.dst = nil
+	c.buf = c.stack[:0]
+	collectorPool.Put(c)
+}
+
 // CollectRanges adds every ImageID whose key falls in ranges directly to dst in
 // native S2 order. No sorted slice is built and no global sort runs.
 func (i *Index) CollectRanges(dst *roar.MutableBitmap, ranges []Range) {
@@ -414,12 +430,13 @@ func (i *Index) CollectRanges(dst *roar.MutableBitmap, ranges []Range) {
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
 			c.add(id)
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 }
 
@@ -456,7 +473,7 @@ func (i *Index) CollectRadius(dst *roar.MutableBitmap, latitude, longitude, radi
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
 			if keyDistanceMeters(key, center) <= radiusMeters {
 				c.add(id)
@@ -464,6 +481,7 @@ func (i *Index) CollectRadius(dst *roar.MutableBitmap, latitude, longitude, radi
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 	return nil
 }
@@ -488,7 +506,7 @@ func (i *Index) FilterRanges(dst *roar.MutableBitmap, candidates roar.Bitmap, ra
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
 			if candidates.Contains(id) {
 				c.add(id)
@@ -496,6 +514,7 @@ func (i *Index) FilterRanges(dst *roar.MutableBitmap, candidates roar.Bitmap, ra
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 }
 
@@ -532,7 +551,7 @@ func (i *Index) FilterRadius(dst *roar.MutableBitmap, candidates roar.Bitmap, la
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
 			if candidates.Contains(id) && keyDistanceMeters(key, center) <= radiusMeters {
 				c.add(id)
@@ -540,6 +559,7 @@ func (i *Index) FilterRadius(dst *roar.MutableBitmap, candidates roar.Bitmap, la
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 	return nil
 }
@@ -718,7 +738,7 @@ func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) ([]common.ImageID
 		return ids, false
 	}
 	words := int(uint64(limit)>>6) + 1
-	set := make([]uint64, words)
+	set := acquireBitset(words)
 	for _, id := range ids {
 		set[id>>6] |= 1 << (id & 63)
 	}
@@ -731,7 +751,36 @@ func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) ([]common.ImageID
 			word &= word - 1
 		}
 	}
+	releaseBitset(set)
 	return ids[:out], true
+}
+
+// bitsetScratchCap bounds the word count of a pooled bitset (256 KiB), so the
+// pool cannot retain an unbounded buffer. Larger bitsets are allocated directly.
+const bitsetScratchCap = 1 << 15
+
+var bitsetPool = sync.Pool{New: func() any { return make([]uint64, 0, 1024) }}
+
+// acquireBitset returns a zeroed bitset of words words, reusing a pooled buffer
+// when possible so broad sorted queries do not allocate per call.
+func acquireBitset(words int) []uint64 {
+	if words > bitsetScratchCap {
+		return make([]uint64, words)
+	}
+	set := bitsetPool.Get().([]uint64)
+	if cap(set) < words {
+		set = make([]uint64, words)
+	}
+	set = set[:words]
+	clear(set)
+	return set
+}
+
+// releaseBitset returns set to the pool for reuse.
+func releaseBitset(set []uint64) {
+	if cap(set) <= bitsetScratchCap {
+		bitsetPool.Put(set[:0])
+	}
 }
 
 // radixSortIDs sorts a uint64 slice with an 8-pass, base-256 LSD radix sort. One

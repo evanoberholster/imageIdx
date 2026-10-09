@@ -82,6 +82,53 @@ type base struct {
 	maxID common.ImageID
 }
 
+// mutationSet is an id membership test over a mutation layer sorted by id. It
+// stores a dense bitset when the ImageID domain is compact relative to the data,
+// and otherwise falls back to a binary search over the layer. The read path
+// caches one per view and compaction builds one per base rewrite, so a
+// membership test is O(1) on the common domains instead of O(log delta).
+type mutationSet struct {
+	layer []mutation
+	bits  []uint64
+}
+
+// newMutationSet builds the cheapest membership structure for layer. bound is the
+// number of base entries the set will be tested against; the bitset is kept only
+// while it stays proportional to that data, so sparse ImageID domains do not
+// allocate a huge bitset.
+func newMutationSet(layer []mutation, bound int) mutationSet {
+	set := mutationSet{layer: layer}
+	limit := common.ImageID(0)
+	for n := range layer {
+		if layer[n].id > limit {
+			limit = layer[n].id
+		}
+	}
+	if limit != 0 && uint64(limit) <= bitsetMaxID &&
+		uint64(limit) <= 64*uint64(bound+len(layer)+1) {
+		words := int(uint64(limit)>>6) + 1
+		bits := make([]uint64, words)
+		for n := range layer {
+			bits[layer[n].id>>6] |= 1 << (layer[n].id & 63)
+		}
+		set.bits = bits
+	}
+	return set
+}
+
+// touched reports whether id is named by the set's layer.
+func (s mutationSet) touched(id common.ImageID) bool {
+	if s.bits != nil {
+		word := id >> 6
+		if int(word) < len(s.bits) {
+			return s.bits[word]&(1<<(id&63)) != 0
+		}
+		return false
+	}
+	_, touched := mutationIndex(s.layer, id)
+	return touched
+}
+
 // view is one immutable reader snapshot. Its slices are never mutated after
 // publication; a writer replaces the whole view. active and layers are the live
 // pending mutations (active is newest), and frozen is the compaction snapshot.
@@ -97,7 +144,7 @@ type view struct {
 	deltaOnce sync.Once
 	delta     []mutation
 	deltaAdds []mutation // effective inserts, sorted by (key, id)
-	deltaSet  []uint64   // membership bitset over delta ids, nil when not built
+	deltaSet  mutationSet
 }
 
 // Index is a specialized geographic index: lock-free readers and one serialized
@@ -188,40 +235,15 @@ func viewDelta(v *view) []mutation {
 			return cmp.Compare(a.id, b.id)
 		})
 		v.deltaAdds = adds
-		limit := v.maxID
-		for n := range v.delta {
-			if v.delta[n].id > limit {
-				limit = v.delta[n].id
-			}
-		}
-		// Build a membership bitset when the ImageID domain is compact relative
-		// to the data, so base-range filtering is O(1) per entry instead of a
-		// binary search.
-		if limit != 0 && uint64(limit) <= bitsetMaxID &&
-			uint64(limit) <= 64*uint64(len(v.keys)+len(v.delta)+1) {
-			words := int(uint64(limit)>>6) + 1
-			set := make([]uint64, words)
-			for n := range v.delta {
-				set[v.delta[n].id>>6] |= 1 << (v.delta[n].id & 63)
-			}
-			v.deltaSet = set
-		}
+		v.deltaSet = newMutationSet(v.delta, len(v.keys))
 	})
 	return v.delta
 }
 
 // deltaTouched reports whether id is named by the effective delta, using the
-// cached bitset when available and guarding its bounds.
+// cached membership set.
 func deltaTouched(v *view, id common.ImageID) bool {
-	if v.deltaSet != nil {
-		word := id >> 6
-		if int(word) < len(v.deltaSet) {
-			return v.deltaSet[word]&(1<<(id&63)) != 0
-		}
-		return false
-	}
-	_, touched := mutationIndex(v.delta, id)
-	return touched
+	return v.deltaSet.touched(id)
 }
 
 func (i *Index) publishLocked() {
@@ -602,15 +624,15 @@ func (i *Index) Len() uint64 {
 	}
 	// Collapse the layers into one effective delta, then count.
 	v := i.view.Load()
-	eff := viewDelta(v)
+	viewDelta(v)
 	count := uint64(0)
 	for n := range v.keys {
-		if _, touched := mutationIndex(eff, v.ids[n]); !touched {
+		if !v.deltaSet.touched(v.ids[n]) {
 			count++
 		}
 	}
-	for n := range eff {
-		if eff[n].add {
+	for n := range v.delta {
+		if v.delta[n].add {
 			count++
 		}
 	}
