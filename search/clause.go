@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
@@ -113,15 +114,21 @@ func During(index *timeidx.Index, start, end uint64, options ...TimestampOption)
 }
 
 type geoClause struct {
-	index  *bitmapidx.Index
-	ranges []bitmapidx.GeoRange
+	index  *geoidx.Index
+	ranges []geoidx.Range
 	cells  []uint64
 }
 
 func (geoClause) searchClause() {}
 
-// InCells restricts to the union of S2 cells. Like other constructors, it
-// defers validation/normalization to Compile and copies the input slice.
-func InCells(index *bitmapidx.Index, cellIDs ...uint64) Clause {
+// InCells restricts to the union of S2 cells against a geoidx index. Like other
+// constructors, it defers validation/normalization to Compile and copies the
+// input slice. Cell IDs may be at S2Level or coarser; coarser cells expand to
+// their descendants.
+//
+// TODO(geoidx): Add city/area queries once a place-to-S2-region representation
+// is defined. geoidx itself should remain independent of geocoding and
+// place-name databases.
+func InCells(index *geoidx.Index, cellIDs ...uint64) Clause {
 	return geoClause{index: index, cells: append([]uint64(nil), cellIDs...)}
 }

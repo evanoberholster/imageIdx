@@ -128,7 +128,16 @@ func (plan Plan) probe(ctx context.Context, candidates []ImageID, ws *Workspace,
 				candidates, err = st.namespaceQuery.Filter(candidates[:0], candidates)
 			}
 		case StageGeo:
-			candidates, err = st.geoIndex.FilterGeoRanges(candidates[:0], candidates, st.geoRanges)
+			// Geo has no reverse index, so it is buffered by prepareProbes and
+			// verified by membership in the collected geo ID set.
+			out := candidates[:0]
+			fallback := ws.fallback[n]
+			for _, id := range candidates {
+				if _, ok := slices.BinarySearch(fallback, id); ok {
+					out = append(out, id)
+				}
+			}
+			candidates = out
 		case StageACL:
 			candidates, err = st.filterACL(candidates[:0], candidates, ws)
 		case StageHash:

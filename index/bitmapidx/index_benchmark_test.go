@@ -499,86 +499,9 @@ func BenchmarkContainerDelta(b *testing.B) {
 	}
 }
 
-// BenchmarkContainerGeoMove measures one Add+Remove transition cycle between
-// two geo buckets of the given container sizes. The round trip returns the
-// moved image to its source bucket.
-func BenchmarkContainerGeoMove(b *testing.B) {
-	paris, err := KeyFromLatLng(48.8566, 2.3522)
-	if err != nil {
-		b.Fatal(err)
-	}
-	london, err := KeyFromLatLng(51.5074, -0.1278)
-	if err != nil {
-		b.Fatal(err)
-	}
-	cases := []struct{ from, to int }{
-		{3, 3},
-		{4, 4},
-		{4, 64},
-		{64, 4},
-		{64, 64},
-	}
-	for _, testCase := range cases {
-		b.Run(fmt.Sprintf("From%dTo%d", testCase.from, testCase.to), func(b *testing.B) {
-			namespace, err := NewGeoNamespace(common.NamespaceLocation, nil, NamespaceConfig{})
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() { _ = namespace.Close() })
-			for id := 1; id <= testCase.from; id++ {
-				commit(b, namespace, func(bt *Batch) error {
-					return bt.Add(Entry{ImageID: common.ImageID(id), Value: GeoValue(paris)})
-				})
-			}
-			for id := 1000; id < 1000+testCase.to; id++ {
-				commit(b, namespace, func(bt *Batch) error {
-					return bt.Add(Entry{ImageID: common.ImageID(id), Value: GeoValue(london)})
-				})
-			}
-			if err := namespace.Compact(); err != nil {
-				b.Fatal(err)
-			}
-			batch := namespace.NewBatch()
-			defer batch.Close()
-			b.ReportAllocs()
-			b.ResetTimer()
-			for n := 0; n < b.N; n++ {
-				if err := batch.Reset(); err != nil {
-					b.Fatal(err)
-				}
-				if err := batch.Move(Move{ImageID: 1, From: int64(paris), To: int64(london)}); err != nil {
-					b.Fatal(err)
-				}
-				if err := batch.Apply(); err != nil {
-					b.Fatal(err)
-				}
-				if err := namespace.Barrier(); err != nil {
-					b.Fatal(err)
-				}
-				if err := batch.Reset(); err != nil {
-					b.Fatal(err)
-				}
-				if err := batch.Move(Move{ImageID: 1, From: int64(london), To: int64(paris)}); err != nil {
-					b.Fatal(err)
-				}
-				if err := batch.Apply(); err != nil {
-					b.Fatal(err)
-				}
-				if err := namespace.Barrier(); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}
-
 // BenchmarkContainerFlip measures the full public path for a tiny<->bitmap
 // promotion and demotion cycle, including publication and both folds.
 func BenchmarkContainerFlip(b *testing.B) {
-	paris, err := KeyFromLatLng(48.8566, 2.3522)
-	if err != nil {
-		b.Fatal(err)
-	}
 	b.Run("Enum", func(b *testing.B) {
 		namespace, _, value := seededEnumNamespace(b, 4)
 		batch := namespace.NewBatch()
@@ -605,57 +528,6 @@ func BenchmarkContainerFlip(b *testing.B) {
 				b.Fatal(err)
 			}
 			if err := batch.Remove(Entry{ImageID: 1000, Value: value}); err != nil {
-				b.Fatal(err)
-			}
-			if err := batch.Apply(); err != nil {
-				b.Fatal(err)
-			}
-			if err := namespace.Barrier(); err != nil {
-				b.Fatal(err)
-			}
-			if err := namespace.Compact(); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-	b.Run("Geo", func(b *testing.B) {
-		namespace, err := NewGeoNamespace(common.NamespaceLocation, nil, NamespaceConfig{})
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.Cleanup(func() { _ = namespace.Close() })
-		for id := 1; id <= 4; id++ {
-			commit(b, namespace, func(bt *Batch) error {
-				return bt.Add(Entry{ImageID: common.ImageID(id), Value: GeoValue(paris)})
-			})
-		}
-		if err := namespace.Compact(); err != nil {
-			b.Fatal(err)
-		}
-		batch := namespace.NewBatch()
-		defer batch.Close()
-		b.ReportAllocs()
-		b.ResetTimer()
-		for n := 0; n < b.N; n++ {
-			if err := batch.Reset(); err != nil {
-				b.Fatal(err)
-			}
-			if err := batch.Add(Entry{ImageID: 1000, Value: GeoValue(paris)}); err != nil {
-				b.Fatal(err)
-			}
-			if err := batch.Apply(); err != nil {
-				b.Fatal(err)
-			}
-			if err := namespace.Barrier(); err != nil {
-				b.Fatal(err)
-			}
-			if err := namespace.Compact(); err != nil {
-				b.Fatal(err)
-			}
-			if err := batch.Reset(); err != nil {
-				b.Fatal(err)
-			}
-			if err := batch.Remove(Entry{ImageID: 1000, Value: GeoValue(paris)}); err != nil {
 				b.Fatal(err)
 			}
 			if err := batch.Apply(); err != nil {

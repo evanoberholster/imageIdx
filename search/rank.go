@@ -9,7 +9,7 @@ import (
 	"time"
 
 	common "github.com/evanoberholster/imageIdx/common"
-	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
 
@@ -68,19 +68,24 @@ func (plan Plan) rankTime(ctx context.Context, dst []Result, workspace *Workspac
 // in metres from the origin, keeping the best k. A negative k ranks every
 // match; a zero k returns dst unchanged. Invalid origins and nil lookups
 // return errors; images without valid coordinates are skipped.
-func (plan Plan) RankGeo(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup bitmapidx.GeoCoordinateLookup, k int) ([]GeoResult, error) {
+//
+// lookup supplies canonical coordinates for arbitrary candidate IDs. This is a
+// separate concern from the geoidx store, which is authoritative for S2 cell
+// membership and cell-center distance; RankGeo does not consult geoidx and does
+// not require candidates to be in a geographic index.
+func (plan Plan) RankGeo(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup geoidx.CoordinateLookup, k int) ([]GeoResult, error) {
 	return plan.rankGeo(ctx, dst, workspace, latitude, longitude, lookup, k, nil)
 }
 
 // RankGeoWithMetrics records filter stages plus scoring, heap and sort time.
-func (plan Plan) RankGeoWithMetrics(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup bitmapidx.GeoCoordinateLookup, k int, metrics *SearchMetrics) ([]GeoResult, error) {
+func (plan Plan) RankGeoWithMetrics(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup geoidx.CoordinateLookup, k int, metrics *SearchMetrics) ([]GeoResult, error) {
 	if metrics == nil {
 		return dst, ErrInvalidOptions
 	}
 	return plan.rankGeo(ctx, dst, workspace, latitude, longitude, lookup, k, metrics)
 }
 
-func (plan Plan) rankGeo(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup bitmapidx.GeoCoordinateLookup, k int, metrics *SearchMetrics) ([]GeoResult, error) {
+func (plan Plan) rankGeo(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup geoidx.CoordinateLookup, k int, metrics *SearchMetrics) ([]GeoResult, error) {
 	if metrics != nil {
 		started := time.Now()
 		metrics.reset(plan, OperationRankGeo)
@@ -89,7 +94,7 @@ func (plan Plan) rankGeo(ctx context.Context, dst []GeoResult, workspace *Worksp
 	if lookup == nil {
 		return dst, ErrInvalidOptions
 	}
-	if _, err := bitmapidx.KeyFromLatLng(latitude, longitude); err != nil {
+	if _, err := geoidx.KeyFromLatLng(latitude, longitude); err != nil {
 		return dst, errors.Join(ErrInvalidOptions, err)
 	}
 	return rankByScore(ctx, dst, plan, workspace, k, metrics, func(id ImageID) (float64, bool) {
@@ -97,13 +102,13 @@ func (plan Plan) rankGeo(ctx context.Context, dst []GeoResult, workspace *Worksp
 		if !ok {
 			return 0, false
 		}
-		if _, err := bitmapidx.KeyFromLatLng(lat, lng); err != nil {
+		if _, err := geoidx.KeyFromLatLng(lat, lng); err != nil {
 			return 0, false
 		}
 		if lat == latitude && lng == longitude {
 			return 0, true
 		}
-		meters := bitmapidx.DistanceMeters(latitude, longitude, lat, lng)
+		meters := geoidx.DistanceBetween(latitude, longitude, lat, lng)
 		if math.IsNaN(meters) || math.IsInf(meters, 0) || meters < 0 {
 			// Invalid distances cannot participate in an ordered result.
 			return 0, false
@@ -259,20 +264,24 @@ func FilterTime(dst, candidates []ImageID, lookup timeidx.ExactTimestampFunc, st
 // using the same cell expansion as InCells. It is the geo analogue of
 // FilterTime for ranked candidate lists. A nil index or empty cell list
 // appends nothing; invalid cells join ErrInvalidClause. Like FilterTime it
-// has no Context form: cell expansion is the only index-independent work
-// and the probe itself is bounded by the candidate list.
-func FilterGeo(dst, candidates []ImageID, index *bitmapidx.Index, cellIDs ...uint64) ([]ImageID, error) {
+// has no Context form.
+func FilterGeo(dst, candidates []ImageID, index *geoidx.Index, cellIDs ...uint64) ([]ImageID, error) {
 	if index == nil || len(cellIDs) == 0 {
 		return dst, nil
 	}
-	if index.Spec().Kind != common.KindBitmapGeo {
-		return dst, ErrInvalidClause
-	}
-	ranges, err := bitmapidx.RangesFromCellIDs(nil, cellIDs)
+	ranges, err := geoidx.RangesFromCellIDs(nil, cellIDs)
 	if err != nil {
 		return dst, errors.Join(ErrInvalidClause, err)
 	}
-	return index.FilterGeoRanges(dst, candidates, ranges)
+	// geoidx has no reverse index, so collect the covered IDs and test
+	// candidates against them, preserving candidate order and duplicates.
+	inGeo := index.SearchRanges(nil, ranges)
+	for _, id := range candidates {
+		if _, ok := slices.BinarySearch(inGeo, id); ok {
+			dst = append(dst, id)
+		}
+	}
+	return dst, nil
 }
 
 // FilterRanked appends the ranked entries that satisfy the plan to dst as

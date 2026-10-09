@@ -2,6 +2,7 @@ package bitmapidx
 
 import (
 	"bytes"
+	"slices"
 	"sort"
 
 	common "github.com/evanoberholster/imageIdx/common"
@@ -613,4 +614,25 @@ func (i *Index) detachOwned(result *roar.Bitmap, owned bool) {
 	if i.owner != nil && !owned {
 		*result = result.Clone()
 	}
+}
+
+// AppendTo appends every live ImageID in the namespace to dst in ascending
+// order. It is a full-namespace scan for diagnostics and benchmarks; prefer a
+// typed namespace query. It materializes merged deltas.
+func (i *Index) AppendTo(dst []common.ImageID) []common.ImageID {
+	token := i.readers.Acquire()
+	defer i.readers.Release(token)
+	if i.closed.Load() {
+		return dst
+	}
+	view := i.view.Load()
+	start := len(dst)
+	for _, key := range view.allKeys() {
+		if posting, ok := view.effective(key); ok && !posting.isEmpty() {
+			dst = posting.bitmap().AppendTo(dst)
+		}
+	}
+	slices.Sort(dst[start:])
+	tail := slices.Compact(dst[start:])
+	return dst[:start+len(tail)]
 }

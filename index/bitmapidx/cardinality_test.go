@@ -83,7 +83,6 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 		boolNamespace(common.NamespaceFlag),
 		continuousNamespace(common.NamespaceRating),
 		textNamespace(common.NamespaceObject),
-		geoNamespaceFor(common.NamespaceLocation),
 		enumNamespace(common.NamespaceUserACL), // registered but empty
 	}
 	store, err := NewStore(dir, namespaces, NamespaceConfig{}, common.DurabilityOS)
@@ -94,7 +93,6 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	flag, _ := store.Lookup(common.NamespaceFlag)
 	rating, _ := store.Lookup(common.NamespaceRating)
 	object, _ := store.Lookup(common.NamespaceObject)
-	location, _ := store.Lookup(common.NamespaceLocation)
 	for _, entry := range []Entry{
 		{ImageID: 1, Value: EnumStringValue("a")},
 		{ImageID: 1, Value: EnumStringValue("b")},
@@ -111,16 +109,9 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	commit(t, object, func(bt *Batch) error {
 		return bt.ReplaceText(TextReplacement{ImageID: 1, After: []string{"red blue"}}, TextReplacement{ImageID: 2, After: []string{"blue green"}})
 	})
-	cell, err := KeyFromLatLng(37, -122)
-	if err != nil {
-		t.Fatal(err)
-	}
-	commit(t, location, func(bt *Batch) error {
-		return bt.Move(Move{ImageID: 1, To: int64(cell)})
-	})
 	want := map[common.Namespace]uint64{
 		common.NamespaceTag: 2, common.NamespaceFlag: 2, common.NamespaceRating: 2,
-		common.NamespaceObject: 3, common.NamespaceLocation: 1, common.NamespaceUserACL: 0,
+		common.NamespaceObject: 3, common.NamespaceUserACL: 0,
 	}
 	if got := store.Cardinalities(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("before checkpoint: got %v, want %v", got, want)

@@ -9,6 +9,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/golang/geo/s2"
 )
@@ -57,15 +58,11 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	}
 	defer timeIndex.Close()
 
-	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(20), []bitmapidx.GeoEntry{
-		{ImageID: 1, Latitude: 37, Longitude: -122}, {ImageID: 2, Latitude: 37, Longitude: -122},
-		{ImageID: 3, Latitude: 37, Longitude: -122}, {ImageID: 4, Latitude: 37, Longitude: -122},
-	}, bitmapidx.NamespaceConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer geo.Close()
-	key, err := bitmapidx.KeyFromLatLng(37, -122)
+	geo := newTestGeoNamespace(t, common.Namespace(20), []geoEntry{
+		{id: 1, lat: 37, lng: -122}, {id: 2, lat: 37, lng: -122},
+		{id: 3, lat: 37, lng: -122}, {id: 4, lat: 37, lng: -122},
+	})
+	key, err := geoidx.KeyFromLatLng(37, -122)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +70,7 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 		AllValues(tags, bitmapidx.EnumStringValue("favorite")),
 		AllValues(albums, bitmapidx.EnumStringValue("holiday")),
 		During(timeIndex, 2*quantum, 5*quantum),
-		InCells(geo, bitmapidx.DecodeS2Key(key)),
+		InCells(geo, geoidx.DecodeKey(key)),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -93,25 +90,25 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 }
 
 func TestInCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
-	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(21), []bitmapidx.GeoEntry{
-		{ImageID: 1, Latitude: 37.7749, Longitude: -122.4194},
-		{ImageID: 2, Latitude: 34.0522, Longitude: -118.2437},
-	}, bitmapidx.NamespaceConfig{})
+	geo := newTestGeoNamespace(t, common.Namespace(21), []geoEntry{
+		{id: 1, lat: 37.7749, lng: -122.4194},
+		{id: 2, lat: 34.0522, lng: -118.2437},
+	})
+	cellID, err := geoidx.CellIDFromLatLng(37.7749, -122.4194)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer geo.Close()
-	cell := s2.CellID(bitmapidx.CellIDFromLatLng(37.7749, -122.4194))
-	for _, level := range []int{16, 12, 10} {
+	cell := s2.CellID(cellID)
+	for _, level := range []int{geoidx.S2Level, 12, 10} {
 		got, err := SearchOnce(context.Background(), nil, InCells(geo, uint64(cell.Parent(level))))
 		if err != nil || !slices.Equal(got, []ImageID{1}) {
 			t.Fatalf("level %d Search = %v, err=%v", level, got, err)
 		}
 	}
-	if _, err = Compile(InCells(geo, 0)); err == nil {
+	if _, err := Compile(InCells(geo, 0)); err == nil {
 		t.Fatal("invalid cell accepted")
 	}
-	if _, err = Compile(InCells(geo)); !errors.Is(err, ErrInvalidClause) {
+	if _, err := Compile(InCells(geo)); !errors.Is(err, ErrInvalidClause) {
 		t.Fatalf("empty cells error = %v", err)
 	}
 }
@@ -210,58 +207,47 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 	}
 }
 
-func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
-	newGeo := func(t *testing.T, typ common.Namespace, ids []uint64) (*bitmapidx.Index, bitmapidx.S2Key) {
+func TestGeoStageCollectsCandidates(t *testing.T) {
+	newGeo := func(t *testing.T, typ common.Namespace, ids []uint64) (*geoidx.Index, uint64) {
 		t.Helper()
-		entries := make([]bitmapidx.GeoEntry, len(ids))
+		entries := make([]geoEntry, len(ids))
 		for i, id := range ids {
-			entries[i] = bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122}
+			entries[i] = geoEntry{id: id, lat: 37, lng: -122}
 		}
-		index, err := bitmapidx.NewGeoNamespace(typ, entries, bitmapidx.NamespaceConfig{})
+		index := newTestGeoNamespace(t, typ, entries)
+		cellID, err := geoidx.CellIDFromLatLng(37, -122)
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = index.Close() })
-		key, err := bitmapidx.KeyFromLatLng(37, -122)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return index, key
+		return index, cellID
 	}
 
-	geo, key := newGeo(t, common.Namespace(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	geo, cellID := newGeo(t, common.Namespace(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
 	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
-	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")), InCells(geo, bitmapidx.DecodeS2Key(key)))
+	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")), InCells(geo, cellID))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := plan.AppendIDs(context.Background(), nil, NewWorkspace(16)); err != nil || !slices.Equal(got, []ImageID{1, 2, 3}) {
-		t.Fatalf("filter-path Search = %v", got)
+		t.Fatalf("geo collect Search = %v", got)
 	}
 
 	geoIDs := make([]uint64, 0, 100)
-	geoEntries := make([]bitmapidx.GeoEntry, 0, 100)
+	geoEntries := make([]geoEntry, 0, 100)
 	cellIDs := make([]uint64, 0, 10)
 	for cell := range 10 {
-		key, err := bitmapidx.KeyFromLatLng(37+float64(cell)/100, -122)
+		cellID, err := geoidx.CellIDFromLatLng(37+float64(cell)/100, -122)
 		if err != nil {
 			t.Fatal(err)
 		}
-		decoded := bitmapidx.DecodeS2Key(key)
-		if cell == 0 || decoded != cellIDs[len(cellIDs)-1] {
-			cellIDs = append(cellIDs, decoded)
-		}
+		cellIDs = append(cellIDs, cellID)
 		for i := range 10 {
 			id := uint64(cell*10 + i + 1)
 			geoIDs = append(geoIDs, id)
-			geoEntries = append(geoEntries, bitmapidx.GeoEntry{ImageID: id, Latitude: 37 + float64(cell)/100, Longitude: -122})
+			geoEntries = append(geoEntries, geoEntry{id: id, lat: 37 + float64(cell)/100, lng: -122})
 		}
 	}
-	bigGeo, err := bitmapidx.NewGeoNamespace(common.Namespace(23), geoEntries, bitmapidx.NamespaceConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bigGeo.Close()
+	bigGeo := newTestGeoNamespace(t, common.Namespace(23), geoEntries)
 	if len(cellIDs) < 5 {
 		t.Fatalf("need distinct cells, got %d", len(cellIDs))
 	}
@@ -277,7 +263,7 @@ func TestGeoStageFiltersSmallCandidatesAndCollectsLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, err := fallback.AppendIDs(context.Background(), nil, NewWorkspace(100)); err != nil || !slices.Equal(got, bitmapIDs) {
-		t.Fatalf("fallback-path Search = %v, want %v", got, bitmapIDs)
+		t.Fatalf("large geo collect Search = %v, want %v", got, bitmapIDs)
 	}
 }
 

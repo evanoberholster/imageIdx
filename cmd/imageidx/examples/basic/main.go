@@ -16,6 +16,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/search"
 )
@@ -29,7 +30,6 @@ func main() {
 	}
 	namespaces, err := bitmapidx.NewStore(namespaceDir, []bitmapidx.NamespaceSpec{
 		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
-		{Namespace: common.NamespaceLocation, Kind: common.KindBitmapGeo, Geo: bitmapidx.GeoCodec{Version: 1}},
 	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
 	if err != nil {
 		log.Fatal(err)
@@ -54,10 +54,11 @@ func main() {
 	if err := favorites.Barrier(); err != nil {
 		log.Fatal(err)
 	}
-	geo, ok := namespaces.Lookup(common.NamespaceLocation)
-	if !ok {
-		log.Fatal("location namespace missing")
+	geo, err := geoidx.NewMemory(geoidx.Config{Namespace: common.NamespaceLocation})
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer geo.Close()
 	for _, entry := range []struct {
 		id  common.ImageID
 		lat float64
@@ -66,21 +67,16 @@ func main() {
 		{100, 37.7749, -122.4194}, {200, 37.7749, -122.4194},
 		{300, 34.0522, -118.2437}, {400, 40.7128, -74.0060},
 	} {
-		key, err := bitmapidx.KeyFromLatLng(entry.lat, entry.lng)
+		key, err := geoidx.KeyFromLatLng(entry.lat, entry.lng)
 		if err != nil {
 			log.Fatal(err)
 		}
-		geoBatch := geo.NewBatch()
-		if err := geoBatch.Move(bitmapidx.Move{ImageID: entry.id, To: int64(key)}); err != nil {
+		if err := geo.Insert(key, entry.id); err != nil {
 			log.Fatal(err)
 		}
-		if err := geoBatch.Apply(); err != nil {
-			log.Fatal(err)
-		}
-		geoBatch.Close()
-		if err := geo.Barrier(); err != nil {
-			log.Fatal(err)
-		}
+	}
+	if err := geo.Compact(); err != nil {
+		log.Fatal(err)
 	}
 
 	canonical := map[common.ImageID]uint64{
@@ -104,6 +100,10 @@ func main() {
 	}
 	defer times.Close()
 
+	cellID, err := geoidx.CellIDFromLatLng(37.7749, -122.4194)
+	if err != nil {
+		log.Fatal(err)
+	}
 	plan, err := search.Compile(
 		search.AllValues(favorites, bitmapidx.EnumStringValue("favorite")),
 		search.During(times, quantum, 3*quantum,
@@ -111,7 +111,7 @@ func main() {
 				value, ok := canonical[id]
 				return value, ok
 			})),
-		search.InCells(geo, bitmapidx.CellIDFromLatLng(37.7749, -122.4194)),
+		search.InCells(geo, cellID),
 	)
 	if err != nil {
 		log.Fatal(err)

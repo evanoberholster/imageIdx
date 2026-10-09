@@ -68,24 +68,17 @@ type Quantizer struct {
 	Offset  int64
 }
 
-// GeoCodec identifies the S2 cell level of a KindBitmapGeo namespace. Level zero
-// selects the default GeoS2Level. Any other explicit level but GeoS2Level
-// is rejected until smaller buckets are supported.
-type GeoCodec struct {
-	Version uint16
-	Level   uint8
-}
-
 // NamespaceSpec is one registered metadata namespace: its stable number,
 // value shape, and the codecs that interpret values. Only the codecs for the
 // namespace's kind are consulted; the rest must be zero. Definitions are
 // immutable once registered. Schema names belong to common.NamespaceDef.
+//
+// Geography is not a bitmap kind: geographic indexing lives in index/geoidx.
 type NamespaceSpec struct {
 	Namespace  common.Namespace
 	Kind       common.NamespaceKind
 	Name       string    // Namespace Name; not persisted, only for user display
 	Quant      Quantizer // KindBitmapContinuous only
-	Geo        GeoCodec  // KindBitmapGeo only
 	Normalizer CodecSpec // KindBitmapEnum only
 	Analyzer   CodecSpec // KindBitmapString only
 	Flags      uint32    // supported feature bits; unknown bits are rejected
@@ -166,10 +159,6 @@ func validateNamespace(f NamespaceSpec) error {
 			return ErrInvalidNamespace
 		}
 		if f.Quant.Code == QuantIdentity && (f.Quant.Scale != 1 || f.Quant.Offset != 0) {
-			return ErrInvalidNamespace
-		}
-	case common.KindBitmapGeo:
-		if f.Geo.Version > 1 || (f.Geo.Level != 0 && f.Geo.Level != GeoS2Level) {
 			return ErrInvalidNamespace
 		}
 	default:
@@ -287,11 +276,6 @@ func BoolValue(value bool) Value { return Value{Kind: common.KindBitmapBool, Boo
 // IntValue returns a continuous value already converted into the namespace's
 // int64 grid domain. No quantizer runs at write time.
 func IntValue(value int64) Value { return Value{Kind: common.KindBitmapContinuous, Int: value} }
-
-// GeoValue returns a KindBitmapGeo value carrying a level-16 S2 key. Keys fit in
-// int64; build them with KeyFromLatLng or KeyFromCellID and query them
-// with RangesFromCellIDs or CoverRegion.
-func GeoValue(key uint64) Value { return Value{Kind: common.KindBitmapGeo, Int: int64(key)} }
 
 // Entry is one ImageID to value membership change. ImageID zero is
 // reserved and rejected with ErrInvalidImageID.

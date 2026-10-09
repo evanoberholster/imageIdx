@@ -118,6 +118,28 @@ type namespaceView struct {
 
 func (v *namespaceView) hasDeltas() bool { return v.frozen != nil || v.active != nil }
 
+// allKeys returns the sorted, unique keys present in the base and any delta
+// layers.
+func (v *namespaceView) allKeys() []NamespaceKey {
+	size := len(v.base.keys)
+	if v.frozen != nil {
+		size += len(v.frozen.keys)
+	}
+	if v.active != nil {
+		size += len(v.active.keys)
+	}
+	keys := make([]NamespaceKey, 0, size)
+	keys = append(keys, v.base.keys...)
+	if v.frozen != nil {
+		keys = append(keys, v.frozen.keys...)
+	}
+	if v.active != nil {
+		keys = append(keys, v.active.keys...)
+	}
+	slices.SortFunc(keys, compareNamespaceKey)
+	return slices.Compact(keys)
+}
+
 func (v *namespaceView) contains(key NamespaceKey, id common.ImageID) bool {
 	if v.active == nil && v.frozen == nil {
 		if p, ok := v.base.get(key); ok {

@@ -18,7 +18,9 @@ func (s *stage) bitmap() (roar.Bitmap, error) {
 		return s.aclBitmap()
 	}
 	if s.kind == StageGeo {
-		return s.geoIndex.GeoRanges(s.geoRanges)
+		mutable := roar.NewMutableBitmap()
+		s.geoIndex.CollectRanges(mutable, s.geoRanges)
+		return mutable.Freeze(), nil
 	}
 	if s.namespaceKind == namespaceRange {
 		return s.namespaceIndex.Range(s.namespaceRange)
@@ -145,28 +147,98 @@ func (plan Plan) Exists(ctx context.Context, ws *Workspace) (bool, error) {
 }
 
 // countBitmaps uses the N-way cardinality kernel without an ID result slice.
+// Plans without a geo stage reuse the workspace bitmap slice and allocate
+// nothing. Geo stages are folded as direct bitmap filters: the other bitmap
+// stages form the candidate set, and geography filters it in native S2 order
+// without materializing its own bitmap.
 func (plan Plan) countBitmaps(ctx context.Context, ws *Workspace) (uint64, error) {
 	if ws == nil {
 		ws = &Workspace{}
 	}
-	ws.bitmaps = ws.bitmaps[:0]
-	defer func() { clear(ws.bitmaps); ws.bitmaps = ws.bitmaps[:0] }()
+	geoPresent := false
+	for n := range plan.stages {
+		if plan.stages[n].kind == StageGeo {
+			geoPresent = true
+			break
+		}
+	}
+	if !geoPresent {
+		ws.bitmaps = ws.bitmaps[:0]
+		defer func() { clear(ws.bitmaps); ws.bitmaps = ws.bitmaps[:0] }()
+		for n := range plan.stages {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			bit, err := plan.stages[n].bitmap()
+			if err != nil {
+				return 0, err
+			}
+			if bit.IsEmpty() {
+				return 0, nil
+			}
+			ws.bitmaps = append(ws.bitmaps, bit)
+		}
+		count := roar.AndManyCardinality(ws.bitmaps...)
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return count, nil
+	}
+
+	var nonGeo []roar.Bitmap
+	var geoStages []*stage
 	for n := range plan.stages {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		bit, err := plan.stages[n].bitmap()
+		st := &plan.stages[n]
+		if st.kind == StageGeo {
+			geoStages = append(geoStages, st)
+			continue
+		}
+		bit, err := st.bitmap()
 		if err != nil {
 			return 0, err
 		}
 		if bit.IsEmpty() {
 			return 0, nil
 		}
-		ws.bitmaps = append(ws.bitmaps, bit)
+		nonGeo = append(nonGeo, bit)
 	}
-	count := roar.AndManyCardinality(ws.bitmaps...)
-	if err := ctx.Err(); err != nil {
-		return 0, err
+	var candidates roar.Bitmap
+	if len(nonGeo) != 0 {
+		candidates = roar.AndMany(nonGeo...)
+		if candidates.IsEmpty() {
+			return 0, nil
+		}
 	}
-	return count, nil
+	if len(geoStages) == 1 {
+		st := geoStages[0]
+		m := ws.mutableBitmap()
+		m.Reset()
+		if len(nonGeo) == 0 {
+			st.geoIndex.CollectRanges(m, st.geoRanges)
+		} else {
+			st.geoIndex.FilterRanges(m, candidates, st.geoRanges)
+		}
+		return m.Cardinality(), ctx.Err()
+	}
+	// Multiple geo stages: fold sequentially. Each frozen bitmap is independent
+	// because every stage uses a fresh mutable accumulator.
+	for n, st := range geoStages {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		m := roar.NewMutableBitmap()
+		if n == 0 && len(nonGeo) == 0 {
+			st.geoIndex.CollectRanges(m, st.geoRanges)
+		} else {
+			st.geoIndex.FilterRanges(m, candidates, st.geoRanges)
+		}
+		candidates = m.Freeze()
+		if candidates.IsEmpty() {
+			return 0, nil
+		}
+	}
+	return candidates.Cardinality(), ctx.Err()
 }

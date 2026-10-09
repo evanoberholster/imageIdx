@@ -7,6 +7,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/golang/geo/s2"
 )
@@ -49,8 +50,8 @@ func BenchmarkCombinedSearch(b *testing.B) {
 	quantum := uint64(1) << timeidx.TimestampShift
 	namespaceIDs := make([]uint64, 0, count/2)
 	records := make([]timeidx.Entry, count)
-	geoEntries := make([]bitmapidx.GeoEntry, count)
-	key, err := bitmapidx.KeyFromLatLng(37, -122)
+	geoEntries := make([]geoEntry, count)
+	key, err := geoidx.KeyFromLatLng(37, -122)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func BenchmarkCombinedSearch(b *testing.B) {
 			namespaceIDs = append(namespaceIDs, id)
 		}
 		records[index] = timeidx.Entry{Timestamp: id * quantum, ImageID: common.ImageID(id)}
-		geoEntries[index] = bitmapidx.GeoEntry{ImageID: id, Latitude: 37, Longitude: -122}
+		geoEntries[index] = geoEntry{id: id, lat: 37, lng: -122}
 	}
 	namespaceIndex := benchmarkEnumNamespace(b, common.NamespaceTag, "favorite", namespaceIDs)
 	timeIndex, err := timeidx.NewMemory(timeidx.Spec{Entries: records}, timeidx.Config{})
@@ -68,15 +69,11 @@ func BenchmarkCombinedSearch(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = timeIndex.Close() })
-	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(30), geoEntries, bitmapidx.NamespaceConfig{})
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = geo.Close() })
+	geo := newTestGeoNamespace(b, common.Namespace(30), geoEntries)
 	plan, err := Compile(
 		AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")),
 		During(timeIndex, 4_000*quantum, 6_000*quantum),
-		InCells(geo, bitmapidx.DecodeS2Key(key)),
+		InCells(geo, geoidx.DecodeKey(key)),
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -97,21 +94,17 @@ func BenchmarkCombinedSearch(b *testing.B) {
 func BenchmarkGeoCollectSearch(b *testing.B) {
 	const count = 100_000
 	namespaceIDs := make([]uint64, 0, count/2)
-	geoEntries := make([]bitmapidx.GeoEntry, 0, count)
+	geoEntries := make([]geoEntry, 0, count)
 	for id := uint64(1); id <= count; id++ {
 		if id%2 == 0 {
 			namespaceIDs = append(namespaceIDs, id)
 		}
-		geoEntries = append(geoEntries, bitmapidx.GeoEntry{
-			ImageID: id, Latitude: 30 + float64(id%200)*0.05, Longitude: -120 + float64(id/200)*0.05,
+		geoEntries = append(geoEntries, geoEntry{
+			id: id, lat: 30 + float64(id%200)*0.05, lng: -120 + float64(id/200)*0.05,
 		})
 	}
 	namespaceIndex := benchmarkEnumNamespace(b, common.NamespaceTag, "favorite", namespaceIDs)
-	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(31), geoEntries, bitmapidx.NamespaceConfig{})
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = geo.Close() })
+	geo := newTestGeoNamespace(b, common.Namespace(31), geoEntries)
 	cover := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(30, -120)).Parent(0))
 	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")), InCells(geo, cover))
 	if err != nil {
@@ -140,23 +133,19 @@ func BenchmarkGeoCityPlan(b *testing.B) {
 	const perCity = 5_000
 	rng := rand.New(rand.NewSource(7))
 	total := perCity * len(cities)
-	geoEntries := make([]bitmapidx.GeoEntry, 0, total)
+	geoEntries := make([]geoEntry, 0, total)
 	namespaceIDs := make([]uint64, 0, total/2)
 	for id := uint64(1); id <= uint64(total); id++ {
 		city := cities[(int(id)-1)/perCity]
-		geoEntries = append(geoEntries, bitmapidx.GeoEntry{
-			ImageID: id, Latitude: city.lat + (rng.Float64()-0.5)*0.3, Longitude: city.lng + (rng.Float64()-0.5)*0.3,
+		geoEntries = append(geoEntries, geoEntry{
+			id: id, lat: city.lat + (rng.Float64()-0.5)*0.3, lng: city.lng + (rng.Float64()-0.5)*0.3,
 		})
 		if id%2 == 0 {
 			namespaceIDs = append(namespaceIDs, id)
 		}
 	}
 	namespaceIndex := benchmarkEnumNamespace(b, common.NamespaceTag, "favorite", namespaceIDs)
-	geo, err := bitmapidx.NewGeoNamespace(common.Namespace(32), geoEntries, bitmapidx.NamespaceConfig{})
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = geo.Close() })
+	geo := newTestGeoNamespace(b, common.Namespace(32), geoEntries)
 	for _, city := range cities {
 		cityCell := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(city.lat, city.lng)).Parent(8))
 		plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")), InCells(geo, cityCell))

@@ -169,14 +169,9 @@ func decodeNamespaceChanges(namespace NamespaceSpec, payload []byte, groups uint
 			return nil, 0, ErrCorruptWAL
 		}
 		change := stagedChange{base: NamespaceKey{Namespace: namespace.Namespace, Hash: hash}, next: -1}
-		if namespace.Kind == common.KindBitmapContinuous || namespace.Kind == common.KindBitmapGeo {
+		if namespace.Kind == common.KindBitmapContinuous {
 			if n != 0 {
 				return nil, 0, ErrCorruptWAL
-			}
-			if namespace.Kind == common.KindBitmapGeo {
-				if _, err := CellIDFromKey(hash); err != nil {
-					return nil, 0, ErrCorruptWAL
-				}
 			}
 		} else {
 			change.canonical = append([]byte{}, payload[24:24+n]...)
