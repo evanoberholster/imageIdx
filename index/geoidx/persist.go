@@ -178,15 +178,22 @@ func encodeDirectory(shards []*shard) []byte {
 	return buf
 }
 
-// decodeDirectory rebuilds shard views from a directory extent and validates
-// every referenced extent's bounds, ordering, and checksums. Overlap between
-// extents is detected when the allocator marks the live set.
+// decodeDirectory rebuilds shard views from a directory extent and validates the
+// extent's placement (alignment, reserved region, bounds) and every referenced
+// shard. Overlap between extents is detected when the allocator marks the live
+// set.
 func decodeDirectory(arena []byte, dirOffset uint64, dirCount uint32) ([]*shard, error) {
 	if dirCount == 0 {
 		return nil, nil
 	}
+	size := uint64(len(arena))
 	length := uint64(dirCount) * dirEntryBytes
-	if dirOffset+length > uint64(len(arena)) {
+	// Subtraction-based bounds check: never compute dirOffset+length, which can
+	// wrap for a hostile dirOffset.
+	if dirOffset < 2*superblockBytes || dirOffset%uint64(pagealloc.MinBlockSize) != 0 {
+		return nil, ErrCorrupt
+	}
+	if dirOffset > size || length > size-dirOffset {
 		return nil, ErrCorrupt
 	}
 	buf := arena[dirOffset : dirOffset+length]
@@ -214,8 +221,10 @@ func decodeDirEntry(arena, entry []byte) (*shard, error) {
 		return nil, ErrCorrupt
 	}
 	length := uint64(count) * shardBytesPerRecord
-	// Checked arithmetic: offset + length must not overflow or leave the arena.
-	if offset%uint64(pagealloc.MinBlockSize) != 0 || length > uint64(len(arena)) || offset > uint64(len(arena))-length {
+	// Checked arithmetic: offset + length must not overflow or leave the arena,
+	// and length must fit the uint32 extent representation.
+	if offset%uint64(pagealloc.MinBlockSize) != 0 || length > (uint64(1)<<32)-1 ||
+		length > uint64(len(arena)) || offset > uint64(len(arena))-length {
 		return nil, ErrCorrupt
 	}
 	keys, err := storage.View[S2Key](arena, offset, uint64(count), ErrCorrupt, ErrCorrupt)
@@ -977,10 +986,14 @@ func (i *Index) runCompaction() {
 	outcome, cerr := i.commit(i.slot^1, gen, dirOffset, uint32(len(newShards)), uint64(totalEntries(newShards)), liveBytes(newShards), i.arenaBytes)
 	if outcome != commitDurable {
 		if outcome == commitUncertain {
-			// The slot may have been modified but durability is unknown. Protect
-			// both generations (and any prior uncertain extents), keep the previous
-			// in-memory generation authoritative, and retain the frozen snapshot so
-			// the caller can retry. Never reuse the uncertain extents.
+			// The slot may have been modified but durability is unknown. Keep the
+			// previous in-memory generation authoritative, retain the frozen
+			// snapshot so the caller can retry, and protect the union of this
+			// attempt's extents, the previous generation's extents, and any prior
+			// uncertain candidates. Rule: an uncertain candidate becomes
+			// reclaimable only when a later durable commit overwrites the slot it
+			// was written to (the next successful commit resets i.live to exactly
+			// the two recoverable generations). Until then it is never reused.
 			protected := combined
 			if u, uerr := dedupExtents(append(append([]extentRef(nil), combined...), i.live...)); uerr == nil {
 				protected = u
