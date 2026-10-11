@@ -61,6 +61,9 @@ var (
 	ErrEmptyBatch = errors.New("index: batch has no operations")
 	// ErrDuplicateNamespace reports a duplicate namespace number.
 	ErrDuplicateNamespace = errors.New("index: duplicate namespace")
+	// ErrRecoveryRequired reports a namespace that may be incomplete after an
+	// interrupted multi-engine mutation and must be rebuilt from canonical data.
+	ErrRecoveryRequired = errors.New("index: namespace requires rebuild after an interrupted mutation")
 	// ErrIndexStale reports that the store's confirmed completeness watermark is
 	// behind a required canonical-database generation. It is a logical staleness
 	// signal, never corruption.

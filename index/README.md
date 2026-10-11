@@ -104,7 +104,21 @@ so an incomplete entity is never searchable.
 checksummed versioned persistence in `store.bin`. Before the manifest records a
 generation, every touched namespace is **checkpointed** (a verified durability
 barrier): the engine data is made durable first, so a manifest claim of
-completeness can never outrun recoverable engine data. The store-wide
+completeness can never outrun recoverable engine data. A timeidx batch commits
+its mutations and its watermark in one engine transaction.
+
+### Interrupted mutations
+
+A batch that could leave one engine durable and another not (two or more
+namespaces including a synchronously durable family such as timeidx, or any
+engine under `DurabilitySync`) writes a compact durable **recovery marker**
+(`recovery.bin`) listing the intended namespaces *before* the first engine can
+persist, and clears it only after the touched engines are durable. If the
+process is interrupted, `Open` reads the marker and marks those namespaces
+rebuild-required and unavailable (`ErrRecoveryRequired`), preserving healthy
+namespaces; `RecoveryNamespaces()` reports them and `ClearRecovery()` removes
+the marker after a rebuild. A partially failed mutation therefore never
+silently becomes healthy after reopening. The store-wide
 `SourceGeneration()` is the **minimum** across declared namespaces, so a partial
 namespace change cannot overstate completeness. For timeidx namespaces the
 generation is also persisted into the engine's own watermark and validated
@@ -152,12 +166,18 @@ hits, err := m.Match(dst, items, index.MatchParams{PHashDistance: 4, PDQDistance
 - Deleted images are filtered by the entity-liveness bitmap, and stale hash
   associations are already removed by `Update`, so neither can be returned.
 - `MatchItem` carries optional SHA256/BLAKE3/pHash/PDQ inputs; the live-entity
-  bitmap is cached with a version-consistent protocol (build, then re-check the
-  version; retry on a race), so a stale snapshot is never published as a newer
-  generation. Until a liveness removal is durably recorded the filter is
-  skipped entirely; the flag is written to the manifest before the first
+  bitmap is cached through a **seqlock**: the writer marks a liveness mutation
+  in progress (odd sequence) before it can become visible and completes it
+  (even) after publishing, and a reader accepts only an even sequence whose
+  value did not change across its snapshot build. This is stronger than a bare
+  before/after version compare, which could pair a post-mutation bitmap with a
+  pre-mutation version. Until a liveness removal is durably recorded the filter
+  is skipped entirely; the flag is written to the manifest before the first
   removal commits, so reopening a store with no deletes keeps the fast path
   while a store with deletes filters conservatively.
+- Matching validates every required namespace once per batch **before appending
+  any result**, so a degraded or missing namespace returns an error with the
+  caller's destination slice unchanged (never a partial batch).
 - `MatchWithWorkspace` accepts caller-owned `MatchWorkspace{Exact, Similar}`
   scratch; with adequate capacity, duplicate-heavy exact and perceptual
   matching allocate nothing (versus a stack/`sync.Pool` fallback in `Match`).
@@ -198,12 +218,23 @@ hits, err := m.Match(dst, items, index.MatchParams{PHashDistance: 4, PDQDistance
   `Engine.Hash`/`Engine.Sim`/`Engine.Vector` accessors remain for compatibility.
 - **Matcher atomicity.** Import matching does not commit; it only reports live
   matches. There is no match-and-commit transaction.
-- **Matcher degradation check cost.** Each required family pays one lock-free
-  degradation check per call (~2 ns for a single exact lookup), preserving the
+- **Matcher degradation check cost.** Each batch pays one lock-free degradation
+  check per required family before appending results, preserving the
   zero-allocation path; the direct engine path is unchanged.
 - **First-delete manifest write.** The first liveness removal in a store writes
   the manifest (write-ahead flag) once, adding one directory sync to that
   delete; subsequent deletes and steady-state matching are unaffected.
+- **Generation advancement cost.** `ApplyWithGeneration` is dominated by the
+  durable unified-manifest write (one directory sync) plus, for risky
+  multi-namespace batches, a per-engine checkpoint and recovery-marker write.
+  Ordinary `Apply` does not pay this unless the batch is risky. Measured:
+  ordinary Apply ≈ 7.7 ms vs `ApplyWithGeneration` ≈ 33 ms per 64-entity batch.
+- **Recovery-marker conservatism.** Interrupting a risky batch marks its
+  intended namespaces rebuild-required on reopen even if the batch had actually
+  completed in memory; the application rebuilds or clears via `ClearRecovery`.
+- **Non-time generation verification.** Non-time namespaces are trusted via the
+  checkpoint-before-manifest ordering rather than an independent engine
+  watermark (timeidx validates its own).
 - **Unified-layer allocations.** Operation staging allocates one engine batch
   per affected namespace; batch scratch reuse is not yet complete, so
   zero-allocation single mutations are not guaranteed.

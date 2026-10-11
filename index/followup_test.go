@@ -1,6 +1,9 @@
 package index_test
 
 import (
+	"encoding/binary"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -10,7 +13,193 @@ import (
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
+
+// P0-1: once Delete returns, the matcher must not return the deleted ID.
+func TestMatcherDeleteVisibleImmediately(t *testing.T) {
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{0x33}
+	for i := 1; i <= 16; i++ {
+		if err := db.Add(index.Entry{ValueID: common.ValueID(i), Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i <= 16; i++ {
+		if err := db.Delete(common.EntityImage, common.ValueID(i)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(matchIDs(got), common.ValueID(i)) {
+			t.Fatalf("deleted id %d still matched after Delete returned: %v", i, got)
+		}
+	}
+}
+
+// P0-2: a mid-batch failure across engines leaves a durable recovery marker,
+// and reopening marks the affected namespaces rebuild-required.
+func TestRecoveryMarkerPersistsPartialFailure(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: testSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashIdx, ok := db.Hash(4)
+	if !ok {
+		t.Fatal("hash namespace missing")
+	}
+	if err := hashIdx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch(2)
+	if err := batch.Add(index.Entry{ValueID: 1, Times: []index.TimeValue{{Namespace: 1, Timestamp: 5}}, Hashes: []index.HashValue{{Namespace: 4, Hash: radixhash.Hash{1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Apply(batch); err == nil {
+		t.Fatal("expected a mid-batch failure")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); err != nil {
+		t.Fatalf("recovery marker missing after partial failure: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, ok := reopened.Time(1); ok {
+		t.Fatal("time namespace should be recovery-required")
+	}
+	if _, ok := reopened.Hash(4); ok {
+		t.Fatal("hash namespace should be recovery-required")
+	}
+	if _, ok := reopened.Bitmap(6); !ok {
+		t.Fatal("unrelated namespace should remain available")
+	}
+	rec := reopened.RecoveryNamespaces()
+	slices.Sort(rec)
+	if !slices.Contains(rec, common.Namespace(1)) || !slices.Contains(rec, common.Namespace(4)) {
+		t.Fatalf("RecoveryNamespaces = %v, want [1 4]", rec)
+	}
+	if h, _ := reopened.HealthOf(1); !h.NeedsRebuild {
+		t.Fatalf("health = %+v, want NeedsRebuild", h)
+	}
+	if err := reopened.ClearRecovery(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); !os.IsNotExist(err) {
+		t.Fatalf("recovery marker not cleared: %v", err)
+	}
+}
+
+// P0-2: a successful risky batch clears the marker.
+func TestRecoveryMarkerClearedOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: testSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Add(index.Entry{ValueID: 1, Times: []index.TimeValue{{Namespace: 1, Timestamp: 5}}, Hashes: []index.HashValue{{Namespace: 4, Hash: radixhash.Hash{1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); !os.IsNotExist(err) {
+		t.Fatalf("marker present after a successful batch: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if len(reopened.RecoveryNamespaces()) != 0 {
+		t.Fatalf("reopened recovery namespaces = %v", reopened.RecoveryNamespaces())
+	}
+	if _, ok := reopened.Time(1); !ok {
+		t.Fatal("time namespace unavailable after a clean batch")
+	}
+}
+
+// P1-1: malformed manifests are rejected.
+func TestManifestCorruptionRejected(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(filepath.Join(dir, "store.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string][]byte{
+		"truncated": append([]byte(nil), original[:len(original)-1]...),
+		"extra":     append(append([]byte(nil), original...), 0),
+		"bad_crc":   flip(original, len(original)-1),
+		"bad_magic": flip(original, 0),
+		"bad_ver":   flip(original, 4),
+		"unk_flags": flip(original, 8),
+		"bad_count": flip(original, 6),
+	}
+	for name, corrupt := range cases {
+		if err := os.WriteFile(filepath.Join(dir, "store.bin"), corrupt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.Open(dir); err == nil {
+			t.Fatalf("%s: corrupt manifest accepted", name)
+		}
+	}
+}
+
+func flip(src []byte, i int) []byte {
+	out := append([]byte(nil), src...)
+	out[i] ^= 0xFF
+	return out
+}
+
+// Increment a small counter field to test structural mismatches.
+func TestManifestCountMismatch(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "store.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := binary.LittleEndian.Uint16(raw[6:8])
+	binary.LittleEndian.PutUint16(raw[6:8], count+1)
+	// Fix the CRC so only the structural mismatch is under test.
+	body := raw[:len(raw)-4]
+	binary.LittleEndian.PutUint32(raw[len(raw)-4:], storage.Checksum(body))
+	if err := os.WriteFile(filepath.Join(dir, "store.bin"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.Open(dir); err == nil {
+		t.Fatal("manifest with an inflated namespace count accepted")
+	}
+}
 
 // P0-1: a vector engine failure during flush must degrade the vector namespace
 // and leave unrelated namespaces usable.

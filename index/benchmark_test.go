@@ -146,6 +146,37 @@ func BenchmarkStoreApplyUpdate(b *testing.B) {
 	}
 }
 
+// BenchmarkStoreApplyWithGeneration documents the cost of explicit generation
+// advancement relative to ordinary Apply: the same mutation plus a durable
+// unified-manifest write (and, for multi-namespace risky batches, a per-engine
+// checkpoint and recovery-marker write). This workload touches one timestamp
+// namespace, so it isolates the manifest write.
+func BenchmarkStoreApplyWithGeneration(b *testing.B) {
+	for _, size := range []int{1, 16, 32, 64} {
+		b.Run(benchName(size), func(b *testing.B) {
+			db := benchStore(b)
+			batch := db.NewBatch(size)
+			gen := uint64(0)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				gen++
+				if err := batch.Reset(); err != nil {
+					b.Fatal(err)
+				}
+				for n := 0; n < size; n++ {
+					if err := batch.Add(Entry{ValueID: common.ValueID(n + 1), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i*size + n + 1)}}}); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := db.ApplyWithGeneration(batch, gen); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkRegistryLookup verifies the routing table resolves without
 // allocating. It is the hot namespace-resolution path used by every mutation
 // and compiled query.

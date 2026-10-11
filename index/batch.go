@@ -217,7 +217,14 @@ func (s *Store) flushTime() error {
 				return timeidx.ErrBatchTooLarge
 			}
 		}
-		if err := idx.Apply(batch); err != nil {
+		// Commit the mutations and, for an explicit generation batch, the
+		// completeness watermark in the same timeidx transaction.
+		if s.flushExplicit {
+			err = idx.ApplyWithGeneration(batch, s.flushSourceGen)
+		} else {
+			err = idx.Apply(batch)
+		}
+		if err != nil {
 			return err
 		}
 		i = j
@@ -402,6 +409,10 @@ func (s *Store) flushLiveness(add bool) error {
 	if live == nil {
 		return ErrNamespaceUnavailable
 	}
+	// Seqlock: mark a mutation in progress (odd) before it can become visible,
+	// and complete (even) only after it is published. A matcher that reads an
+	// even sequence is guaranteed no mutation overlapped its snapshot build.
+	s.liveSeq.Add(1)
 	batch := live.NewBatch()
 	var addErr error
 	for i := range s.stage.live {
@@ -419,19 +430,16 @@ func (s *Store) flushLiveness(add bool) error {
 	}
 	if addErr != nil {
 		_ = batch.Close()
+		s.liveSeq.Add(1)
 		return addErr
 	}
-	if err := applyBitmapBatch(live, batch); err != nil {
-		return err
-	}
-	// Publish a new liveness version once the change is visible, so a matcher
-	// that starts after this batch returns rebuilds its cached live bitmap.
-	// A committed removal also disables the matcher's no-removal fast path.
-	s.liveVersion.Add(1)
-	if !add {
+	err := applyBitmapBatch(live, batch)
+	if err == nil && !add {
+		// A committed removal disables the matcher's no-removal fast path.
 		s.liveRemovals.Store(true)
 	}
-	return nil
+	s.liveSeq.Add(1)
+	return err
 }
 
 // flushVector executes staged vector operations. vectoridx has no value-batch

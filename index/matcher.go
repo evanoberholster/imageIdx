@@ -170,46 +170,23 @@ func (m *Matcher) Match(dst []Match, items []MatchItem, params MatchParams) ([]M
 		c := live.NewCursor()
 		cursor = &c
 	}
-	// Degradation is checked lazily per required family so a single-family call
-	// pays one lock-free check and unrelated healthy families keep working.
-	var shaChecked, blakeChecked, perChecked bool
-	var shaDeg, blakeDeg, perDeg bool
+	// Validate every required namespace once, before appending any result, so a
+	// failure leaves dst unchanged rather than returning a partial batch.
+	if err := m.validateBindings(items); err != nil {
+		return dst, err
+	}
 	for i := range items {
 		it := &items[i]
 		if it.SHA256 != nil && m.sha256 != nil {
-			if !shaChecked {
-				shaChecked, shaDeg = true, m.store.isDegraded(m.sha256NS)
-			}
-			if shaDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.sha256NS)
-			}
 			dst = m.exactInto(dst, i, MatchSHA256, m.sha256, *it.SHA256, cursor)
 		}
 		if it.BLAKE3 != nil && m.blake3 != nil {
-			if !blakeChecked {
-				blakeChecked, blakeDeg = true, m.store.isDegraded(m.blake3NS)
-			}
-			if blakeDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.blake3NS)
-			}
 			dst = m.exactInto(dst, i, MatchBLAKE3, m.blake3, *it.BLAKE3, cursor)
 		}
 		if it.PHash != nil && m.perceptual != nil {
-			if !perChecked {
-				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
-			}
-			if perDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
-			}
 			dst = m.pHashInto(dst, i, *it.PHash, params.PHashDistance, cursor)
 		}
 		if it.PDQ != nil && m.perceptual != nil {
-			if !perChecked {
-				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
-			}
-			if perDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
-			}
 			dst = m.pdqInto(dst, i, it.PDQ, params.PDQDistance, cursor)
 		}
 	}
@@ -217,6 +194,34 @@ func (m *Matcher) Match(dst []Match, items []MatchItem, params MatchParams) ([]M
 		dst = m.intraBatch(dst, items, params)
 	}
 	return dst, nil
+}
+
+// validateBindings checks, once per batch, that every namespace the batch needs
+// is currently available. Unrelated healthy families are not affected.
+func (m *Matcher) validateBindings(items []MatchItem) error {
+	var needSHA, needBLAKE, needPer bool
+	for i := range items {
+		it := &items[i]
+		if it.SHA256 != nil && m.sha256 != nil {
+			needSHA = true
+		}
+		if it.BLAKE3 != nil && m.blake3 != nil {
+			needBLAKE = true
+		}
+		if (it.PHash != nil || it.PDQ != nil) && m.perceptual != nil {
+			needPer = true
+		}
+	}
+	if needSHA && m.store.isDegraded(m.sha256NS) {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.sha256NS)
+	}
+	if needBLAKE && m.store.isDegraded(m.blake3NS) {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.blake3NS)
+	}
+	if needPer && m.store.isDegraded(m.perceptualNS) {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
+	}
+	return nil
 }
 
 // MatchOne matches a single incoming image. It avoids allocating a one-element
@@ -250,44 +255,21 @@ func (m *Matcher) MatchWithWorkspace(dst []Match, ws *MatchWorkspace, items []Ma
 		c := live.NewCursor()
 		cursor = &c
 	}
-	var shaChecked, blakeChecked, perChecked bool
-	var shaDeg, blakeDeg, perDeg bool
+	if err := m.validateBindings(items); err != nil {
+		return dst, err
+	}
 	for i := range items {
 		it := &items[i]
 		if it.SHA256 != nil && m.sha256 != nil {
-			if !shaChecked {
-				shaChecked, shaDeg = true, m.store.isDegraded(m.sha256NS)
-			}
-			if shaDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.sha256NS)
-			}
 			dst = m.exactIntoScratch(dst, i, MatchSHA256, m.sha256, *it.SHA256, cursor, &ws.Exact)
 		}
 		if it.BLAKE3 != nil && m.blake3 != nil {
-			if !blakeChecked {
-				blakeChecked, blakeDeg = true, m.store.isDegraded(m.blake3NS)
-			}
-			if blakeDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.blake3NS)
-			}
 			dst = m.exactIntoScratch(dst, i, MatchBLAKE3, m.blake3, *it.BLAKE3, cursor, &ws.Exact)
 		}
 		if it.PHash != nil && m.perceptual != nil {
-			if !perChecked {
-				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
-			}
-			if perDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
-			}
 			dst = m.pHashIntoScratch(dst, i, *it.PHash, params.PHashDistance, cursor, &ws.Similar)
 		}
 		if it.PDQ != nil && m.perceptual != nil {
-			if !perChecked {
-				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
-			}
-			if perDeg {
-				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
-			}
 			dst = m.pdqIntoScratch(dst, i, it.PDQ, params.PDQDistance, cursor, &ws.Similar)
 		}
 	}
@@ -333,29 +315,34 @@ func (m *Matcher) pdqIntoScratch(dst []Match, item int, query *simhash.PDQHash, 
 	return dst
 }
 
-// liveBitmap returns the live-entity bitmap for a consistent liveness version.
+// liveBitmap returns the live-entity bitmap for a consistent liveness
+// generation using the store's liveness seqlock.
 //
-// The protocol is: read the version, build the bitmap, then re-read the version
-// and publish only if it is unchanged. Any liveness publication happens-before
-// its version increment (flushLiveness commits, then liveVersion.Add), so a
-// snapshot whose version did not change during construction is exactly the
-// state of that version; a concurrent change forces a retry rather than a
-// mismatched cache entry. The returned bitmap stays valid because it is an
-// immutable snapshot.
+// A reader accepts only an even sequence, builds the bitmap (an immutable,
+// detached snapshot), and re-reads the sequence. Because the writer increments
+// to odd before a mutation can become visible and back to even after it is
+// published, an unchanged even sequence proves no mutation overlapped the
+// build; anything else retries. This is stronger than a plain before/after
+// version compare, which could pair a post-mutation bitmap with a
+// pre-mutation version. The returned bitmap stays valid across later
+// BitmapIdx mutations and compaction because MatchValues detaches owned bytes.
 func (m *Matcher) liveBitmap() (roar.Bitmap, error) {
 	for {
-		version := m.store.liveVersion.Load()
-		if c := m.liveCache.Load(); c != nil && c.version == version {
+		seq := m.store.liveSeq.Load()
+		if seq&1 != 0 {
+			continue // a liveness mutation is in progress
+		}
+		if c := m.liveCache.Load(); c != nil && c.version == seq {
 			return c.bm, nil
 		}
 		bm, err := m.live.MatchValues(m.liveVal)
 		if err != nil {
 			return roar.Bitmap{}, err
 		}
-		if m.store.liveVersion.Load() != version {
+		if m.store.liveSeq.Load() != seq {
 			continue // a liveness change raced construction; do not publish
 		}
-		m.liveCache.Store(&liveCache{version: version, bm: bm})
+		m.liveCache.Store(&liveCache{version: seq, bm: bm})
 		return bm, nil
 	}
 }

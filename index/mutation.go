@@ -184,9 +184,22 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 	if err := s.prevalidate(b.entries, b.changes, b.deletes); err != nil {
 		return err
 	}
-	if err := s.applyLocked(b.entries, b.changes, b.deletes); err != nil {
-		s.degradeIntended(err)
-		return err
+	// If this batch could make some engines durable and others not, record the
+	// intended namespaces durably before the first engine can persist.
+	risky := s.batchMayPartiallyPersist()
+	if risky {
+		if err := s.pendingAddSet(); err != nil {
+			return err
+		}
+	}
+	s.flushSourceGen = sourceGeneration
+	s.flushExplicit = explicit
+	applyErr := s.applyLocked(b.entries, b.changes, b.deletes)
+	s.flushExplicit = false
+	s.flushSourceGen = 0
+	if applyErr != nil {
+		s.degradeIntended(applyErr)
+		return applyErr
 	}
 	s.source = sourceGeneration
 	s.gen++
@@ -196,14 +209,95 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 			s.degradeIntended(err)
 			return err
 		}
+		if risky {
+			if err := s.pendingRemoveSet(); err != nil {
+				return err
+			}
+		}
 		if advanced {
 			s.safeSource.Store(s.recomputeSafe())
 			if err := s.writeManifest(); err != nil {
 				return err
 			}
 		}
+	} else if risky {
+		// Ordinary Apply does not otherwise checkpoint; make the touched engines
+		// durable before clearing the marker so a crash cannot lose the marker
+		// while leaving some engines ahead.
+		if err := s.syncTouchedForCompleteness(); err != nil {
+			s.degradeIntended(err)
+			return err
+		}
+		if err := s.pendingRemoveSet(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// batchMayPartiallyPersist reports whether the batch touches at least two
+// namespaces and includes an engine that can become durable during apply
+// (timeidx always; any engine under DurabilitySync). Only then can a crash
+// leave some engines ahead of others.
+func (s *Store) batchMayPartiallyPersist() bool {
+	intended := 0
+	syncFamily := false
+	for w, word := range s.pvSet {
+		for bit := 0; bit < 64; bit++ {
+			if word&(1<<uint(bit)) == 0 {
+				continue
+			}
+			intended++
+			if def, ok := s.schema.Lookup(common.Namespace(w*64 + bit)); ok && def.Kind == common.KindTimestamp {
+				syncFamily = true
+			}
+		}
+	}
+	if intended < 2 {
+		return false
+	}
+	return syncFamily || s.opts.Durability == common.DurabilitySync
+}
+
+// pendingAddSet unions the current intended set into the durable recovery
+// marker. The caller holds mu.
+func (s *Store) pendingAddSet() error {
+	if len(s.pendingSet) < len(s.pvSet) {
+		s.pendingSet = append(s.pendingSet, make([]uint64, len(s.pvSet)-len(s.pendingSet))...)
+	}
+	changed := false
+	for w, word := range s.pvSet {
+		if word == 0 {
+			continue
+		}
+		if s.pendingSet[w]&word != word {
+			changed = true
+		}
+		s.pendingSet[w] |= word
+	}
+	if !changed {
+		return nil
+	}
+	return s.persistRecovery()
+}
+
+// pendingRemoveSet clears the current intended set from the durable recovery
+// marker. The caller holds mu.
+func (s *Store) pendingRemoveSet() error {
+	changed := false
+	for w, word := range s.pvSet {
+		if w >= len(s.pendingSet) {
+			break
+		}
+		if s.pendingSet[w]&word != 0 {
+			changed = true
+		}
+		s.pendingSet[w] &^= word
+	}
+	if !changed {
+		return nil
+	}
+	return s.persistRecovery()
 }
 
 // advanceTouchedCompleteness establishes a durability barrier for every
@@ -344,9 +438,24 @@ func (s *Store) applyOne(entry Entry, change *Change, del *DeleteOp) error {
 	if err := s.prevalidate(entries, changes, deletes); err != nil {
 		return err
 	}
+	risky := s.batchMayPartiallyPersist()
+	if risky {
+		if err := s.pendingAddSet(); err != nil {
+			return err
+		}
+	}
 	if err := s.applyLocked(entries, changes, deletes); err != nil {
 		s.degradeIntended(err)
 		return err
+	}
+	if risky {
+		if err := s.syncTouchedForCompleteness(); err != nil {
+			s.degradeIntended(err)
+			return err
+		}
+		if err := s.pendingRemoveSet(); err != nil {
+			return err
+		}
 	}
 	s.gen++
 	return nil

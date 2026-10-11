@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sync"
@@ -57,10 +58,18 @@ type Store struct {
 	nsSource   []uint64
 	safeSource atomic.Uint64
 
-	// liveVersion increments after every committed entity-liveness change. The
-	// import matcher uses it to cache the live-entity bitmap without serving
-	// stale state after a delete.
-	liveVersion atomic.Uint64
+	// pendingSet is the durable recovery marker: namespaces whose data may be
+	// incomplete because an interrupted multi-engine mutation could have made
+	// some engines durable and others not. It is written before the mutation
+	// can persist and cleared only after the touched engines are durable.
+	// Writer-owned (guarded by mu); the persisted form is recovery.bin.
+	pendingSet []uint64
+
+	// liveSeq is a seqlock over entity-liveness publication: it is incremented
+	// to an odd value before a liveness mutation begins and to an even value
+	// after it is published. The import matcher reads it to pair a bitmap
+	// snapshot with the exact generation it reflects.
+	liveSeq atomic.Uint64
 
 	// liveRemovals records whether any liveness removal has ever been committed.
 	// Until one has, every engine record is live and the import matcher can skip
@@ -78,6 +87,12 @@ type Store struct {
 	pvCursors []simCursor
 	stage     stageState
 	flush     flushScratch
+
+	// flushSourceGen / flushExplicit let the timeidx flush commit mutations and
+	// the completeness watermark in one engine transaction instead of a second
+	// empty-generation commit. Writer-owned.
+	flushSourceGen uint64
+	flushExplicit  bool
 }
 
 // flushScratch holds reusable per-engine buffers for staged flushing. It is
@@ -171,6 +186,19 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	s.reconcileGenerations(gens, safe)
+	if rec, rerr := readRecovery(dir); rerr != nil {
+		return nil, rerr
+	} else if len(rec) != 0 {
+		// A prior interrupted multi-engine mutation may have left these
+		// namespaces incomplete; they must not silently become healthy.
+		s.pendingSet = rec
+		for _, ns := range namespacesOfBitSet(rec) {
+			if _, ok := s.schema.Lookup(ns); ok {
+				s.markDegraded(ns, ErrRecoveryRequired)
+				s.health[ns].NeedsRebuild = true
+			}
+		}
+	}
 	return s, nil
 }
 
@@ -309,6 +337,10 @@ func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
 	count := int(binary.LittleEndian.Uint16(raw[6:8]))
 	flags := binary.LittleEndian.Uint16(raw[8:10])
 	safe := binary.LittleEndian.Uint64(raw[10:18])
+	if flags&^uint16(1) != 0 {
+		// Unknown persistent flags must not be silently ignored.
+		return nil, 0, 0, nil, ErrCorrupt
+	}
 	body := raw[18 : len(raw)-4]
 	if len(body) != count*10 {
 		return nil, 0, 0, nil, ErrCorrupt
@@ -321,8 +353,14 @@ func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
 	if err := schema.UnmarshalBinary(schemaBytes); err != nil {
 		return nil, 0, 0, nil, errors.Join(ErrCorrupt, err)
 	}
+	defs := schema.Defs()
+	// The generation table must describe exactly the schema's namespaces: no
+	// missing records (incomplete table) and no unexpected ones.
+	if count != len(defs) {
+		return nil, 0, 0, nil, ErrCorrupt
+	}
 	var maxNS common.Namespace
-	for _, def := range schema.Defs() {
+	for _, def := range defs {
 		if def.Namespace > maxNS {
 			maxNS = def.Namespace
 		}
@@ -338,7 +376,115 @@ func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
 		seen[ns] = true
 		gens[ns] = gen
 	}
+	for _, def := range defs {
+		if !seen[def.Namespace] {
+			return nil, 0, 0, nil, ErrCorrupt
+		}
+	}
 	return schema, safe, flags, gens, nil
+}
+
+const (
+	recoveryMagic   uint32 = 0x52454356 // RECV
+	recoveryVersion uint16 = 1
+	recoveryName           = "recovery.bin"
+)
+
+// persistRecovery writes or removes the durable recovery marker for the current
+// pending set. The caller holds mu. An empty set removes the marker.
+func (s *Store) persistRecovery() error {
+	count := 0
+	for _, w := range s.pendingSet {
+		count += bits.OnesCount64(w)
+	}
+	if count == 0 {
+		if err := os.Remove(filepath.Join(s.dir, recoveryName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return storage.SyncDir(s.dir)
+	}
+	buf := make([]byte, 0, 4+2+2+count*2+4)
+	buf = binary.LittleEndian.AppendUint32(buf, recoveryMagic)
+	buf = binary.LittleEndian.AppendUint16(buf, recoveryVersion)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(count))
+	for w, word := range s.pendingSet {
+		for bit := 0; bit < 64; bit++ {
+			if word&(1<<uint(bit)) != 0 {
+				buf = binary.LittleEndian.AppendUint16(buf, uint16(w*64+bit))
+			}
+		}
+	}
+	return writeFileAtomic(s.dir, recoveryName, binary.LittleEndian.AppendUint32(buf, storage.Checksum(buf)))
+}
+
+// readRecovery loads the recovery marker, returning nil when absent.
+func readRecovery(dir string) ([]uint64, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, recoveryName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(raw) < 12 || binary.LittleEndian.Uint32(raw[0:4]) != recoveryMagic ||
+		binary.LittleEndian.Uint16(raw[4:6]) != recoveryVersion {
+		return nil, ErrCorrupt
+	}
+	if storage.Checksum(raw[:len(raw)-4]) != binary.LittleEndian.Uint32(raw[len(raw)-4:]) {
+		return nil, ErrCorrupt
+	}
+	count := int(binary.LittleEndian.Uint16(raw[6:8]))
+	body := raw[8 : len(raw)-4]
+	if len(body) != count*2 {
+		return nil, ErrCorrupt
+	}
+	var maxNS common.Namespace
+	for i := 0; i < count; i++ {
+		if ns := common.Namespace(binary.LittleEndian.Uint16(body[i*2:])); ns > maxNS {
+			maxNS = ns
+		}
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	set := make([]uint64, int(maxNS>>6)+1)
+	for i := 0; i < count; i++ {
+		ns := common.Namespace(binary.LittleEndian.Uint16(body[i*2:]))
+		set[ns>>6] |= 1 << (uint(ns) & 63)
+	}
+	return set, nil
+}
+
+// RecoveryNamespaces returns namespaces flagged by the durable recovery marker.
+func (s *Store) RecoveryNamespaces() []common.Namespace {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return namespacesOfBitSet(s.pendingSet)
+}
+
+// ClearRecovery removes the durable recovery marker after the affected
+// namespaces have been rebuilt. It does not re-enable namespaces already marked
+// stale in this process; reopen after rebuilding.
+func (s *Store) ClearRecovery() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return ErrClosed
+	}
+	s.pendingSet = s.pendingSet[:0]
+	return s.persistRecovery()
+}
+
+func namespacesOfBitSet(set []uint64) []common.Namespace {
+	var out []common.Namespace
+	for w, word := range set {
+		for bit := 0; bit < 64; bit++ {
+			if word&(1<<uint(bit)) != 0 {
+				out = append(out, common.Namespace(w*64+bit))
+			}
+		}
+	}
+	return out
 }
 
 func writeFileAtomic(dir, name string, data []byte) error {
