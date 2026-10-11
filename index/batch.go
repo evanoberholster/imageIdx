@@ -154,29 +154,42 @@ func (s *Store) flushStage() error {
 			return err
 		}
 	}
+	s.injectCrash("start")
 	// Deletions clear liveness before any value change; additions set it last.
 	if err := s.flushLiveness(false); err != nil {
 		return err
 	}
+	s.injectCrash("liveness-remove")
 	if err := s.flushTime(); err != nil {
 		return err
 	}
+	s.injectCrash("time")
 	if err := s.flushGeo(); err != nil {
 		return err
 	}
+	s.injectCrash("geo")
 	if err := s.flushSim(); err != nil {
 		return err
 	}
+	s.injectCrash("sim")
 	if err := s.flushHash(); err != nil {
 		return err
 	}
+	s.injectCrash("hash")
 	if err := s.flushBitmap(); err != nil {
 		return err
 	}
+	s.injectCrash("bitmap")
 	if err := s.flushVector(); err != nil {
 		return err
 	}
-	return s.flushLiveness(true)
+	s.injectCrash("vector")
+	s.injectCrash("liveness-add-pre")
+	if err := s.flushLiveness(true); err != nil {
+		return err
+	}
+	s.injectCrash("liveness-add")
+	return nil
 }
 
 func (s *Store) stageHasLivenessRemoval() bool {

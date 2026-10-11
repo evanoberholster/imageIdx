@@ -2,7 +2,9 @@ package index
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	common "github.com/evanoberholster/imageIdx/common"
@@ -41,6 +43,173 @@ func boundarySchema(t *testing.T) *common.Schema {
 		t.Fatal(err)
 	}
 	return schema
+}
+
+// TestUnifiedProcessCrashRecovery kills the process at each staged-flush
+// boundary of an update to an already-live entity and verifies the recovery
+// classification on reopen: a single-unit (time-only) update leaves no marker
+// and stays consistent and live, while a multi-engine (time+hash) update is
+// flagged rebuild-required because radixhash is not crash-durable.
+func TestUnifiedProcessCrashRecovery(t *testing.T) {
+	if dir := os.Getenv("UNIFIED_CRASH_DIR"); dir != "" {
+		stage := os.Getenv("UNIFIED_CRASH_STAGE")
+		scenario := os.Getenv("UNIFIED_CRASH_SCENARIO")
+		db, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.crash = func(s string) {
+			if s == stage {
+				os.Exit(83)
+			}
+		}
+		batch := db.NewBatch(1)
+		switch scenario {
+		case "time-update":
+			if err := batch.Add(Entry{ValueID: 1, Times: []TimeValue{{Namespace: 1, Timestamp: 9}}}); err != nil {
+				t.Fatal(err)
+			}
+		case "time-hash-update":
+			if err := batch.Add(Entry{ValueID: 1, Times: []TimeValue{{Namespace: 1, Timestamp: 9}}, Hashes: []HashValue{{Namespace: 4, Hash: radixhash.Hash{0xB}}}}); err != nil {
+				t.Fatal(err)
+			}
+		case "hash-update":
+			if err := batch.Add(Entry{ValueID: 1, Hashes: []HashValue{{Namespace: 4, Hash: radixhash.Hash{0xB}}}}); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unknown scenario %q", scenario)
+		}
+		_ = db.Apply(batch)
+		os.Exit(0)
+	}
+
+	scenarios := []struct {
+		name     string
+		scenario string
+		seed     func(t *testing.T, db *Store)
+	}{
+		{
+			name:     "time-update",
+			scenario: "time-update",
+			seed: func(t *testing.T, db *Store) {
+				if err := db.Add(Entry{ValueID: 1, Times: []TimeValue{{Namespace: 1, Timestamp: 5}}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "time-hash-update",
+			scenario: "time-hash-update",
+			seed: func(t *testing.T, db *Store) {
+				if err := db.Add(Entry{ValueID: 1, Times: []TimeValue{{Namespace: 1, Timestamp: 5}}, Hashes: []HashValue{{Namespace: 4, Hash: radixhash.Hash{0xA}}}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "hash-update",
+			scenario: "hash-update",
+			seed: func(t *testing.T, db *Store) {
+				if err := db.Add(Entry{ValueID: 1, Hashes: []HashValue{{Namespace: 4, Hash: radixhash.Hash{0xA}}}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	stages := []string{"start", "liveness-add-pre", "time", "hash", "liveness-add"}
+	for _, sc := range scenarios {
+		for _, stage := range stages {
+			t.Run(sc.name+"/"+stage, func(t *testing.T) {
+				dir := t.TempDir()
+				db, err := Create(dir, Spec{Schema: boundarySchema(t)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				sc.seed(t, db)
+				if err := db.Checkpoint(); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				cmd := exec.Command(os.Args[0], "-test.run=^TestUnifiedProcessCrashRecovery$")
+				cmd.Env = append(os.Environ(),
+					"UNIFIED_CRASH_DIR="+dir,
+					"UNIFIED_CRASH_STAGE="+stage,
+					"UNIFIED_CRASH_SCENARIO="+sc.scenario)
+				out, err := cmd.CombinedOutput()
+				if err == nil {
+					t.Fatalf("child did not crash at %s: %s", stage, out)
+				}
+
+				reopened, err := Open(dir)
+				if err != nil {
+					t.Fatalf("reopen: %v: %s", err, out)
+				}
+				defer reopened.Close()
+				_, statErr := os.Stat(filepath.Join(dir, "recovery.bin"))
+				marker := statErr == nil
+
+				switch sc.name {
+				case "time-update":
+					if marker {
+						t.Fatal("single-unit update wrote a recovery marker")
+					}
+					ti, ok := reopened.Time(1)
+					if !ok {
+						t.Fatal("time namespace unavailable after interrupt")
+					}
+					if got := ti.Search(nil, 0, 100); !slices.Equal(got, []uint64{1}) {
+						t.Fatalf("time search = %v, want [1]", got)
+					}
+					live, val, ok := reopened.Liveness(common.EntityImage)
+					if !ok {
+						t.Fatal("liveness unavailable")
+					}
+					if bm, _ := live.MatchValues(val); !bm.Contains(1) {
+						t.Fatal("already-live entity was not preserved")
+					}
+				case "time-hash-update":
+					if !marker {
+						t.Fatal("interrupted multi-engine update left no recovery marker")
+					}
+					rec := reopened.RecoveryNamespaces()
+					slices.Sort(rec)
+					if !slices.Contains(rec, common.Namespace(1)) || !slices.Contains(rec, common.Namespace(4)) {
+						t.Fatalf("recovery namespaces = %v, want [1 4]", rec)
+					}
+					if _, ok := reopened.Time(1); ok {
+						t.Fatal("flagged time namespace is resolvable")
+					}
+					if _, ok := reopened.Hash(4); ok {
+						t.Fatal("flagged hash namespace is resolvable")
+					}
+					if _, ok := reopened.Geo(2); !ok {
+						t.Fatal("unrelated namespace became unavailable")
+					}
+				case "hash-update":
+					// Single checkpoint-dependent unit: no marker, the namespace
+					// stays resolvable, and the un-checkpointed update is simply
+					// lost, leaving the durable "before" association.
+					if marker {
+						t.Fatal("single-unit hash update wrote a recovery marker")
+					}
+					idx, ok := reopened.Hash(4)
+					if !ok {
+						t.Fatal("hash namespace unavailable after interrupt")
+					}
+					if got := idx.Lookup(nil, radixhash.Hash{0xA}); !slices.Contains(got, uint64(1)) {
+						t.Fatalf("durable hash A lost: %v", got)
+					}
+					if got := idx.Lookup(nil, radixhash.Hash{0xB}); len(got) != 0 {
+						t.Fatalf("non-durable hash B present: %v", got)
+					}
+				}
+			})
+		}
+	}
 }
 
 // TestSingleNamespaceLivenessFailureIsBenign verifies that a single-namespace

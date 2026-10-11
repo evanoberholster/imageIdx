@@ -95,6 +95,16 @@ type Store struct {
 	// empty-generation commit. Writer-owned.
 	flushSourceGen uint64
 	flushExplicit  bool
+
+	// crash is a per-Store test seam: when non-nil it is invoked at each
+	// staged-flush boundary. It is nil in production and never shared.
+	crash func(string)
+}
+
+func (s *Store) injectCrash(stage string) {
+	if s.crash != nil {
+		s.crash(stage)
+	}
 }
 
 // flushScratch holds reusable per-engine buffers for staged flushing. It is
