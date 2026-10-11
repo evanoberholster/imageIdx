@@ -117,8 +117,12 @@ func New(arenaBytes uint64) (*Allocator, error) {
 		free:        make([]uint64, (totalBlocks+63)/64),
 	}
 	// Block zero is reserved; every other block starts free.
-	for block := uint64(1); block < totalBlocks; block++ {
-		allocator.free[block>>6] |= uint64(1) << (block & 63)
+	for word := range allocator.free {
+		allocator.free[word] = ^uint64(0)
+	}
+	allocator.free[0] &^= 1
+	if tail := totalBlocks & 63; tail != 0 {
+		allocator.free[len(allocator.free)-1] &= (uint64(1) << tail) - 1
 	}
 	allocator.freeCount = totalBlocks - 1
 	allocator.cursor = 1

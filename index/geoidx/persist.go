@@ -41,19 +41,19 @@ var (
 )
 
 // commitOutcome is the result of attempting to commit a generation.
-type commitOutcome uint8
+type commitOutcome = storage.CommitOutcome
 
 const (
 	// commitAborted means no bytes of the inactive slot were modified, so the new
 	// allocations may be rolled back.
-	commitAborted commitOutcome = iota
+	commitAborted = storage.CommitAborted
 	// commitDurable means the new generation is written and synchronized, so it
 	// must be published.
-	commitDurable
+	commitDurable = storage.CommitDurable
 	// commitUncertain means the inactive slot may have been modified but
 	// durability is unconfirmed; the new extents must be protected and the attempt
 	// retried.
-	commitUncertain
+	commitUncertain = storage.CommitUncertain
 )
 
 // writeSuperblockSlotFunc is a test seam for the superblock slot write;
@@ -166,14 +166,7 @@ func encodeDirectory(shards []*shard) []byte {
 	buf := make([]byte, len(shards)*dirEntryBytes)
 	for n, s := range shards {
 		entry := buf[n*dirEntryBytes : (n+1)*dirEntryBytes]
-		binary.LittleEndian.PutUint64(entry[0:8], uint64(s.keys[0]))
-		binary.LittleEndian.PutUint64(entry[8:16], uint64(s.ids[0]))
-		binary.LittleEndian.PutUint64(entry[16:24], s.offset)
-		binary.LittleEndian.PutUint32(entry[24:28], uint32(s.count()))
-		binary.LittleEndian.PutUint32(entry[28:32], s.keyCRC)
-		binary.LittleEndian.PutUint32(entry[32:36], s.idCRC)
-		binary.LittleEndian.PutUint64(entry[40:48], uint64(s.minID))
-		binary.LittleEndian.PutUint64(entry[48:56], uint64(s.maxID))
+		storage.EncodeShardDescriptor(entry, storage.ShardDescriptor{FirstKey: uint64(s.keys[0]), FirstID: uint64(s.ids[0]), Offset: s.offset, Count: uint32(s.count()), KeyCRC: s.keyCRC, IDCRC: s.idCRC, MinID: uint64(s.minID), MaxID: uint64(s.maxID)})
 	}
 	return buf
 }
@@ -209,14 +202,8 @@ func decodeDirectory(arena []byte, dirOffset uint64, dirCount uint32) ([]*shard,
 }
 
 func decodeDirEntry(arena, entry []byte) (*shard, error) {
-	firstKey := binary.LittleEndian.Uint64(entry[0:8])
-	firstID := binary.LittleEndian.Uint64(entry[8:16])
-	offset := binary.LittleEndian.Uint64(entry[16:24])
-	count := binary.LittleEndian.Uint32(entry[24:28])
-	keyCRC := binary.LittleEndian.Uint32(entry[28:32])
-	idCRC := binary.LittleEndian.Uint32(entry[32:36])
-	minID := binary.LittleEndian.Uint64(entry[40:48])
-	maxID := binary.LittleEndian.Uint64(entry[48:56])
+	d := storage.DecodeShardDescriptor(entry)
+	firstKey, firstID, offset, count, keyCRC, idCRC, minID, maxID := d.FirstKey, d.FirstID, d.Offset, d.Count, d.KeyCRC, d.IDCRC, d.MinID, d.MaxID
 	if count == 0 {
 		return nil, ErrCorrupt
 	}
@@ -287,20 +274,13 @@ func superblockOffset(slot int) uint64 { return uint64(slot) * superblockBytes }
 // dedupExtents. This is the durable allocator state: recovery reconstructs it
 // from the committed directory set. Overlapping extents fail Reserve.
 func allocatorFromLive(arenaBytes uint64, live []extentRef) (*pagealloc.Allocator, error) {
-	alloc, err := pagealloc.New(arenaBytes)
+	extents := make([]storage.Extent, len(live))
+	for n, e := range live {
+		extents[n] = storage.Extent{Ref: e.ref, Size: e.size}
+	}
+	alloc, err := storage.ReconstructAllocator(arenaBytes, extents)
 	if err != nil {
-		return nil, err
-	}
-	if err := alloc.Reserve(secondSuperblockRef, pagealloc.MinBlockSize); err != nil {
-		return nil, err
-	}
-	for _, e := range live {
-		if e.size == 0 {
-			return nil, ErrCorrupt
-		}
-		if err := alloc.Reserve(e.ref, e.size); err != nil {
-			return nil, ErrCorrupt
-		}
+		return nil, errors.Join(ErrCorrupt, err)
 	}
 	return alloc, nil
 }
@@ -309,17 +289,17 @@ func allocatorFromLive(arenaBytes uint64, live []extentRef) (*pagealloc.Allocato
 // with mismatched lengths. Two generations legitimately share the exact same
 // extent; anything else at the same offset is corruption.
 func dedupExtents(live []extentRef) ([]extentRef, error) {
-	seen := make(map[pagealloc.Ref]uint32, len(live))
+	extents := make([]storage.Extent, len(live))
+	for n, e := range live {
+		extents[n] = storage.Extent{Ref: e.ref, Size: e.size}
+	}
+	union, err := storage.UnionExtents(extents)
+	if err != nil {
+		return nil, errors.Join(ErrCorrupt, err)
+	}
 	out := live[:0]
-	for _, e := range live {
-		if size, ok := seen[e.ref]; ok {
-			if size != e.size {
-				return nil, ErrCorrupt
-			}
-			continue
-		}
-		seen[e.ref] = e.size
-		out = append(out, e)
+	for _, e := range union {
+		out = append(out, extentRef{ref: e.Ref, size: e.Size})
 	}
 	return out, nil
 }
@@ -539,25 +519,18 @@ func decodeGeneration(arena, payload []byte, fileBytes uint64) ([]*shard, uint64
 func (i *Index) commit(slot int, generation, dirOffset uint64, dirCount uint32, totalEntries, liveBytes, arenaBytes uint64) (commitOutcome, error) {
 	var payload [superblockPayloadBytes]byte
 	encodeSuperblockPayload(payload[:], arenaBytes, dirOffset, dirCount, totalEntries, liveBytes)
-	var slotBytes [storage.SuperblockSlotBytes]byte
-	if err := storage.EncodeSuperblock(slotBytes[:], storage.SuperblockHeader{
+	return storage.CommitSuperblock(storage.SuperblockHeader{
 		Magic:      geoidxMagic,
 		Version:    geoidxVersion,
 		Generation: generation,
-	}, payload[:]); err != nil {
-		return commitAborted, err
-	}
-	if err := writeSuperblockSlotFunc(i.arena.data, superblockOffset(slot), slotBytes[:]); err != nil {
-		// The slot may have been partially modified; protect and retry.
-		return commitUncertain, err
-	}
-	if err := failStage(persistSuperSync); err != nil {
-		return commitUncertain, err
-	}
-	if err := syncArenaFunc(i.arena.mf); err != nil {
-		return commitUncertain, err
-	}
-	return commitDurable, nil
+	}, payload[:], func(data []byte) error {
+		return writeSuperblockSlotFunc(i.arena.data, superblockOffset(slot), data)
+	}, func() error {
+		if err := failStage(persistSuperSync); err != nil {
+			return err
+		}
+		return syncArenaFunc(i.arena.mf)
+	})
 }
 
 // liveBytes sums the shard payload bytes.

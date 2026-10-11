@@ -67,10 +67,9 @@ func benchmarkSearchSize(b *testing.B, size int) {
 	}
 }
 
-// BenchmarkUpdate measures single-write publish latency through the
-// writer loop, including WAL append and delta staging. Backpressure
-// retries are part of the measured path via submitWithBackpressure;
-// regressions show up first in allocs/op, then ns/op.
+// BenchmarkUpdate retains the baseline fixture/name: these are identical
+// upserts of already stored pairs. The new backend detects them as no-ops.
+// BenchmarkModernization measures real changed-key batches separately.
 func BenchmarkUpdate(b *testing.B) {
 	index, _ := benchmarkIndex(b, 65_536, Config{DeltaCapacity: 4_096})
 	batch := NewBatch(1)

@@ -1,277 +1,164 @@
 package timeidx
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"os"
-	"slices"
 	"sync"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-type indexedRecord struct {
-	marker    timemarker
-	timestamp uint64
-	imageID   common.ValueID
-}
-
-// Index is one compressed timestamp candidate index. Readers search immutable
-// block views without locks; a single writer owns delta publication.
 type Index struct {
-	namespace  common.Namespace
-	flags      uint32
-	offset     uint64
-	startTime  uint64
-	endTime    uint64
-	generation atomic.Uint64
-	baseCount  atomic.Uint64
-	config     Config
-	directory  atomic.Pointer[blockDirectory]
-	readers    storage.ReaderTracker
-
-	writes        chan *Batch
-	barriers      chan chan barrierResult
-	rotate        chan rotateRequest
-	compactions   chan compactionTask
-	compactDone   chan compactionResult
-	stop          chan struct{}
-	closed        atomic.Bool
-	pending       atomic.Int64
-	closeOnce     sync.Once
-	lifecycle     sync.RWMutex
-	workers       sync.WaitGroup
-	writerNeeds   []uint32
-	writerTouched []int
-	// writerMarks and writerBlocks cache per-write marker encodings and
-	// block indexes from applyBatch validation, so the append pass
-	// neither re-encodes timestamps nor re-searches the directory.
-	// Writer-loop owned and reused across batches.
-	writerMarks  []uint64
-	writerBlocks []int
-	// writeGroup and writeResults buffer one coalesced writer-loop group.
-	// Writer-loop owned and reused across groups.
-	writeGroup   []*Batch
-	writeResults []error
-
-	// failMu guards failed, the latched first WAL error. While set,
-	// writes fail fast and maintenance refuses, until close and reopen.
-	failMu sync.Mutex
-	failed error
-
-	// lock is the store directory lock, nil for in-memory indexes.
-	lock *os.File
-
-	persistence *persistentState
+	namespace   common.Namespace
+	flags       uint32
+	offset      uint64 // compatibility metadata only
+	config      Config
+	mu          sync.Mutex
+	view        atomic.Pointer[snapshot]
+	closed      atomic.Bool
+	ownerClosed *atomic.Bool
+	readers     storage.ReaderTracker
+	failed      error
+	file        *storage.MappedFile
+	retired     []*storage.MappedFile
+	path        string
+	lock        *os.File
+	alloc       *pagealloc.Allocator
+	live        []storage.Extent
+	currentLive []storage.Extent // immutable extents of the published generation; writer-owned
+	root        storage.Extent
+	slot        int
+	// Per-index seams are nil in production and never shared by namespaces.
+	fault     func(string) error
+	crash     func(string)
+	lastStats CommitStats
+	scratch   writeScratch // serialized writer-owned temporary routing storage
 }
 
-// fail latches the first WAL error wrapped with ErrRecoveryRequired and
-// reports the latched error. Later failures keep the first one so the
-// recovery story stays singular.
-func (i *Index) fail(err error) error {
-	i.failMu.Lock()
-	defer i.failMu.Unlock()
-	if i.failed == nil {
-		i.failed = errors.Join(ErrRecoveryRequired, err)
-	}
-	return i.failed
+type CommitStats struct {
+	LogicalBytesWritten uint64
+	AllocatedBytes      uint64
+	RewrittenShards     int
+	FileBytes           uint64
 }
 
-// failedErr reports the latched WAL failure, if any.
-func (i *Index) failedErr() error {
-	i.failMu.Lock()
-	defer i.failMu.Unlock()
-	return i.failed
+func (i *Index) isClosed() bool {
+	return i.closed.Load() || (i.ownerClosed != nil && i.ownerClosed.Load())
 }
 
-// NewMemory constructs an in-memory index from stable metadata and canonical
-// timestamp entries.
+func (i *Index) CommitStats() CommitStats { i.mu.Lock(); defer i.mu.Unlock(); return i.lastStats }
+
 func NewMemory(spec Spec, config Config) (*Index, error) {
-	config, err := config.withDefaults()
+	cfg, err := config.withDefaults()
 	if err != nil {
 		return nil, err
 	}
-
-	prepared := make([]indexedRecord, len(spec.Entries))
-	seen := make(map[common.ValueID]struct{}, len(spec.Entries))
-	for i, record := range spec.Entries {
-		if _, duplicate := seen[record.ImageID]; duplicate {
-			return nil, ErrDuplicateImageID
-		}
-		seen[record.ImageID] = struct{}{}
-		marker, encodeErr := encodeTimemarkerChecked(record.Timestamp, spec.Offset)
-		if encodeErr != nil {
-			return nil, encodeErr
-		}
-		prepared[i] = indexedRecord{marker: marker, timestamp: record.Timestamp, imageID: record.ImageID}
+	shards, err := initialShards(spec.Entries, int(cfg.MaxShardBytes/recordBytes))
+	if err != nil {
+		return nil, err
 	}
-	// SortFunc avoids sort.Slice's reflective dispatch on the bulk-load
-	// path; ordering matches newBase's validation exactly.
-	slices.SortFunc(prepared, func(a, b indexedRecord) int {
-		if result := cmp.Compare(a.marker, b.marker); result != 0 {
-			return result
-		}
-		return cmp.Compare(a.imageID, b.imageID)
-	})
-
-	directory := buildDirectory(prepared, spec.Offset, config)
-	index := &Index{
-		namespace:     spec.Namespace,
-		flags:         spec.Flags,
-		offset:        spec.Offset,
-		config:        config,
-		writes:        make(chan *Batch, config.WriteQueueCapacity),
-		barriers:      make(chan chan barrierResult),
-		rotate:        make(chan rotateRequest),
-		compactions:   make(chan compactionTask, max(config.CompactionQueue, len(directory.entries))),
-		compactDone:   make(chan compactionResult, max(config.CompactionQueue, len(directory.entries))),
-		stop:          make(chan struct{}),
-		writerNeeds:   make([]uint32, len(directory.entries)),
-		writerTouched: make([]int, 0, 256),
-	}
-	index.generation.Store(1)
-	index.baseCount.Store(uint64(len(spec.Entries)))
-	if len(prepared) != 0 {
-		index.startTime = prepared[0].timestamp
-		last := prepared[0].timestamp
-		for i := 1; i < len(prepared); i++ {
-			if prepared[i].timestamp < index.startTime {
-				index.startTime = prepared[i].timestamp
-			}
-			if prepared[i].timestamp > last {
-				last = prepared[i].timestamp
-			}
-		}
-		if last != ^uint64(0) {
-			index.endTime = last + 1
-		} else {
-			index.endTime = last
-		}
-	}
-	index.directory.Store(directory)
-	index.workers.Add(2)
-	go index.writerLoop()
-	go index.compactorLoop()
-	return index, nil
+	i := &Index{namespace: spec.Namespace, flags: spec.Flags, offset: spec.Offset, config: cfg}
+	i.view.Store(&snapshot{shards: shards, generation: 1, count: uint64(len(spec.Entries))})
+	return i, nil
 }
 
-func buildDirectory(records []indexedRecord, offset uint64, config Config) *blockDirectory {
-	if len(records) == 0 {
-		base, _ := newBase(nil, nil)
-		return &blockDirectory{entries: []blockEntry{{
-			startMarker: 0,
-			endMarker:   markerSpaceEnd,
-			meta: blockMetadata{
-				StartTime:  offset,
-				EndTime:    timestampForBoundary(markerSpaceEnd, offset),
-				Generation: 1,
-			},
-			block: newBlock(base, config.DeltaCapacity),
-		}}}
-	}
-
-	starts := make([]int, 0, (len(records)+config.BlockSize-1)/config.BlockSize)
-	starts = append(starts, 0)
-	for start := 0; start < len(records); {
-		next := min(start+config.BlockSize, len(records))
-		for next < len(records) && records[next].marker == records[next-1].marker {
-			next++
-		}
-		if next < len(records) {
-			starts = append(starts, next)
-		}
-		start = next
-	}
-
-	entries := make([]blockEntry, len(starts))
-	var markerOffset uint64
-	for i, start := range starts {
-		end := len(records)
-		if i+1 < len(starts) {
-			end = starts[i+1]
-		}
-		startMarker := uint64(0)
-		if i > 0 {
-			startMarker = uint64(records[start].marker)
-		}
-		endMarker := markerSpaceEnd
-		if i+1 < len(starts) {
-			endMarker = uint64(records[end].marker)
-		}
-		markers := make([]timemarker, end-start)
-		ids := make([]common.ValueID, end-start)
-		for j := start; j < end; j++ {
-			markers[j-start] = records[j].marker
-			ids[j-start] = records[j].imageID
-		}
-		base, _ := newBase(markers, ids)
-		entries[i] = blockEntry{
-			startMarker: startMarker,
-			endMarker:   endMarker,
-			meta: blockMetadata{
-				StartTime:    timestampForBoundary(startMarker, offset),
-				EndTime:      timestampForBoundary(endMarker, offset),
-				MarkerOffset: markerOffset * 4,
-				IDOffset:     markerOffset * 8,
-				Count:        uint32(end - start),
-				Generation:   1,
-			},
-			block: newBlock(base, config.DeltaCapacity),
-		}
-		markerOffset += uint64(end - start)
-	}
-	return &blockDirectory{entries: entries}
-}
-
-// Metadata returns a copied summary of the current base generation.
 func (i *Index) Metadata() Metadata {
-	return Metadata{
-		Namespace: i.namespace, Flags: i.flags, Generation: i.generation.Load(),
-		Offset: i.offset, BaseCount: i.baseCount.Load(), BlockCount: uint32(len(i.directory.Load().entries)),
+	// Snapshot counters and the slice header live on the Go heap, not in mmap.
+	v := i.view.Load()
+	return Metadata{Namespace: i.namespace, Flags: i.flags, Offset: i.offset, Generation: v.generation, BaseCount: v.count, BlockCount: uint32(len(v.shards))}
+}
+
+// SourceGeneration is the contiguous database completeness watermark supplied
+// by the application. Zero means no application checkpoint has been recorded.
+func (i *Index) SourceGeneration() uint64 { return i.view.Load().sourceGeneration }
+
+// CheckSourceGeneration detects logical staleness, not structural corruption.
+func (i *Index) CheckSourceGeneration(required uint64) error {
+	if i.isClosed() {
+		return ErrClosed
 	}
+	if i.SourceGeneration() < required {
+		return ErrIndexStale
+	}
+	return nil
+}
+func (i *Index) Namespace() common.Namespace        { return i.namespace }
+func (i *Index) Generation() uint64                 { return i.view.Load().generation }
+func (i *Index) Len() uint64                        { return i.view.Load().count }
+func (i *Index) PendingCompactions() int64          { return 0 }
+func (i *Index) WaitIdle(ctx context.Context) error { return ctx.Err() }
+
+// All accepted mutations are already compacted. These compatibility barriers
+// do not advance the generation or rewrite data.
+func (i *Index) Checkpoint() error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.isClosed() {
+		return ErrClosed
+	}
+	if i.failed != nil {
+		return i.failed
+	}
+	if i.file == nil {
+		return ErrNotPersistent
+	}
+	return nil
 }
 
-// PendingCompactions reports in-flight block compactions.
-func (i *Index) PendingCompactions() int64 { return i.pending.Load() }
+// Sync is a compatibility barrier: successful changed Apply calls already sync.
+func (i *Index) Sync() error { return i.Checkpoint() }
 
-// WaitIdle waits until background compactions drain or ctx is cancelled.
-func (i *Index) WaitIdle(ctx context.Context) error {
-	return storage.WaitForCondition(ctx, func() bool { return i.pending.Load() == 0 })
+// Vacuum is a compatibility barrier; it does not compact or shrink the file.
+func (i *Index) Vacuum() error { return i.Checkpoint() }
+
+// Compact is a compatibility barrier; accepted mutations are already compacted.
+func (i *Index) Compact() error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.isClosed() {
+		return ErrClosed
+	}
+	return i.failed
+}
+func (i *Index) OnDiskBytes() uint64 {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.file == nil {
+		return 0
+	}
+	return uint64(len(i.file.Bytes()))
 }
 
-// Close stops background workers, closes the WAL, and releases mmap regions.
 func (i *Index) Close() error {
-	var closeErr error
-	i.closeOnce.Do(func() {
-		i.lifecycle.Lock()
-		defer i.lifecycle.Unlock()
-		i.closed.Store(true)
-		close(i.stop)
-		i.workers.Wait()
-		i.readers.WaitForPriorReaders()
-		if i.persistence != nil && i.persistence.wal != nil {
-			// An already-closed handle reports os.ErrClosed, which is
-			// tolerated so a broken WAL can never brick cleanup (and
-			// with it, lock release); any other error propagates.
-			if err := i.persistence.wal.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-				closeErr = err
-			}
-		}
-		if i.persistence != nil {
-			for _, mapping := range i.persistence.mappings {
-				if err := storage.Unmap(mapping); err != nil && closeErr == nil {
-					closeErr = err
-				}
-			}
-		}
-		// Last: releasing the directory lock admits the next opener.
-		// A nil lock (in-memory index) is a no-op.
-		if err := storage.ReleaseLock(i.lock); err != nil && closeErr == nil {
-			closeErr = err
-		}
-	})
-	return closeErr
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.closed.Swap(true) {
+		return nil
+	}
+	i.readers.WaitForPriorReaders()
+	i.scratch = writeScratch{}
+	var err error
+	if i.file != nil {
+		err = i.file.Close()
+		i.file = nil
+	}
+	for _, m := range i.retired {
+		err = errors.Join(err, m.Close())
+	}
+	i.retired = nil
+	return errors.Join(err, storage.ReleaseLock(i.lock))
+}
+
+func (i *Index) inject(stage string) error {
+	if i.crash != nil {
+		i.crash(stage)
+	}
+	if i.fault != nil {
+		return i.fault(stage)
+	}
+	return nil
 }

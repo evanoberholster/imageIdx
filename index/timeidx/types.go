@@ -1,135 +1,140 @@
-// Package timeidx implements a block-local timestamp index optimized for
-// immutable, structure-of-arrays base data and small append-only deltas.
+// Package timeidx indexes exact unsigned nanoseconds since 1900-01-01 UTC.
+// Each persistent namespace owns one COW mmap file. Published SoA shards are
+// immutable; searches pin one coherent snapshot without taking writer locks.
 package timeidx
 
 import (
 	"errors"
-	"math"
+	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-type timemarker uint32
+type TimeKey uint64
 
+// TimestampShift is retained for source compatibility only. The new index
+// does not shift, quantize, or rebase timestamps.
 const TimestampShift uint8 = 24
+const DefaultBlockSize = 65_536
+const DefaultDeltaCapacity = 2_048
+const epochUnixSeconds int64 = -2_208_988_800
 
-const (
-	DefaultBlockSize     = 65_536
-	DefaultDeltaCapacity = 2_048
+// EncodeTime converts a UTC instant without using UnixNano or time.Duration,
+// and supports every instant in calendar years 1900 through 2100 inclusive.
+// Local times without a timezone must be resolved by the caller.
+func EncodeTime(t time.Time) (TimeKey, error) {
+	u := t.UTC()
+	if u.Year() < 1900 || u.Year() > 2100 {
+		return 0, ErrInvalidRange
+	}
+	seconds := uint64(u.Unix() - epochUnixSeconds)
+	return TimeKey(seconds*1_000_000_000 + uint64(u.Nanosecond())), nil
+}
 
-	// maxBlockSize caps one base block so per-block slices stay well
-	// below allocation-panic territory and uint32 count fields never
-	// truncate.
-	maxBlockSize = 1 << 24
-	// maxDeltaCapacity caps one delta so its planes plus hash table
-	// stay bounded (~200 bytes per entry worst case across the
-	// active/frozen/spare trio).
-	maxDeltaCapacity = 1 << 20
-	// maxQueueCapacity caps writer channels, which hold pointers and
-	// batch shells only.
-	maxQueueCapacity = 1 << 16
-)
+func DecodeTime(key TimeKey) (time.Time, error) {
+	const end2100 uint64 = 6_342_969_600_000_000_000 // 2101-01-01, exclusive
+	if uint64(key) >= end2100 {
+		return time.Time{}, ErrInvalidRange
+	}
+	return time.Unix(epochUnixSeconds+int64(uint64(key)/1_000_000_000), int64(uint64(key)%1_000_000_000)).UTC(), nil
+}
 
 var (
-	ErrBackpressure       = errors.New("timeidx: block delta is awaiting compaction")
+	ErrBackpressure       = errors.New("timeidx: backpressure") // retained; synchronous COW does not return it
 	ErrBatchInFlight      = errors.New("timeidx: write batch is already in flight")
-	ErrBatchTooLarge      = errors.New("timeidx: write batch exceeds delta capacity")
+	ErrBatchTooLarge      = errors.New("timeidx: write batch exceeds capacity")
 	ErrClosed             = errors.New("timeidx: index is closed")
-	ErrDuplicateImageID   = errors.New("timeidx: duplicate image ID")
+	ErrDuplicateImageID   = errors.New("timeidx: duplicate value ID")
 	ErrInvalidBase        = errors.New("timeidx: invalid base arrays")
 	ErrInvalidConfig      = errors.New("timeidx: invalid configuration")
 	ErrInvalidMutation    = errors.New("timeidx: invalid mutation")
-	ErrInvalidRange       = errors.New("timeidx: timestamp cannot be represented by this index")
+	ErrSourceGeneration   = errors.New("timeidx: source generation cannot decrease")
+	ErrIndexStale         = errors.New("timeidx: index is behind the authoritative database")
+	ErrInvalidRange       = errors.New("timeidx: unsupported calendar time")
 	ErrNotPersistent      = errors.New("timeidx: index is not persistent")
 	ErrUninitializedBatch = errors.New("timeidx: write batch was not created with NewBatch")
-	ErrUnsupportedEndian  = errors.New("timeidx: mmap format requires a little-endian host")
-	ErrUnsupported        = errors.New("timeidx: unsupported format")
-	// ErrStoreBusy reports another process holding the store lock. It
-	// aliases storage.ErrBusy; see internal/storage.
-	ErrStoreBusy = storage.ErrBusy
-	// ErrStoreExists reports creating a store in a non-empty directory.
-	// It aliases storage.ErrExists; see internal/storage.
-	ErrStoreExists = storage.ErrExists
-	// ErrRecoveryRequired reports a WAL failure that latched the index:
-	// every later write and maintenance call fails with it until the
-	// index is closed and reopened. It aliases storage.ErrWALFailed.
-	// Recovery is close plus reopen: replay restores the last durable
-	// prefix and reports a torn tail as a clean stop or ErrCorruptWAL.
-	ErrRecoveryRequired = storage.ErrWALFailed
+	ErrUnsupportedEndian  = errors.New("timeidx: mmap requires little-endian host")
+	ErrUnsupported        = errors.New("timeidx: unsupported format; rebuild from canonical timestamps")
+	ErrCorrupt            = errors.New("timeidx: corrupt namespace file")
+	ErrCorruptManifest    = ErrCorrupt                                 // legacy error spelling
+	ErrCorruptWAL         = errors.New("timeidx: obsolete WAL format") // deprecated; no WAL in current formats
+	ErrNamespaceMismatch  = errors.New("timeidx: namespace identity mismatch")
+	ErrInvalidNamespace   = errors.New("timeidx: invalid namespace")
+	ErrStartupRequired    = errors.New("timeidx: namespace registry has not been published")
+	ErrNamespaceFrozen    = errors.New("timeidx: namespace membership is immutable after startup")
+	ErrRebuildRequired    = errors.New("timeidx: index rebuild required")
+	ErrNamespaceNotFound  = errors.New("timeidx: namespace does not exist")
+	ErrNamespaceExists    = storage.ErrExists
+	ErrAmbiguousNamespace = errors.New("timeidx: specify a namespace when opening a multi-namespace directory")
+	ErrStoreBusy          = storage.ErrBusy
+	ErrStoreExists        = storage.ErrExists
+	ErrRecoveryRequired   = errors.New("timeidx: uncertain commit; close and reopen")
 )
 
-func encodeTimemarker(timestamp, offset uint64) timemarker {
-	return timemarker((timestamp - offset) >> TimestampShift)
-}
-
-func encodeTimemarkerChecked(timestamp, offset uint64) (timemarker, error) {
-	if timestamp < offset || ((timestamp-offset)>>TimestampShift) > math.MaxUint32 {
-		return 0, ErrInvalidRange
-	}
-	return encodeTimemarker(timestamp, offset), nil
-}
-
-func decodeTimemarker(marker timemarker, offset uint64) uint64 {
-	return offset + (uint64(marker) << TimestampShift)
-}
-
-type blockMetadata struct {
-	StartTime    uint64
-	EndTime      uint64
-	MarkerOffset uint64
-	IDOffset     uint64
-	Count        uint32
-	Flags        uint32
-	Generation   uint64
-}
-
-// Entry is one canonical timestamp to index.
 type Entry struct {
 	Timestamp uint64
 	ImageID   common.ValueID
 }
 
-// Spec describes an index's stable identity, compression offset, and initial
-// entries. Namespace is the shared schema identity of this index and may be
-// zero for an ephemeral in-memory index created with New; registering it in a
-// common.Schema requires a non-zero namespace. Name is the schema name and is
-// never persisted.
 type Spec struct {
 	Namespace common.Namespace
 	Name      string
 	Flags     uint32
-	Offset    uint64
-	Entries   []Entry
+	// Offset is retained as metadata for source compatibility, not used in encoding.
+	Offset  uint64
+	Entries []Entry
 }
 
-// NamespaceDef returns the common.Schema definition for this spec. The
-// timestamp index records no kind-specific schema configuration, so Config is
-// nil.
 func (s Spec) NamespaceDef() common.NamespaceDef {
 	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindTimestamp}
 }
 
-// Metadata is a copied summary of the current persisted/base generation.
-// BaseCount deliberately excludes pending Active and Frozen corrections.
-// Namespace is the index's schema namespace: zero identifies an ephemeral
-// in-memory index created with New, never a schema-registered one.
 type Metadata struct {
 	Namespace  common.Namespace
 	Flags      uint32
 	Generation uint64
 	Offset     uint64
 	BaseCount  uint64
-	BlockCount uint32
+	BlockCount uint32 // number of size-bounded shards
 }
 
-// Config controls base block sizing, fixed delta capacity, and writer queues.
-// The zero value selects the benchmarked defaults.
 type Config struct {
-	BlockSize          int
+	// MaxShardBytes is the maximum SoA payload per shard (default 4 KiB,
+	// retained after clustered/historical sweeps; see SCALE_BENCHMARKS.md).
+	MaxShardBytes int64
+	// MaxFileBytes is initial sparse arena capacity, NOT a growth limit.
+	MaxFileBytes int64
+	// BlockSize is a deprecated record-count alias for MaxShardBytes.
+	BlockSize int
+	// Deprecated queue/delta sizing fields are validated but no longer used.
 	DeltaCapacity      int
 	WriteQueueCapacity int
 	CompactionQueue    int
+}
+
+func (c Config) withDefaults() (Config, error) {
+	if c.MaxShardBytes < 0 || c.MaxFileBytes < 0 || c.BlockSize < 0 || c.BlockSize > 1<<24 ||
+		c.DeltaCapacity < 0 || c.DeltaCapacity == 1 || c.DeltaCapacity > 1<<20 || c.WriteQueueCapacity < 0 || c.WriteQueueCapacity > 1<<16 ||
+		c.CompactionQueue < 0 || c.CompactionQueue > 1<<16 {
+		return Config{}, ErrInvalidConfig
+	}
+	if c.MaxShardBytes == 0 {
+		c.MaxShardBytes = 4 << 10
+		if c.BlockSize != 0 {
+			c.MaxShardBytes = int64(c.BlockSize) * 16
+		}
+	}
+	if c.MaxFileBytes == 0 {
+		c.MaxFileBytes = 4 << 20
+	}
+	if c.MaxShardBytes < 16 || c.MaxShardBytes > 1<<30 || c.MaxFileBytes < 1024 || c.MaxFileBytes > 1<<41 {
+		return Config{}, ErrInvalidConfig
+	}
+	if uint64(c.MaxFileBytes) > uint64(^uint(0)>>1)&^uint64(4095) {
+		return Config{}, ErrInvalidConfig
+	}
+	return c, nil
 }
 
 type Durability = common.Durability
@@ -138,57 +143,3 @@ const (
 	DurabilityOS   = common.DurabilityOS
 	DurabilitySync = common.DurabilitySync
 )
-
-func (c Config) withDefaults() (Config, error) {
-	if c.BlockSize < 0 || c.DeltaCapacity < 0 || c.WriteQueueCapacity < 0 || c.CompactionQueue < 0 {
-		return Config{}, ErrInvalidConfig
-	}
-	if c.BlockSize == 0 {
-		c.BlockSize = DefaultBlockSize
-	}
-	if c.DeltaCapacity == 0 {
-		c.DeltaCapacity = DefaultDeltaCapacity
-	}
-	if c.WriteQueueCapacity == 0 {
-		c.WriteQueueCapacity = 64
-	}
-	if c.CompactionQueue == 0 {
-		c.CompactionQueue = 16
-	}
-	if c.BlockSize < 1 || c.DeltaCapacity < 2 {
-		return Config{}, ErrInvalidConfig
-	}
-	// Upper bounds keep worst-case allocations (delta planes and hash
-	// tables, channel buffers, WAL scratch) far from overflow and panic
-	// on every platform, including 32-bit int arithmetic.
-	if c.BlockSize > maxBlockSize || c.DeltaCapacity > maxDeltaCapacity ||
-		c.WriteQueueCapacity > maxQueueCapacity || c.CompactionQueue > maxQueueCapacity {
-		return Config{}, ErrInvalidConfig
-	}
-	return c, nil
-}
-
-func markerRange(start, end, offset uint64) (lo, hi uint64, ok bool) {
-	if start >= end || end <= offset {
-		return 0, 0, false
-	}
-	if start < offset {
-		start = offset
-	}
-	startDelta := start - offset
-	lo = startDelta >> TimestampShift
-	if lo > math.MaxUint32 {
-		return 0, 0, false
-	}
-
-	last := end - 1
-	if last < offset {
-		return 0, 0, false
-	}
-	lastMarker := (last - offset) >> TimestampShift
-	if lastMarker > math.MaxUint32 {
-		lastMarker = math.MaxUint32
-	}
-	hi = lastMarker + 1
-	return lo, hi, lo < hi
-}

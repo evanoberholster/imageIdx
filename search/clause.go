@@ -101,6 +101,8 @@ func ExactTimestamp(lookup timeidx.ExactTimestampFunc) TimestampOption {
 }
 
 // During restricts images to the half-open timestamp range [start, end).
+// Bounds use timeidx's exact unsigned nanoseconds since 1900-01-01 UTC,
+// the same encoding as the selected index and any ExactTimestamp lookup.
 // An empty range (start >= end) is valid and compiles to an empty plan;
 // a nil index is rejected at Compile time with ErrInvalidClause.
 func During(index *timeidx.Index, start, end uint64, options ...TimestampOption) Clause {

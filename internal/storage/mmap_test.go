@@ -59,3 +59,37 @@ func TestViewRejectsInvalidRanges(t *testing.T) {
 		t.Fatalf("zero count = %v, %v", values, err)
 	}
 }
+
+func TestMappedSizeRejectsBeforeTruncation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "existing")
+	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	limit := uint64(^uint(0) >> 1)
+	for _, size := range []int64{0, -1, int64(limit + 1)} {
+		if _, err := CreateMapped(path, size); !errors.Is(err, ErrMappedSize) {
+			t.Fatal(size, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != "keep" {
+			t.Fatal("invalid size truncated data", err)
+		}
+	}
+	if limit < uint64(^uint64(0)>>1) {
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(int64(limit + 1)); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		f.Close()
+		if _, err := OpenMapped(path); !errors.Is(err, ErrMappedSize) {
+			t.Fatal(err)
+		}
+		if _, err := MapFile(path, nil); !errors.Is(err, ErrMappedSize) {
+			t.Fatal(err)
+		}
+	}
+}
