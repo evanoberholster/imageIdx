@@ -255,6 +255,44 @@ func (a *Allocator) RetiredBytes() uint64 {
 	return total
 }
 
+// LargestFreeBytes returns the size of the largest contiguous free run. It is a
+// fragmentation metric for callers, not a hot-path operation.
+func (a *Allocator) LargestFreeBytes() uint64 {
+	if a == nil {
+		return 0
+	}
+	var best, run uint64
+	for block := uint64(1); block < a.totalBlocks; block++ {
+		if a.isFree(block) {
+			run++
+			if run > best {
+				best = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	return best * uint64(MinBlockSize)
+}
+
+// FreeRunCount returns the number of contiguous free runs, the denominator of a
+// fragmentation ratio. It is a diagnostics helper, not a hot path.
+func (a *Allocator) FreeRunCount() uint64 {
+	if a == nil {
+		return 0
+	}
+	var runs uint64
+	prevFree := false
+	for block := uint64(1); block < a.totalBlocks; block++ {
+		free := a.isFree(block)
+		if free && !prevFree {
+			runs++
+		}
+		prevFree = free
+	}
+	return runs
+}
+
 // FreeBytes returns the total free capacity in bytes.
 func (a *Allocator) FreeBytes() uint64 {
 	if a == nil {

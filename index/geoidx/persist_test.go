@@ -1,13 +1,15 @@
 package geoidx
 
 import (
-	common "github.com/evanoberholster/imageIdx/common"
-	"github.com/evanoberholster/imageIdx/internal/storage"
+	"encoding/binary"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func validKeys(t *testing.T, n int) []S2Key {
@@ -67,10 +69,103 @@ func TestValidateBase(t *testing.T) {
 	}
 }
 
-// TestOpenRejectsMalformed checks that a damaged manifest or base file yields
-// ErrCorrupt rather than a panic.
+// TestOpenRejectsMalformed checks that a damaged superblock, shard extent,
+// directory, or truncated file yields an error rather than a panic.
 func TestOpenRejectsMalformed(t *testing.T) {
-	build := func(t *testing.T) (string, Config) {
+	build := func(t *testing.T) (dir string, config Config, shardOffset, dirOffset uint64) {
+		t.Helper()
+		dir = t.TempDir()
+		config = Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
+		index, err := New(dir, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertKeys(t, index, validKeys(t, 50), 1)
+		if err := index.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		if shards := index.view.Load().shards; len(shards) > 0 {
+			shardOffset = shards[0].offset
+		}
+		dirOffset = index.dirOffset
+		if err := index.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dir, config, shardOffset, dirOffset
+	}
+	corrupt := func(t *testing.T, dir string, offset uint64) {
+		t.Helper()
+		f, err := os.OpenFile(filepath.Join(dir, geoidxFile), os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		var b [1]byte
+		if _, err := f.ReadAt(b[:], int64(offset)); err != nil {
+			t.Fatal(err)
+		}
+		b[0] ^= 0xFF
+		if _, err := f.WriteAt(b[:], int64(offset)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("superblock", func(t *testing.T) {
+		dir, config, _, _ := build(t)
+		corrupt(t, dir, 0)               // slot 0
+		corrupt(t, dir, superblockBytes) // slot 1: no valid generation remains
+		if _, err := Open(dir, config); err == nil {
+			t.Fatal("Open accepted a corrupt superblock")
+		}
+	})
+	t.Run("shard-falls-back", func(t *testing.T) {
+		dir, config, shardOffset, _ := build(t)
+		corrupt(t, dir, shardOffset)
+		index, err := Open(dir, config)
+		if err != nil {
+			t.Fatalf("Open should fall back to the previous generation: %v", err)
+		}
+		defer index.Close()
+		if !validateDirectory(index.view.Load().shards) {
+			t.Fatal("fallback directory invalid")
+		}
+		// The corrupt newest generation must be rejected: the fallback here is the
+		// empty generation created before the Checkpoint.
+		if got := index.Len(); got != 0 {
+			t.Fatalf("corrupt newest generation not rejected: Len = %d, want 0", got)
+		}
+	})
+	t.Run("directory-falls-back", func(t *testing.T) {
+		dir, config, _, dirOffset := build(t)
+		corrupt(t, dir, dirOffset+16) // the first entry's offset field
+		index, err := Open(dir, config)
+		if err != nil {
+			t.Fatalf("Open should fall back to the previous generation: %v", err)
+		}
+		defer index.Close()
+		if !validateDirectory(index.view.Load().shards) {
+			t.Fatal("fallback directory invalid")
+		}
+		if got := index.Len(); got != 0 {
+			t.Fatalf("corrupt newest generation not rejected: Len = %d, want 0", got)
+		}
+	})
+	t.Run("truncated", func(t *testing.T) {
+		dir, config, _, _ := build(t)
+		if err := os.Truncate(filepath.Join(dir, geoidxFile), 64); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(dir, config); err == nil {
+			t.Fatal("Open accepted a truncated file")
+		}
+	})
+}
+
+// TestOpenRejectsExtentAnomalies corrupts a directory entry's offset to be
+// unaligned or out of bounds. The newest generation must be rejected (falling
+// back to the empty previous generation); no panic.
+func TestOpenRejectsExtentAnomalies(t *testing.T) {
+	build := func(t *testing.T) (string, Config, uint64) {
 		t.Helper()
 		dir := t.TempDir()
 		config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
@@ -82,66 +177,49 @@ func TestOpenRejectsMalformed(t *testing.T) {
 		if err := index.Checkpoint(); err != nil {
 			t.Fatal(err)
 		}
+		dirOffset := index.dirOffset
 		if err := index.Close(); err != nil {
 			t.Fatal(err)
 		}
-		return dir, config
+		return dir, config, dirOffset
 	}
-
-	t.Run("manifest-crc", func(t *testing.T) {
-		dir, config := build(t)
-		data, err := os.ReadFile(filepath.Join(dir, "manifest"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		data[len(data)-1] ^= 0xFF
-		if err := os.WriteFile(filepath.Join(dir, "manifest"), data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Open(dir, config); err == nil {
-			t.Fatal("Open accepted a corrupt manifest")
-		}
-	})
-
-	t.Run("base-truncated", func(t *testing.T) {
-		dir, config := build(t)
-		manifest, err := os.ReadFile(filepath.Join(dir, "manifest"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		generation, _, ok := decodeManifest(manifest)
-		if !ok {
-			t.Fatal("decode manifest")
-		}
-		path := basePath(dir, generation)
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Truncate(path, info.Size()/2); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Open(dir, config); err == nil {
-			t.Fatal("Open accepted a truncated base")
-		}
-	})
-
-	t.Run("base-magic", func(t *testing.T) {
-		dir, config := build(t)
-		manifest, _ := os.ReadFile(filepath.Join(dir, "manifest"))
-		generation, _, _ := decodeManifest(manifest)
-		path := basePath(dir, generation)
-		f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	writeOffset := func(t *testing.T, dir string, at, value uint64) {
+		t.Helper()
+		f, err := os.OpenFile(filepath.Join(dir, geoidxFile), os.O_RDWR, 0o600)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		if _, err := f.WriteAt([]byte{0, 0, 0, 0}, 0); err != nil {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], value)
+		if _, err := f.WriteAt(b[:], int64(at)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Open(dir, config); err == nil {
-			t.Fatal("Open accepted a base with a bad magic")
+	}
+	check := func(t *testing.T, dir string, config Config) {
+		t.Helper()
+		index, err := Open(dir, config)
+		if err != nil {
+			return // acceptable: no valid generation
 		}
+		defer index.Close()
+		if !validateDirectory(index.view.Load().shards) {
+			t.Fatal("fallback directory invalid")
+		}
+		if got := index.Len(); got != 0 {
+			t.Fatalf("corrupt newest generation not rejected: Len = %d, want 0", got)
+		}
+	}
+
+	t.Run("unaligned-offset", func(t *testing.T) {
+		dir, config, dirOffset := build(t)
+		writeOffset(t, dir, dirOffset+16, 1_000_001) // not a multiple of 512
+		check(t, dir, config)
+	})
+	t.Run("out-of-bounds-offset", func(t *testing.T) {
+		dir, config, dirOffset := build(t)
+		writeOffset(t, dir, dirOffset+16, 1<<40)
+		check(t, dir, config)
 	})
 }
 
@@ -201,8 +279,8 @@ func TestSortSuffixPreservesPrefix(t *testing.T) {
 	}
 }
 
-// TestPersistentSize records the on-disk base size for a fixed image count so
-// storage changes are visible. Run with -v.
+// TestPersistentSize records the live payload, arena capacity, and single-file
+// layout for a fixed image count so storage changes are visible. Run with -v.
 func TestPersistentSize(t *testing.T) {
 	if testing.Short() {
 		t.Skip("persistent size check")
@@ -229,9 +307,31 @@ func TestPersistentSize(t *testing.T) {
 	if err := index.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
+	stats := index.StorageStats()
 	if err := index.Close(); err != nil {
 		t.Fatal(err)
 	}
-	size := storage.DirSize(dir, "manifest", "base.*.dat")
-	t.Logf("geoidx persistent 1M uniform: %d bytes (%d B/image)", size, size/uint64(n))
+	files, _ := filepath.Glob(filepath.Join(dir, "*"))
+	if len(files) != 2 { // geoidx.dat + geoidx.lock
+		t.Fatalf("persistent directory has %d files, want 2: %v", len(files), files)
+	}
+	info, err := os.Stat(filepath.Join(dir, geoidxFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("geoidx persistent 1M: file=%d arena=%d live=%d free=%d largestFree=%d runs=%d (%d B/image)",
+		info.Size(), stats.ArenaBytes, stats.LiveBytes, stats.FreeBytes, stats.LargestFree, stats.FreeRuns, stats.LiveBytes/uint64(n))
+
+	// Recovery cost: reopen validates the superblock, directory, and every shard.
+	start := time.Now()
+	reopened, err := Open(dir, Config{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	openDuration := time.Since(start)
+	defer reopened.Close()
+	if got := reopened.Len(); got != n {
+		t.Fatalf("reopened Len = %d, want %d", got, n)
+	}
+	t.Logf("geoidx persistent 1M: open/validate %v, %d shards", openDuration, len(reopened.view.Load().shards))
 }

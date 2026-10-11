@@ -9,6 +9,7 @@ import (
 	"math/bits"
 	"slices"
 	"sort"
+	"sync"
 )
 
 // Result is one distance-aware geographic match. Distance is the great-circle
@@ -44,54 +45,62 @@ func viewTouched(v *view, id common.ImageID) (present, touched bool) {
 // with pending additions last. It imposes no ImageID ordering. ranges must be
 // normalized. fn returning false stops the scan.
 func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
-	if viewDelta(v) == nil {
-		position := 0
+	useDelta := viewDelta(v) != nil
+	if !scanShards(v.shards, ranges, useDelta, v, fn) {
+		return false
+	}
+	if useDelta {
+		// Additions come from the cached key-sorted insert list, so only the
+		// adds inside the ranges are visited.
+		adds := v.deltaAdds
 		for _, r := range ranges {
-			position += sort.Search(len(v.keys)-position, func(k int) bool {
-				return v.keys[position+k] >= r.Start
-			})
-			for position < len(v.keys) && v.keys[position] <= r.End {
-				if id := v.ids[position]; id != 0 {
-					if !fn(v.keys[position], id) {
+			low := sort.Search(len(adds), func(i int) bool { return adds[i].key >= r.Start })
+			for low < len(adds) && adds[low].key <= r.End {
+				if !fn(adds[low].key, adds[low].id) {
+					return false
+				}
+				low++
+			}
+		}
+	}
+	return true
+}
+
+// scanShards walks the shard directory in global key order, visiting base
+// entries inside ranges. When useDelta is set, base entries named by the delta
+// are shadowed. The range cursor advances monotonically across shards, so a
+// range that spans shards is continued rather than restarted. A repeated S2Key
+// spanning shards is visited in every shard that holds part of its run.
+func scanShards(shards []*shard, ranges []Range, useDelta bool, v *view, fn func(S2Key, common.ImageID) bool) bool {
+	if len(ranges) == 0 {
+		return true
+	}
+	ri := 0
+	for si := firstShardAtOrAfter(shards, ranges[0].Start); si < len(shards); si++ {
+		s := shards[si]
+		if len(s.keys) == 0 {
+			continue
+		}
+		firstKey := s.keys[0]
+		for ri < len(ranges) && ranges[ri].End < firstKey {
+			ri++
+		}
+		if ri == len(ranges) {
+			return true
+		}
+		lastKey := s.keys[len(s.keys)-1]
+		for j := ri; j < len(ranges) && ranges[j].Start <= lastKey; j++ {
+			r := ranges[j]
+			low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= r.Start })
+			for low < len(s.keys) && s.keys[low] <= r.End {
+				id := s.ids[low]
+				if id != 0 && (!useDelta || !deltaTouched(v, id)) {
+					if !fn(s.keys[low], id) {
 						return false
 					}
 				}
-				position++
+				low++
 			}
-		}
-		return true
-	}
-	return scanRangesEff(v, ranges, fn)
-}
-
-// scanRangesEff scans a view with pending mutations. Base entries shadowed by
-// the effective delta are skipped via the cached membership bitset (or a binary
-// search), and additions come from the cached key-sorted insert list so only the
-// adds inside the ranges are visited.
-func scanRangesEff(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
-	position := 0
-	for _, r := range ranges {
-		position += sort.Search(len(v.keys)-position, func(k int) bool {
-			return v.keys[position+k] >= r.Start
-		})
-		for position < len(v.keys) && v.keys[position] <= r.End {
-			id := v.ids[position]
-			if id != 0 && !deltaTouched(v, id) {
-				if !fn(v.keys[position], id) {
-					return false
-				}
-			}
-			position++
-		}
-	}
-	adds := v.deltaAdds
-	for _, r := range ranges {
-		low := sort.Search(len(adds), func(i int) bool { return adds[i].key >= r.Start })
-		for low < len(adds) && adds[low].key <= r.End {
-			if !fn(adds[low].key, adds[low].id) {
-				return false
-			}
-			low++
 		}
 	}
 	return true
@@ -113,13 +122,33 @@ func normalizeResult(stack *[DefaultMaxCells]Range, ranges []Range) []Range {
 }
 
 // appendBaseRanges appends the base ImageIDs covered by normalized ranges using
-// a bulk copy per range. Callers use it only when no mutation layers exist.
+// a bulk copy per shard-range overlap. Callers use it only when no mutation
+// layers exist.
 func appendBaseRanges(dst []common.ImageID, v *view, ranges []Range) []common.ImageID {
-	for _, r := range ranges {
-		low := sort.Search(len(v.keys), func(i int) bool { return v.keys[i] >= r.Start })
-		high := sort.Search(len(v.keys), func(i int) bool { return v.keys[i] > r.End })
-		if high > low {
-			dst = append(dst, v.ids[low:high]...)
+	if len(ranges) == 0 {
+		return dst
+	}
+	ri := 0
+	for si := firstShardAtOrAfter(v.shards, ranges[0].Start); si < len(v.shards); si++ {
+		s := v.shards[si]
+		if len(s.keys) == 0 {
+			continue
+		}
+		firstKey := s.keys[0]
+		for ri < len(ranges) && ranges[ri].End < firstKey {
+			ri++
+		}
+		if ri == len(ranges) {
+			break
+		}
+		lastKey := s.keys[len(s.keys)-1]
+		for j := ri; j < len(ranges) && ranges[j].Start <= lastKey; j++ {
+			r := ranges[j]
+			low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= r.Start })
+			high := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] > r.End })
+			if high > low {
+				dst = append(dst, s.ids[low:high]...)
+			}
 		}
 	}
 	return dst
@@ -156,7 +185,7 @@ func (i *Index) SearchRanges(dst []common.ImageID, ranges []Range) []common.Imag
 		if viewDelta(v) == nil {
 			dst = appendBaseRanges(dst, v, normalized)
 		} else {
-			scanRangesEff(v, normalized, func(_ S2Key, id common.ImageID) bool {
+			scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
 				dst = append(dst, id)
 				return true
 			})
@@ -384,12 +413,6 @@ type collector struct {
 	stack [collectChunk]common.ImageID
 }
 
-func newCollector(dst *roar.MutableBitmap) *collector {
-	c := &collector{dst: dst}
-	c.buf = c.stack[:0]
-	return c
-}
-
 func (c *collector) add(id common.ImageID) {
 	if len(c.buf) == cap(c.buf) {
 		c.flush()
@@ -405,6 +428,27 @@ func (c *collector) flush() {
 	c.buf = c.buf[:0]
 }
 
+// collectorPool reuses collectors across queries. A fresh collector escapes to
+// the heap (AddMany may retain the slice), so pooling keeps Filter/Collect
+// queries allocation-free on the steady-state path while still bounding the
+// staged buffer to a single chunk.
+var collectorPool = sync.Pool{New: func() any { return new(collector) }}
+
+// acquireCollector returns a pooled collector targeting dst.
+func acquireCollector(dst *roar.MutableBitmap) *collector {
+	c := collectorPool.Get().(*collector)
+	c.dst = dst
+	c.buf = c.stack[:0]
+	return c
+}
+
+// releaseCollector returns c to the pool after the caller has flushed it.
+func releaseCollector(c *collector) {
+	c.dst = nil
+	c.buf = c.stack[:0]
+	collectorPool.Put(c)
+}
+
 // CollectRanges adds every ImageID whose key falls in ranges directly to dst in
 // native S2 order. No sorted slice is built and no global sort runs.
 func (i *Index) CollectRanges(dst *roar.MutableBitmap, ranges []Range) {
@@ -414,12 +458,13 @@ func (i *Index) CollectRanges(dst *roar.MutableBitmap, ranges []Range) {
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
 			c.add(id)
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 }
 
@@ -456,7 +501,7 @@ func (i *Index) CollectRadius(dst *roar.MutableBitmap, latitude, longitude, radi
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
 			if keyDistanceMeters(key, center) <= radiusMeters {
 				c.add(id)
@@ -464,6 +509,7 @@ func (i *Index) CollectRadius(dst *roar.MutableBitmap, latitude, longitude, radi
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 	return nil
 }
@@ -488,7 +534,7 @@ func (i *Index) FilterRanges(dst *roar.MutableBitmap, candidates roar.Bitmap, ra
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
 			if candidates.Contains(id) {
 				c.add(id)
@@ -496,6 +542,7 @@ func (i *Index) FilterRanges(dst *roar.MutableBitmap, candidates roar.Bitmap, ra
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 }
 
@@ -532,7 +579,7 @@ func (i *Index) FilterRadius(dst *roar.MutableBitmap, candidates roar.Bitmap, la
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
-		c := newCollector(dst)
+		c := acquireCollector(dst)
 		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
 			if candidates.Contains(id) && keyDistanceMeters(key, center) <= radiusMeters {
 				c.add(id)
@@ -540,6 +587,7 @@ func (i *Index) FilterRadius(dst *roar.MutableBitmap, candidates roar.Bitmap, la
 			return true
 		})
 		c.flush()
+		releaseCollector(c)
 	})
 	return nil
 }
@@ -593,11 +641,13 @@ func (i *Index) EstimateRanges(ranges []Range) uint64 {
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
-		for _, r := range normalized {
-			low := sort.Search(len(v.keys), func(k int) bool { return v.keys[k] >= r.Start })
-			high := sort.Search(len(v.keys), func(k int) bool { return v.keys[k] > r.End })
-			if high > low {
-				estimate += uint64(high - low)
+		for _, s := range v.shards {
+			for _, r := range normalized {
+				low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= r.Start })
+				high := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] > r.End })
+				if high > low {
+					estimate += uint64(high - low)
+				}
 			}
 		}
 		for n := range v.frozen {
@@ -629,9 +679,14 @@ func (i *Index) Contains(key S2Key, id common.ImageID) bool {
 			found = present && layerKey(v, id) == key
 			return
 		}
-		low := sort.Search(len(v.keys), func(k int) bool { return v.keys[k] >= key })
-		for low < len(v.keys) && v.keys[low] == key {
-			if v.ids[low] == id {
+		si := shardFor(v.shards, key, id)
+		if si < 0 {
+			return
+		}
+		s := v.shards[si]
+		low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= key })
+		for low < len(s.keys) && s.keys[low] == key {
+			if s.ids[low] == id {
 				found = true
 				return
 			}
@@ -718,7 +773,7 @@ func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) ([]common.ImageID
 		return ids, false
 	}
 	words := int(uint64(limit)>>6) + 1
-	set := make([]uint64, words)
+	set := acquireBitset(words)
 	for _, id := range ids {
 		set[id>>6] |= 1 << (id & 63)
 	}
@@ -731,7 +786,36 @@ func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) ([]common.ImageID
 			word &= word - 1
 		}
 	}
+	releaseBitset(set)
 	return ids[:out], true
+}
+
+// bitsetScratchCap bounds the word count of a pooled bitset (256 KiB), so the
+// pool cannot retain an unbounded buffer. Larger bitsets are allocated directly.
+const bitsetScratchCap = 1 << 15
+
+var bitsetPool = sync.Pool{New: func() any { return make([]uint64, 0, 1024) }}
+
+// acquireBitset returns a zeroed bitset of words words, reusing a pooled buffer
+// when possible so broad sorted queries do not allocate per call.
+func acquireBitset(words int) []uint64 {
+	if words > bitsetScratchCap {
+		return make([]uint64, words)
+	}
+	set := bitsetPool.Get().([]uint64)
+	if cap(set) < words {
+		set = make([]uint64, words)
+	}
+	set = set[:words]
+	clear(set)
+	return set
+}
+
+// releaseBitset returns set to the pool for reuse.
+func releaseBitset(set []uint64) {
+	if cap(set) <= bitsetScratchCap {
+		bitsetPool.Put(set[:0])
+	}
 }
 
 // radixSortIDs sorts a uint64 slice with an 8-pass, base-256 LSD radix sort. One
