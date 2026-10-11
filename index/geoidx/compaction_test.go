@@ -10,6 +10,7 @@ import (
 	"time"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -341,9 +342,9 @@ func equalIDs(a, b []uint64) bool {
 	return true
 }
 
-// TestCompactionCommitReconcilesAfterRename simulates the manifest rename
-// succeeding but the commit reporting an error (for example a directory-sync
-// failure). The committed generation must be adopted, not discarded.
+// TestCompactionCommitReconcilesAfterRename simulates the superblock write
+// succeeding but the commit reporting an error (for example a sync failure).
+// The committed generation must be adopted, not discarded.
 func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
 	dir := t.TempDir()
 	config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
@@ -354,16 +355,15 @@ func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
 	insertKeys(t, index, testKeys(100), 1)
 	before := index.Generation()
 
-	writeManifestFunc = func(dir string, data []byte) error {
-		if err := writeManifest(dir, data); err != nil {
-			return err
-		}
-		return errors.New("simulated post-rename sync failure")
+	original := commitSuperblockFunc
+	commitSuperblockFunc = func(arena []byte, offset uint64, slot []byte) error {
+		copy(arena[offset:offset+storage.SuperblockSlotBytes], slot)
+		return errors.New("simulated post-write sync failure")
 	}
-	defer func() { writeManifestFunc = writeManifest }()
+	defer func() { commitSuperblockFunc = original }()
 
 	if err := index.Compact(); err != nil {
-		t.Fatalf("Compact returned %v despite a committed manifest", err)
+		t.Fatalf("Compact returned %v despite a committed superblock", err)
 	}
 	if index.Generation() == before {
 		t.Fatal("generation not advanced after reconciled commit")

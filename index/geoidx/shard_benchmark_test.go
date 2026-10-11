@@ -1,6 +1,7 @@
 package geoidx
 
 import (
+	"fmt"
 	"testing"
 
 	common "github.com/evanoberholster/imageIdx/common"
@@ -94,6 +95,96 @@ func BenchmarkShardTargetSize(b *testing.B) {
 					}
 				}
 			})
+		})
+	}
+}
+
+// BenchmarkAffectedShardSelection isolates the affected-shard scan of a
+// compaction (no disk I/O): one delete on a 1M-entry memory index. With
+// monotonic ImageIDs each shard's MinImageID/MaxImageID range is nearly disjoint,
+// so the scan prunes to the victim's shard; with random IDs the ranges overlap
+// and most shards are scanned. shards-scanned reports the pruned count.
+func BenchmarkAffectedShardSelection(b *testing.B) {
+	for _, tc := range []struct {
+		name    string
+		entries func(int) []Entry
+	}{
+		{"monotonic", monotonicEntries},
+		{"clustered", shardedMemoryEntries},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			cfg := Config{TargetShardBytes: 256 << 10, MaxShardBytes: 512 << 10, MinShardBytes: 64 << 10}
+			index, err := NewMemory(cfg)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = index.Close() })
+			entries := tc.entries(1_000_000)
+			if err := index.InsertBatch(entries); err != nil {
+				b.Fatal(err)
+			}
+			if err := index.Compact(); err != nil {
+				b.Fatal(err)
+			}
+			victim := entries[len(entries)/2]
+			stale, err := KeyFromLatLng(testLat+10, testLng+10)
+			if err != nil {
+				b.Fatal(err)
+			}
+			delta := []mutation{{id: victim.ImageID, key: stale, add: false}}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := index.prepareShards(index.shards, delta); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(index.lastScannedShards), "shards-scanned")
+			b.ReportMetric(float64(len(index.shards)), "shards-total")
+		})
+	}
+}
+
+// BenchmarkSingleFileCompact measures a one-image update plus a full
+// single-file compaction on a persistent index, across shard target sizes, and
+// reports the resulting free-space fragmentation. The arena is fixed, so the
+// file never grows: replaced extents are reused.
+func BenchmarkSingleFileCompact(b *testing.B) {
+	for _, target := range []int64{1 << 20, 4 << 20} {
+		b.Run(fmt.Sprintf("target=%dMiB", target>>20), func(b *testing.B) {
+			dir := b.TempDir()
+			cfg := Config{
+				TargetShardBytes: target,
+				MaxShardBytes:    2 * target,
+				MinShardBytes:    target / 4,
+				MaxFileBytes:     96 << 20,
+			}
+			entries := shardedMemoryEntries(500_000)
+			index := persistentShardedIndex(b, dir, cfg, entries)
+			victim := entries[len(entries)/2]
+			moveKey, err := KeyFromLatLng(testLat+0.3, testLng)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := index.Delete(victim.Key, victim.ImageID); err != nil {
+					b.Fatal(err)
+				}
+				if err := index.Insert(moveKey, victim.ImageID); err != nil {
+					b.Fatal(err)
+				}
+				if err := index.Compact(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			stats := index.StorageStats()
+			b.ReportMetric(float64(stats.FreeBytes), "free-B")
+			b.ReportMetric(float64(stats.LargestFree), "largest-free-B")
+			b.ReportMetric(float64(stats.FreeRuns), "free-runs")
 		})
 	}
 }

@@ -2,6 +2,7 @@ package geoidx
 
 import (
 	"sort"
+	"unsafe"
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
@@ -13,14 +14,21 @@ const shardBytesPerRecord = 16
 
 // shard is one immutable contiguous interval of the global (S2Key, ImageID)
 // order. keys and ids are parallel, ascending by (key, id), and never mutated
-// after publication: compaction replaces a shard wholesale. A persistent shard
-// views an mmap arena through mf; a memory shard owns its heap arrays.
+// after publication: compaction replaces a shard wholesale. For a persistent
+// index keys and ids are sub-slices of the single arena at [offset, offset+length);
+// for a memory index they own their heap arrays.
 type shard struct {
-	keys  []S2Key
-	ids   []common.ImageID
-	mf    *storage.MappedFile
-	gen   uint64
-	maxID common.ImageID
+	keys   []S2Key
+	ids    []common.ImageID
+	offset uint64 // arena byte offset of the extent (persistent); 0 otherwise
+	length uint32 // extent length in bytes (persistent); 0 otherwise
+	gen    uint64
+	minID  common.ImageID
+	maxID  common.ImageID
+	// keyCRC and idCRC cache the extent checksums so the directory can be
+	// re-encoded on compaction without re-hashing unchanged shards.
+	keyCRC uint32
+	idCRC  uint32
 }
 
 // count is the number of records in the shard.
@@ -28,6 +36,22 @@ func (s *shard) count() int { return len(s.keys) }
 
 // bytes is the payload size used for split/merge decisions.
 func (s *shard) bytes() int64 { return int64(len(s.keys)) * shardBytesPerRecord }
+
+// typedBytes reinterprets a slice's backing memory as bytes for hashing. The
+// element type is a fixed-width POD, so this is layout-stable.
+func typedBytes[T any](values []T) []byte {
+	if len(values) == 0 {
+		return nil
+	}
+	var zero T
+	return unsafe.Slice((*byte)(unsafe.Pointer(&values[0])), len(values)*int(unsafe.Sizeof(zero)))
+}
+
+// checksumKeys returns the CRC32C of a shard's key array.
+func checksumKeys(s *shard) uint32 { return storage.Checksum(typedBytes(s.keys)) }
+
+// checksumIDs returns the CRC32C of a shard's ImageID array.
+func checksumIDs(s *shard) uint32 { return storage.Checksum(typedBytes(s.ids)) }
 
 // firstPair returns the shard's first (key, id). The shard must be non-empty.
 func (s *shard) firstPair() (S2Key, common.ImageID) { return s.keys[0], s.ids[0] }

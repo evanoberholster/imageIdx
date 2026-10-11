@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -43,6 +44,11 @@ type Config struct {
 	// MinShardBytes is the payload below which adjacent shards are candidates for
 	// merging. Values <= 0 select defaultMinShardBytes (4 MiB).
 	MinShardBytes int64
+	// MaxFileBytes is the fixed capacity of the single persistent file
+	// (geoidx.dat), created sparse at this size and reused through compaction.
+	// Values <= 0 select defaultMaxFileBytes (1 GiB). Capacity is fixed at
+	// creation; changing it requires rebuilding the index.
+	MaxFileBytes int64
 }
 
 const (
@@ -52,6 +58,7 @@ const (
 	defaultTargetShardBytes = 16 << 20 // 16 MiB
 	defaultMaxShardBytes    = 32 << 20 // 32 MiB
 	defaultMinShardBytes    = 4 << 20  // 4 MiB
+	defaultMaxFileBytes     = 1 << 30  // 1 GiB fixed arena
 )
 
 func (c Config) withDefaults() (Config, error) {
@@ -79,10 +86,16 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MinShardBytes <= 0 {
 		c.MinShardBytes = defaultMinShardBytes
 	}
+	if c.MaxFileBytes <= 0 {
+		c.MaxFileBytes = defaultMaxFileBytes
+	}
 	if c.MaxDelta < c.CompactionTrigger || c.CompactionTrigger < c.TargetDelta {
 		return Config{}, ErrInvalidConfig
 	}
 	if c.MinShardBytes > c.TargetShardBytes || c.TargetShardBytes > c.MaxShardBytes {
+		return Config{}, ErrInvalidConfig
+	}
+	if c.MaxFileBytes < int64(c.MaxShardBytes) {
 		return Config{}, ErrInvalidConfig
 	}
 	return c, nil
@@ -187,8 +200,12 @@ type Index struct {
 	layers   [][]mutation
 	frozen   []mutation
 	deltaMax common.ImageID
-	dirGen   uint64
-	nextGen  uint64
+	gen      uint64
+
+	// lastScannedShards is the number of shards whose base ImageIDs were scanned
+	// to find delta-affected shards in the last prepare. Writer-owned; exposed for
+	// tests and benchmarks to measure pruning effectiveness.
+	lastScannedShards int
 
 	compacting     bool
 	compactionDone chan struct{}
@@ -197,6 +214,19 @@ type Index struct {
 	persistent bool
 	dir        string
 	lock       *os.File
+
+	// Persistent arena state, touched only under mu (except the immutable arena
+	// data, which readers access lock-free). One fixed-size mmap holds every
+	// shard, the directory, and allocator metadata; it is never re-mapped while
+	// the index is open, so reader slices stay valid.
+	arena      *storage.MappedFile
+	alloc      *pagealloc.Allocator
+	slot       int
+	arenaBytes uint64
+	dirOffset  uint64
+	dirLength  uint32
+	metaOffset uint64
+	metaLength uint32
 }
 
 // NewMemory returns an empty heap-backed index.
@@ -205,7 +235,7 @@ func NewMemory(config Config) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	index := &Index{config: cfg, dirGen: 1, nextGen: 2}
+	index := &Index{config: cfg, gen: 1}
 	index.publishLocked()
 	return index, nil
 }
@@ -662,7 +692,7 @@ func (i *Index) Sync() error { return i.Checkpoint() }
 func (i *Index) Generation() uint64 {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	return i.dirGen
+	return i.gen
 }
 
 // Namespace returns the namespace configured for this index.

@@ -90,32 +90,43 @@
 //   - prepare (off-lock) selects the affected shards and rebuilds only those.
 //     Adds are routed to a shard by (key, id); a shard is also affected when any
 //     of its base ImageIDs is named by the delta, which is how a delete or move
-//     reaches a shard it does not name by key. Unaffected shards are kept by
+//     reaches a shard it does not name by key. Each shard carries conservative
+//     MinImageID/MaxImageID bounds so the delta's ImageID range prunes shards
+//     whose range does not overlap, which is the common case for monotonically
+//     increasing or geographically clustered IDs. Unaffected shards are kept by
 //     reference. A rebuilt shard larger than MaxShardBytes is split near the
 //     median; adjacent underutilized plans are coalesced with hysteresis so
 //     split/merge cannot cycle. A fully empty shard leaves the directory.
-//   - commit (locked) publishes the manifest (the durable linearization point).
+//   - commit (locked) writes the inactive superblock slot: the durable
+//     linearization point.
 //   - publish (locked) swaps in the new directory.
-//   - reclaim (off-lock) drains readers, unmaps retired shards, and removes
-//     their files.
+//   - reclaim (off-lock) drains readers, retires the replaced extents, and
+//     returns them to the allocator for reuse.
 //
 // The writer is not blocked by a rebuild and continues accepting mutations into
 // fresh layers. Frozen and active mutations are never lost: a failure before the
-// manifest commit retains the snapshot and a later trigger retries, and once the
-// manifest commits the new directory is always published (a manifest that
-// committed despite a reported sync error is reconciled). When the pending delta
-// reaches MaxDelta the writer waits for the running compaction (backpressure)
-// rather than growing without bound. Compact and Checkpoint fold everything
-// synchronously; retired shards are reclaimed after a reader grace period.
+// superblock commit retains the snapshot and a later trigger retries, and once
+// the slot commits the new directory is always published (a slot that committed
+// despite a reported sync error is reconciled). When the pending delta reaches
+// MaxDelta the writer waits for the running compaction (backpressure) rather
+// than growing without bound. Compact and Checkpoint fold everything
+// synchronously; replaced extents are reclaimed after a reader grace period.
 //
 // # Persistence
 //
-// A file-backed index stores each shard in a generation-numbered mmap file
-// (shard.<gen>.dat) behind a dual-slot CRC32C superblock, and a store manifest
-// (version 2) holding a directory generation, every live shard's generation,
-// first (S2Key, ImageID) boundary, and record count. Persistence is
-// checkpoint-based: mutations are runtime state and become durable on
-// Checkpoint/Compact. Close does not checkpoint. A pre-shard (version 1)
-// monolithic index is rejected with ErrLegacyFormat rather than reinterpreted;
-// rebuild it by re-inserting from canonical image metadata.
+// A file-backed index stores everything in one sparse mmap file (geoidx.dat):
+// two alternating CRC32C superblock slots, and a pagealloc-managed arena holding
+// every shard extent, the shard directory, and the allocator metadata. A shard is
+// one independently replaceable in-file extent, so compaction rewrites only the
+// affected extents and reuses free space instead of growing the file. The active
+// superblock is the durable commit point and references the live directory and
+// allocator state; the inactive slot holds the previous generation, so a failure
+// before the commit leaves the previous generation recoverable. The arena is
+// mapped once at a fixed capacity (Config.MaxFileBytes) and never re-mapped while
+// the index is open, so reader slices into it stay valid; obsolete extents are
+// reclaimed after a reader grace period. Persistence is checkpoint-based:
+// mutations are runtime state and become durable on Checkpoint/Compact. Close
+// does not checkpoint. A pre-shard monolithic or multi-file directory is rejected
+// with ErrLegacyFormat rather than reinterpreted; rebuild by re-inserting from
+// canonical image metadata.
 package geoidx

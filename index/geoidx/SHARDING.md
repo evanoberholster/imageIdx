@@ -1,31 +1,87 @@
-# geoidx size-bounded sharding
+# geoidx size-bounded sharding (single-file)
 
-Design and results for replacing the single monolithic base with independently
-compactable, size-bounded shards. The flat SoA layout, public search API, and
-lock-free reader model are unchanged.
+Design and results for size-bounded shards stored in **one file**, `geoidx.dat`.
+Flat SoA, the public search API, and lock-free readers are unchanged.
 
 ## Architecture
 
 ```
-geoidx
-  directory (sorted []*shard, tens of entries)
-    shard 0  keys[] ids[]   (immutable, contiguous (S2Key, ImageID) interval)
-    shard 1  keys[] ids[]
+geoidx.dat (one sparse mmap, fixed capacity)
+  slot 0  superblock (512 B)     \  dual-slot CRC32C commit point
+  slot 1  superblock (512 B)     /
+  arena (pagealloc, 512 B granularity)
+    shard extent 0  keys[] ids[]
+    shard extent 1  keys[] ids[]
     ...
-  global mutation overlay (active/frozen/layers, id-sorted)
+    directory extent (shard references)
+    allocator metadata extent
+  global mutation overlay (active/frozen/layers, id-sorted, runtime only)
 ```
 
-- **Shard.** Immutable SoA arrays ordered by `(S2Key, ImageID)`. For a persistent
-  index they view an mmap arena; for a memory index they own heap arrays. A shard
-  is never mutated: compaction replaces it wholesale.
-- **Directory.** The ordered shard slice. Boundaries are `(S2Key, ImageID)`
-  pairs, chosen by payload size (16 B/record), not by an S2 prefix, so a repeated
-  S2Key may span shards. Lookup is a binary search over the directory
-  (`shardFor`) followed by an in-shard binary search; a range continues into the
-  next shard rather than restarting.
-- **Mutation overlay.** One global, id-sorted delta shared by all shards. It is
-  ImageID-authoritative, so a delete or move suppresses the old record even when
-  the caller supplies a stale key; no reverse index exists.
+- **Shard.** One contiguous `(S2Key, ImageID)` interval of flat SoA arrays, held
+  as one independently replaceable extent. Boundaries are chosen by payload size,
+  not an S2 prefix, so a repeated S2Key may span shards.
+- **In-file directory.** A compact sorted array of shard references:
+  `firstKey, firstID, offset, count, keyCRC, idCRC, minID, maxID`. A geographic
+  lookup binary-searches the directory and then the shard; it visits every shard
+  whose key range overlaps.
+- **Global mutation overlay.** Unchanged: ImageID-authoritative, so stale-key
+  deletes and moves are correct with no reverse index.
+- **One mapping.** The arena is mapped once at a fixed capacity
+  (`Config.MaxFileBytes`, default 1 GiB) and never re-mapped while the index is
+  open, so reader slices into it stay valid. Free space is reused through
+  compaction rather than growing the file.
+
+## Extent allocator
+
+Reuses `internal/pagealloc` (the same allocator `radixhash` uses):
+512-byte-granular, variable-sized exact-fit extents, a running allocation cursor,
+free-space reuse, and `Retire`/`Reclaim` with a copy-on-write grace period. A
+shard extent is simply a large exact-fit allocation (16–32 MiB), so no geoidx
+specific allocator exists. Added to the shared allocator: `EncodedSize` (reserve
+the metadata extent before encoding), `LargestFreeBytes`, `FreeRunCount`, and
+`Used` (validate a persisted reference on reopen).
+
+## Commit and persistence
+
+Two superblock slots alternate; the highest valid generation wins on open. The
+superblock payload stores: directory offset/count, allocator metadata
+offset/length, total live entries, live bytes, and arena bytes; the header
+carries magic, version, generation, and CRCs.
+
+Commit sequence (unchanged in shape, now in-file):
+
+1. Allocate replacement shard extents.
+2. Write new shard contents.
+3. Write the new directory extent.
+4. Write the new allocator metadata extent (a fresh bitmap marking only the
+   second superblock and the new live extents used, so retired and uncommitted
+   extents are free on reopen).
+5. Sync the arena data.
+6. Commit the inactive superblock slot.
+7. Sync.
+8. Publish the new in-memory directory.
+9. Retire the replaced extents.
+10. Reclaim them after prior readers drain (`ReaderTracker`).
+
+A failure before the superblock commit frees the newly allocated extents and
+retains the frozen snapshot for retry; the old slot stays authoritative. A commit
+that wrote but reported a sync error is reconciled by re-reading the slots.
+Extents referenced by a committed generation are never overwritten.
+
+## Compaction
+
+`prepare → commit → publish → reclaim`. Only affected shards are rebuilt:
+
+1. Insertions are routed to a shard by `(key, id)`.
+2. A shard is also affected when any of its base ImageIDs is named by the delta
+   (the path by which a stale-key delete or move reaches it). Each shard carries
+   conservative `MinImageID`/`MaxImageID` bounds, so the delta's ImageID range
+   skips shards that cannot contain a named ID.
+3. Rebuilt shards above `MaxShardBytes` split near the median; adjacent
+   underutilized plans coalesce with hysteresis; emptied shards leave the
+   directory.
+4. Unchanged shard extents are kept by reference and never rewritten.
 
 ## Configuration
 
@@ -34,95 +90,72 @@ geoidx
 | `TargetShardBytes` | 16 MiB | preferred shard payload; split/merge target |
 | `MaxShardBytes` | 32 MiB | payload above which a rebuilt shard is split |
 | `MinShardBytes` | 4 MiB | payload below which a shard is a merge candidate |
+| `MaxFileBytes` | 1 GiB | fixed single-file capacity, created sparse |
 
-8/16/32 MiB targets were benchmarked (below). For small test datasets the same
-code is exercised with proportionally tiny targets.
+8/16/32 MiB targets were benchmarked (below). `MaxFileBytes` is fixed at
+creation; changing capacity requires rebuilding the index.
 
-## Compaction
+## Results (Apple M4 Pro)
 
-`prepare → commit → publish → reclaim`, unchanged in shape from the monolithic
-design but now selective:
+Query latency is unchanged from the unsharded PR #15 (single-shard at these
+dataset sizes): exact cell 31.5 ns / 0 allocs; 2 km multi-range 5.34 µs / 0;
+nearest k=10 86.4 µs; filter initial 5.36 µs / 0; clustered range 51.5 µs.
 
-1. **prepare (off-lock).** Route each insertion to its shard by `(key, id)`
-   (`partitionAdds`). A shard is *affected* if it receives an insertion or if any
-   of its base ImageIDs is named by the delta — the latter is how a delete/move
-   reaches a shard it does not name by key. Unaffected shards are kept by
-   reference. Each affected shard is rebuilt with the shared streaming
-   `exactCount`/`mergeInto`. A result larger than `MaxShardBytes` is split near
-   the median on `(key, id)`; adjacent underutilized plans are coalesced while
-   their combined payload fits `TargetShardBytes` and one is below
-   `MinShardBytes`, so split/merge cannot cycle. An emptied shard leaves the
-   directory.
-2. **commit (locked).** Publish the manifest: the durable linearization point.
-3. **publish (locked).** Swap in the new directory.
-4. **reclaim (off-lock).** Drain readers, unmap retired shards, remove their
-   files.
+`BenchmarkShardTargetSize`, 4M uniform (memory, `-benchtime=100ms`):
 
-The trigger is `max(CompactionTrigger, baseEntries/8)` over the whole directory,
-so the per-mutation rewrite ratio is the same as before; sharding bounds the size
-of each individual rewrite and lets unrelated shards stay untouched.
+| target | shards | range | exact | compact-small-update |
+|---|---:|---:|---:|---:|
+| single | 1 | 276 µs | 34.8 ns | 46.6 ms / **64.3 MB** |
+| 8 MiB | 8 | 281 µs | 32.9 ns | 22.9 ms / **8.3 MB** |
+| 16 MiB | 4 | 276 µs | 33.6 ns | 26.2 ms / **16.3 MB** |
+| 32 MiB | 2 | 277 µs | 35.2 ns | 33.9 ms / **32.3 MB** |
 
-Only affected shards are rewritten, so a small update costs one (sometimes two)
-shard rewrites instead of a full-base rewrite.
+The maximum individual rewrite is bounded by `MaxShardBytes`.
 
-## Persistence and recovery
+`BenchmarkAffectedShardSelection` isolates the affected-shard scan (one delete on
+a 1M memory index, 62 shards, no disk I/O):
 
-- Each shard is a generation-numbered mmap file `shard.<gen>.dat` with a dual-slot
-  CRC32C superblock (magic `GEOS`, count, max ImageID, key/id CRCs).
-- The manifest (magic `GEOM`, **version 2**) holds a directory generation and one
-  entry per live shard: generation, record count, first `(S2Key, ImageID)`.
-  Published atomically with `WriteFileAtomic`; not replaced until all new shard
-  files are written and synced.
-- `Open` validates the manifest, opens and validates each shard (superblock,
-  count, boundary, checksums, strict `(key, id)` order), validates global shard
-  ordering, reconstructs the reader view, and removes orphan shard files.
-- A **version 1** (pre-shard monolithic) manifest is rejected with
-  `ErrLegacyFormat`; it is not reinterpreted. Rebuild by re-inserting from
-  canonical image metadata, then `Compact`.
-- Commit boundary: a failure before the manifest commit discards the new shard
-  files and retains the frozen snapshot for retry; a manifest that committed
-  despite a reported sync error is reconciled by re-reading it.
+| distribution | ns/op | shards scanned | shards total |
+|---|---:|---:|---:|
+| monotonic ImageIDs | 70.8 µs | 1 | 62 |
+| clustered/random IDs | 5.14 ms | 62 | 62 |
 
-## Benchmarks
+Monotonic/geographically clustered IDs let `MinImageID`/`MaxImageID` prune the
+scan by **73×**; overlapping ranges fall back to a full scan (still allocation
+free, and far cheaper than rewriting every shard).
 
-Apple M4 Pro, Go 1.27. Query results are identical to the unsharded PR #15
-numbers (single-shard at these dataset sizes), so sharding adds no read cost.
+Persistent 1M uniform (one file): live payload 16 MB (16 B/image), arena 1 GiB
+fixed, 2 free runs, ~1.055 GB free — the file is a preallocated sparse arena
+reused across compactions.
 
-Regression check (1M / 200k, one shard): exact cell 29.5 ns / 0 allocs; 2 km
-multi-range 5.35 µs / 0; nearest k=10 86.7 µs; filter initial 5.45 µs / 0;
-clustered range 50.8 µs.
+## Metrics
 
-`BenchmarkShardTargetSize`, 4M uniform (`-benchtime=100ms`, `-count=1`):
+`Index.StorageStats()` reports `ArenaBytes`, `LiveBytes`, `FreeBytes`,
+`LargestFree`, `FreeRuns`, and `RetiredBytes`. The measured 1M index shows low
+fragmentation (2 free runs after a bulk load); `TestSingleFileExtentReuse`
+churns 400 single-image updates in a 1 MiB arena and confirms replaced extents
+are reused and no sidecar file is created. The arena never grows during ordinary
+uploads, so whole-file defragmentation is not needed.
 
-| target | shards | range | exact | nearest10 | compact-small-update |
-|---|---:|---:|---:|---:|---:|
-| single (1 GiB) | 1 | 276 µs | 34.8 ns | 56.7 µs | 46.6 ms / **64.3 MB** |
-| 8 MiB | 8 | 281 µs | 32.9 ns | 57.7 µs | 22.9 ms / **8.3 MB** |
-| 16 MiB | 4 | 276 µs | 33.6 ns | 58.1 µs | 26.2 ms / **16.3 MB** |
-| 32 MiB | 2 | 277 µs | 35.2 ns | 61.1 µs | 33.9 ms / **32.3 MB** |
-
-The query columns are flat across shard sizes. `compact-small-update` deletes and
-re-inserts one image and calls `Compact`: its transient allocation tracks the
-rewritten shard size (8/16/32 MB) instead of the whole 64 MB base, which is the
-core result — **the maximum individual rewrite is bounded by `MaxShardBytes`.**
-
-Small-batch writes (`BenchmarkShardInsertBatch`, 1M base, 64-entry batches):
-8.5–9.1 µs, ~35 KB, allocations independent of the shard target.
-`BenchmarkGeoInsertRotation`: 3.1 µs / 20.5 KB / 4 allocs (trigger=1M), 9.9 µs /
-30.4 KB / 4 allocs (trigger=256).
+`BenchmarkSingleFileCompact` (persistent, 500k images, 96 MiB fixed arena, one
+update + `Compact`): a 1 MiB shard target rewrites 1.2 MB/op with 5 free runs
+(largest 79 MB); a 4 MiB target rewrites 4.5 MB/op with 3 free runs (largest
+59 MB). Free space is reused rather than the file growing.
 
 ## Correctness tests
 
-`shard_test.go` covers: directory ordering; lookup boundaries (`shardFor`,
-`firstShardAtOrAfter`); a repeated S2Key spanning shards; ranges crossing
-multiple shards (differential against a reference, plus Collect/Filter);
-split and merge; empty-shard removal; selective compaction rewriting only
-affected shards; stale-key deletion across shards; multi-shard moves with no
-duplicate live ImageID; persistent round-trip with per-shard files; legacy
-manifest rejection; orphan cleanup; mixed insert/delete/move differential under
-frequent compaction; and concurrent lock-free readers across shard replacement
-(`-race`). Existing compaction failure-injection, slow-reader, and reconciliation
-tests exercise the sharded commit path.
+`shard_test.go` / `persist_test.go` cover: directory ordering and boundaries; a
+repeated S2Key spanning shards; cross-shard ranges differentially against a
+reference (plus Collect/Filter); split and merge; empty-shard removal; selective
+compaction rewriting only affected shards; affected-shard pruning correctness
+with a stale-key delete; stale-key deletes; multi-shard moves without duplicate
+live ImageIDs; single-file layout with no sidecar; extent reuse in a small arena;
+persistent round-trip; legacy-format rejection; malformed superblock / shard /
+directory / metadata / truncated file rejection; compaction failure injection at
+every stage with reopen; commit reconciliation after a post-write sync error;
+reader safety while a slow reader holds the old directory; concurrent readers
+across shard replacement and on a persistent single-file index (`-race`); and a
+mixed insert/delete/move differential under frequent compaction.
 
 ```
 go test ./...
@@ -130,30 +163,28 @@ go test -race ./index/geoidx/... ./search/...
 go vet ./index/geoidx/... ./search/...
 ```
 
+## Migration from earlier formats
+
+- Pre-shard monolithic (`base.<gen>.dat` + v1 manifest) and the multi-file
+  sharded format (`manifest` + `shard.<gen>.dat`) are both rejected with
+  `ErrLegacyFormat`; neither is read implicitly. Rebuild by opening a new index
+  and re-inserting from canonical image metadata (`KeyFromLatLng` + `InsertBatch`
+  + `Compact`).
+- The single-file format is new; there is no in-place upgrade.
+
 ## Trade-offs and limitations
 
-- **Affected-shard selection is O(base) per compaction.** Adds are key-routed,
-  but an ImageID-authoritative delete/move is not, so compaction scans the base
-  ImageIDs against the delta membership set (O(1) per id, no allocation) to find
-  affected shards. This is far cheaper than rewriting every shard and needs no
-  reverse index, but it is linear in the base. It is the price of the global
-  overlay and is the main remaining optimization target (for example a coarse
-  per-shard ImageID Bloom summary).
-- **Write amplification per mutation is unchanged** (`~128 B` at the `base/8`
-  trigger). Sharding reduces the size of each rewrite and enables independent
-  scheduling; it does not reduce the amortized ratio.
-- **Reads are unaffected** at these sizes; the directory adds `O(log shards)`
-  per range.
-- **Merging can rewrite an unaffected shard** when two adjacent undersized shards
-  coalesce. Hysteresis (merge only when combined ≤ target and one < min) prevents
-  cycling.
-- **20M/30M datasets were not run** in this environment; the design is
-  size-independent and 4M was used to get multiple shards at the target sizes.
-  The 1M/10M query benchmarks and 4M shard-target benchmark cover the hot paths.
-- **No new SIMD.** The scan remains memory-bandwidth-bound.
-
-## Not done (scope)
-
-Page-level COW, multi-level radix directories, fixed-prefix S2 sharding, per-cell
-postings, per-shard roaring postings, an ImageID reverse index, a new allocator,
-and a general LSM framework remain out of scope.
+- **Affected-shard selection is O(base) in the worst case.** Adds are key-routed;
+  a delete/move is bounded by `MinImageID`/`MaxImageID` pruning, but when ID
+  ranges overlap heavily the scan is still linear in the base. It allocates
+  nothing and is much cheaper than a full rewrite.
+- **Fixed capacity.** `MaxFileBytes` is set at creation; the file is sparse and
+  reused, so it does not grow during uploads, but exceeding capacity returns an
+  error and requires a rebuild with a larger capacity. Growth by re-mapping is
+  intentionally avoided because it would invalidate reader slices.
+- **Write amplification per mutation is unchanged** (~128 B at the `base/8`
+  trigger). Sharding bounds the size of each rewrite, not the amortized ratio.
+- **Checksums validate the whole base on open** (keys and ids per shard), so open
+  is O(base) read; this trades startup time for corruption detection.
+- 20M/30M datasets were not run here; 4M/1M were used to exercise multiple shards
+  at the target sizes. No SIMD or extra index levels were added.

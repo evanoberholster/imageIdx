@@ -1,7 +1,6 @@
 package geoidx
 
 import (
-	"encoding/binary"
 	"errors"
 	"math/rand"
 	"os"
@@ -396,9 +395,12 @@ func TestPersistentShardedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, _ := filepath.Glob(filepath.Join(dir, "shard.*.dat"))
-	if len(files) != shardsBefore {
-		t.Fatalf("shard files on disk = %d, want %d", len(files), shardsBefore)
+	files, _ := filepath.Glob(filepath.Join(dir, "*"))
+	for _, f := range files {
+		base := filepath.Base(f)
+		if base != geoidxFile && base != "geoidx.lock" {
+			t.Fatalf("unexpected sidecar file %s", base)
+		}
 	}
 
 	reopened, err := Open(dir, cfg)
@@ -418,13 +420,11 @@ func TestPersistentShardedRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLegacyManifestRejected(t *testing.T) {
+func TestLegacyFormatRejected(t *testing.T) {
 	dir := t.TempDir()
-	buf := make([]byte, 26)
-	// old manifest: magic(4) + version(2)=1 + generation(8) + count(8) + crc(4)
-	binary.LittleEndian.PutUint32(buf[0:4], manifestMagic)
-	binary.LittleEndian.PutUint16(buf[4:6], 1)
-	if err := os.WriteFile(filepath.Join(dir, "manifest"), buf, 0o644); err != nil {
+	// A pre-shard multi-file directory has a manifest and shard files and no
+	// geoidx.dat; it must be reported rather than reinterpreted.
+	if err := os.WriteFile(filepath.Join(dir, "manifest"), []byte("legacy"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Open(dir, tinyShardConfig()); !errors.Is(err, ErrLegacyFormat) {
@@ -432,33 +432,168 @@ func TestLegacyManifestRejected(t *testing.T) {
 	}
 }
 
-func TestShardOrphanCleanup(t *testing.T) {
+// TestSingleFileExtentReuse verifies the persistent index uses exactly one file
+// and that replaced extents are reclaimed and reused rather than growing the
+// arena. The small arena forces reuse.
+func TestSingleFileExtentReuse(t *testing.T) {
 	dir := t.TempDir()
 	cfg := tinyShardConfig()
+	cfg.MaxFileBytes = 1 << 20 // 1 MiB arena, forcing extent reuse
 	index, err := New(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	entries := shardedMemoryEntries(1500)
+	entries := shardedMemoryEntries(3000)
 	insertChunked(t, index, entries)
 	if err := index.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
+
+	// Churn single-image updates so extents are replaced and reused.
+	for i := 0; i < 400; i++ {
+		id := entries[i%len(entries)].ImageID
+		key, err := KeyFromLatLng(testLat+0.05, testLng+float64(i)*1e-5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := index.Insert(key, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := index.Compact(); err != nil {
+			t.Fatalf("compact %d: %v", i, err)
+		}
+	}
+	stats := index.StorageStats()
+	if stats.LiveBytes == 0 {
+		t.Fatal("no live bytes")
+	}
+	if stats.FreeBytes == 0 {
+		t.Fatal("expected reusable free space after churn")
+	}
 	if err := index.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Drop an orphan file that no manifest references.
-	orphan := filepath.Join(dir, "shard.ffffffffffffffff.dat")
-	if err := os.WriteFile(orphan, []byte("junk"), 0o644); err != nil {
-		t.Fatal(err)
+	files, _ := filepath.Glob(filepath.Join(dir, "*"))
+	for _, f := range files {
+		base := filepath.Base(f)
+		if base != geoidxFile && base != "geoidx.lock" {
+			t.Fatalf("sidecar file %s created", base)
+		}
 	}
-	reopened, err := Open(dir, cfg)
+}
+
+// persistentShardedIndex builds a persistent index from entries and compacts it.
+func persistentShardedIndex(tb testing.TB, dir string, cfg Config, entries []Entry) *Index {
+	tb.Helper()
+	index, err := New(dir, cfg)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { _ = index.Close() })
+	insertChunked(tb, index, entries)
+	if err := index.Compact(); err != nil {
+		tb.Fatal(err)
+	}
+	return index
+}
+
+// monotonicEntries returns n entries whose keys and ImageIDs both increase, so
+// each key-ordered shard holds a contiguous, nearly disjoint ImageID range. This
+// is the case where per-shard MinImageID/MaxImageID prunes affected-shard scans.
+func monotonicEntries(n int) []Entry {
+	keys := make([]S2Key, n)
+	for i := range keys {
+		k, err := KeyFromLatLng(testLat+float64(i)*1e-5, testLng)
+		if err != nil {
+			panic(err)
+		}
+		keys[i] = k
+	}
+	slices.Sort(keys)
+	entries := make([]Entry, n)
+	for i, k := range keys {
+		entries[i] = Entry{Key: k, ImageID: common.ImageID(i + 1)}
+	}
+	return entries
+}
+
+// TestAffectedShardPruningCorrectness deletes an image through a stale key in a
+// monotonic index and requires the record to be removed while most shards are
+// pruned by the MinImageID/MaxImageID filter.
+func TestAffectedShardPruningCorrectness(t *testing.T) {
+	dir := t.TempDir()
+	cfg := tinyShardConfig()
+	cfg.MaxFileBytes = 1 << 20
+	entries := monotonicEntries(3000)
+	index := persistentShardedIndex(t, dir, cfg, entries)
+	total := len(index.view.Load().shards)
+	if total < 4 {
+		t.Fatalf("need several shards, got %d", total)
+	}
+	victim := entries[len(entries)/2]
+	stale, err := KeyFromLatLng(testLat+10, testLng+10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Fatalf("orphan shard not removed: %v", err)
+	if err := index.Delete(stale, victim.ImageID); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if index.Contains(victim.Key, victim.ImageID) {
+		t.Fatal("stale-key delete not applied under pruning")
+	}
+	if index.lastScannedShards >= total {
+		t.Fatalf("pruning ineffective: scanned %d of %d shards", index.lastScannedShards, total)
+	}
+	if got, want := index.Len(), uint64(len(entries)-1); got != want {
+		t.Fatalf("Len = %d, want %d", got, want)
+	}
+}
+
+// TestConcurrentPersistentReadersDuringCompaction keeps lock-free readers on a
+// single-file persistent index while writes force extent replacement and reuse.
+// Run with -race.
+func TestConcurrentPersistentReadersDuringCompaction(t *testing.T) {
+	dir := t.TempDir()
+	cfg := tinyShardConfig()
+	cfg.MaxFileBytes = 4 << 20
+	entries := shardedMemoryEntries(2500)
+	index := persistentShardedIndex(t, dir, cfg, entries)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			all := []Range{{Start: 0, End: S2Key(^uint64(0))}}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if got := index.SearchRanges(nil, all); len(got) < 1000 {
+					t.Errorf("reader observed %d ids", len(got))
+					return
+				}
+			}
+		}()
+	}
+	more := shardedMemoryEntries(800)
+	for i := range more {
+		more[i].ImageID = common.ImageID(100000 + i)
+	}
+	insertChunked(t, index, more)
+	close(stop)
+	wg.Wait()
+	if err := index.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if got := index.Len(); got < uint64(len(entries)) {
+		t.Fatalf("Len = %d, want >= %d", got, len(entries))
 	}
 }
 

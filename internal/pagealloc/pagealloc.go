@@ -139,6 +139,18 @@ func blocksFor(size uint32) uint32 {
 	return (size + MinBlockSize - 1) / MinBlockSize
 }
 
+// EncodedSize returns the byte length of Encode output for an arena of
+// arenaBytes. Callers use it to reserve an extent for the allocator metadata
+// before encoding it.
+func EncodedSize(arenaBytes uint64) (int, error) {
+	totalBlocks := arenaBytes / uint64(MinBlockSize)
+	if totalBlocks < 2 {
+		return 0, fmt.Errorf("%w: arena of %d bytes", ErrTooLarge, arenaBytes)
+	}
+	words := (totalBlocks + 63) / 64
+	return metadataHeaderSize + int(words)*8 + 4, nil
+}
+
 // Alloc returns the lowest-address free run that holds size bytes. It reports
 // the extent reference and its actual byte capacity (a multiple of
 // MinBlockSize, not necessarily a power of two).
@@ -253,6 +265,54 @@ func (a *Allocator) RetiredBytes() uint64 {
 		total += uint64(extent.blocks) * uint64(MinBlockSize)
 	}
 	return total
+}
+
+// LargestFreeBytes returns the size of the largest contiguous free run. It is a
+// fragmentation metric for callers, not a hot-path operation.
+func (a *Allocator) LargestFreeBytes() uint64 {
+	if a == nil {
+		return 0
+	}
+	var best, run uint64
+	for block := uint64(1); block < a.totalBlocks; block++ {
+		if a.isFree(block) {
+			run++
+			if run > best {
+				best = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	return best * uint64(MinBlockSize)
+}
+
+// FreeRunCount returns the number of contiguous free runs, the denominator of a
+// fragmentation ratio. It is a diagnostics helper, not a hot path.
+func (a *Allocator) FreeRunCount() uint64 {
+	if a == nil {
+		return 0
+	}
+	var runs uint64
+	prevFree := false
+	for block := uint64(1); block < a.totalBlocks; block++ {
+		free := a.isFree(block)
+		if free && !prevFree {
+			runs++
+		}
+		prevFree = free
+	}
+	return runs
+}
+
+// Used reports whether every block in the extent at ref is currently allocated.
+// It validates a persisted reference against the free bitmap on reopen.
+func (a *Allocator) Used(ref Ref, size uint32) (bool, error) {
+	blocks, err := a.validate(ref, size)
+	if err != nil {
+		return false, err
+	}
+	return !a.anyFree(uint64(ref), uint64(blocks)), nil
 }
 
 // FreeBytes returns the total free capacity in bytes.
