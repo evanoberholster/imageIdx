@@ -17,6 +17,7 @@ const commitQueueCapacity = 64
 // batch queued before it is WAL-appended and published.
 type commitReq struct {
 	changes []stagedChange
+	bsi     []bsiOp
 	barrier chan error
 }
 
@@ -120,7 +121,23 @@ func (i *Index) commitGroup(group []commitReq) {
 		}
 		saved := i.dict
 		saved.chunks = slices.Clone(saved.chunks)
-		resolved, payload, updates, err := i.resolveBatch(current, req.changes, false)
+		var (
+			resolved []stagedChange
+			payload  []byte
+			updates  uint32
+			err      error
+		)
+		isBSI := i.spec().Kind == common.KindBitmapBSI
+		var groups uint32
+		if isBSI {
+			resolved, payload, updates, err = i.resolveBSIBatch(current, req.bsi)
+			// BSI frames carry one logical record each, so the group count is
+			// the update count, not the expanded slice-change count.
+			groups = updates
+		} else {
+			resolved, payload, updates, err = i.resolveBatch(current, req.changes, false)
+			groups = uint32(len(resolved))
+		}
 		if err != nil {
 			i.dict = saved
 			i.dict.abort()
@@ -139,7 +156,7 @@ func (i *Index) commitGroup(group []commitReq) {
 			rotatedFrozen = frozen
 		}
 		if i.owner != nil && updates > 0 {
-			frames = append(frames, frame{payload: payload, groups: uint32(len(resolved)), updates: updates})
+			frames = append(frames, frame{payload: payload, groups: groups, updates: updates})
 		}
 		dirty = true
 	}

@@ -132,14 +132,26 @@ func (s *Store) replay(path string) (int64, error) {
 		if !ok {
 			return ErrCorruptWAL
 		}
-		changes, updates, err := decodeNamespaceChanges(index.spec(), payload, binary.LittleEndian.Uint32(header[16:20]))
-		if err != nil || updates != binary.LittleEndian.Uint32(header[20:24]) {
-			return ErrCorruptWAL
-		}
-		// Prepared, canonical memberships are replayed without re-analyzing
-		// text and without live geo preconditions (idempotent set semantics).
-		if err := index.applyChangesReplay(changes); err != nil {
-			return errors.Join(ErrCorruptWAL, err)
+		groups := binary.LittleEndian.Uint32(header[16:20])
+		updates := binary.LittleEndian.Uint32(header[20:24])
+		if index.spec().Kind == common.KindBitmapBSI {
+			ops, decoded, err := decodeBSIChanges(index.spec(), payload, groups)
+			if err != nil || decoded != updates {
+				return ErrCorruptWAL
+			}
+			if err := index.applyBSIReplay(ops); err != nil {
+				return errors.Join(ErrCorruptWAL, err)
+			}
+		} else {
+			changes, decoded, err := decodeNamespaceChanges(index.spec(), payload, groups)
+			if err != nil || decoded != updates {
+				return ErrCorruptWAL
+			}
+			// Prepared, canonical memberships are replayed without re-analyzing
+			// text and without live geo preconditions (idempotent set semantics).
+			if err := index.applyChangesReplay(changes); err != nil {
+				return errors.Join(ErrCorruptWAL, err)
+			}
 		}
 		position += uint64(namespaceWALHeaderSize + len(payload))
 		return nil

@@ -68,6 +68,17 @@ type Quantizer struct {
 	Offset  int64
 }
 
+// BSI (bit-sliced index) widths. A BSI namespace maps each ValueID to one
+// unsigned numeric value of the declared width. Only these widths are valid;
+// BSI16 and BSI32 are configurations of one namespace kind, not separate
+// kinds.
+const (
+	// BSIWidth16 is a 16-bit (uint16) BSI namespace.
+	BSIWidth16 uint8 = 16
+	// BSIWidth32 is a 32-bit (uint32) BSI namespace.
+	BSIWidth32 uint8 = 32
+)
+
 // NamespaceSpec is one registered metadata namespace: its stable number,
 // value shape, and the codecs that interpret values. Only the codecs for the
 // namespace's kind are consulted; the rest must be zero. Definitions are
@@ -78,6 +89,7 @@ type NamespaceSpec struct {
 	Namespace  common.Namespace
 	Kind       common.NamespaceKind
 	Name       string    // Namespace Name; not persisted, only for user display
+	BSIWidth   uint8     // KindBitmapBSI only: BSIWidth16 or BSIWidth32
 	Quant      Quantizer // KindBitmapContinuous only
 	Normalizer CodecSpec // KindBitmapEnum only
 	Analyzer   CodecSpec // KindBitmapString only
@@ -122,6 +134,22 @@ var (
 	ErrCoverWorkspaceFull = errors.New("bitmapidx: cover workspace capacity is insufficient")
 	// ErrCoverBufferFull reports insufficient cover destination capacity.
 	ErrCoverBufferFull = errors.New("bitmapidx: cover destination capacity is insufficient")
+	// ErrInvalidBSIWidth reports a BSI width other than 16 or 32.
+	ErrInvalidBSIWidth = errors.New("bitmapidx: BSI width must be 16 or 32")
+	// ErrBSIValueRange reports a value that does not fit the namespace BSI
+	// width. Values are never silently truncated.
+	ErrBSIValueRange = errors.New("bitmapidx: value out of range for BSI width")
+	// ErrBSIStale reports a conditional BSI update whose expected old value no
+	// longer matches the published value.
+	ErrBSIStale = errors.New("bitmapidx: stale BSI from value")
+	// ErrBSIExists reports a conditional BSI insert whose ValueID already holds
+	// a value.
+	ErrBSIExists = errors.New("bitmapidx: BSI insert on existing value")
+	// ErrBSIDuplicate reports the same ValueID appearing more than once in one
+	// BSI batch, which has ambiguous sequential semantics.
+	ErrBSIDuplicate = errors.New("bitmapidx: duplicate BSI value ID in batch")
+	// ErrBSINotBSI reports a BSI operation on a namespace of another kind.
+	ErrBSINotBSI = errors.New("bitmapidx: namespace is not a BSI namespace")
 )
 
 // MaxValueBytes bounds one canonical value. Longer values are rejected
@@ -144,6 +172,15 @@ func validateNamespace(f NamespaceSpec) error {
 	if f.Namespace == 0 || f.Flags&^namespaceKnownFlags != 0 {
 		return ErrInvalidNamespace
 	}
+	// Only BSI namespaces carry a width; every other kind must leave it zero so
+	// a mismatched persisted width is rejected rather than silently ignored.
+	if f.Kind == common.KindBitmapBSI {
+		if f.BSIWidth != BSIWidth16 && f.BSIWidth != BSIWidth32 {
+			return ErrInvalidBSIWidth
+		}
+	} else if f.BSIWidth != 0 {
+		return ErrInvalidNamespace
+	}
 	switch f.Kind {
 	case common.KindBitmapEnum:
 		if _, err := normalizeEnum(f.Normalizer, nil); err != nil {
@@ -161,6 +198,8 @@ func validateNamespace(f NamespaceSpec) error {
 		if f.Quant.Code == QuantIdentity && (f.Quant.Scale != 1 || f.Quant.Offset != 0) {
 			return ErrInvalidNamespace
 		}
+	case common.KindBitmapBSI:
+		// Width is validated above.
 	default:
 		return ErrInvalidNamespace
 	}
@@ -276,6 +315,32 @@ func BoolValue(value bool) Value { return Value{Kind: common.KindBitmapBool, Boo
 // IntValue returns a continuous value already converted into the namespace's
 // int64 grid domain. No quantizer runs at write time.
 func IntValue(value int64) Value { return Value{Kind: common.KindBitmapContinuous, Int: value} }
+
+// Uint16Value returns a 16-bit BSI value. It is only valid for a BSI namespace
+// whose width is BSIWidth16; the writer rejects it against any other width.
+func Uint16Value(value uint16) Value { return Value{Kind: common.KindBitmapBSI, Int: int64(value)} }
+
+// Uint32Value returns a 32-bit BSI value. It is only valid for a BSI namespace
+// whose width is BSIWidth32; the writer rejects it against any other width.
+func Uint32Value(value uint32) Value { return Value{Kind: common.KindBitmapBSI, Int: int64(value)} }
+
+// BSIMove is one logical BSI value transition for a ValueID. The presence
+// flags are literal preconditions:
+//
+//   - HasFrom and HasTo: replace, requiring the current value to equal From.
+//   - HasFrom only: delete, requiring the current value to equal From.
+//   - HasTo only: insert, requiring the ValueID to be absent.
+//   - neither: a no-op.
+//
+// A no-op move is dropped. Values must fit the namespace width; they are never
+// truncated. All IDs are common.ValueID: a BSI namespace is entity-agnostic.
+type BSIMove struct {
+	ID      common.ValueID
+	From    uint32
+	To      uint32
+	HasFrom bool
+	HasTo   bool
+}
 
 // Entry is one ImageID to value membership change. ImageID zero is
 // reserved and rejected with ErrInvalidImageID.

@@ -14,6 +14,14 @@ func (i *Index) Cardinality() uint64 {
 	if i.closed.Load() {
 		return 0
 	}
+	// A BSI "value" is the number of ValueIDs holding a value: the existence
+	// bitmap cardinality, not the count of slice postings.
+	if view.namespace.Kind == common.KindBitmapBSI {
+		if exists, ok := view.bsiExists(view.namespace.Namespace); ok {
+			return exists.Cardinality()
+		}
+		return 0
+	}
 	count := uint64(len(view.base.keys))
 	if !view.hasDeltas() {
 		return count

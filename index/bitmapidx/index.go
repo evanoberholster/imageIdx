@@ -152,7 +152,14 @@ func (i *Index) spec() NamespaceSpec { return i.view.Load().namespace }
 // Metadata returns a copied summary of the current snapshot.
 func (i *Index) Metadata() NamespaceMetadata {
 	view := i.view.Load()
-	return NamespaceMetadata{Spec: view.namespace.clone(), Generation: view.generation, BaseValues: uint64(len(view.base.keys))}
+	base := uint64(len(view.base.keys))
+	if view.namespace.Kind == common.KindBitmapBSI {
+		base = 0
+		if exists, ok := view.bsiExists(view.namespace.Namespace); ok {
+			base = exists.Cardinality()
+		}
+	}
+	return NamespaceMetadata{Spec: view.namespace.clone(), Generation: view.generation, BaseValues: base}
 }
 
 // PendingCompactions reports the number of in-flight background
