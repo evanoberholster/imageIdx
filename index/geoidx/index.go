@@ -209,7 +209,7 @@ type Index struct {
 	compactionErr  error
 
 	persistent bool
-	dir        string
+	path       string
 	lock       *os.File
 
 	// Persistent arena state, touched only under mu (except the immutable arena

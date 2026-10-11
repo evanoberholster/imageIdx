@@ -150,7 +150,7 @@ func TestNamespaceAndKindValidity(t *testing.T) {
 	for _, kind := range []NamespaceKind{
 		KindBitmapEnum, KindBitmapBool, KindBitmapString,
 		KindBitmapContinuous, KindBitmapGeo, KindBitmapBSI, KindTimestamp, KindHashExact,
-		KindHashPerceptual, KindVector, KindKV,
+		KindHashPerceptual, KindVector, KindKV, KindGeo,
 	} {
 		if !kind.Valid() || kind.String() == "unknown" {
 			t.Fatalf("kind %d valid=%v name=%q", kind, kind.Valid(), kind.String())
