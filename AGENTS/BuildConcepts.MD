@@ -48,41 +48,43 @@ Every change must pass `go build ./...`, `go test ./...`, and
 ## Package Layout and Dependencies
 
 ```text
-./           imageidx: shared ImageID and durability domain types
+common/        shared ImageID/ValueID, namespace and durability domain types
 roar/          immutable zero-copy bitmap sets used by the indexes
 index/bitmapidx/  persistent typed fields and bounded per-field deltas (package bitmapidx)
-index/timeidx/    standalone block-local timestamp index (package timeidx)
-internal/indexutil/ shared non-domain mechanisms used by the indexes
+index/timeidx/    namespace-aware exact-timestamp COW index (package timeidx)
+internal/storage/   shared mmap, superblock/commit, and reader-tracking mechanisms
+internal/pagealloc/ shared 512-byte copy-on-write extent allocator
 search/      cross-index planner and conjunctive query executor
 cmd/imageidx/ runnable one-shot and HTTP-server combined-search example
 ```
 
-Dependency direction remains one-way: the root `imageidx` package imports no
-subpackages; `roar` is standalone and imports only `internal/indexutil` (plus
-its own `internal/bitmapkernel`) and the standard library; all indexes may
-import the root, `roar`, and `internal/indexutil` as appropriate.
-Specialized index packages remain independent of one another. `search` imports
-all three indexes; index packages must never import `search`. Never introduce a
-reverse dependency.
+Dependency direction remains one-way: `common` imports no subpackages; `roar`
+is standalone and imports only `internal/storage` (plus its own
+`internal/bitmapkernel`) and the standard library; all indexes may import
+`common`, `roar`, and the shared `internal/storage`/`internal/pagealloc`
+mechanisms as appropriate. Specialized index packages remain independent of one
+another. `search` imports the indexes; index packages must never import
+`search`. Never introduce a reverse dependency.
 
-### Shared mechanisms live in `internal/indexutil`
+### Shared mechanisms live in `internal/storage`
 
-- `ReaderTracker` provides two-slot read-side lifetime tracking for all three
-  index packages. It is an internal mechanism, owned by an index or persistent
-  store rather than supplied through public configuration.
+- `ReaderTracker` provides two-slot read-side lifetime tracking for the index
+  packages. It is an internal mechanism, owned by an index or persistent store
+  rather than supplied through public configuration.
 - mmap/unmap, little-endian fixed-width mapped slices, alignment, and checked
   offset arithmetic are shared here.
-- exact writes and fsync/rename/directory-sync manifest publication are shared
-  here. Package-specific manifest encodings and WAL record formats remain in
-  their owning packages.
+- exact writes, dual-slot CRC32C superblock commits, extent unions and
+  fsync/rename/directory-sync publication are shared here. Package-specific
+  payload schemas, manifest encodings and WAL record formats remain in their
+  owning packages.
 - The package is internal implementation detail. It must not define database
   IDs, index metadata, format constants, or public index policy.
 
-### Shared domain primitives live in `imageidx`
+### Shared domain primitives live in `common`
 
-- `imageidx.ImageID` is the database-wide `uint64` alias. Every index package
-  exposes the same alias, keeping storage and batch APIs zero-conversion.
-- `imageidx.Durability` is shared by persistent index APIs; package constants
+- `common.ImageID` and `common.ValueID` are the database-wide `uint64` aliases.
+  Every index package uses them, keeping storage and batch APIs zero-conversion.
+- `common.Durability` is shared by persistent index APIs; package constants
   remain aliases for convenient migration.
 
 ### Immutable ID sets live in `roar`
@@ -142,13 +144,13 @@ representation.
 
 ### `ImageID` is one type everywhere
 
-- `bitmapidx.ImageID`, `geoidx.ImageID`, and `timeidx.ImageID` are aliases
-  of `imageidx.ImageID`.
+- `common.ImageID` is the database-wide `uint64` alias shared by every index
+  package; `timeidx` entries and results use the generic `common.ValueID`.
 - Cross-index search never converts or copies IDs solely because of package
   type differences.
 
-`ImageID(0)` is reserved/invalid in `geoidx` only; `timeidx` and `bitmapidx`
-do not reserve zero.
+`common.ValueID(0)` and `MaxUint64` are valid in `timeidx`; other index families
+may reserve zero as their own sentinel.
 
 ## Core Build Concepts
 
@@ -165,19 +167,23 @@ Every index follows the same conceptual skeleton. New code must conform.
    memory reusable. Retired views, deltas, and mmap regions are only reclaimed
    after `WaitForPriorReaders()` guarantees no earlier reader still references
    them. `Close` performs this wait before unmapping storage.
-4. **Bounded read layers.** `Base + Frozen + Active` (bitmapidx/timeidx);
-   `Sparse + Bitmap` (geoidx). Unbounded LSM-style delta chains are forbidden;
-   apply backpressure or compact instead.
+4. **Bounded read layers.** `Base + Frozen + Active` (bitmapidx) and
+   `Sparse + Bitmap` (geoidx) bound their deltas. `timeidx` has no delta layer:
+   every accepted batch publishes a complete compacted snapshot. Unbounded
+   LSM-style delta chains are forbidden; apply backpressure or compact instead.
 5. **SoA and fixed-width storage.** Persisted data is structure-of-arrays,
    little-endian, page-aligned, and mmap-friendly. No Go pointers are persisted;
    offsets + counts are.
-6. **Checksummed formats.** Every persisted file has a `Magic uint32` +
-   `Version uint16` header and CRC32 (IEEE) checksums. See format constants
-   below.
-7. **WAL + manifest + generation files.** Durable ordering is: append WAL,
-   sync per durability policy, mutate/publish, acknowledge. Checkpoint writes a
-   new generation, atomically publishes a manifest, then replays the WAL tail on
-   reopen.
+6. **Checksummed formats.** Every persisted format carries a `Magic uint32` +
+   `Version uint16` identity and CRC checksums: dual-slot CRC32C (Castagnoli)
+   superblock envelopes for index generations, CRC32/IEEE for manifest files.
+   See format constants below.
+7. **Durable ordering.** WAL-based indexes append the WAL, sync per durability
+   policy, mutate/publish, then acknowledge; checkpoint writes a new generation
+   and atomically publishes a manifest, replaying the WAL tail on reopen.
+   `timeidx` instead commits one complete copy-on-write generation behind two
+   sync barriers and recovers from one of two checksummed superblocks — no WAL,
+   manifest, or generation files.
 8. **`Config` with `withDefaults()`.** Every constructor validates and fills
    defaults through `(Config) withDefaults() (Config, error)`. Constants are
    tunable and must not be baked into the persisted format.
@@ -204,19 +210,24 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 ### timeidx
 
-- `New(Spec, Config)` follows the same stable `IndexID`/flags pattern as the
-  other indexes. `Metadata` exposes a copied summary rather than mutable
-  persisted headers.
-- A single write-owner goroutine consumes reusable `Batch` values. Public
-  mutations are sealed values made by `Insert`, `Delete`, and `Move`; `Apply`
-  returns `ErrBackpressure` when a block's delta is awaiting compaction.
-- The private delta is a fixed-capacity, single-writer append structure with a
-  lock-free hash state table for readers. It must not allocate on append.
-- `Search` is compressed-index only (zero-allocation). `SearchExact` re-verifies
-  lossy boundary candidates via a caller-supplied canonical timestamp lookup.
-- Persistence is a SoA `markers.<gen>.base` + `ids.<gen>.base` + `blocks.<gen>.idx`
-  layout with an atomic manifest. Markers remain `uint32`; image IDs remain
-  `uint64` in a separate column.
+- Namespace-aware, exact 1900-epoch nanosecond index: one timestamp per
+  `common.ValueID` per namespace. `NewMemory`, `NewStore`/`OpenStore` (single
+  namespace), and the `Store` manager (`NewNamespaceStore`/`InitializeStore` +
+  `SealStartup`) cover memory and persistent use. `Spec.NamespaceDef()` yields
+  the `common.NamespaceDef` to register in a `common.Schema`.
+- One writer per namespace serializes reusable `Batch` values. Mutations are
+  sealed values made by `Insert`, `Delete`, and `Move`; `Apply` publishes a
+  complete immutable snapshot before returning, and `ApplyWithGeneration`
+  commits a DB completeness watermark in the same superblock.
+- `Search` returns exact `[start, end)` candidates in `(time, ID)` order with
+  zero allocation given caller capacity. `SearchExact` keeps an optional
+  canonical callback for compatibility; `EstimateRange` returns the exact
+  snapshot-local count.
+- Persistence is one COW file per namespace (magic `TIM4`, version 5): a 512-byte
+  two-slot CRC32C superblock, a 64-byte payload, and a 56-byte shard directory
+  over size-bounded `uint64` time and ID columns (16 bytes/entry). There is no
+  WAL, delta layer, or background compactor. See `AGENTS/Timeidx.md` and
+  `index/timeidx/README.md`.
 
 ### geoidx
 
@@ -266,8 +277,7 @@ Every index follows the same conceptual skeleton. New code must conform.
 
 | Package | Kind | Magic | Version |
 |---|---|---|---|
-| timeidx | manifest | `0x54534d46` TSMF | 2 |
-| timeidx | WAL | `0x5453574c` TSWL | 1 |
+| timeidx | namespace superblock | `0x54494d34` TIM4 | 5 |
 | bitmapidx | field segment | `0x424d4653` BMFS | 1 |
 | bitmapidx | field manifest | `0x424d464d` BMFM | 1 |
 | bitmapidx | field WAL | `0x424d4657` BMFW | 1 |
@@ -275,20 +285,19 @@ Every index follows the same conceptual skeleton. New code must conform.
 | geoidx | manifest | `0x47454f4d` GEOM | 1 |
 | geoidx | WAL | `0x4745574c` GEWL | 1 |
 
-All multi-byte integers are little-endian. All payloads are CRC32/IEEE
-checksummed. Fixed records and structural boundaries are multiples of eight;
-large payload starts use the stricter 4,096-byte page alignment. Native element
-widths are unchanged: in particular, timestamp markers remain four-byte values
-in their own SoA column, with padding only between structural regions or at a
-file boundary.
+All multi-byte integers are little-endian. Superblock envelopes and their
+payloads are CRC32C (Castagnoli) checksummed; manifest files use CRC32/IEEE.
+Fixed records and structural boundaries are multiples of eight; large payload
+starts use the stricter 4,096-byte page alignment. Native element widths are
+preserved: `timeidx` stores exact eight-byte timestamp keys and eight-byte value
+IDs in separate SoA columns (16 payload bytes per entry).
 
 ## Tunable Defaults (not part of the persisted format)
 
 | Package | Constant | Value |
 |---|---|---|
-| timeidx | `DefaultBlockSize` | 65,536 entries |
-| timeidx | `DefaultDeltaCapacity` | 2,048 |
-| timeidx | `TimestampShift` | 24 |
+| timeidx | `MaxShardBytes` | 4 KiB |
+| timeidx | `MaxFileBytes` (initial arena) | 4 MiB |
 | bitmapidx | `DefaultActiveTarget` | 2,048 |
 | bitmapidx | `DefaultHardDeltaLimit` | 4,095 |
 | geoidx | `GeoS2Level` | 16 |
@@ -296,7 +305,10 @@ file boundary.
 | geoidx | `DefaultPublishThreshold` | 256 |
 | geoidx | `DefaultCoverCells` | 32 |
 
-These are benchmark-driven; change them only with supporting evidence.
+`timeidx` also retains `DefaultBlockSize`, `DefaultDeltaCapacity`, and
+`TimestampShift` as deprecated source-compatibility constants; none affects
+encoding. These defaults are benchmark-driven; change them only with supporting
+evidence.
 
 ## Conventions When Extending
 

@@ -6,8 +6,10 @@ Project-specific agent resources.
   tested, and extended. Read this first.
 - [BitmapIndex.md](BitmapIndex.md) — implemented `bitmapidx` design and format:
   persistent typed fields (enum, bool, text, continuous, geo).
-- [Timeidx.md](Timeidx.md) — implemented `timeidx` design and
-  structure-of-arrays format.
+- [Timeidx.md](Timeidx.md) — implemented `timeidx` design: exact 1900-epoch
+  nanoseconds, namespace-aware copy-on-write shards, and the source-completeness
+  watermark. Package detail lives in `index/timeidx/README.md` and
+  `index/timeidx/BENCHMARKS.md`.
 - [SimHash.md](SimHash.md) — implemented `simhash` design: exact
   `pHash64 + PDQ256 + quality` similarity store, mmap columnar format, batch redo
   WAL.

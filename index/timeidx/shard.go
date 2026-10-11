@@ -129,23 +129,7 @@ func initialShards(entries []Entry, maxRecords int) ([]*shard, error) {
 // ID range pruning avoids unrelated scans where the domain is clustered. No
 // reverse map is persisted: sparse/random IDs can require scanning many shards.
 func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScratch, reuse bool) []*shard {
-	scratch.nextBuffer = 0
-	if cap(scratch.adds) < len(ops) {
-		scratch.adds = make([]Mutation, 0, len(ops))
-	}
-	adds := scratch.adds[:0]
-	for _, op := range ops {
-		if op.kind != mutationDelete {
-			adds = append(adds, op)
-		}
-	}
-	slices.SortFunc(adds, func(a, b Mutation) int {
-		if d := cmp.Compare(a.to, b.to); d != 0 {
-			return d
-		}
-		return cmp.Compare(a.imageID, b.imageID)
-	})
-	scratch.adds = adds
+	adds := collectAdditions(scratch, ops)
 	if len(current) == 0 {
 		times, ids := scratch.columns(len(adds), reuse)
 		times = times[:len(adds)]
@@ -247,20 +231,49 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 		}
 		out = splitShards(out, times, ids, maxRecords)
 	}
-	// Coalesce only adjacent new shards. Never rewrite an otherwise unaffected
-	// shard merely to improve occupancy.
+	return coalesceAdjacentShards(out, maxRecords, scratch, reuse)
+}
+
+// collectAdditions returns the non-delete mutations in (time, ID) order, reusing
+// the writer-owned scratch slice. It also resets the scratch buffer cursor so a
+// fresh prepare call reuses merge columns from the start.
+func collectAdditions(scratch *writeScratch, ops []Mutation) []Mutation {
+	scratch.nextBuffer = 0
+	if cap(scratch.adds) < len(ops) {
+		scratch.adds = make([]Mutation, 0, len(ops))
+	}
+	adds := scratch.adds[:0]
+	for _, op := range ops {
+		if op.kind != mutationDelete {
+			adds = append(adds, op)
+		}
+	}
+	slices.SortFunc(adds, func(a, b Mutation) int {
+		if d := cmp.Compare(a.to, b.to); d != 0 {
+			return d
+		}
+		return cmp.Compare(a.imageID, b.imageID)
+	})
+	scratch.adds = adds
+	return adds
+}
+
+// coalesceAdjacentShards merges adjacent NEW (never-yet-allocated) shards whose
+// combined payload fits maxRecords and where at least one side is well under
+// the bound. Persistent shards are never rewritten merely to improve occupancy.
+func coalesceAdjacentShards(out []*shard, maxRecords int, scratch *writeScratch, reuse bool) []*shard {
 	merged := out[:0]
 	for _, s := range out {
 		if len(merged) > 0 {
 			p := merged[len(merged)-1]
 			if p.offset == 0 && s.offset == 0 && len(p.times)+len(s.times) <= maxRecords &&
 				(min(len(p.times), len(s.times)) < maxRecords/4) {
-				t, ids := scratch.columns(len(p.times)+len(s.times), reuse)
-				t = append(t, p.times...)
-				t = append(t, s.times...)
+				times, ids := scratch.columns(len(p.times)+len(s.times), reuse)
+				times = append(times, p.times...)
+				times = append(times, s.times...)
 				ids = append(ids, p.ids...)
 				ids = append(ids, s.ids...)
-				merged[len(merged)-1] = newShard(t, ids)
+				merged[len(merged)-1] = newShard(times, ids)
 				continue
 			}
 		}

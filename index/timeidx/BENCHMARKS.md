@@ -1,158 +1,180 @@
-# TimeIdx before/after measurements
+# timeidx benchmark evidence
 
-For the subsequent GeoIdx/TimeIdx review and shared-kernel optimizations against
-the initial modernization commit, see [PERSISTENCE_REVIEW.md](PERSISTENCE_REVIEW.md).
+Measured on Apple M4 Pro, Go 1.27.0, darwin/arm64, `GOMAXPROCS=12`, same local
+filesystem, serial runs with no competing test/benchmark load. All figures are
+medians of repeated hot-cache microbenchmark samples — **not** cold-storage,
+p50/p95/p99 or service-level latency claims. Re-run on the target hardware and
+workload before treating any number as a regression gate.
 
-Baseline: `ae8fda19018d9ea76eed990a963aa40a8536a4b3` (merged GeoIdx PR #15).
-After: the namespace-aware version 4 implementation in this change.
-Machine: Apple M4 Pro, Go 1.27.0, darwin/arm64, 12 benchmark workers. Five samples per
-comparison, `-benchtime=200ms`, **medians**, with benchmarks run sequentially
-without correctness/race suites competing for CPU. Numbers are hot-cache
-microbenchmarks, not cold-storage or service SLAs.
+Where a baseline is shown it is the previous quantized/WAL implementation; the
+comparison isolates the current synchronous-COW architecture and is not an
+across-the-board ingestion improvement (see the write tradeoffs below).
 
-`workload_benchmark_test.go` uses only the pre-existing public API and was copied
-unchanged into a detached baseline worktree. It uses 100K entries spread over a
-synthetic year, identical numeric keys/IDs and result cardinalities in both
-versions. Timestamp spacing is aligned to the old quantum to avoid comparing
-different candidate counts. The new encoding's calendar conversion is tested
-separately. Append cases are moving upserts toward newer times, with a bounded
-periodic wrap so the old 32-bit encoding does not overflow. Historical cases
-move the same 64 IDs to deterministic dispersed older times. They are NOT
-no-op writes. Setup and caller-buffer allocation are outside timing.
+## Search and range queries
 
-## Comparable range/lookup workloads (100K base)
+100K-entry base, hot cache. All cases are **0 B/op and 0 allocs/op** with
+caller-provided destination capacity.
 
-| Query | Matches | Before | After | Speedup | Before/after B/op; allocs/op |
-|---|---:|---:|---:|---:|---|
-| Exact timestamp hit | 1 | 66.42 ns | 14.57 ns | 4.56x | 0 / 0; 0 / 0 |
-| Exact miss | 0 | 64.04 ns | 15.09 ns | 4.24x | 0 / 0; 0 / 0 |
-| One hour | 12 | 89.73 ns | 15.52 ns | 5.78x | 0 / 0; 0 / 0 |
-| One day | 274 | 619.2 ns | 43.53 ns | 14.22x | 0 / 0; 0 / 0 |
-| One month | 8,220 | 16.799 us | 1.079 us | 15.57x | 0 / 0; 0 / 0 |
-| One repeated time, spanning shards | 100,000 | 204.271 us | 17.822 us | 11.46x | 0 / 0; 0 / 0 |
-
-Bulk-appending immutable ID-column slices removes the old per-record delta
-membership checks. Both versions already support zero-allocation searches;
-the change improves throughput, not an allocation guarantee absent before.
-
-## Writes and reopen (100K base unless noted)
-
-| Operation | Before | After | Before -> after B/op | Before -> after allocs/op |
+| Query | Matches | Current | Previous | Speedup |
 |---|---:|---:|---:|---:|
-| 64 newer-time moves, memory | 13.141 us | 4.528 us | 61,949 -> 6,928 | 0 -> 5 |
-| 64 historical moves, memory | 210.265 us | 98.574 us | 97,727 -> 352,650 | 0 -> 377 |
-| 64 newer-time moves, persistent sync | 3.793 ms | 8.001 ms | 51,347 -> 33,050 | 0 -> 31 |
-| 64 historical moves, persistent sync | 3.754 ms | 9.436 ms | 78,307 -> 122,673 | 0 -> 319 |
-| Clean reopen | 167.863 us | 499.799 us | 625,684 -> 81,696 | 107 -> 455 |
-| Single persistent sync insert, growing initially empty index | 3.104 ms | 8.047 ms | 0 -> 2,233 | 0 -> 12 |
+| Exact timestamp hit | 1 | 14.6 ns | 66.4 ns | 4.6× |
+| Exact miss | 0 | 15.1 ns | 64.0 ns | 4.2× |
+| One hour | 12 | 15.5 ns | 89.7 ns | 5.8× |
+| One day | 274 | 43.5 ns | 619 ns | 14.2× |
+| One month | 8,220 | 1.08 µs | 16.8 µs | 15.6× |
+| One repeated time spanning shards | 100,000 | 17.8 µs | 204 µs | 11.5× |
 
-Important regressions/tradeoffs:
+1M-entry fixture (retained baseline names):
 
-- **Sync writes are 2.1–2.6x slower here.** WAL acknowledgment needed one sync;
-  the confirmed COW-before-return policy needs payload sync then root sync.
-  Atomic batch visibility and complete committed snapshots are stronger than
-  the old mutable-delta prefix visibility. This is not an across-the-board
-  ingestion improvement. An embedded journal/group durability design was not
-  selected by the user.
-- Clean reopen is about 3x slower, despite roughly 7.7x fewer allocated bytes.
-  The new loader validates directory/column checksums, global uniqueness and
-  recoverable extent sets; smaller shards add descriptors. It does not silently
-  skip correctness checks to match the old open time.
-- Random memory writes allocate more bytes and objects because they publish
-  replacement immutable shards immediately rather than staging mutable deltas.
-  Persistent writes reuse merge buffers; allocation counts are per affected
-  shard/metadata object, not per input record. Tiny shards reduce rewritten
-  payload but increase directory/object overhead.
-- Old reported `0 allocs/op` write counts are rounded amortized values including
-  background worker allocations, **not zero B/op** or a universal no-allocation
-  guarantee. Memory comparisons include that background work, not its complete
-  drain time. Persistent baseline writes defer base compaction to checkpoint;
-  the new API has already done selective compaction when it returns.
+| Query | Current | Previous |
+|---|---:|---:|
+| Narrow range | 18.2 ns | 105.5 ns |
+| Medium range | 0.41 µs | 9.83 µs |
+| Broad range | 44.0 µs | 577.6 µs |
 
-## Existing benchmarks retained (1M search fixture)
+Bulk-appending immutable ID-column slices removes per-record delta membership
+checks. Both implementations already supported zero-allocation searches, so this
+improves throughput, not an allocation guarantee that was previously absent.
 
-| Operation | Before | After | Comment |
-|---|---:|---:|---|
-| Narrow range | 105.5 ns | 18.17 ns | 0 B/op, 0 allocations in both |
-| Medium range | 9.830 us | 0.413 us | 0 B/op, 0 allocations in both |
-| Broad range | 577.616 us | 44.024 us | 0 B/op, 0 allocations in both |
-| `BenchmarkUpdate` | 535.4 ns | 68.90 ns | This fixture repeats identical upserts; new code detects no-ops |
+## Writes and reopen
 
-Do not extrapolate the no-op update result to real changed-key insertion cost.
+100K base unless noted. Final interleaved ten-process A/B vs the prior
+implementation; `benchstat` for the p-values.
 
-## Shard-size evidence and default
+| Operation | Previous | Current | p | B/op | allocs/op |
+|---|---:|---:|---:|---:|---:|
+| 64 historical moves, memory | 93.3 µs | 86.6 µs | .001 | ~353 KB | 252 |
+| 64 newer-time moves, memory | 4.5 µs | ~4.5 µs | — | 7,440 B | 4 |
+| 64 durable appends | 8.18 ms | 8.12 ms | .631 | ~18.7 KB | 11 |
+| 64 historical durable moves | 9.96 ms | 10.09 ms | .315 | ~98.5 KB | 291 |
+| 10M sequential single mutation | 19.49 ms | 18.38 ms | .052 | 1,663,888 B | 11 |
+| Clean reopen | 472.9 µs | 474.1 µs | .353 | ~67.3 KB | 436 |
+| Day search | 41.56 ns | 42.12 ns | <.001 | 0 | 0 |
 
-`BenchmarkTimeShardSize` compares 100K entries with clustered 64-ID updates
-and a 25K-result scan. A separate historical sweep spreads those IDs throughout
-the time domain. Clustered/scan numbers are five-sample medians; historical
-numbers are three-sample medians, all after the scalar membership optimization.
+**Tradeoffs, stated explicitly:**
 
-| Maximum payload | Clustered batch | 25K-result scan | Historical batch |
+- A confirmed persistent `Apply` syncs payload and root (two barriers) before
+  returning, so durable writes are slower than the old one-sync WAL
+  acknowledgment. Atomic batch visibility and complete committed snapshots are
+  stronger than prefix visibility.
+- Random/historical memory writes allocate more bytes than the old staged deltas
+  because they publish replacement immutable shards immediately; persistent
+  writes reuse merge buffers, so allocation counts track affected shards, not
+  input records.
+- Reopen validates directory/column checksums, global uniqueness and recoverable
+  extent sets; it does not skip correctness checks to match the old open time.
+- The day-search drift is below the 5% acceptance threshold and remains
+  zero-allocation; search code did not change.
+- Old `0 allocs/op` write counts were rounded amortized values including
+  background workers, not zero bytes or a universal guarantee.
+
+## Shard size
+
+`BenchmarkTimeShardSize` compares 100K clustered 64-ID updates and a 25K-result
+scan; a separate sweep spreads the same IDs historically. Ten preparation samples
+and three-to-five matrix samples.
+
+| Max payload | Clustered batch | 25K scan | Historical batch |
 |---:|---:|---:|---:|
-| 4 KiB | 4.707 us | 4.313 us | 94.335 us |
-| 16 KiB | 7.971 us | 4.446 us | 310.449 us |
-| 64 KiB | 15.850 us | 3.625 us | 374.641 us |
-| 256 KiB | 49.579 us | 3.400 us | not sampled |
-| 1 MiB | 346.510 us | 3.331 us | 358.962 us |
+| 4 KiB | 4.7 µs | 4.31 µs | 94.3 µs |
+| 16 KiB | 8.0 µs | 4.45 µs | 310 µs |
+| 64 KiB | 15.9 µs | 3.63 µs | 375 µs |
+| 256 KiB | 49.6 µs | 3.40 µs | — |
+| 1 MiB | 347 µs | 3.33 µs | 359 µs |
 
-The 1 MiB clustered case straddles the initial balanced shard boundary, so it
-rewrites two shards. It is not a universal 74x advantage for 4 KiB. The
-historical sweep supplies the independent evidence: about 3.8x less CPU at
-4 KiB than 1 MiB, at a cost of about 29% more time for this broad scan and larger
-directories. Small batches and random historical imports are specified goals,
-so **4 KiB is the measured initial default**, not an assumed GeoIdx constant.
-Read-heavy/very-large namespaces can select larger `MaxShardBytes` explicitly.
-Retained `BlockSize` selects its equivalent payload size when provided.
+At 10M rows, random-ID historical-commit write volume and wide-search cost split
+the decision; no single bound dominates:
 
-## New capabilities and storage counters (after only)
+| Bound | 1M rewrite bytes | 10M rewrite bytes | 10M wide search (2.5M IDs) | 10M directory bytes / entries |
+|---:|---:|---:|---:|---:|
+| 4 KiB | 478,232 | 2,446,960 | 1.22 ms | 2,187,752 / 39,067 |
+| 16 KiB | 1,103,392 | 1,596,024 | 0.65 ms | 546,952 / 9,767 |
+| 64 KiB | 4,160,704 | 4,330,600 | 0.46 ms | 136,808 / 2,443 |
+| 256 KiB | 8,003,984 | 8,152,624 | 0.39 ms | 34,272 / 612 |
+| 1 MiB | 8,001,408 | 9,420,840 | 0.35 ms | 8,568 / 153 |
 
-| Benchmark | Median result |
-|---|---|
-| Eight namespaces, concurrent durable 64-entry batches | 2.877 ms/batch aggregate; 3,018 B/op, 11 allocs/op |
-| Selective 64-entry changed commit on 100K base | 7.994 ms; 26,488 logical bytes written; 26,112 allocated extent bytes |
-| Same selective case, arena size | 4,194,304 bytes of logical sparse file capacity |
-| Grow a 4 KiB arena while adding 1K entries | 7.562 ms; final file capacity 32,768 bytes |
-| 5K-result search during durable commits | 566.8 ns/op; sampled p50 666 ns, p99 792 ns; median 27 concurrent commits/run |
+Wide searches remain 0 B/op / 0 allocs/op. **4 KiB remains the default** because
+small and historical batches are the specified goal and 4 KiB has the lowest
+scattered-update write volume; larger bounds favor wide reads and large
+namespaces. `MaxShardBytes` stays configurable (16 KiB is worth evaluating for
+10M-row namespaces); there is no adaptive sizing.
 
-There is no old namespace-manager baseline: that capability did not exist.
-`BenchmarkNamespaceParallel` reports aggregate throughput per completed batch,
-NOT per-request p99 latency. Its per-worker streams reuse IDs. During-commit
-p50/p99 sample the first up to 4,096 queries and include clock overhead; reported
-B/op includes concurrent writer allocations. They are not production tail
-latency guarantees. Search itself is separately verified at zero allocations.
+## Random-ID scaling
 
-Logical bytes include new shard payloads, the complete directory and the
-512-byte root envelope. Extent bytes include allocator-rounded shard/directory
-allocations, not an assertion of physical device writes. File-B is sparse
-logical capacity, not filesystem allocated blocks or live payload bytes.
+Ten preparation samples; three-sample changed durable commits. Tuple values are
+batches **1 / 8 / 32 / 64**.
 
-The full-width payload is **16 bytes/entry versus the old 12 bytes/entry**
-(4-byte marker plus 8-byte ID), a derived 33% increase before directory,
-allocator rounding and retained-generation overhead. That buys exact timestamps
-and the required historical coverage. The default initial sparse capacity is
-4 MiB; it is not evidence that a small namespace physically consumes 4 MiB.
+| Rows | Prepare (ms) | Durable commit (ms) | Prepare bytes / allocs |
+|---:|---|---:|---|
+| 1M | 2.91 / 3.17 / 1.83 / 2.00 | 12.23 / 13.93 / 13.44 / 14.53 | 32,864 / 33,536 / 35,840 / 38,912 B; 2 / 9 / 33 / 65 |
+| 10M | 12.04 / 23.90 / 19.42 / 19.76 | 25.38 / 37.77 / 32.47 / 34.44 | 319,584 / 320,256 / 322,560 / 325,632 B; 2 / 9 / 33 / 65 |
+
+Detection inspects approximately all IDs at 10M (~39,063 shards at 4 KiB) but
+rewrites only the affected shards, so random-ID detection is explicitly
+**O(records)** and directory publication is O(shards). At 10M this is roughly
+1.8K mutations/s in explicit 64-record batches on this machine — useful batch
+throughput, not a QPS or tail-latency guarantee. There is no reverse index.
+
+10M reopen medians are ~1.36 s across all five bounds; sorting IDs for
+duplicate validation dominates and leaves temporary O(records) memory.
+
+## Directory and commit-phase costs
+
+10M rows / 4 KiB, ten phase samples (diagnostics, not an additive commit model):
+
+| Phase | Median | B/op / allocs/op |
+|---|---:|---:|
+| Allocate/free directory | 18.6 µs | 0 / 0 |
+| Encode directory (no clear pass) | 386 µs | 0 / 0 |
+| Directory CRC32C | 189.5 µs | 0 / 0 |
+| Union of sorted retained extent lists | 185.9 µs | 630,784 / 1 |
+| Allocator reconstruction | 616 µs | 73,824 / 2 |
+| Dirty unpublished directory, one real sync | 8.04 ms | 0 / 0 |
+
+A 10M-row directory is ~2.19 MB per root and is rewritten per committed
+generation, so a one-row change pays that directory cost even though it does not
+rewrite record columns. Flat-directory O(shards) write amplification and one
+dirty-directory sync are the largest remaining durable costs. No directory tree,
+extra data file, persistent reverse lookup or relaxed durability was added.
+
+## Sustained growth and extent reuse
+
+`TestSustainedGrowthAndExtentReuse` starts at 4096 bytes / 512-byte shards, ramps
+to 2048 rows, then runs 128 bounded cycles of insert64/move64/delete64/reinsert64
+with four concurrent readers, reopening after every growth event. At steady
+state the file plateaus (64 active shards, 3584 directory bytes, file 65,536
+bytes, largest free run 16,896 bytes) with exact capacity accounting
+(current + retained-only + free + superblocks = file). Both full-width ID
+distributions produce the same geometry; no obsolete-generation accumulation
+occurs. Reuse is only counted when an address disappears from both recoverable
+roots and returns.
 
 ## Reproduction
 
 ```sh
-# Run this identical public-API harness at baseline and after revisions:
+# Current public-API comparison harness:
 go test ./index/timeidx -run '^$' -bench '^BenchmarkModernization$' \
   -benchmem -benchtime=200ms -count=5
 
-# Retained baseline names:
+# Retained search/durable benchmark names:
 go test ./index/timeidx -run '^$' \
   -bench '^(BenchmarkSearch|BenchmarkUpdate|BenchmarkApplyPersistentSyncSingle)$' \
   -benchmem -benchtime=200ms -count=5
 
-# Architecture-specific after measurements:
-go test ./index/timeidx -run '^$' \
+# Architecture-specific measurements:
+TIMESTAMP_BENCH_LARGE=1 go test ./index/timeidx -run '^$' \
   -bench '^(BenchmarkTimeShardSize|BenchmarkTimeHistoricalShardSize|BenchmarkTimeSelectiveCommit|BenchmarkNamespaceParallel|BenchmarkTimeGrowth|BenchmarkTimeSearchDuringCommit)$' \
   -benchmem -benchtime=200ms -count=5
+
+# Opt-in 1M/10M scale matrix and correctness:
+TIMEIDX_SCALE=1 GOMAXPROCS=12 go test ./index/timeidx -run '^$' \
+  -bench '^BenchmarkScalePreparation$' -benchmem -benchtime=200ms -count=10
+TIMEIDX_SCALE=1 go test -race ./index/timeidx -run '^TestScaleMutationCorrectness$' -count=1
+go test -race ./index/timeidx -run 'SustainedGrowth|Rebuild' -count=1 -v
 ```
 
-The old private block/WAL matrix was replaced by the public-API comparison and
-namespace/shard benchmarks; it cannot describe the new architecture unchanged.
-Before declaring a production no-regression gate satisfied, repeat these on
+`benchmark_ab.sh` runs an alternating A/B comparison across two worktrees; the
+`commit*_benchmark_test.go` probes isolate allocation, encoding and commit
+components. Before declaring a no-regression gate satisfied, repeat these on
 target hardware at application scale, including representative namespace counts,
-long-held readers, cold opens, update-ID distributions and durability requirements.
-No SIMD or timestamp compression was added.
+long-held readers, cold opens, update-ID distributions and durability needs.

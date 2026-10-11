@@ -345,17 +345,21 @@ SIMD and scalar implementations must return identical results.
 
 # 10. TimeIdx Benchmarks
 
-Benchmark:
+`timeidx` supports exact half-open `[start, end)` search and `EstimateRange`;
+it has no nearest-before/after API. Benchmark:
 
 ```text
-exact timestamp lookup if supported
+exact hit
+exact miss
 small range
 medium range
 large range
 full range
-nearest-before
-nearest-after
-nearest-to
+repeated time spanning many shards
+memory Apply (1 / 8 / 32 / 64 mutations)
+persistent Apply (durable append, historical move, new-ID insert)
+clean reopen
+concurrent search during commits
 ```
 
 Test time distributions:
@@ -366,7 +370,18 @@ clustered
 bursty
 mostly recent
 multi-year
+dense repeated timestamps
 ```
+
+Test ID distributions:
+
+```text
+sequential
+permuted (random)
+```
+
+Sweep `MaxShardBytes` (4 KiB default through 1 MiB) for historical rewrite
+volume, wide-search cost and directory size.
 
 Measure both:
 
@@ -381,13 +396,14 @@ Test queries that:
 
 ```text
 miss entirely
-hit one block
-cross two blocks
-cross many blocks
+hit one shard
+cross two shards
+cross many shards
 cover entire index
 ```
 
-This is important if TimeIdx uses block min/max skipping.
+Shard `MinID`/`MaxID` prune unaffected scans; timestamp columns use binary
+search, not a block min/max walk.
 
 ---
 
@@ -817,6 +833,7 @@ TimeIdx
 N = 1K, 10K, 100K, 1M
 small + medium + large range
 uniform + clustered timestamps
+memory + persistent 64-mutation Apply
 
 
 CryptoHashIdx

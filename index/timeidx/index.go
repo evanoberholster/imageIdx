@@ -92,9 +92,11 @@ func (i *Index) Len() uint64                        { return i.view.Load().count
 func (i *Index) PendingCompactions() int64          { return 0 }
 func (i *Index) WaitIdle(ctx context.Context) error { return ctx.Err() }
 
-// All accepted mutations are already compacted. These compatibility barriers
-// do not advance the generation or rewrite data.
-func (i *Index) Checkpoint() error {
+// barrier reports whether a compatibility call may proceed. Writes are already
+// durable when Apply returns, so it never advances the generation or rewrites
+// data; it only surfaces closed, latched-failure and (when required) in-memory
+// state. requirePersistent additionally rejects indexes with no backing file.
+func (i *Index) barrier(requirePersistent bool) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.isClosed() {
@@ -103,11 +105,15 @@ func (i *Index) Checkpoint() error {
 	if i.failed != nil {
 		return i.failed
 	}
-	if i.file == nil {
+	if requirePersistent && i.file == nil {
 		return ErrNotPersistent
 	}
 	return nil
 }
+
+// Checkpoint is a compatibility barrier requiring a persistent index.
+// All accepted mutations are already compacted.
+func (i *Index) Checkpoint() error { return i.barrier(true) }
 
 // Sync is a compatibility barrier: successful changed Apply calls already sync.
 func (i *Index) Sync() error { return i.Checkpoint() }
@@ -116,14 +122,7 @@ func (i *Index) Sync() error { return i.Checkpoint() }
 func (i *Index) Vacuum() error { return i.Checkpoint() }
 
 // Compact is a compatibility barrier; accepted mutations are already compacted.
-func (i *Index) Compact() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.isClosed() {
-		return ErrClosed
-	}
-	return i.failed
-}
+func (i *Index) Compact() error { return i.barrier(false) }
 func (i *Index) OnDiskBytes() uint64 {
 	i.mu.Lock()
 	defer i.mu.Unlock()

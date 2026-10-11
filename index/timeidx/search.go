@@ -8,6 +8,9 @@ import (
 
 type ExactTimestampFunc func(common.ValueID) (uint64, bool)
 
+// rangeIndexes returns the half-open row span [lo, hi) whose timestamps fall in
+// [start, end). Both bounds skip their binary search when the shard cannot
+// contribute, which matters for shards fully inside a wide range.
 func (s *shard) rangeIndexes(start, end uint64) (int, int) {
 	lo, hi := 0, len(s.times)
 	if s.times[0] < start {
@@ -17,6 +20,16 @@ func (s *shard) rangeIndexes(start, end uint64) (int, int) {
 		hi = sort.Search(hi, func(n int) bool { return s.times[n] >= end })
 	}
 	return lo, hi
+}
+
+// firstShardAtOrAfter returns the index of the first shard whose last time is
+// at least start. Shards are ordered, so later shards cannot contain a match
+// when this returns len(shards).
+func firstShardAtOrAfter(shards []*shard, start uint64) int {
+	return sort.Search(len(shards), func(n int) bool {
+		s := shards[n]
+		return s.times[len(s.times)-1] >= start
+	})
 }
 
 // Search appends exact [start,end) matches in (TimeKey, ValueID) order. All
@@ -43,8 +56,7 @@ func (i *Index) search(dst []common.ValueID, start, end uint64, lookup ExactTime
 		return dst
 	}
 	shards := i.view.Load().shards
-	first := sort.Search(len(shards), func(n int) bool { s := shards[n]; return s.times[len(s.times)-1] >= start })
-	for _, s := range shards[first:] {
+	for _, s := range shards[firstShardAtOrAfter(shards, start):] {
 		if s.times[0] >= end {
 			break
 		}
@@ -72,9 +84,8 @@ func (i *Index) EstimateRange(start, end uint64) uint64 {
 		return 0
 	}
 	shards := i.view.Load().shards
-	first := sort.Search(len(shards), func(n int) bool { s := shards[n]; return s.times[len(s.times)-1] >= start })
 	var count uint64
-	for _, s := range shards[first:] {
+	for _, s := range shards[firstShardAtOrAfter(shards, start):] {
 		if s.times[0] >= end {
 			break
 		}

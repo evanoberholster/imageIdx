@@ -28,6 +28,13 @@ func NamespaceFilename(ns common.Namespace) string {
 	return string([]byte{hex[uint16(ns)>>12], hex[uint16(ns)>>8&15], hex[uint16(ns)>>4&15], hex[uint16(ns)&15]}) + ".timeidx"
 }
 
+// legacyManifestPresent reports a pre-namespace store directory. Such stores
+// must be rebuilt from canonical timestamps, never silently reinterpreted.
+func legacyManifestPresent(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "manifest"))
+	return err == nil
+}
+
 // NewStore retains the standalone constructor. Namespace zero is supported
 // only by this compatibility API; new schema-managed namespaces must be nonzero.
 // Neither durability setting weakens the synchronous COW commit guarantee.
@@ -40,7 +47,7 @@ func createStore(dir string, spec Spec, config Config, durability Durability, co
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
-	if _, err := os.Stat(filepath.Join(dir, "manifest")); err == nil {
+	if legacyManifestPresent(dir) {
 		return nil, ErrUnsupported
 	}
 	i, err := NewMemory(spec, config)
@@ -133,7 +140,7 @@ func OpenStore(dir string, config Config, durability Durability) (*Index, error)
 }
 
 func singleNamespace(dir string) (common.Namespace, error) {
-	if _, err := os.Stat(filepath.Join(dir, "manifest")); err == nil {
+	if legacyManifestPresent(dir) {
 		return 0, ErrUnsupported
 	}
 	entries, err := os.ReadDir(dir)
@@ -191,7 +198,7 @@ func openNamespace(dir string, ns common.Namespace, config Config, durability Du
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(filepath.Join(dir, "manifest")); err == nil {
+	if legacyManifestPresent(dir) {
 		return nil, ErrUnsupported
 	}
 	path := filepath.Join(dir, NamespaceFilename(ns))
@@ -292,11 +299,27 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 	if storage.Checksum(dir) != crc {
 		return generation{}, ErrCorrupt
 	}
+	shards, total, err := decodeDirectoryShards(data, dir, count, entries, maxShard)
+	if err != nil {
+		return generation{}, err
+	}
+	root := extent(rootOffset, uint32(length))
+	g := generation{view: &snapshot{shards: shards, generation: gen, sourceGeneration: binary.LittleEndian.Uint64(payload[56:64]), count: total}, root: root, live: shardLive(shards, root), flags: binary.LittleEndian.Uint32(payload[4:8]), offset: binary.LittleEndian.Uint64(payload[40:48])}
+	if _, err := storage.ReconstructAllocator(arenaBytes, g.live); err != nil {
+		return generation{}, errors.Join(ErrCorrupt, err)
+	}
+	return g, nil
+}
+
+// decodeDirectoryShards validates and materializes every shard named by the
+// directory. It enforces per-shard checksums, placement bounds, global ID
+// uniqueness and strictly increasing (time, ID) order across the generation.
+func decodeDirectoryShards(data, dir []byte, count uint32, entries, maxShard uint64) ([]*shard, uint64, error) {
+	if entries > uint64(len(data))/recordBytes {
+		return nil, 0, ErrCorrupt
+	}
 	shards := make([]*shard, count)
 	var total uint64
-	if entries > uint64(len(data))/recordBytes {
-		return generation{}, ErrCorrupt
-	}
 	// Validate uniqueness without a per-entry hash table. Compact ID domains
 	// use a bounded bitset; sparse uint64 domains use one sorted scratch column.
 	var maxID uint64
@@ -317,19 +340,19 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 		off, num := d.Offset, d.Count
 		bytes := uint64(num) * recordBytes
 		if num == 0 || bytes > maxShard || bytes > uint64(len(data)) || off < 1024 || off%512 != 0 || off > uint64(len(data))-bytes {
-			return generation{}, ErrCorrupt
+			return nil, 0, ErrCorrupt
 		}
 		times, err := storage.View[uint64](data, off, uint64(num), ErrCorrupt, ErrUnsupportedEndian)
 		if err != nil {
-			return generation{}, err
+			return nil, 0, err
 		}
 		ids, err := storage.View[common.ValueID](data, off+uint64(num)*8, uint64(num), ErrCorrupt, ErrUnsupportedEndian)
 		if err != nil {
-			return generation{}, err
+			return nil, 0, err
 		}
 		tcrc, icrc := d.KeyCRC, d.IDCRC
 		if storage.Checksum(data[off:off+uint64(num)*8]) != tcrc || storage.Checksum(data[off+uint64(num)*8:off+bytes]) != icrc {
-			return generation{}, ErrCorrupt
+			return nil, 0, ErrCorrupt
 		}
 		s := newShard(times, ids)
 		s.offset = off
@@ -337,49 +360,44 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 		s.timeCRC = tcrc
 		s.idCRC = icrc
 		if times[0] != d.FirstKey || ids[0] != d.FirstID || s.minID != d.MinID || s.maxID != d.MaxID {
-			return generation{}, ErrCorrupt
+			return nil, 0, ErrCorrupt
 		}
 		for k, id := range ids {
 			if seenBits != nil {
 				word, mask := id>>6, uint64(1)<<(id&63)
 				if word >= uint64(len(seenBits)) || seenBits[word]&mask != 0 {
-					return generation{}, ErrCorrupt
+					return nil, 0, ErrCorrupt
 				}
 				seenBits[word] |= mask
 			} else {
 				seenIDs = append(seenIDs, id)
 			}
 			if k > 0 && !pairLess(times[k-1], ids[k-1], times[k], id) {
-				return generation{}, ErrCorrupt
+				return nil, 0, ErrCorrupt
 			}
 		}
 		if n > 0 {
 			p := shards[n-1]
 			k := len(p.times) - 1
 			if !pairLess(p.times[k], p.ids[k], times[0], ids[0]) {
-				return generation{}, ErrCorrupt
+				return nil, 0, ErrCorrupt
 			}
 		}
 		shards[n] = s
 		total += uint64(num)
 	}
 	if total != entries {
-		return generation{}, ErrCorrupt
+		return nil, 0, ErrCorrupt
 	}
 	if seenBits == nil {
 		slices.Sort(seenIDs)
 		for n := 1; n < len(seenIDs); n++ {
 			if seenIDs[n] == seenIDs[n-1] {
-				return generation{}, ErrCorrupt
+				return nil, 0, ErrCorrupt
 			}
 		}
 	}
-	root := extent(rootOffset, uint32(length))
-	g := generation{view: &snapshot{shards: shards, generation: gen, sourceGeneration: binary.LittleEndian.Uint64(payload[56:64]), count: total}, root: root, live: shardLive(shards, root), flags: binary.LittleEndian.Uint32(payload[4:8]), offset: binary.LittleEndian.Uint64(payload[40:48])}
-	if _, err := storage.ReconstructAllocator(arenaBytes, g.live); err != nil {
-		return generation{}, errors.Join(ErrCorrupt, err)
-	}
-	return g, nil
+	return shards, total, nil
 }
 
 func recoverGenerations(data []byte, ns common.Namespace) ([]generation, error) {
@@ -626,18 +644,7 @@ func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 		rollback()
 		return errors.Join(ErrCorrupt, err)
 	}
-	var payload [payloadBytes]byte
-	binary.LittleEndian.PutUint16(payload[:2], uint16(i.namespace))
-	binary.LittleEndian.PutUint16(payload[2:4], 1)
-	binary.LittleEndian.PutUint32(payload[4:8], i.flags)
-	binary.LittleEndian.PutUint64(payload[8:16], uint64(root.Ref)*512)
-	binary.LittleEndian.PutUint32(payload[16:20], uint32(len(shards)))
-	binary.LittleEndian.PutUint32(payload[20:24], dirCRC)
-	binary.LittleEndian.PutUint64(payload[24:32], total)
-	binary.LittleEndian.PutUint64(payload[32:40], uint64(len(i.file.Bytes())))
-	binary.LittleEndian.PutUint64(payload[40:48], i.offset)
-	binary.LittleEndian.PutUint64(payload[48:56], uint64(max(i.config.MaxShardBytes, largestShard(shards))))
-	binary.LittleEndian.PutUint64(payload[56:64], sourceGeneration)
+	payload := i.encodePayload(shards, root, dirCRC, total, sourceGeneration)
 	if err = i.inject("commit"); err != nil {
 		rollback()
 		return err
@@ -701,6 +708,27 @@ func largestShard(shards []*shard) int64 {
 		bytes = max(bytes, int64(len(s.times))*recordBytes)
 	}
 	return bytes
+}
+
+// encodePayload renders the 64-byte superblock payload for one generation:
+// namespace identity, exact-epoch encoding tag, directory placement and CRC,
+// logical count, arena length, and the source watermark. The persisted shard
+// bound is the larger of the configured limit and the largest retained shard so
+// reopening with a smaller configuration never invalidates old shards.
+func (i *Index) encodePayload(shards []*shard, root storage.Extent, dirCRC uint32, total, sourceGeneration uint64) [payloadBytes]byte {
+	var payload [payloadBytes]byte
+	binary.LittleEndian.PutUint16(payload[:2], uint16(i.namespace))
+	binary.LittleEndian.PutUint16(payload[2:4], 1)
+	binary.LittleEndian.PutUint32(payload[4:8], i.flags)
+	binary.LittleEndian.PutUint64(payload[8:16], uint64(root.Ref)*512)
+	binary.LittleEndian.PutUint32(payload[16:20], uint32(len(shards)))
+	binary.LittleEndian.PutUint32(payload[20:24], dirCRC)
+	binary.LittleEndian.PutUint64(payload[24:32], total)
+	binary.LittleEndian.PutUint64(payload[32:40], uint64(len(i.file.Bytes())))
+	binary.LittleEndian.PutUint64(payload[40:48], i.offset)
+	binary.LittleEndian.PutUint64(payload[48:56], uint64(max(i.config.MaxShardBytes, largestShard(shards))))
+	binary.LittleEndian.PutUint64(payload[56:64], sourceGeneration)
+	return payload
 }
 
 // Verify validates a closed single-namespace directory without modifying files.

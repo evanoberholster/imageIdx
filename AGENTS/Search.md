@@ -10,9 +10,9 @@ is a `bitmapidx.KindGeo` field; there is no OR, reranking, or vector clause.
 - `FieldText(index, text)`: every analyzed token must be present.
 - `FieldRange(index, bounds)`: a `KindContinuous` field must fall inside the
   supplied numeric range.
-- `During(index, start, end, options...)`: half-open timestamp range. Lossy
-  ranges on the same index coalesce by intersection; `ExactTimestamp` remains
-  a separate exact verification stage.
+- `During(index, start, end, options...)`: half-open exact timestamp range.
+  Ranges on the same index coalesce by intersection; `ExactTimestamp` adds an
+  optional canonical-data verification stage.
 - `WithinCells(index, cellIDs...)`: union of S2 cells on a `KindGeo` field.
 
 Clauses are sealed and unknown implementations are rejected. Empty queries
