@@ -13,35 +13,53 @@ import (
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-// persistStage identifies a persistence step for the test-only persistFail
-// seam. Production leaves persistFail nil.
+// persistStage identifies a persistence step for the test-only hooks. Production
+// leaves persistFail and persistCrash nil.
 type persistStage uint8
 
 const (
-	persistCreate    persistStage = iota // extent allocation
+	persistCreate    persistStage = iota // extent allocation (pre-commit)
 	persistGrow                          // file extension
 	persistMmap                          // mapping creation
 	persistWrite                         // shard data
 	persistDirectory                     // directory
 	persistSync                          // data sync
-	persistCommit                        // inactive superblock write
-	persistSuperSync                     // superblock sync
-	persistPublish                       // view publication
-	persistRetire                        // region retirement
-	persistReclaim                       // free-space reclamation
-	persistRemove                        // post-reclaim cleanup
+	persistCommit                        // before the inactive superblock write
+	persistSuperSync                     // before the superblock sync
+	persistPublish                       // before in-memory publication (crash point)
+	persistRetire                        // before region retirement (crash point)
+	persistReclaim                       // before reclamation (crash point)
+	persistRemove                        // after reclamation (crash point)
 )
 
-// persistFail is a test seam; production leaves it nil.
-var persistFail func(persistStage) error
+// persistFail injects an error at a fallible persistence step; persistCrash runs
+// at a step that cannot itself fail (publication, retirement, reclamation) so
+// tests can block or terminate the process.
+var (
+	persistFail  func(persistStage) error
+	persistCrash func(persistStage)
+)
 
-// errCommitUncertain reports that the inactive superblock slot was written but
-// its synchronization failed, so durability is unknown. The caller must protect
-// both generations and retry; durability is never inferred from mmap contents.
-var errCommitUncertain = errors.New("geoidx: superblock sync failed; commit outcome uncertain")
+// commitOutcome is the result of attempting to commit a generation.
+type commitOutcome uint8
+
+const (
+	// commitAborted means no bytes of the inactive slot were modified, so the new
+	// allocations may be rolled back.
+	commitAborted commitOutcome = iota
+	// commitDurable means the new generation is written and synchronized, so it
+	// must be published.
+	commitDurable
+	// commitUncertain means the inactive slot may have been modified but
+	// durability is unconfirmed; the new extents must be protected and the attempt
+	// retried.
+	commitUncertain
+)
 
 // writeSuperblockSlotFunc is a test seam for the superblock slot write;
-// production copies the slot into the mapping.
+// production copies the slot into the mapping. The production write is a single
+// copy that cannot report a partial write, so the caller treats any write error as
+// an uncertain commit.
 var writeSuperblockSlotFunc = func(arena []byte, offset uint64, slot []byte) error {
 	copy(arena[offset:offset+storage.SuperblockSlotBytes], slot)
 	return nil
@@ -55,6 +73,12 @@ func failStage(stage persistStage) error {
 		return nil
 	}
 	return persistFail(stage)
+}
+
+func crashStage(stage persistStage) {
+	if persistCrash != nil {
+		persistCrash(stage)
+	}
 }
 
 const (
@@ -311,6 +335,9 @@ func New(dir string, config Config) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.MaxFileBytes < cfg.MaxShardBytes {
+		return nil, ErrInvalidConfig
+	}
 	lock, err := storage.AcquireLock(dir, lockName, true)
 	if err != nil {
 		return nil, err
@@ -349,6 +376,9 @@ func Open(dir string, config Config) (*Index, error) {
 	cfg, err := config.withDefaults()
 	if err != nil {
 		return nil, err
+	}
+	if cfg.MaxFileBytes < cfg.MaxShardBytes {
+		return nil, ErrInvalidConfig
 	}
 	lock, err := storage.AcquireLock(dir, lockName, false)
 	if err != nil {
@@ -393,8 +423,12 @@ func (i *Index) createEmptyLocked() error {
 	i.live = nil
 	i.dirOffset, i.dirLength = 0, 0
 	i.gen = 1
-	if err := i.commit(0, i.gen, 0, 0, 0, 0, i.arenaBytes); err != nil {
+	outcome, err := i.commit(0, i.gen, 0, 0, 0, 0, i.arenaBytes)
+	if err != nil {
 		return err
+	}
+	if outcome != commitDurable {
+		return errors.New("geoidx: initial superblock not durable")
 	}
 	i.slot = 0
 	i.publishLocked()
@@ -489,11 +523,11 @@ func decodeGeneration(arena, payload []byte, fileBytes uint64) ([]*shard, uint64
 	return shards, dirOffset, dirCount, nil
 }
 
-// commit writes the inactive superblock slot and synchronizes it. It returns nil
-// on a durable commit, errCommitUncertain when the slot was written but the sync
-// failed (durability unknown), and any other error when the slot write itself
-// failed (nothing durable changed).
-func (i *Index) commit(slot int, generation, dirOffset uint64, dirCount uint32, totalEntries, liveBytes, arenaBytes uint64) error {
+// commit writes the inactive superblock slot and synchronizes it. It reports
+// commitAborted only when no bytes of the slot were modified (an encoding failure
+// or the pre-write hook), commitUncertain when the slot may have been modified but
+// durability is unconfirmed (a write or sync error), and commitDurable on success.
+func (i *Index) commit(slot int, generation, dirOffset uint64, dirCount uint32, totalEntries, liveBytes, arenaBytes uint64) (commitOutcome, error) {
 	var payload [superblockPayloadBytes]byte
 	encodeSuperblockPayload(payload[:], arenaBytes, dirOffset, dirCount, totalEntries, liveBytes)
 	var slotBytes [storage.SuperblockSlotBytes]byte
@@ -502,18 +536,19 @@ func (i *Index) commit(slot int, generation, dirOffset uint64, dirCount uint32, 
 		Version:    geoidxVersion,
 		Generation: generation,
 	}, payload[:]); err != nil {
-		return err
+		return commitAborted, err
 	}
 	if err := writeSuperblockSlotFunc(i.arena.data, superblockOffset(slot), slotBytes[:]); err != nil {
-		return err
+		// The slot may have been partially modified; protect and retry.
+		return commitUncertain, err
 	}
 	if err := failStage(persistSuperSync); err != nil {
-		return errors.Join(errCommitUncertain, err)
+		return commitUncertain, err
 	}
 	if err := syncArenaFunc(i.arena.mf); err != nil {
-		return errors.Join(errCommitUncertain, err)
+		return commitUncertain, err
 	}
-	return nil
+	return commitDurable, nil
 }
 
 // liveBytes sums the shard payload bytes.
@@ -937,31 +972,32 @@ func (i *Index) runCompaction() {
 		i.finishCompaction(cerr)
 		return
 	}
-	switch cerr := i.commit(i.slot^1, gen, dirOffset, uint32(len(newShards)), uint64(totalEntries(newShards)), liveBytes(newShards), i.arenaBytes); {
-	case errors.Is(cerr, errCommitUncertain):
-		// The slot was written but durability is unknown. Protect both generations
-		// (and any prior uncertain extents), keep the previous in-memory generation
-		// authoritative, and retain the frozen snapshot so the caller can retry.
-		// Never reuse the uncertain extents.
-		protected := combined
-		if u, uerr := dedupExtents(append(append([]extentRef(nil), combined...), i.live...)); uerr == nil {
-			protected = u
+	outcome, cerr := i.commit(i.slot^1, gen, dirOffset, uint32(len(newShards)), uint64(totalEntries(newShards)), liveBytes(newShards), i.arenaBytes)
+	if outcome != commitDurable {
+		if outcome == commitUncertain {
+			// The slot may have been modified but durability is unknown. Protect
+			// both generations (and any prior uncertain extents), keep the previous
+			// in-memory generation authoritative, and retain the frozen snapshot so
+			// the caller can retry. Never reuse the uncertain extents.
+			protected := combined
+			if u, uerr := dedupExtents(append(append([]extentRef(nil), combined...), i.live...)); uerr == nil {
+				protected = u
+			}
+			i.live = protected
+			if alloc, aerr := allocatorFromLive(i.arenaBytes, protected); aerr == nil {
+				i.alloc = alloc
+			}
+			i.mu.Unlock()
+			i.finishCompaction(cerr)
+			return
 		}
-		i.live = protected
-		if alloc, aerr := allocatorFromLive(i.arenaBytes, protected); aerr == nil {
-			i.alloc = alloc
-		}
-		i.mu.Unlock()
-		i.finishCompaction(cerr)
-		return
-	case cerr != nil:
-		// The slot write itself failed; nothing durable changed.
+		// commitAborted: no bytes of the slot were modified.
 		i.mu.Unlock()
 		i.rollback(allocated)
 		i.finishCompaction(cerr)
 		return
 	}
-	_ = failStage(persistPublish)
+	crashStage(persistPublish)
 	i.shards = newShards
 	i.frozen = nil
 	i.compactionErr = nil
@@ -992,11 +1028,11 @@ func (i *Index) publishResult(newShards []*shard, gen uint64, _ uint64, _ uint32
 
 // finishReclaim drains prior readers and releases mappings no longer referenced.
 func (i *Index) finishReclaim() {
-	_ = failStage(persistReclaim)
+	crashStage(persistReclaim)
 	i.tracker.WaitForPriorReaders()
-	_ = failStage(persistRetire)
+	crashStage(persistRetire)
 	i.releaseRetiredRegions()
-	_ = failStage(persistRemove)
+	crashStage(persistRemove)
 	i.mu.Lock()
 	i.compacting = false
 	close(i.compactionDone)

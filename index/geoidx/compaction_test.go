@@ -344,8 +344,8 @@ func equalIDs(a, b []uint64) bool {
 
 // TestCompactionCommitReconcilesAfterRename simulates the superblock slot being
 // written but its synchronization failing. Durability is unknown, so Compact
-// reports errCommitUncertain, the previous generation stays authoritative in
-// memory, and a retry succeeds.
+// reports an error, the previous generation stays authoritative in memory, and a
+// retry succeeds.
 func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
 	dir := t.TempDir()
 	config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
@@ -358,8 +358,8 @@ func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
 
 	original := syncArenaFunc
 	syncArenaFunc = func(mf *storage.MappedFile) error { return errors.New("simulated sync failure") }
-	if err := index.Compact(); !errors.Is(err, errCommitUncertain) {
-		t.Fatalf("Compact = %v, want errCommitUncertain", err)
+	if err := index.Compact(); err == nil {
+		t.Fatal("Compact succeeded despite an uncertain commit")
 	}
 	if index.Generation() != before {
 		t.Fatal("uncertain commit advanced the durable generation")
@@ -467,14 +467,13 @@ func TestSlowReaderDelaysReclamation(t *testing.T) {
 	reclaimEntered := make(chan struct{})
 	allowReclaim := make(chan struct{})
 	var once sync.Once
-	persistFail = func(stage persistStage) error {
+	persistCrash = func(stage persistStage) {
 		if stage == persistReclaim {
 			once.Do(func() { close(reclaimEntered) })
 			<-allowReclaim
 		}
-		return nil
 	}
-	defer func() { persistFail = nil }()
+	defer func() { persistCrash = nil }()
 
 	compacted := make(chan error, 1)
 	go func() { compacted <- index.Compact() }()
@@ -520,10 +519,6 @@ func TestCompactionFailureStages(t *testing.T) {
 		{"sync", persistSync},
 		{"commit", persistCommit},
 		{"super-sync", persistSuperSync},
-		{"publish", persistPublish},
-		{"retire", persistRetire},
-		{"reclaim", persistReclaim},
-		{"remove", persistRemove},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

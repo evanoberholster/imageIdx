@@ -73,15 +73,25 @@ overlapping live extents. `StorageStats` exposes the resulting fragmentation.
 10. Release superseded mappings.
 
 A failure before step 5 frees the new extents and keeps the previous generation
-authoritative; the frozen snapshot is retained for retry. A slot write failure
-aborts cleanly (`commitAborted`). A slot written but not synchronized is an
-**uncertain commit** (`errCommitUncertain`): durability is never inferred from
-mmap contents. On uncertainty the index keeps the previous generation
-authoritative in memory, protects both generations' extents (plus any prior
-uncertain extents) so none is reused, and returns the error so the caller can
-retry. The retry overwrites the same inactive slot, resolving the uncertainty.
+authoritative; the frozen snapshot is retained for retry. The commit reports one
+of three outcomes:
+
+- **aborted** — no bytes of the slot were modified (an encoding failure or a
+  pre-write check); the new extents are rolled back.
+- **durable** — the slot is written and synchronized; the new generation is
+  published.
+- **uncertain** — the slot may have been modified but durability is unconfirmed (a
+  write error, including a partial write, or a sync error). Durability is never
+  inferred from mmap contents. The index keeps the previous generation
+  authoritative in memory, protects both generations' extents (plus any prior
+  uncertain extents) so none is reused, and returns the error so the caller can
+  retry. The retry overwrites the same inactive slot, resolving the uncertainty.
+
 The newest slot is validated end to end (directory bounds, ordering, checksums)
-on open; if it fails, an older valid generation is selected instead.
+on open; if it fails, an older valid generation is selected instead. Publication,
+retirement, and reclamation cannot fail; they expose test-only crash points (not
+ignored error hooks) so termination between the durable commit and in-memory
+publication can be exercised.
 
 ## Safe mmap growth
 
@@ -151,13 +161,17 @@ target 4.46 MB/op (3 runs, largest 67 MB). Reused, not grown.
   compaction failure stage (allocate, grow, mmap, write, directory, data sync,
   commit, superblock sync, publish, retire, reclaim, remove) with reopen;
   **fallback** to the previous generation when the newest is corrupt.
-- Commit-state injection: before slot write, during slot write, before sync,
-  during sync, and after sync/before publish, each with retry and reopen.
+- Commit-state injection: before slot write, during slot write (partial and
+  full-then-error), before sync, during sync, and after sync/before publish, each
+  with retry and reopen.
+- Differential batches of 1/8/32/64 plus moves and duplicate ids checked against a
+  reference for exact membership, ascending order, ImageID uniqueness, and
+  `(S2Key, ImageID)` directory ordering after every commit.
 - Growth: forced growth with four concurrent readers (`-race`); injected file
   extension and mapping failures with retry; second-generation crash during growth
   recovered by subprocess; growth reuses/releases mappings.
-- Crash: subprocess hard-exit at the commit and superblock-sync boundaries, then
-  reopen and read.
+- Crash: subprocess hard-exit at the commit, superblock-sync, and
+  pre-publication boundaries, then reopen and read.
 - Stress: 600 repeated shard replacements reach a steady-state arena; concurrent
   searches with repeated replacement, forced growth, and shutdown (`-race`).
 

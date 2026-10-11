@@ -95,9 +95,6 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MinShardBytes > c.TargetShardBytes || c.TargetShardBytes > c.MaxShardBytes {
 		return Config{}, ErrInvalidConfig
 	}
-	if c.MaxFileBytes < int64(c.MaxShardBytes) {
-		return Config{}, ErrInvalidConfig
-	}
 	return c, nil
 }
 

@@ -14,6 +14,8 @@ func stageName(stage persistStage) string {
 		return "commit"
 	case persistSuperSync:
 		return "super-sync"
+	case persistPublish:
+		return "publish"
 	}
 	return ""
 }
@@ -27,7 +29,7 @@ func TestSubprocessCrashRecovery(t *testing.T) {
 		runCrashChild(t, dir, os.Getenv("GEOIDX_CRASH_STAGE"))
 		return
 	}
-	for _, stage := range []string{"commit", "super-sync"} {
+	for _, stage := range []string{"commit", "super-sync", "publish"} {
 		t.Run(stage, func(t *testing.T) {
 			dir := t.TempDir()
 			cmd := exec.Command(os.Args[0], "-test.run=TestSubprocessCrashRecovery")
@@ -71,6 +73,17 @@ func runCrashChild(t *testing.T, dir, stage string) {
 	more := withNewIDs(shardedMemoryEntries(2000), 1_000_000)
 	if err := index.InsertBatch(more); err != nil {
 		t.Fatalf("child InsertBatch: %v", err)
+	}
+	// Synchronizes successfully, then terminates before in-memory publication
+	// (the "publish" stage), through the crash hook.
+	if stage == stageName(persistPublish) {
+		persistCrash = func(s persistStage) {
+			if s == persistPublish {
+				os.Exit(8)
+			}
+		}
+		_ = index.Compact()
+		os.Exit(0)
 	}
 	persistFail = func(s persistStage) error {
 		if stageName(s) == stage {

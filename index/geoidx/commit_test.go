@@ -2,9 +2,11 @@ package geoidx
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 
+	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -91,8 +93,8 @@ func TestCommitFailureInjection(t *testing.T) {
 			}
 			return nil
 		}
-		if err := index.Compact(); !errors.Is(err, errCommitUncertain) {
-			t.Fatalf("Compact = %v, want errCommitUncertain", err)
+		if err := index.Compact(); err == nil {
+			t.Fatal("Compact succeeded despite an uncertain commit (before sync)")
 		}
 		persistFail = nil
 		// The previous generation remains authoritative in memory.
@@ -110,8 +112,8 @@ func TestCommitFailureInjection(t *testing.T) {
 		defer index.Close()
 		original := syncArenaFunc
 		syncArenaFunc = func(_ *storage.MappedFile) error { return errors.New("sync") }
-		if err := index.Compact(); !errors.Is(err, errCommitUncertain) {
-			t.Fatalf("Compact = %v, want errCommitUncertain", err)
+		if err := index.Compact(); err == nil {
+			t.Fatal("Compact succeeded despite an uncertain commit (during sync)")
 		}
 		syncArenaFunc = original
 		if err := index.Compact(); err != nil {
@@ -122,18 +124,13 @@ func TestCommitFailureInjection(t *testing.T) {
 
 	t.Run("after-sync-before-publish", func(t *testing.T) {
 		index, dir := newIndex(t)
-		defer index.Close()
-		// Publication failure must not roll back a durable commit.
-		persistFail = func(s persistStage) error {
-			if s == persistPublish {
-				return errors.New("publish")
-			}
-			return nil
-		}
+		// Publication cannot fail; a durable commit must stand even when the
+		// publication crash point runs.
+		persistCrash = func(persistStage) {}
 		if err := index.Compact(); err != nil {
 			t.Fatalf("Compact = %v; a durable commit must stand", err)
 		}
-		persistFail = nil
+		persistCrash = nil
 		if err := index.Compact(); err != nil {
 			t.Fatalf("retry: %v", err)
 		}
@@ -285,4 +282,180 @@ func TestConcurrentSearchGrowthShutdown(t *testing.T) {
 	if reopened.Len() < 30_000 {
 		t.Fatalf("reopened Len = %d, want >= 30000", reopened.Len())
 	}
+}
+
+// TestPartialSuperblockWrite verifies that a superblock write which modifies only
+// part of the slot (or writes it fully but then reports an error) is treated as an
+// uncertain commit: the previous generation stays authoritative, the new extents
+// are protected, and a retry succeeds.
+func TestPartialSuperblockWrite(t *testing.T) {
+	config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
+	newIndex := func(t *testing.T) (*Index, string, uint64) {
+		t.Helper()
+		dir := t.TempDir()
+		index, err := New(dir, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertKeys(t, index, testKeys(100), 1)
+		if err := index.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		before := index.Generation()
+		insertKeys(t, index, testKeys(50), 1000)
+		return index, dir, before
+	}
+	run := func(t *testing.T, write func(arena []byte, offset uint64, slot []byte) error) {
+		t.Helper()
+		index, dir, before := newIndex(t)
+		original := writeSuperblockSlotFunc
+		writeSuperblockSlotFunc = write
+		if err := index.Compact(); err == nil {
+			t.Fatal("Compact succeeded despite an uncertain slot write")
+		}
+		writeSuperblockSlotFunc = original
+		if index.Generation() != before {
+			t.Fatal("uncertain write advanced the durable generation")
+		}
+		if got := index.Len(); got != 150 {
+			t.Fatalf("Len = %d, want 150", got)
+		}
+		if err := index.Compact(); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		if err := index.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := Open(dir, config)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer reopened.Close()
+		if got := reopened.Len(); got != 150 {
+			t.Fatalf("reopened Len = %d, want 150", got)
+		}
+	}
+
+	t.Run("partial", func(t *testing.T) {
+		run(t, func(arena []byte, offset uint64, slot []byte) error {
+			copy(arena[offset:offset+64], slot[:64]) // only the first 64 bytes
+			return errors.New("partial write")
+		})
+	})
+	t.Run("full-then-error", func(t *testing.T) {
+		run(t, func(arena []byte, offset uint64, slot []byte) error {
+			copy(arena[offset:offset+storage.SuperblockSlotBytes], slot)
+			return errors.New("write reported failure")
+		})
+	})
+}
+
+// TestShardDifferentialBatches drives batches of 1/8/32/64 and moves/duplicates
+// against a reference model, checking exact membership, ascending order, ImageID
+// uniqueness, and (S2Key, ImageID) directory ordering after every commit.
+func TestShardDifferentialBatches(t *testing.T) {
+	index, entries := shardedMemoryIndex(t, 3000, tinyShardConfig())
+	live := map[common.ImageID]Entry{}
+	for _, e := range entries {
+		live[e.ImageID] = e
+	}
+	nextID := common.ImageID(len(entries) + 1)
+	keyFor := func(i int) S2Key {
+		lat := testLat + (float64(i)*0.0007 - 0.35)
+		lng := testLng + (float64(i%97)*0.0007 - 0.03)
+		k, err := KeyFromLatLng(lat, lng)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	check := func(t *testing.T, step int) {
+		t.Helper()
+		if err := index.Compact(); err != nil {
+			t.Fatalf("step %d Compact: %v", step, err)
+		}
+		if !validateDirectory(index.view.Load().shards) {
+			t.Fatalf("step %d directory not ordered", step)
+		}
+		seen := map[common.ImageID]struct{}{}
+		for _, s := range index.view.Load().shards {
+			for n := range s.ids {
+				if _, dup := seen[s.ids[n]]; dup {
+					t.Fatalf("step %d duplicate live ImageID %d", step, s.ids[n])
+				}
+				seen[s.ids[n]] = struct{}{}
+			}
+		}
+		want := make([]common.ImageID, 0, len(live))
+		for id := range live {
+			want = append(want, id)
+		}
+		slices.Sort(want)
+		got := index.SearchRanges(nil, []Range{{Start: 0, End: S2Key(^uint64(0))}})
+		if !slices.Equal(got, want) {
+			t.Fatalf("step %d membership/order mismatch: got %d ids, want %d", step, len(got), len(want))
+		}
+		if !slices.IsSorted(got) {
+			t.Fatalf("step %d results not ascending", step)
+		}
+		for id, e := range live {
+			if !index.Contains(e.Key, id) {
+				t.Fatalf("step %d image %d missing", step, id)
+			}
+		}
+		if got := index.Len(); got != uint64(len(live)) {
+			t.Fatalf("step %d Len = %d, want %d", step, got, len(live))
+		}
+	}
+
+	for _, size := range []int{1, 8, 32, 64} {
+		batch := make([]Entry, 0, size)
+		for i := 0; i < size; i++ {
+			e := Entry{Key: keyFor(i), ImageID: nextID}
+			nextID++
+			batch = append(batch, e)
+			live[e.ImageID] = e
+		}
+		if err := index.InsertBatch(batch); err != nil {
+			t.Fatal(err)
+		}
+		deletes := make([]Entry, 0, size/2)
+		for i := 0; i < len(batch); i += 2 {
+			deletes = append(deletes, Entry{Key: keyFor(i + 500), ImageID: batch[i].ImageID}) // stale key
+			delete(live, batch[i].ImageID)
+		}
+		if err := index.DeleteBatch(deletes); err != nil {
+			t.Fatal(err)
+		}
+		check(t, size)
+	}
+
+	// Move some ids across shards, then exercise a duplicate insert.
+	for i := 0; i < 32; i++ {
+		for id, old := range live {
+			e := Entry{Key: keyFor(i + 900), ImageID: id}
+			if err := index.Delete(old.Key, id); err != nil {
+				t.Fatal(err)
+			}
+			if err := index.Insert(e.Key, id); err != nil {
+				t.Fatal(err)
+			}
+			live[id] = e
+			break
+		}
+	}
+	var dupID common.ImageID
+	for id := range live {
+		dupID = id
+		break
+	}
+	dupKey := keyFor(1234)
+	if err := index.Insert(dupKey, dupID); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Insert(dupKey, dupID); err != nil {
+		t.Fatal(err)
+	}
+	live[dupID] = Entry{Key: dupKey, ImageID: dupID}
+	check(t, 99)
 }
