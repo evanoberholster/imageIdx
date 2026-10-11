@@ -61,6 +61,10 @@ var (
 	ErrEmptyBatch = errors.New("index: batch has no operations")
 	// ErrDuplicateNamespace reports a duplicate namespace number.
 	ErrDuplicateNamespace = errors.New("index: duplicate namespace")
+	// ErrIndexStale reports that the store's confirmed completeness watermark is
+	// behind a required canonical-database generation. It is a logical staleness
+	// signal, never corruption.
+	ErrIndexStale = errors.New("index: index is behind the authoritative database")
 	// ErrNamespaceIDModel reports a ValueID incompatible with an engine's
 	// native identifier model. simhash assigns dense, 1-based record IDs, so a
 	// simhash value must use the next dense ValueID.
@@ -176,7 +180,10 @@ type Change struct {
 	After  Entry
 }
 
-// NamespaceHealth reports the open state of one namespace after Create/Open.
+// NamespaceHealth reports the open state of one namespace. Stale is set when a
+// failed multi-engine batch may have left the namespace partially applied; such
+// a namespace is treated as unavailable until the process is reopened (each
+// engine is individually consistent after reopen) or the namespace is rebuilt.
 type NamespaceHealth struct {
 	Namespace    common.Namespace
 	Kind         common.NamespaceKind
@@ -184,6 +191,7 @@ type NamespaceHealth struct {
 	Available    bool
 	NeedsRebuild bool
 	Corrupt      bool
+	Stale        bool
 	Err          error
 }
 

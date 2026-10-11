@@ -121,6 +121,9 @@ func validateSchema(schema *common.Schema) ([]common.NamespaceDef, error) {
 		return nil, fmt.Errorf("%w: no namespaces", ErrInvalidSchema)
 	}
 	defs := schema.Defs()
+	for i := range defs {
+		defs[i].Config = append([]byte(nil), defs[i].Config...)
+	}
 	for _, def := range defs {
 		if def.Namespace == livenessNamespace {
 			return nil, fmt.Errorf("%w: namespace %d is reserved for liveness", ErrInvalidSchema, livenessNamespace)
@@ -143,6 +146,20 @@ func validateSchema(schema *common.Schema) ([]common.NamespaceDef, error) {
 		}
 	}
 	return defs, nil
+}
+
+// cloneSchema returns an independent copy so a Store never shares mutable
+// schema state with its caller.
+func cloneSchema(src *common.Schema) (*common.Schema, error) {
+	data, err := src.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	clone := common.NewSchema()
+	if err := clone.UnmarshalBinary(data); err != nil {
+		return nil, err
+	}
+	return clone, nil
 }
 
 // livenessValues caches one enum value per entity kind. Indexing is direct and

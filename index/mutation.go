@@ -168,30 +168,107 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 	if len(b.entries)+len(b.changes)+len(b.deletes) == 0 {
 		// An empty batch is a no-op unless it advances the completeness
 		// watermark, which is a supported way to mark a bulk import complete.
+		// It claims completeness through sourceGeneration for every healthy
+		// namespace.
 		if !explicit || sourceGeneration == s.source {
 			return ErrEmptyBatch
 		}
+		if err := s.advanceAllCompleteness(sourceGeneration); err != nil {
+			return err
+		}
 		s.source = sourceGeneration
 		s.gen++
+		s.safeSource.Store(s.recomputeSafe())
 		return s.writeManifest()
 	}
-	if err := s.applyLocked(b.entries, b.changes, b.deletes); err != nil {
+	if err := s.prevalidate(b.entries, b.changes, b.deletes); err != nil {
 		return err
 	}
-	changed := sourceGeneration != s.source
+	if err := s.applyLocked(b.entries, b.changes, b.deletes); err != nil {
+		s.degradeIntended(err)
+		return err
+	}
 	s.source = sourceGeneration
 	s.gen++
-	if explicit && changed {
-		if err := s.writeManifest(); err != nil {
+	if explicit {
+		advanced, err := s.advanceTouchedCompleteness(sourceGeneration)
+		if err != nil {
+			s.degradeIntended(err)
 			return err
+		}
+		if advanced {
+			s.safeSource.Store(s.recomputeSafe())
+			if err := s.writeManifest(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
+// advanceTouchedCompleteness records that every namespace the batch touched is
+// complete through gen, and persists gen into each touched timeidx namespace's
+// own watermark. It returns whether any namespace advanced.
+func (s *Store) advanceTouchedCompleteness(gen uint64) (bool, error) {
+	advanced := false
+	for w, word := range s.pvSet {
+		for bit := 0; bit < 64; bit++ {
+			if word&(1<<uint(bit)) == 0 {
+				continue
+			}
+			ns := common.Namespace(w*64 + bit)
+			if gen > s.nsSource[ns] {
+				s.nsSource[ns] = gen
+				advanced = true
+			}
+			if def, ok := s.schema.Lookup(ns); ok && def.Kind == common.KindTimestamp {
+				if idx, ok := s.reg.timeIndex(ns); ok {
+					if err := applyTimeGeneration(idx, gen); err != nil {
+						return advanced, err
+					}
+				}
+			}
+		}
+	}
+	return advanced, nil
+}
+
+// advanceAllCompleteness records that every healthy namespace is complete
+// through gen. It is used by an empty generation-only batch.
+func (s *Store) advanceAllCompleteness(gen uint64) error {
+	for _, def := range s.defs {
+		if !s.health[def.Namespace].Available || s.isDegraded(def.Namespace) {
+			continue
+		}
+		if gen > s.nsSource[def.Namespace] {
+			s.nsSource[def.Namespace] = gen
+		}
+		if def.Kind == common.KindTimestamp {
+			if idx, ok := s.reg.timeIndex(def.Namespace); ok {
+				if err := applyTimeGeneration(idx, gen); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// applyTimeGeneration persists a completeness watermark into a timeidx
+// namespace through its empty-batch generation path.
+func applyTimeGeneration(idx *timeidx.Index, gen uint64) error {
+	batch := timeidx.NewBatch(0)
+	return idx.ApplyWithGeneration(batch, gen)
+}
+
 // applyOne runs a single staged operation under the caller-held write lock.
 func (s *Store) applyOne(entry Entry, change *Change, del *DeleteOp) error {
-	if err := s.applyLocked(entrySlice(entry), changeSlice(change), deleteSlice(del)); err != nil {
+	entries, changes, deletes := entrySlice(entry), changeSlice(change), deleteSlice(del)
+	if err := s.prevalidate(entries, changes, deletes); err != nil {
+		return err
+	}
+	if err := s.applyLocked(entries, changes, deletes); err != nil {
+		s.degradeIntended(err)
 		return err
 	}
 	s.gen++
@@ -223,28 +300,352 @@ func deleteSlice(d *DeleteOp) []DeleteOp {
 	return []DeleteOp{*d}
 }
 
-// applyLocked applies deletes first (clearing liveness), then partial changes,
-// then additions, so a later addition of the same entity wins.
+// applyLocked stages the whole batch into per-engine groups and then flushes
+// one commit per affected namespace. Liveness is cleared before value changes
+// and set after them, so a later addition of the same entity wins and a partial
+// batch never exposes an incomplete entity as live.
 func (s *Store) applyLocked(entries []Entry, changes []Change, deletes []DeleteOp) error {
 	if len(entries)+len(changes)+len(deletes) == 0 {
 		return ErrEmptyBatch
 	}
+	s.resetStage()
 	for i := range deletes {
-		if err := s.applyDelete(deletes[i]); err != nil {
+		if err := s.stageDelete(deletes[i]); err != nil {
 			return err
 		}
 	}
 	for i := range changes {
-		if err := s.applyChange(changes[i]); err != nil {
+		if err := s.stageChange(changes[i]); err != nil {
 			return err
 		}
 	}
 	for i := range entries {
-		if err := s.applyEntry(entries[i]); err != nil {
+		if err := s.stageEntry(entries[i]); err != nil {
+			return err
+		}
+	}
+	return s.flushStage()
+}
+
+func (s *Store) routeEntity(ns common.Namespace) common.EntityKind {
+	rt, _ := s.reg.lookup(ns)
+	return rt.entity
+}
+
+func (s *Store) stageEntry(e Entry) error {
+	for _, v := range e.Times {
+		s.stageTime(v, e.ValueID, s.routeEntity(v.Namespace))
+	}
+	for _, v := range e.Geos {
+		s.stageGeo(v, e.ValueID, s.routeEntity(v.Namespace))
+	}
+	for _, v := range e.Sims {
+		s.stageSim(v, e.ValueID, s.routeEntity(v.Namespace))
+	}
+	for _, v := range e.Hashes {
+		s.stageHash(v, e.ValueID, s.routeEntity(v.Namespace))
+	}
+	for _, v := range e.Vectors {
+		if err := s.applyVectorValue(v, e.ValueID); err != nil {
+			return err
+		}
+		s.stageLiveAdd(s.routeEntity(v.Namespace), e.ValueID)
+	}
+	for _, v := range e.Bitmaps {
+		s.stageBitmap(v, e.ValueID, s.routeEntity(v.Namespace))
+	}
+	return nil
+}
+
+func (s *Store) stageChange(c Change) error {
+	id, err := changeID(c)
+	if err != nil {
+		return err
+	}
+	for _, v := range c.After.Times {
+		s.stageTime(v, id, s.routeEntity(v.Namespace))
+	}
+	for _, bv := range c.Before.Times {
+		if !hasTimeNS(c.After.Times, bv.Namespace) {
+			s.stageTimeDelete(bv.Namespace, id)
+		}
+	}
+	for _, v := range c.After.Geos {
+		s.stageGeo(v, id, s.routeEntity(v.Namespace))
+	}
+	for _, bv := range c.Before.Geos {
+		if !hasGeoNS(c.After.Geos, bv.Namespace) {
+			s.stageGeoDelete(bv.Namespace, bv.Key, id)
+		}
+	}
+	for _, v := range c.After.Sims {
+		s.stageSim(v, id, s.routeEntity(v.Namespace))
+	}
+	for _, v := range c.After.Hashes {
+		s.stageHash(v, id, s.routeEntity(v.Namespace))
+	}
+	for _, bv := range c.Before.Hashes {
+		if !hasHash(c.After.Hashes, bv) {
+			s.stageHashDelete(bv, id)
+		}
+	}
+	for _, v := range c.After.Vectors {
+		if err := s.applyVectorValue(v, id); err != nil {
+			return err
+		}
+		s.stageLiveAdd(s.routeEntity(v.Namespace), id)
+	}
+	for _, bv := range c.Before.Vectors {
+		if !hasVectorNS(c.After.Vectors, bv.Namespace) {
+			if err := s.deleteVector(bv.Namespace, id); err != nil {
+				return err
+			}
+		}
+	}
+	for _, bv := range c.Before.Bitmaps {
+		if !hasBitmap(c.After.Bitmaps, bv) {
+			s.stageBitmapDelete(bv, id)
+		}
+	}
+	for _, v := range c.After.Bitmaps {
+		s.stageBitmap(v, id, s.routeEntity(v.Namespace))
+	}
+	return nil
+}
+
+func (s *Store) stageDelete(d DeleteOp) error {
+	s.stageLiveRemove(d.Entity, d.ID)
+	for ns, rt := range s.reg.routes {
+		if rt.slot == noSlot || rt.entity != d.Entity {
+			continue
+		}
+		switch familyOf(rt.kind) {
+		case familyTime:
+			s.stageTimeDelete(common.Namespace(ns), d.ID)
+		case familyVector:
+			if err := s.deleteVector(common.Namespace(ns), d.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// prevalidate checks the complete batch before any engine is mutated, and
+// records every namespace the batch intends to modify. It rejects routing,
+// entity, ValueID, vector-dimension and identifier-model errors so a malformed
+// batch cannot partially apply. It has no engine side effects.
+func (s *Store) prevalidate(entries []Entry, changes []Change, deletes []DeleteOp) error {
+	words := (len(s.reg.routes) + 63) / 64
+	if cap(s.pvSet) < words {
+		s.pvSet = make([]uint64, words)
+	}
+	s.pvSet = s.pvSet[:words]
+	clear(s.pvSet)
+	s.pvCursors = s.pvCursors[:0]
+
+	for i := range deletes {
+		d := deletes[i]
+		if !d.Entity.Valid() {
+			return fmt.Errorf("%w: %d", ErrEntityMismatch, d.Entity)
+		}
+		if d.ID == 0 {
+			return fmt.Errorf("%w: entity id 0", ErrEntityMismatch)
+		}
+		if _, _, ok := s.reg.liveness(d.Entity); !ok {
+			return fmt.Errorf("%w: entity %d", ErrNamespaceNotFound, d.Entity)
+		}
+		// A delete also touches the entity's ID-authoritative time and vector
+		// namespaces, so a failed delete degrades them too.
+		for ns, rt := range s.reg.routes {
+			if rt.slot == noSlot || rt.entity != d.Entity {
+				continue
+			}
+			if familyOf(rt.kind) == familyTime || familyOf(rt.kind) == familyVector {
+				s.pvMark(common.Namespace(ns))
+			}
+		}
+	}
+	for i := range entries {
+		if err := s.prevalidateEntry(entries[i]); err != nil {
+			return err
+		}
+	}
+	for i := range changes {
+		if _, err := changeID(changes[i]); err != nil {
+			return err
+		}
+		if err := s.prevalidateEntry(changes[i].Before); err != nil {
+			return err
+		}
+		if err := s.prevalidateEntry(changes[i].After); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Store) prevalidateEntry(e Entry) error {
+	values := len(e.Times) + len(e.Geos) + len(e.Sims) + len(e.Hashes) + len(e.Vectors) + len(e.Bitmaps)
+	if values == 0 {
+		return nil
+	}
+	if e.ValueID == 0 {
+		return fmt.Errorf("%w: entity id 0", ErrEntityMismatch)
+	}
+	for _, v := range e.Times {
+		if err := s.pvKind(v.Namespace, common.KindTimestamp); err != nil {
+			return err
+		}
+	}
+	for _, v := range e.Geos {
+		if err := s.pvKind(v.Namespace, common.KindGeo); err != nil {
+			return err
+		}
+	}
+	for _, v := range e.Sims {
+		if err := s.pvSim(v.Namespace, e.ValueID); err != nil {
+			return err
+		}
+	}
+	for _, v := range e.Hashes {
+		if err := s.pvKind(v.Namespace, common.KindHashExact); err != nil {
+			return err
+		}
+	}
+	for _, v := range e.Vectors {
+		if err := s.pvVector(v, e.ValueID); err != nil {
+			return err
+		}
+	}
+	for _, v := range e.Bitmaps {
+		if err := s.pvBitmap(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) pvKind(ns common.Namespace, want common.NamespaceKind) error {
+	def, ok := s.schema.Lookup(ns)
+	if !ok || def.Kind != want {
+		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, ns)
+	}
+	if s.isDegraded(ns) || int(ns) >= len(s.reg.routes) || !s.reg.routes[ns].available {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, ns)
+	}
+	s.pvMark(ns)
+	return nil
+}
+
+func (s *Store) pvBitmap(v BitmapValue) error {
+	def, ok := s.schema.Lookup(v.Namespace)
+	if !ok || !def.Kind.IsBitmap() || def.Kind != v.Value.Kind {
+		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, v.Namespace)
+	}
+	if s.isDegraded(v.Namespace) || int(v.Namespace) >= len(s.reg.routes) || !s.reg.routes[v.Namespace].available {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, v.Namespace)
+	}
+	s.pvMark(v.Namespace)
+	return nil
+}
+
+func (s *Store) pvSim(ns common.Namespace, id common.ValueID) error {
+	def, ok := s.schema.Lookup(ns)
+	if !ok || def.Kind != common.KindHashPerceptual {
+		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, ns)
+	}
+	if s.isDegraded(ns) {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, ns)
+	}
+	idx, ok := s.reg.simStore(ns)
+	if !ok {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, ns)
+	}
+	s.pvMark(ns)
+	n := idx.Len()
+	for i := range s.pvCursors {
+		if s.pvCursors[i].ns == ns {
+			switch {
+			case id == s.pvCursors[i].next:
+				s.pvCursors[i].next++
+				return nil
+			case id <= n:
+				return nil
+			default:
+				return fmt.Errorf("%w: simhash id %d, next %d", ErrNamespaceIDModel, id, s.pvCursors[i].next)
+			}
+		}
+	}
+	switch {
+	case id <= n:
+		s.pvCursors = append(s.pvCursors, simCursor{ns: ns, next: n + 1})
+		return nil
+	case id == n+1:
+		s.pvCursors = append(s.pvCursors, simCursor{ns: ns, next: n + 2})
+		return nil
+	default:
+		return fmt.Errorf("%w: simhash id %d, next %d", ErrNamespaceIDModel, id, n+1)
+	}
+}
+
+func (s *Store) pvVector(v VectorValue, id common.ValueID) error {
+	def, ok := s.schema.Lookup(v.Namespace)
+	if !ok || def.Kind != common.KindVector {
+		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, v.Namespace)
+	}
+	if s.isDegraded(v.Namespace) {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, v.Namespace)
+	}
+	idx, ok := s.reg.vectorIndex(v.Namespace)
+	if !ok {
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, v.Namespace)
+	}
+	cfg := idx.Config()
+	if v.Element != cfg.ElementType || !vectorLenMatches(v, int(cfg.Dimensions)) {
+		return fmt.Errorf("%w: vector element/dimension", ErrWrongEngine)
+	}
+	if id > math.MaxUint32 {
+		return fmt.Errorf("%w: %d", ErrValueIDTooLarge, id)
+	}
+	s.pvMark(v.Namespace)
+	return nil
+}
+
+func vectorLenMatches(v VectorValue, dims int) bool {
+	switch v.Element {
+	case vectoridx.ElementFloat32:
+		return len(v.Float32) == dims
+	case vectoridx.ElementInt8:
+		return len(v.Int8) == dims
+	case vectoridx.ElementUint8:
+		return len(v.Uint8) == dims
+	case vectoridx.ElementInt16:
+		return len(v.Int16) == dims
+	case vectoridx.ElementUint16:
+		return len(v.Uint16) == dims
+	default:
+		return false
+	}
+}
+
+func (s *Store) pvMark(ns common.Namespace) {
+	w := int(ns) >> 6
+	if w < len(s.pvSet) {
+		s.pvSet[w] |= 1 << (uint(ns) & 63)
+	}
+}
+
+// degradeIntended marks every namespace the failed batch intended to modify as
+// stale, so no later query silently uses a possibly incomplete namespace.
+func (s *Store) degradeIntended(err error) {
+	for w, word := range s.pvSet {
+		for bit := 0; bit < 64; bit++ {
+			if word&(1<<uint(bit)) != 0 {
+				s.markDegraded(common.Namespace(w*64+bit), err)
+			}
+		}
+	}
 }
 
 func changeID(c Change) (common.ValueID, error) {
@@ -337,10 +738,19 @@ func (s *Store) applyChange(c Change) error {
 			}
 		}
 	}
-	// Multi-valued families: diff individual values.
+	// Multi-valued families: diff individual values. Hashes are removed by
+	// (hash, id) through radixhash's targeted deletion so a hash update cannot
+	// leave a stale association behind; this does not rely on liveness.
 	for _, av := range c.After.Hashes {
 		if err := s.addHash(av, id, &touched); err != nil {
 			return err
+		}
+	}
+	for _, bv := range c.Before.Hashes {
+		if !hasHash(c.After.Hashes, bv) {
+			if err := s.removeHash(bv, id, &touched); err != nil {
+				return err
+			}
 		}
 	}
 	for _, bv := range c.Before.Bitmaps {
@@ -485,6 +895,21 @@ func (s *Store) addHash(v HashValue, id common.ValueID, touched *entitySet) erro
 		return err
 	}
 	if err := idx.Apply([]radixhash.Entry{{Hash: v.Hash, ImageID: id}}); err != nil {
+		return err
+	}
+	touched.add(rt.entity)
+	return nil
+}
+
+// removeHash deletes one (hash, id) association. radixhash supports targeted
+// per-association removal, so the old hash stops matching without a rebuild and
+// without relying on entity liveness.
+func (s *Store) removeHash(v HashValue, id common.ValueID, touched *entitySet) error {
+	idx, rt, err := s.radixFor(v.Namespace)
+	if err != nil {
+		return err
+	}
+	if err := idx.Remove([]radixhash.Entry{{Hash: v.Hash, ImageID: id}}); err != nil {
 		return err
 	}
 	touched.add(rt.entity)
@@ -654,6 +1079,9 @@ func (s *Store) timeFor(ns common.Namespace) (*timeidx.Index, route, error) {
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
 	}
+	if s.isDegraded(ns) {
+		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
+	}
 	idx, ok := s.reg.timeIndex(ns)
 	if !ok {
 		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
@@ -665,6 +1093,9 @@ func (s *Store) geoFor(ns common.Namespace) (*geoidx.Index, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
+	}
+	if s.isDegraded(ns) {
+		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
 	}
 	idx, ok := s.reg.geoIndex(ns)
 	if !ok {
@@ -678,6 +1109,9 @@ func (s *Store) simFor(ns common.Namespace) (*simhash.Store, route, error) {
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
 	}
+	if s.isDegraded(ns) {
+		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
+	}
 	st, ok := s.reg.simStore(ns)
 	if !ok {
 		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
@@ -689,6 +1123,9 @@ func (s *Store) radixFor(ns common.Namespace) (*radixhash.Index, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
+	}
+	if s.isDegraded(ns) {
+		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
 	}
 	idx, ok := s.reg.radixIndex(ns)
 	if !ok {
@@ -702,6 +1139,9 @@ func (s *Store) vectorFor(ns common.Namespace) (*vectoridx.VectorIdx, route, err
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
 	}
+	if s.isDegraded(ns) {
+		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
+	}
 	idx, ok := s.reg.vectorIndex(ns)
 	if !ok {
 		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
@@ -713,6 +1153,9 @@ func (s *Store) bitmapFor(ns common.Namespace) (*bitmapidx.Index, route, error) 
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
+	}
+	if s.isDegraded(ns) {
+		return nil, rt, fmt.Errorf("%w: %d", ErrNamespaceUnavailable, ns)
 	}
 	idx, ok := s.reg.bitmapIndex(ns)
 	if !ok {
@@ -744,6 +1187,15 @@ func hasGeoNS(values []GeoValue, ns common.Namespace) bool {
 func hasVectorNS(values []VectorValue, ns common.Namespace) bool {
 	for _, v := range values {
 		if v.Namespace == ns {
+			return true
+		}
+	}
+	return false
+}
+
+func hasHash(values []HashValue, want HashValue) bool {
+	for _, v := range values {
+		if v.Namespace == want.Namespace && v.Hash == want.Hash {
 			return true
 		}
 	}

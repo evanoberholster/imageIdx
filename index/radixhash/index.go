@@ -217,6 +217,178 @@ func (i *Index) Apply(entries []Entry) error {
 	return nil
 }
 
+// Remove atomically deletes the given (hash, ImageID) associations. It follows
+// the same copy-on-write protocol as Apply: only the affected leaves and the
+// interior nodes on their paths are replaced, a leaf that loses its last record
+// is detached, and an interior node with no remaining children is pruned.
+// Removing a pair that is not present publishes no generation, so retries are
+// idempotent. Duplicate hashes stay supported: only the named (hash, ImageID)
+// pair is removed and other ImageIDs for the same hash remain.
+func (i *Index) Remove(entries []Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.closed.Load() {
+		return ErrClosed
+	}
+	for _, entry := range entries {
+		if entry.ImageID == 0 {
+			return ErrInvalidEntry
+		}
+	}
+
+	var counts [radixFanout]int
+	records := i.groupByRoot(entries, &counts)
+	var starts [radixFanout]int
+	sum := 0
+	for key := 0; key < radixFanout; key++ {
+		starts[key] = sum
+		sum += counts[key]
+	}
+
+	current := i.view.Load()
+	oldRoot := current.root
+	batch := &txn{index: i, arena: current.arena}
+	nextRoot := *oldRoot
+	scratch := &i.partition
+	changed := false
+	for key := 0; key < radixFanout; key++ {
+		if counts[key] == 0 {
+			continue
+		}
+		updated, err := batch.removeChild(oldRoot[key], 1, records[starts[key]:starts[key]+counts[key]], scratch)
+		if err != nil {
+			batch.rollback()
+			return err
+		}
+		if updated != oldRoot[key] {
+			nextRoot[key] = updated
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	i.view.Store(&indexView{
+		generation:  current.generation + 1,
+		root:        &nextRoot,
+		arena:       current.arena,
+		entries:     uint64(int64(current.entries) + batch.delta.Load()),
+		rootBuckets: countRootBuckets(&nextRoot),
+		depth:       maxUint8(current.depth, uint8(batch.maxDepth.Load())),
+	})
+	for _, replaced := range batch.retirements {
+		_ = i.alloc.Retire(replaced.ref, replaced.bytes)
+	}
+	if i.config.AutoReclaimBytes > 0 && i.alloc.RetiredBytes() >= i.config.AutoReclaimBytes {
+		i.tracker.WaitForPriorReaders()
+		_ = i.alloc.Reclaim()
+	}
+	return nil
+}
+
+// removeChild returns the replacement child reference after deleting every
+// removal whose tail starts at level. It returns oldChild unchanged when
+// nothing matched and 0 when the subtree becomes empty.
+func (t *txn) removeChild(oldChild uint32, level int, removals []slot, scratch *partitionScratch) (uint32, error) {
+	if oldChild == 0 {
+		return 0, nil
+	}
+	tailLen := tailLenFor(level)
+	ref, isNode := decodeChild(oldChild)
+	if isNode {
+		if !validExtent(t.arena, ref, radixNodeBytes) {
+			return 0, fmt.Errorf("%w: node extent outside arena", ErrCorrupt)
+		}
+		var old [radixFanout]uint32
+		readNode(t.arena, ref, &old)
+		var counts [radixFanout]uint32
+		var offsets [radixFanout + 1]uint32
+		out := scratch.buffer(level, len(removals))
+		partitionSlots(out, removals, tailLen, &counts, &offsets)
+
+		var next [radixFanout]uint32
+		changed := false
+		nonEmpty := false
+		for key := 0; key < radixFanout; key++ {
+			child := old[key]
+			if counts[key] != 0 {
+				updated, err := t.removeChild(child, level+1, out[offsets[key]:offsets[key+1]], scratch)
+				if err != nil {
+					return 0, err
+				}
+				if updated != child {
+					if !changed {
+						next = old
+						changed = true
+					}
+					next[key] = updated
+					child = updated
+				}
+			}
+			if child != 0 {
+				nonEmpty = true
+			}
+		}
+		if !changed {
+			return oldChild, nil
+		}
+		if !nonEmpty {
+			t.retire(ref, radixNodeBytes)
+			return 0, nil
+		}
+		newRef, _, err := t.alloc(radixNodeBytes)
+		if err != nil {
+			return 0, err
+		}
+		if err := writeNode(t.arena, newRef, &next); err != nil {
+			return 0, err
+		}
+		t.retire(ref, radixNodeBytes)
+		return encodeChild(newRef, true), nil
+	}
+
+	header, err := readLeafHeader(t.arena, ref)
+	if err != nil {
+		return 0, err
+	}
+	if header.depth != level {
+		return 0, fmt.Errorf("%w: leaf depth %d reached at level %d", ErrCorrupt, header.depth, level)
+	}
+	existing, _, err := readLeafSlotsInto(scratch.existing[:0], t.arena, ref)
+	if err != nil {
+		return 0, err
+	}
+	scratch.existing = existing
+	removals = dedupeSlots(removals, tailLen)
+
+	keep := existing[:0]
+	ri := 0
+	removed := 0
+	for n := range existing {
+		s := &existing[n]
+		for ri < len(removals) && compareSlot(&removals[ri], s, tailLen) < 0 {
+			ri++
+		}
+		if ri < len(removals) && sameSlot(&removals[ri], s, tailLen) {
+			removed++
+			continue
+		}
+		keep = append(keep, *s)
+	}
+	if removed == 0 {
+		return oldChild, nil
+	}
+	if len(keep) == 0 {
+		t.retire(ref, header.extentBytes)
+		t.addDelta(-int64(header.count))
+		return 0, nil
+	}
+	return t.writeLeaf(level, keep, ref, header.extentBytes, header.count)
+}
+
 // groupByRoot copies entries into the reusable writer scratch ordered by
 // Hash[0] and fills counts with the per-bucket record count. Each root bucket
 // is then one contiguous run, so the caller never builds a map and never grows

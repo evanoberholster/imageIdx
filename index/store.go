@@ -21,7 +21,7 @@ import (
 
 const (
 	storeMagic    uint32 = 0x58444955 // UIDX
-	storeVersion  uint16 = 1
+	storeVersion  uint16 = 2          // v2: per-namespace completeness generations
 	storeBinName         = "store.bin"
 	schemaBinName        = "schema.bin"
 	storeLockName        = "store.lock"
@@ -47,14 +47,44 @@ type Store struct {
 
 	mu     sync.Mutex // serializes Apply/lifecycle
 	closed atomic.Bool
-	source uint64 // guarded by mu
+	source uint64 // last requested watermark; guarded by mu
 	gen    uint64 // guarded by mu
+
+	// nsSource holds the confirmed completeness generation per namespace
+	// (dense, indexed by namespace number) and safeSource is the store-wide
+	// watermark: the minimum across every declared namespace. Readers consult
+	// safeSource lock-free; both are guarded by mu on the writer side.
+	nsSource   []uint64
+	safeSource atomic.Uint64
+
+	// degraded is an immutable bitset of namespaces known to be potentially
+	// incomplete after a partially failed batch. Readers consult it lock-free;
+	// the writer republishes a copy (a rare failure path) while holding mu.
+	degraded atomic.Pointer[[]uint64]
+
+	// Writer-owned scratch for batch prevalidation and staged, grouped
+	// application. All are only touched under mu and reused across batches.
+	pvSet     []uint64
+	pvCursors []simCursor
+	stage     stageState
+}
+
+// simCursor tracks the next dense simhash ValueID expected for one namespace
+// during prevalidation, so a batch of appends is validated without mutating an
+// engine.
+type simCursor struct {
+	ns   common.Namespace
+	next uint64
 }
 
 // Create builds a new unified Store at dir, creating every configured
 // namespace. It fails if a unified store already exists there.
 func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 	defs, err := validateSchema(spec.Schema)
+	if err != nil {
+		return nil, err
+	}
+	storedSchema, err := cloneSchema(spec.Schema)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +95,7 @@ func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 	if _, err := os.Stat(filepath.Join(dir, storeBinName)); err == nil {
 		return nil, fmt.Errorf("%w: %s already exists", ErrInvalidSchema, storeBinName)
 	}
-	s := &Store{dir: dir, opts: options, schema: spec.Schema, defs: defs}
+	s := &Store{dir: dir, opts: options, schema: storedSchema, defs: defs}
 	// bitmapidx.NewStore requires an empty directory (its exclusive lock checks
 	// for foreign files), so every engine is created before the unified
 	// manifest and lock exist.
@@ -96,7 +126,7 @@ func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 // from opening; a query that needs an unavailable namespace fails explicitly.
 func Open(dir string, opts ...Option) (*Store, error) {
 	options := applyOptions(opts)
-	schema, source, err := readSchema(dir)
+	schema, safe, gens, err := readSchema(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -108,12 +138,78 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock, source: source}
+	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock}
 	if err := s.openEngines(false); err != nil {
 		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
+	s.reconcileGenerations(gens, safe)
 	return s, nil
+}
+
+// reconcileGenerations restores per-namespace completeness and validates it
+// against each engine's own recoverable state. A namespace whose engine
+// recovered an older watermark than the manifest recorded is stale, not
+// corrupt: it is marked unavailable so a query cannot silently use it. The
+// store-wide safe watermark is the minimum across declared namespaces.
+func (s *Store) reconcileGenerations(gens []uint64, safe uint64) {
+	for _, def := range s.defs {
+		var recorded uint64
+		if int(def.Namespace) < len(gens) {
+			recorded = gens[def.Namespace]
+		}
+		if !s.health[def.Namespace].Available || s.isDegraded(def.Namespace) {
+			s.nsSource[def.Namespace] = 0
+			continue
+		}
+		if def.Kind == common.KindTimestamp {
+			idx, ok := s.reg.timeIndex(def.Namespace)
+			if !ok {
+				s.nsSource[def.Namespace] = 0
+				continue
+			}
+			engineGen := idx.SourceGeneration()
+			if engineGen < recorded {
+				s.markUnavailable(def, fmt.Errorf("%w: namespace %d engine=%d recorded=%d", ErrIndexStale, def.Namespace, engineGen, recorded))
+				s.nsSource[def.Namespace] = 0
+				continue
+			}
+			s.nsSource[def.Namespace] = engineGen
+			continue
+		}
+		s.nsSource[def.Namespace] = recorded
+	}
+	computed := s.recomputeSafe()
+	if computed > safe {
+		computed = safe
+	}
+	s.safeSource.Store(computed)
+	// s.source tracks the highest generation any namespace has recorded, so
+	// monotonicity survives reopen even when the store-wide safe watermark is
+	// lower because some namespaces advanced independently.
+	var maxGen uint64
+	for _, def := range s.defs {
+		if s.nsSource[def.Namespace] > maxGen {
+			maxGen = s.nsSource[def.Namespace]
+		}
+	}
+	s.source = maxGen
+}
+
+// recomputeSafe returns the minimum confirmed generation across declared
+// namespaces. An unavailable namespace contributes zero, so the store-wide
+// watermark never overstates completeness.
+func (s *Store) recomputeSafe() uint64 {
+	var safe uint64
+	first := true
+	for _, def := range s.defs {
+		g := s.nsSource[def.Namespace]
+		if first || g < safe {
+			safe = g
+			first = false
+		}
+	}
+	return safe
 }
 
 func applyOptions(opts []Option) Options {
@@ -137,45 +233,76 @@ func (s *Store) writeSchema() error {
 	return s.writeManifest()
 }
 
-// writeManifest persists the unified manifest, including the tracked canonical
-// database watermark. It is called on Create and whenever the watermark
-// advances.
+// writeManifest persists the unified manifest: magic, version, namespace
+// count, the store-wide safe watermark, one (namespace, generation) record per
+// declared namespace, and a trailing CRC32C. It is called on Create and
+// whenever a confirmed watermark advances.
 func (s *Store) writeManifest() error {
-	var manifest [20]byte
-	binary.LittleEndian.PutUint32(manifest[0:4], storeMagic)
-	binary.LittleEndian.PutUint16(manifest[4:6], storeVersion)
-	binary.LittleEndian.PutUint64(manifest[8:16], s.source)
-	binary.LittleEndian.PutUint32(manifest[16:20], storage.Checksum(manifest[:16]))
-	return writeFileAtomic(s.dir, storeBinName, manifest[:])
+	count := len(s.defs)
+	buf := make([]byte, 0, 4+2+2+8+count*10+4)
+	buf = binary.LittleEndian.AppendUint32(buf, storeMagic)
+	buf = binary.LittleEndian.AppendUint16(buf, storeVersion)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(count))
+	buf = binary.LittleEndian.AppendUint64(buf, s.safeSource.Load())
+	for _, def := range s.defs {
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(def.Namespace))
+		buf = binary.LittleEndian.AppendUint64(buf, s.nsSource[def.Namespace])
+	}
+	return writeFileAtomic(s.dir, storeBinName, binary.LittleEndian.AppendUint32(buf, storage.Checksum(buf)))
 }
 
-func readSchema(dir string) (*common.Schema, uint64, error) {
-	manifest, err := os.ReadFile(filepath.Join(dir, storeBinName))
+// readSchema loads and validates the unified manifest and schema. It returns
+// the schema, the recorded safe watermark, and a dense per-namespace
+// generation slice indexed by namespace number.
+func readSchema(dir string) (*common.Schema, uint64, []uint64, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, storeBinName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, fmt.Errorf("%w: %s missing", ErrInvalidSchema, storeBinName)
+			return nil, 0, nil, fmt.Errorf("%w: %s missing", ErrInvalidSchema, storeBinName)
 		}
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
-	if len(manifest) < 20 || binary.LittleEndian.Uint32(manifest[0:4]) != storeMagic {
-		return nil, 0, ErrCorrupt
+	if len(raw) < 16+4 || binary.LittleEndian.Uint32(raw[0:4]) != storeMagic {
+		return nil, 0, nil, ErrCorrupt
 	}
-	if v := binary.LittleEndian.Uint16(manifest[4:6]); v != storeVersion {
-		return nil, 0, fmt.Errorf("%w: version %d", ErrUnsupportedVersion, v)
+	if v := binary.LittleEndian.Uint16(raw[4:6]); v != storeVersion {
+		return nil, 0, nil, fmt.Errorf("%w: version %d", ErrUnsupportedVersion, v)
 	}
-	if storage.Checksum(manifest[:16]) != binary.LittleEndian.Uint32(manifest[16:20]) {
-		return nil, 0, ErrCorrupt
+	if storage.Checksum(raw[:len(raw)-4]) != binary.LittleEndian.Uint32(raw[len(raw)-4:]) {
+		return nil, 0, nil, ErrCorrupt
 	}
-	source := binary.LittleEndian.Uint64(manifest[8:16])
+	count := int(binary.LittleEndian.Uint16(raw[6:8]))
+	safe := binary.LittleEndian.Uint64(raw[8:16])
+	body := raw[16 : len(raw)-4]
+	if len(body) != count*10 {
+		return nil, 0, nil, ErrCorrupt
+	}
 	schemaBytes, err := os.ReadFile(filepath.Join(dir, schemaBinName))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	schema := common.NewSchema()
 	if err := schema.UnmarshalBinary(schemaBytes); err != nil {
-		return nil, 0, errors.Join(ErrCorrupt, err)
+		return nil, 0, nil, errors.Join(ErrCorrupt, err)
 	}
-	return schema, source, nil
+	var maxNS common.Namespace
+	for _, def := range schema.Defs() {
+		if def.Namespace > maxNS {
+			maxNS = def.Namespace
+		}
+	}
+	gens := make([]uint64, int(maxNS)+1)
+	seen := make([]bool, int(maxNS)+1)
+	for i := 0; i < count; i++ {
+		ns := common.Namespace(binary.LittleEndian.Uint16(body[i*10:]))
+		gen := binary.LittleEndian.Uint64(body[i*10+2:])
+		if _, ok := schema.Lookup(ns); !ok || int(ns) >= len(gens) || seen[ns] {
+			return nil, 0, nil, ErrCorrupt
+		}
+		seen[ns] = true
+		gens[ns] = gen
+	}
+	return schema, safe, gens, nil
 }
 
 func writeFileAtomic(dir, name string, data []byte) error {
@@ -205,6 +332,7 @@ func (s *Store) openEngines(create bool) error {
 	for i := range s.reg.routes {
 		s.reg.routes[i].slot = noSlot
 	}
+	s.nsSource = make([]uint64, int(maxNS)+1)
 	s.health = make([]NamespaceHealth, int(maxNS)+1)
 	for i := range s.health {
 		s.health[i].Namespace = common.Namespace(i)
@@ -452,6 +580,9 @@ func (s *Store) markUnavailable(def common.NamespaceDef, err error) {
 	h.Err = err
 	h.NeedsRebuild = needsRebuild(err)
 	h.Corrupt = isCorrupt(err)
+	if int(def.Namespace) < len(s.reg.routes) {
+		s.reg.routes[def.Namespace].available = false
+	}
 }
 
 func needsRebuild(err error) bool {
@@ -472,12 +603,25 @@ func isCorrupt(err error) bool {
 // Dir returns the root directory.
 func (s *Store) Dir() string { return s.dir }
 
-// Schema returns the persisted schema (read-only).
-func (s *Store) Schema() *common.Schema { return s.schema }
+// Schema returns a defensive copy of the persisted schema. Mutating the result
+// (including any NamespaceDef.Config bytes) cannot affect the Store.
+func (s *Store) Schema() *common.Schema {
+	clone := common.NewSchema()
+	if data, err := s.schema.MarshalBinary(); err == nil {
+		_ = clone.UnmarshalBinary(data)
+	}
+	return clone
+}
 
-// NamespaceDef returns the persisted definition for a namespace.
+// NamespaceDef returns a copy of the persisted definition for a namespace. The
+// Config bytes are deep-copied so callers cannot mutate stored configuration.
 func (s *Store) NamespaceDef(ns common.Namespace) (common.NamespaceDef, bool) {
-	return s.schema.Lookup(ns)
+	def, ok := s.schema.Lookup(ns)
+	if !ok {
+		return common.NamespaceDef{}, false
+	}
+	def.Config = append([]byte(nil), def.Config...)
+	return def, true
 }
 
 // Health returns per-namespace open state for every declared namespace.
@@ -500,12 +644,78 @@ func (s *Store) HealthOf(ns common.Namespace) (NamespaceHealth, bool) {
 	return s.health[ns], true
 }
 
-// SourceGeneration returns the tracked canonical-database completeness
-// watermark. Zero means unrecorded.
-func (s *Store) SourceGeneration() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.source
+// isDegraded reports whether a namespace is known to be potentially incomplete
+// after a partially failed batch. It is lock-free.
+func (s *Store) isDegraded(ns common.Namespace) bool {
+	d := s.degraded.Load()
+	if d == nil {
+		return false
+	}
+	w := int(ns) >> 6
+	if w >= len(*d) {
+		return false
+	}
+	return (*d)[w]&(1<<(uint(ns)&63)) != 0
+}
+
+// markDegraded records that a namespace may be incomplete. The caller holds mu.
+// It must not be called for a namespace that is already unavailable for another
+// reason (health is left as-is in that case).
+func (s *Store) markDegraded(ns common.Namespace, err error) {
+	words := (len(s.reg.routes) + 63) / 64
+	cur := s.degraded.Load()
+	var next []uint64
+	if cur != nil {
+		next = append([]uint64(nil), (*cur)...)
+	}
+	if len(next) < words {
+		next = append(next, make([]uint64, words-len(next))...)
+	}
+	next[ns>>6] |= 1 << (uint(ns) & 63)
+	s.degraded.Store(&next)
+	if int(ns) < len(s.health) {
+		h := &s.health[ns]
+		h.Available = false
+		h.Stale = true
+		if err != nil && h.Err == nil {
+			h.Err = err
+		}
+	}
+}
+
+// DegradedNamespaces returns the namespaces currently considered stale after a
+// partially failed batch. They are unavailable until reopen or rebuild.
+func (s *Store) DegradedNamespaces() []common.Namespace {
+	d := s.degraded.Load()
+	if d == nil {
+		return nil
+	}
+	var out []common.Namespace
+	for w, word := range *d {
+		for bit := 0; bit < 64; bit++ {
+			if word&(1<<uint(bit)) != 0 {
+				out = append(out, common.Namespace(w*64+bit))
+			}
+		}
+	}
+	return out
+}
+
+// SourceGeneration returns the confirmed store-wide canonical-database
+// completeness watermark: the minimum confirmed generation across every
+// declared namespace. Zero means unrecorded. It is read lock-free.
+func (s *Store) SourceGeneration() uint64 { return s.safeSource.Load() }
+
+// CheckSourceGeneration returns ErrIndexStale when the confirmed watermark is
+// behind required, and ErrClosed after shutdown. Staleness is never corruption.
+func (s *Store) CheckSourceGeneration(required uint64) error {
+	if s.closed.Load() {
+		return ErrClosed
+	}
+	if have := s.safeSource.Load(); have < required {
+		return fmt.Errorf("%w: have %d, want %d", ErrIndexStale, have, required)
+	}
+	return nil
 }
 
 // Generation returns the Store's own monotonic batch generation.
@@ -544,8 +754,11 @@ func (s *Store) Close() error {
 	return errors.Join(err, storage.ReleaseLock(s.lock))
 }
 
-// Sync flushes every engine that exposes a synchronization barrier.
+// Sync flushes every engine that exposes a synchronization barrier. It
+// serializes with mutations and other lifecycle operations on the writer mutex.
 func (s *Store) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed.Load() {
 		return ErrClosed
 	}
@@ -569,8 +782,11 @@ func (s *Store) Sync() error {
 	return err
 }
 
-// Checkpoint flushes every engine's durable checkpoint.
+// Checkpoint flushes every engine's durable checkpoint. It serializes with
+// mutations on the writer mutex.
 func (s *Store) Checkpoint() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed.Load() {
 		return ErrClosed
 	}
@@ -594,8 +810,11 @@ func (s *Store) Checkpoint() error {
 	return err
 }
 
-// Compact compacts every engine that supports it.
+// Compact compacts every engine that supports it. It serializes with mutations
+// on the writer mutex.
 func (s *Store) Compact() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed.Load() {
 		return ErrClosed
 	}
@@ -621,6 +840,11 @@ func (s *Store) Compact() error {
 // each engine exposes; engines without a standalone verifier rely on their Open
 // validation.
 func (s *Store) Verify() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return ErrClosed
+	}
 	var err error
 	for _, def := range s.defs {
 		switch familyOf(def.Kind) {
@@ -655,24 +879,50 @@ func (s *Store) eachTime(fn func(*timeidx.Index) error) error {
 // ---- typed accessors for the search planner ----
 
 // Time returns a timestamp namespace index if it is available.
-func (s *Store) Time(ns common.Namespace) (*timeidx.Index, bool) { return s.reg.timeIndex(ns) }
+func (s *Store) Time(ns common.Namespace) (*timeidx.Index, bool) {
+	if s.isDegraded(ns) {
+		return nil, false
+	}
+	return s.reg.timeIndex(ns)
+}
 
 // Geo returns a geographic namespace index if it is available.
-func (s *Store) Geo(ns common.Namespace) (*geoidx.Index, bool) { return s.reg.geoIndex(ns) }
+func (s *Store) Geo(ns common.Namespace) (*geoidx.Index, bool) {
+	if s.isDegraded(ns) {
+		return nil, false
+	}
+	return s.reg.geoIndex(ns)
+}
 
 // Sim returns a perceptual-similarity namespace store if it is available.
-func (s *Store) Sim(ns common.Namespace) (*simhash.Store, bool) { return s.reg.simStore(ns) }
+func (s *Store) Sim(ns common.Namespace) (*simhash.Store, bool) {
+	if s.isDegraded(ns) {
+		return nil, false
+	}
+	return s.reg.simStore(ns)
+}
 
 // Hash returns an exact-hash namespace index if it is available.
-func (s *Store) Hash(ns common.Namespace) (*radixhash.Index, bool) { return s.reg.radixIndex(ns) }
+func (s *Store) Hash(ns common.Namespace) (*radixhash.Index, bool) {
+	if s.isDegraded(ns) {
+		return nil, false
+	}
+	return s.reg.radixIndex(ns)
+}
 
 // Vector returns a vector namespace index if it is available.
 func (s *Store) Vector(ns common.Namespace) (*vectoridx.VectorIdx, bool) {
+	if s.isDegraded(ns) {
+		return nil, false
+	}
 	return s.reg.vectorIndex(ns)
 }
 
 // Bitmap returns a bitmap namespace index if it is available.
 func (s *Store) Bitmap(ns common.Namespace) (*bitmapidx.Index, bool) {
+	if s.isDegraded(ns) {
+		return nil, false
+	}
 	return s.reg.bitmapIndex(ns)
 }
 
@@ -680,6 +930,10 @@ func (s *Store) Bitmap(ns common.Namespace) (*bitmapidx.Index, bool) {
 func (s *Store) Liveness(entity common.EntityKind) (*bitmapidx.Index, bitmapidx.Value, bool) {
 	return s.reg.liveness(entity)
 }
+
+// BitmapStore returns the bitmap store owning every bitmap namespace, including
+// the reserved liveness namespace. It backs ACL clause compilation.
+func (s *Store) BitmapStore() *bitmapidx.Store { return s.bitmapStore }
 
 // EntityOf returns the entity kind of a namespace.
 func (s *Store) EntityOf(ns common.Namespace) (common.EntityKind, bool) {

@@ -87,16 +87,28 @@ Single operations and batches share the same internal pipeline.
 ## Consistency contract
 
 A `Store` is **not** an atomic multi-engine transaction. A batch is applied
-engine by engine under the store write mutex. Value mutations publish first;
-for additions liveness is set last and for deletions liveness is cleared first,
-so a partially failed batch never makes an incomplete entity searchable. A
-failure returns the underlying engine error; previously committed engine changes
-are not rolled back. Every engine remains individually crash-safe and
-rebuildable from the canonical application database.
+engine by engine under the store write mutex. The complete batch is
+prevalidated (routing, family, entity, ValueID, vector dimensions, simhash id
+model) before any engine is mutated, so a malformed batch cannot partially
+apply.
 
-`ApplyWithGeneration` records a canonical-database completeness watermark; the
-value is persisted in `store.bin` on change. See the timeidx source-watermark
-documentation for the staleness model.
+If an engine fails during application, every namespace the batch intended to
+modify is marked **stale** (`NamespaceHealth.Stale`); those namespaces are
+returned as unavailable by their accessors and rejected by search compilation
+until the process is reopened (each engine is individually consistent after
+reopen) or the namespace is rebuilt. Unrelated namespaces are untouched. Value
+mutations publish before liveness on additions and after liveness on deletions,
+so an incomplete entity is never searchable.
+
+`ApplyWithGeneration` records a per-namespace completeness generation with
+checksummed versioned persistence in `store.bin`. The store-wide
+`SourceGeneration()` is the **minimum** across declared namespaces, so a partial
+namespace change cannot overstate completeness. For timeidx namespaces the
+generation is also persisted into the engine's own watermark and validated
+against it on reopen; a timeidx engine that recovered an older watermark than
+the manifest recorded marks that namespace stale (`ErrIndexStale`), never
+corrupt. Empty generation-only batches claim completeness for every healthy
+namespace.
 
 ## Search integration
 
@@ -122,21 +134,31 @@ reflection, no string lookups (a routing lookup is 0 B/op and sub-nanosecond).
 
 ## Known limitations
 
-- **Cross-engine atomicity.** There is no multi-engine snapshot or transaction;
-  see the consistency contract above.
+- **Cross-engine atomicity.** There is no multi-engine snapshot or transaction.
+  A mid-batch failure degrades every namespace the batch intended (see the
+  consistency contract); there is no rollback of already-committed engines.
+- **Hash updates need `Before`.** Invalidation of a stale `(hash, id)` uses the
+  previous hash supplied in `Change.Before`; if the caller omits it, the stale
+  association cannot be targeted and remains (liveness filtering is not used for
+  an entity that stays live).
 - **simhash IDs are dense.** simhash assigns 1-based record IDs, so a simhash
   value must use the next dense `ValueID`; other IDs return
-  `ErrNamespaceIDModel` rather than being remapped.
-- **Search clauses.** The `search` package currently compiles bitmap, timestamp,
-  and geographic clauses. Exact-hash, perceptual-hash, and vector results are
+  `ErrNamespaceIDModel`. Prevalidation enforces this for a whole batch before
+  any engine is mutated.
+- **Search clauses.** The `search` package compiles bitmap, timestamp, and
+  geographic clauses. Exact-hash, perceptual-hash, and vector results are
   available through the typed accessors (`Engine.Hash`/`Sim`/`Vector`) and must
   be filtered by liveness by the caller until dedicated clauses are added.
+  `Engine.Compile` rejects clause/entity mismatches and clauses bound to another
+  Store.
 - **Unified-layer allocations.** Operation staging allocates one engine batch
   per affected namespace; batch scratch reuse is not yet complete, so
   zero-allocation single mutations are not guaranteed.
 - **geoidx legacy detection.** When a geoidx data file is missing, geoidx
   reports `ErrLegacyFormat` if the directory contains any file named `manifest`
   (for example the bitmapidx manifest). The namespace is unavailable either way.
+- **Degradation lifetime.** A stale (degraded) namespace clears only on reopen;
+  there is no in-process repair path.
 
 ## Validation
 
