@@ -151,23 +151,30 @@ type Match struct {
 // peers follow in ascending peer order. The caller owns dst; with sufficient
 // capacity and a bounded live set only the live bitmap is allocated.
 func (m *Matcher) Match(dst []Match, items []MatchItem, params MatchParams) ([]Match, error) {
-	live, err := m.liveBitmap()
-	if err != nil {
-		return dst, err
+	// Until this process has committed a liveness removal, every engine record
+	// is live and the filter is an identity, so skip it entirely.
+	var cursor *roar.Cursor
+	if m.store.liveRemovals.Load() {
+		live, err := m.liveBitmap()
+		if err != nil {
+			return dst, err
+		}
+		c := live.NewCursor()
+		cursor = &c
 	}
 	for i := range items {
 		it := &items[i]
 		if it.SHA256 != nil && m.sha256 != nil {
-			dst = m.exactInto(dst, i, MatchSHA256, m.sha256, *it.SHA256, live)
+			dst = m.exactInto(dst, i, MatchSHA256, m.sha256, *it.SHA256, cursor)
 		}
 		if it.BLAKE3 != nil && m.blake3 != nil {
-			dst = m.exactInto(dst, i, MatchBLAKE3, m.blake3, *it.BLAKE3, live)
+			dst = m.exactInto(dst, i, MatchBLAKE3, m.blake3, *it.BLAKE3, cursor)
 		}
 		if it.PHash != nil && m.perceptual != nil {
-			dst = m.pHashInto(dst, i, *it.PHash, params.PHashDistance, live)
+			dst = m.pHashInto(dst, i, *it.PHash, params.PHashDistance, cursor)
 		}
 		if it.PDQ != nil && m.perceptual != nil {
-			dst = m.pdqInto(dst, i, it.PDQ, params.PDQDistance, live)
+			dst = m.pdqInto(dst, i, it.PDQ, params.PDQDistance, cursor)
 		}
 	}
 	if params.DetectIntraBatch {
@@ -199,11 +206,11 @@ func (m *Matcher) liveBitmap() (roar.Bitmap, error) {
 // exactInto appends the live index IDs whose exact hash equals h. Exact hashes
 // usually have few duplicates, so a small stack buffer avoids per-call
 // allocation; a duplicate-heavy hash grows it as needed.
-func (m *Matcher) exactInto(dst []Match, item int, kind MatchKind, idx *radixhash.Index, h radixhash.Hash, live roar.Bitmap) []Match {
+func (m *Matcher) exactInto(dst []Match, item int, kind MatchKind, idx *radixhash.Index, h radixhash.Hash, cursor *roar.Cursor) []Match {
 	var stack [16]radixhash.ImageID
 	ids := idx.Lookup(stack[:0], h)
 	for _, id := range ids {
-		if live.Contains(uint64(id)) {
+		if cursor == nil || cursor.Contains(uint64(id)) {
 			dst = append(dst, Match{Item: item, Kind: kind, ImageID: id})
 		}
 	}
@@ -211,11 +218,11 @@ func (m *Matcher) exactInto(dst []Match, item int, kind MatchKind, idx *radixhas
 }
 
 // pHashInto appends live matches within maxDistance of query.
-func (m *Matcher) pHashInto(dst []Match, item int, query uint64, maxDistance uint8, live roar.Bitmap) []Match {
+func (m *Matcher) pHashInto(dst []Match, item int, query uint64, maxDistance uint8, cursor *roar.Cursor) []Match {
 	scratch := m.getResults()
 	results := m.perceptual.SearchPHash(scratch, query, maxDistance)
 	for _, r := range results {
-		if live.Contains(uint64(r.ImageID)) {
+		if cursor == nil || cursor.Contains(uint64(r.ImageID)) {
 			dst = append(dst, Match{Item: item, Kind: MatchPHash, ImageID: r.ImageID, Distance: uint16(r.Distance)})
 		}
 	}
@@ -224,14 +231,14 @@ func (m *Matcher) pHashInto(dst []Match, item int, query uint64, maxDistance uin
 }
 
 // pdqInto appends live matches within maxDistance of query.
-func (m *Matcher) pdqInto(dst []Match, item int, query *simhash.PDQHash, maxDistance uint8, live roar.Bitmap) []Match {
+func (m *Matcher) pdqInto(dst []Match, item int, query *simhash.PDQHash, maxDistance uint8, cursor *roar.Cursor) []Match {
 	if maxDistance > simhash.MaxPDQSearchDistance {
 		maxDistance = simhash.MaxPDQSearchDistance
 	}
 	scratch := m.getResults()
 	results := m.perceptual.SearchPDQ(scratch, query, maxDistance)
 	for _, r := range results {
-		if live.Contains(uint64(r.ImageID)) {
+		if cursor == nil || cursor.Contains(uint64(r.ImageID)) {
 			dst = append(dst, Match{Item: item, Kind: MatchPDQ, ImageID: r.ImageID, Distance: uint16(r.Distance)})
 		}
 	}

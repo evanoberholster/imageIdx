@@ -150,7 +150,9 @@ hits, err := m.Match(dst, items, index.MatchParams{PHashDistance: 4, PDQDistance
   associations are already removed by `Update`, so neither can be returned.
 - `MatchItem` carries optional SHA256/BLAKE3/pHash/PDQ inputs; per-call liveness
   is cached by version, so steady-state exact matching is allocation-free and
-  perceptual matching is at parity with the underlying engines.
+  perceptual matching is at parity with the underlying engines. Until this
+  process commits a liveness removal the filter is skipped entirely (every
+  engine record is live); a reopened store filters conservatively.
 - Results are deterministic: index hits in ascending ID order, then intra-batch
   peers in ascending item order. `DetectIntraBatch` reports duplicates among the
   incoming items (`Match.Intra` with `Match.Peer`).

@@ -206,6 +206,51 @@ func TestMatcherValidatesEntityAndKind(t *testing.T) {
 	}
 }
 
+// TestMatcherDeletedExcludedAfterReopen verifies the conservative reopen path:
+// a store reopened after a delete still filters liveness.
+func TestMatcherDeletedExcludedAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{7}
+	if err := db.Add(index.Entry{ValueID: 100, Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Add(index.Entry{ValueID: 200, Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(common.EntityImage, 100); err != nil {
+		t.Fatal(err)
+	}
+	// radixhash/simhash Close does not checkpoint; Checkpoint makes the
+	// committed generation durable for reopen.
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m, err := reopened.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{200}) {
+		t.Fatalf("reopened matches = %v, want [200]", ids)
+	}
+}
+
 func TestMatcherBatchOf64(t *testing.T) {
 	db, m := newMatcher(t)
 	items := make([]index.MatchItem, 64)

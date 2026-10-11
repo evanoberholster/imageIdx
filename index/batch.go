@@ -374,7 +374,11 @@ func (s *Store) flushLiveness(add bool) error {
 	}
 	// Publish a new liveness version once the change is visible, so a matcher
 	// that starts after this batch returns rebuilds its cached live bitmap.
+	// A committed removal also disables the matcher's no-removal fast path.
 	s.liveVersion.Add(1)
+	if !add {
+		s.liveRemovals.Store(true)
+	}
 	return nil
 }
 

@@ -62,6 +62,11 @@ type Store struct {
 	// stale state after a delete.
 	liveVersion atomic.Uint64
 
+	// liveRemovals records whether any liveness removal has ever been committed.
+	// Until one has, every engine record is live and the import matcher can skip
+	// the liveness filter entirely. It is persisted in the manifest.
+	liveRemovals atomic.Bool
+
 	// degraded is an immutable bitset of namespaces known to be potentially
 	// incomplete after a partially failed batch. Readers consult it lock-free;
 	// the writer republishes a copy (a rare failure path) while holding mu.
@@ -144,6 +149,9 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock}
+	// A reopened store may already contain deletes from a prior process; be
+	// conservative and filter until this process proves no removals.
+	s.liveRemovals.Store(true)
 	if err := s.openEngines(false); err != nil {
 		_ = storage.ReleaseLock(lock)
 		return nil, err
