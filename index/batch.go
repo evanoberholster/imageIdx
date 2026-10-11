@@ -47,6 +47,13 @@ type stagedBitmap struct {
 	delete bool
 }
 
+type stagedVector struct {
+	ns     common.Namespace
+	id     common.ValueID
+	value  VectorValue
+	delete bool
+}
+
 type stagedLive struct {
 	add   bool
 	entry bitmapidx.Entry
@@ -58,6 +65,7 @@ type stageState struct {
 	sim    []stagedSim
 	hash   []stagedHash
 	bitmap []stagedBitmap
+	vector []stagedVector
 	live   []stagedLive
 }
 
@@ -67,6 +75,7 @@ func (s *Store) resetStage() {
 	s.stage.sim = s.stage.sim[:0]
 	s.stage.hash = s.stage.hash[:0]
 	s.stage.bitmap = s.stage.bitmap[:0]
+	s.stage.vector = s.stage.vector[:0]
 	s.stage.live = s.stage.live[:0]
 }
 
@@ -113,6 +122,15 @@ func (s *Store) stageBitmapDelete(v BitmapValue, id common.ValueID) {
 	s.stage.bitmap = append(s.stage.bitmap, stagedBitmap{ns: v.Namespace, entry: bitmapidx.Entry{ImageID: id, Value: v.Value}, delete: true})
 }
 
+func (s *Store) stageVector(v VectorValue, id common.ValueID, entity common.EntityKind) {
+	s.stage.vector = append(s.stage.vector, stagedVector{ns: v.Namespace, id: id, value: v})
+	s.stageLiveAdd(entity, id)
+}
+
+func (s *Store) stageVectorDelete(ns common.Namespace, id common.ValueID) {
+	s.stage.vector = append(s.stage.vector, stagedVector{ns: ns, id: id, delete: true})
+}
+
 func (s *Store) stageLiveAdd(entity common.EntityKind, id common.ValueID) {
 	if id == 0 {
 		return
@@ -127,6 +145,15 @@ func (s *Store) stageLiveRemove(entity common.EntityKind, id common.ValueID) {
 // ---- flush (one engine commit per affected namespace) ----
 
 func (s *Store) flushStage() error {
+	// Write-ahead the liveness-removal flag before the first removal commits, so
+	// a crash can never leave a durable removal with the flag unset. If the
+	// manifest write fails, abort before mutating any engine.
+	if !s.liveRemovals.Load() && s.stageHasLivenessRemoval() {
+		s.liveRemovals.Store(true)
+		if err := s.writeManifest(); err != nil {
+			return err
+		}
+	}
 	// Deletions clear liveness before any value change; additions set it last.
 	if err := s.flushLiveness(false); err != nil {
 		return err
@@ -146,7 +173,19 @@ func (s *Store) flushStage() error {
 	if err := s.flushBitmap(); err != nil {
 		return err
 	}
+	if err := s.flushVector(); err != nil {
+		return err
+	}
 	return s.flushLiveness(true)
+}
+
+func (s *Store) stageHasLivenessRemoval() bool {
+	for i := range s.stage.live {
+		if !s.stage.live[i].add {
+			return true
+		}
+	}
+	return false
 }
 
 func sortStageByNS[T any](ops []T, ns func(T) common.Namespace) {
@@ -154,6 +193,14 @@ func sortStageByNS[T any](ops []T, ns func(T) common.Namespace) {
 }
 
 func (s *Store) flushTime() error {
+	if len(s.stage.time) == 0 {
+		return nil
+	}
+	if s.flush.timeBatch == nil || s.flush.timeCap < len(s.stage.time) {
+		s.flush.timeBatch = timeidx.NewBatch(len(s.stage.time))
+		s.flush.timeCap = len(s.stage.time)
+	}
+	batch := s.flush.timeBatch
 	sortStageByNS(s.stage.time, func(o stagedTime) common.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.time); {
 		j := i
@@ -164,7 +211,7 @@ func (s *Store) flushTime() error {
 		if err != nil {
 			return err
 		}
-		batch := timeidx.NewBatch(j - i)
+		batch.Reset()
 		for k := i; k < j; k++ {
 			if !batch.Append(s.stage.time[k].m) {
 				return timeidx.ErrBatchTooLarge
@@ -189,7 +236,8 @@ func (s *Store) flushGeo() error {
 		if err != nil {
 			return err
 		}
-		var inserts, deletes []geoidx.Entry
+		inserts := s.flush.geoIns[:0]
+		deletes := s.flush.geoDel[:0]
 		for k := i; k < j; k++ {
 			if s.stage.geo[k].delete {
 				deletes = append(deletes, s.stage.geo[k].entry)
@@ -197,6 +245,7 @@ func (s *Store) flushGeo() error {
 				inserts = append(inserts, s.stage.geo[k].entry)
 			}
 		}
+		s.flush.geoIns, s.flush.geoDel = inserts, deletes
 		if len(inserts) != 0 || len(deletes) != 0 {
 			if err := idx.Apply(inserts, deletes); err != nil {
 				return err
@@ -242,8 +291,8 @@ func (s *Store) flushSimNamespace(ops []stagedSim) error {
 		}
 		unique = append(unique, op)
 	}
-	var appends []simhash.Record
-	var updates []simhash.Update
+	appends := s.flush.simApp[:0]
+	updates := s.flush.simUpd[:0]
 	expected := n + 1
 	for _, op := range unique {
 		switch {
@@ -256,6 +305,7 @@ func (s *Store) flushSimNamespace(ops []stagedSim) error {
 			return ErrNamespaceIDModel
 		}
 	}
+	s.flush.simApp, s.flush.simUpd = appends, updates
 	if len(appends) != 0 {
 		if _, err := idx.AppendBatch(appends); err != nil {
 			return err
@@ -280,7 +330,8 @@ func (s *Store) flushHash() error {
 		if err != nil {
 			return err
 		}
-		var adds, dels []radixhash.Entry
+		adds := s.flush.hashAdd[:0]
+		dels := s.flush.hashDel[:0]
 		for k := i; k < j; k++ {
 			if s.stage.hash[k].delete {
 				dels = append(dels, s.stage.hash[k].entry)
@@ -288,6 +339,7 @@ func (s *Store) flushHash() error {
 				adds = append(adds, s.stage.hash[k].entry)
 			}
 		}
+		s.flush.hashAdd, s.flush.hashDel = adds, dels
 		if len(dels) != 0 {
 			if err := idx.Remove(dels); err != nil {
 				return err
@@ -382,15 +434,36 @@ func (s *Store) flushLiveness(add bool) error {
 	return nil
 }
 
-// vector staging applies immediately because vectoridx has no batch insertion
-// API beyond one typed vector at a time.
-func (s *Store) applyVectorValue(v VectorValue, id common.ValueID) error {
-	idx, _, err := s.vectorFor(v.Namespace)
-	if err != nil {
-		return err
+// flushVector executes staged vector operations. vectoridx has no value-batch
+// API, so operations are applied one typed vector at a time, in staged order,
+// grouped by namespace. Staging itself never touches the engine.
+func (s *Store) flushVector() error {
+	sortStageByNS(s.stage.vector, func(o stagedVector) common.Namespace { return o.ns })
+	for i := 0; i < len(s.stage.vector); {
+		j := i
+		for j < len(s.stage.vector) && s.stage.vector[j].ns == s.stage.vector[i].ns {
+			j++
+		}
+		idx, _, err := s.vectorFor(s.stage.vector[i].ns)
+		if err != nil {
+			return err
+		}
+		for k := i; k < j; k++ {
+			op := &s.stage.vector[k]
+			if op.delete {
+				if err := deleteVectorIndex(idx, op.id); err != nil {
+					return err
+				}
+				continue
+			}
+			if op.id > math.MaxUint32 {
+				return ErrValueIDTooLarge
+			}
+			if err := addVector(idx, vectoridx.NodeID(op.id), op.value); err != nil {
+				return err
+			}
+		}
+		i = j
 	}
-	if id > math.MaxUint32 {
-		return ErrValueIDTooLarge
-	}
-	return addVector(idx, vectoridx.NodeID(id), v)
+	return nil
 }

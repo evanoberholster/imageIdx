@@ -2,6 +2,7 @@ package index
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -52,6 +53,12 @@ type Matcher struct {
 	live       *bitmapidx.Index
 	liveVal    bitmapidx.Value
 
+	// Bound namespace numbers, checked lock-free for degradation before each
+	// match so a namespace broken after construction is never silently used.
+	sha256NS     common.Namespace
+	blake3NS     common.Namespace
+	perceptualNS common.Namespace
+
 	// resPool reuses perceptual-result buffers across queries; safe for
 	// concurrent readers. Exact lookups use a small stack buffer instead.
 	resPool sync.Pool // []simhash.Result
@@ -88,6 +95,9 @@ func (s *Store) Matcher(spec MatcherSpec) (*Matcher, error) {
 		return idx, nil
 	}
 	var err error
+	m.sha256NS = spec.SHA256
+	m.blake3NS = spec.BLAKE3
+	m.perceptualNS = spec.Perceptual
 	if m.sha256, err = exact(spec.SHA256); err != nil {
 		return nil, err
 	}
@@ -151,8 +161,6 @@ type Match struct {
 // peers follow in ascending peer order. The caller owns dst; with sufficient
 // capacity and a bounded live set only the live bitmap is allocated.
 func (m *Matcher) Match(dst []Match, items []MatchItem, params MatchParams) ([]Match, error) {
-	// Until this process has committed a liveness removal, every engine record
-	// is live and the filter is an identity, so skip it entirely.
 	var cursor *roar.Cursor
 	if m.store.liveRemovals.Load() {
 		live, err := m.liveBitmap()
@@ -162,18 +170,46 @@ func (m *Matcher) Match(dst []Match, items []MatchItem, params MatchParams) ([]M
 		c := live.NewCursor()
 		cursor = &c
 	}
+	// Degradation is checked lazily per required family so a single-family call
+	// pays one lock-free check and unrelated healthy families keep working.
+	var shaChecked, blakeChecked, perChecked bool
+	var shaDeg, blakeDeg, perDeg bool
 	for i := range items {
 		it := &items[i]
 		if it.SHA256 != nil && m.sha256 != nil {
+			if !shaChecked {
+				shaChecked, shaDeg = true, m.store.isDegraded(m.sha256NS)
+			}
+			if shaDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.sha256NS)
+			}
 			dst = m.exactInto(dst, i, MatchSHA256, m.sha256, *it.SHA256, cursor)
 		}
 		if it.BLAKE3 != nil && m.blake3 != nil {
+			if !blakeChecked {
+				blakeChecked, blakeDeg = true, m.store.isDegraded(m.blake3NS)
+			}
+			if blakeDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.blake3NS)
+			}
 			dst = m.exactInto(dst, i, MatchBLAKE3, m.blake3, *it.BLAKE3, cursor)
 		}
 		if it.PHash != nil && m.perceptual != nil {
+			if !perChecked {
+				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
+			}
+			if perDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
+			}
 			dst = m.pHashInto(dst, i, *it.PHash, params.PHashDistance, cursor)
 		}
 		if it.PDQ != nil && m.perceptual != nil {
+			if !perChecked {
+				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
+			}
+			if perDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
+			}
 			dst = m.pdqInto(dst, i, it.PDQ, params.PDQDistance, cursor)
 		}
 	}
@@ -190,17 +226,138 @@ func (m *Matcher) MatchOne(dst []Match, item MatchItem, params MatchParams) ([]M
 	return m.Match(dst, items[:], params)
 }
 
+// MatchWorkspace is caller-owned scratch for MatchWithWorkspace. Reusing it
+// across calls makes duplicate-heavy exact matching and perceptual matching
+// allocation-free once the buffers have grown to the needed size.
+type MatchWorkspace struct {
+	Exact   []radixhash.ImageID
+	Similar []simhash.Result
+}
+
+// MatchWithWorkspace is Match using caller-owned scratch instead of stack/
+// pool buffers. It removes the per-call allocations that Match incurs when an
+// exact hash has many duplicates or a perceptual query returns many matches.
+func (m *Matcher) MatchWithWorkspace(dst []Match, ws *MatchWorkspace, items []MatchItem, params MatchParams) ([]Match, error) {
+	if ws == nil {
+		return m.Match(dst, items, params)
+	}
+	var cursor *roar.Cursor
+	if m.store.liveRemovals.Load() {
+		live, err := m.liveBitmap()
+		if err != nil {
+			return dst, err
+		}
+		c := live.NewCursor()
+		cursor = &c
+	}
+	var shaChecked, blakeChecked, perChecked bool
+	var shaDeg, blakeDeg, perDeg bool
+	for i := range items {
+		it := &items[i]
+		if it.SHA256 != nil && m.sha256 != nil {
+			if !shaChecked {
+				shaChecked, shaDeg = true, m.store.isDegraded(m.sha256NS)
+			}
+			if shaDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.sha256NS)
+			}
+			dst = m.exactIntoScratch(dst, i, MatchSHA256, m.sha256, *it.SHA256, cursor, &ws.Exact)
+		}
+		if it.BLAKE3 != nil && m.blake3 != nil {
+			if !blakeChecked {
+				blakeChecked, blakeDeg = true, m.store.isDegraded(m.blake3NS)
+			}
+			if blakeDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.blake3NS)
+			}
+			dst = m.exactIntoScratch(dst, i, MatchBLAKE3, m.blake3, *it.BLAKE3, cursor, &ws.Exact)
+		}
+		if it.PHash != nil && m.perceptual != nil {
+			if !perChecked {
+				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
+			}
+			if perDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
+			}
+			dst = m.pHashIntoScratch(dst, i, *it.PHash, params.PHashDistance, cursor, &ws.Similar)
+		}
+		if it.PDQ != nil && m.perceptual != nil {
+			if !perChecked {
+				perChecked, perDeg = true, m.store.isDegraded(m.perceptualNS)
+			}
+			if perDeg {
+				return dst, fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, m.perceptualNS)
+			}
+			dst = m.pdqIntoScratch(dst, i, it.PDQ, params.PDQDistance, cursor, &ws.Similar)
+		}
+	}
+	if params.DetectIntraBatch {
+		dst = m.intraBatch(dst, items, params)
+	}
+	return dst, nil
+}
+
+func (m *Matcher) exactIntoScratch(dst []Match, item int, kind MatchKind, idx *radixhash.Index, h radixhash.Hash, cursor *roar.Cursor, scratch *[]radixhash.ImageID) []Match {
+	ids := idx.Lookup((*scratch)[:0], h)
+	*scratch = ids
+	for _, id := range ids {
+		if cursor == nil || cursor.Contains(uint64(id)) {
+			dst = append(dst, Match{Item: item, Kind: kind, ImageID: id})
+		}
+	}
+	return dst
+}
+
+func (m *Matcher) pHashIntoScratch(dst []Match, item int, query uint64, maxDistance uint8, cursor *roar.Cursor, scratch *[]simhash.Result) []Match {
+	results := m.perceptual.SearchPHash((*scratch)[:0], query, maxDistance)
+	*scratch = results[:0]
+	for _, r := range results {
+		if cursor == nil || cursor.Contains(uint64(r.ImageID)) {
+			dst = append(dst, Match{Item: item, Kind: MatchPHash, ImageID: r.ImageID, Distance: uint16(r.Distance)})
+		}
+	}
+	return dst
+}
+
+func (m *Matcher) pdqIntoScratch(dst []Match, item int, query *simhash.PDQHash, maxDistance uint8, cursor *roar.Cursor, scratch *[]simhash.Result) []Match {
+	if maxDistance > simhash.MaxPDQSearchDistance {
+		maxDistance = simhash.MaxPDQSearchDistance
+	}
+	results := m.perceptual.SearchPDQ((*scratch)[:0], query, maxDistance)
+	*scratch = results[:0]
+	for _, r := range results {
+		if cursor == nil || cursor.Contains(uint64(r.ImageID)) {
+			dst = append(dst, Match{Item: item, Kind: MatchPDQ, ImageID: r.ImageID, Distance: uint16(r.Distance)})
+		}
+	}
+	return dst
+}
+
+// liveBitmap returns the live-entity bitmap for a consistent liveness version.
+//
+// The protocol is: read the version, build the bitmap, then re-read the version
+// and publish only if it is unchanged. Any liveness publication happens-before
+// its version increment (flushLiveness commits, then liveVersion.Add), so a
+// snapshot whose version did not change during construction is exactly the
+// state of that version; a concurrent change forces a retry rather than a
+// mismatched cache entry. The returned bitmap stays valid because it is an
+// immutable snapshot.
 func (m *Matcher) liveBitmap() (roar.Bitmap, error) {
-	version := m.store.liveVersion.Load()
-	if c := m.liveCache.Load(); c != nil && c.version == version {
-		return c.bm, nil
+	for {
+		version := m.store.liveVersion.Load()
+		if c := m.liveCache.Load(); c != nil && c.version == version {
+			return c.bm, nil
+		}
+		bm, err := m.live.MatchValues(m.liveVal)
+		if err != nil {
+			return roar.Bitmap{}, err
+		}
+		if m.store.liveVersion.Load() != version {
+			continue // a liveness change raced construction; do not publish
+		}
+		m.liveCache.Store(&liveCache{version: version, bm: bm})
+		return bm, nil
 	}
-	bm, err := m.live.MatchValues(m.liveVal)
-	if err != nil {
-		return roar.Bitmap{}, err
-	}
-	m.liveCache.Store(&liveCache{version: version, bm: bm})
-	return bm, nil
 }
 
 // exactInto appends the live index IDs whose exact hash equals h. Exact hashes

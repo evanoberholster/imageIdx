@@ -390,6 +390,71 @@ func BenchmarkMatcherMixedBatch64(b *testing.B) {
 	_ = dst
 }
 
+// BenchmarkMatcherDuplicateHeavyWorkspace64 is the duplicate-heavy case with
+// caller-owned workspace scratch.
+func BenchmarkMatcherDuplicateHeavyWorkspace64(b *testing.B) {
+	db, err := index.Create(b.TempDir(), index.Spec{Schema: matchSchema(b)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+	shared := radixhash.Hash{0x55}
+	batch := db.NewBatch(64)
+	for i := 0; i < 64; i++ {
+		if err := batch.Add(index.Entry{ValueID: common.ValueID(i + 1), Hashes: []index.HashValue{{Namespace: 4, Hash: shared}}}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Apply(batch); err != nil {
+		b.Fatal(err)
+	}
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		b.Fatal(err)
+	}
+	items := make([]index.MatchItem, 64)
+	for i := range items {
+		items[i] = index.MatchItem{SHA256: &shared}
+	}
+	dst := make([]index.Match, 0, 4096)
+	ws := &index.MatchWorkspace{Exact: make([]radixhash.ImageID, 0, 64)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		dst, err = m.MatchWithWorkspace(dst[:0], ws, items, index.MatchParams{})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = dst
+}
+
+// BenchmarkMatcherMixedWorkspace64 is the mixed batch with workspace scratch.
+func BenchmarkMatcherMixedWorkspace64(b *testing.B) {
+	mb := newMatcherBench(b, matcherBenchN)
+	items := make([]index.MatchItem, 64)
+	for i := range items {
+		s := mb.sha[i]
+		bl := mb.blake[i]
+		ph := mb.phash[i]
+		pd := mb.pdq[i]
+		items[i] = index.MatchItem{SHA256: &s, BLAKE3: &bl, PHash: &ph, PDQ: &pd}
+	}
+	dst := make([]index.Match, 0, 128)
+	ws := &index.MatchWorkspace{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		dst, err = mb.m.MatchWithWorkspace(dst[:0], ws, items, index.MatchParams{PHashDistance: 1, PDQDistance: 8})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = dst
+}
+
 // BenchmarkMatcherDuplicateHeavyBatch64 matches 64 incoming images that all
 // share one SHA-256 hash already associated with 64 stored images.
 func BenchmarkMatcherDuplicateHeavyBatch64(b *testing.B) {

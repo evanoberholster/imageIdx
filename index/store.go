@@ -77,6 +77,20 @@ type Store struct {
 	pvSet     []uint64
 	pvCursors []simCursor
 	stage     stageState
+	flush     flushScratch
+}
+
+// flushScratch holds reusable per-engine buffers for staged flushing. It is
+// writer-owned (no mutex) because writes are serialized.
+type flushScratch struct {
+	timeBatch *timeidx.Batch
+	timeCap   int
+	geoIns    []geoidx.Entry
+	geoDel    []geoidx.Entry
+	simApp    []simhash.Record
+	simUpd    []simhash.Update
+	hashAdd   []radixhash.Entry
+	hashDel   []radixhash.Entry
 }
 
 // simCursor tracks the next dense simhash ValueID expected for one namespace
@@ -136,7 +150,7 @@ func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 // from opening; a query that needs an unavailable namespace fails explicitly.
 func Open(dir string, opts ...Option) (*Store, error) {
 	options := applyOptions(opts)
-	schema, safe, gens, err := readSchema(dir)
+	schema, safe, flags, gens, err := readSchema(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -149,9 +163,9 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock}
-	// A reopened store may already contain deletes from a prior process; be
-	// conservative and filter until this process proves no removals.
-	s.liveRemovals.Store(true)
+	// The flag is written before the first removal commits, so its absence
+	// proves no removal was ever durable and the fast path is safe.
+	s.liveRemovals.Store(flags&1 != 0)
 	if err := s.openEngines(false); err != nil {
 		_ = storage.ReleaseLock(lock)
 		return nil, err
@@ -252,10 +266,18 @@ func (s *Store) writeSchema() error {
 // whenever a confirmed watermark advances.
 func (s *Store) writeManifest() error {
 	count := len(s.defs)
-	buf := make([]byte, 0, 4+2+2+8+count*10+4)
+	buf := make([]byte, 0, 4+2+2+2+8+count*10+4)
 	buf = binary.LittleEndian.AppendUint32(buf, storeMagic)
 	buf = binary.LittleEndian.AppendUint16(buf, storeVersion)
 	buf = binary.LittleEndian.AppendUint16(buf, uint16(count))
+	// flags bit 0: at least one liveness removal has been durably recorded.
+	// It is written before the first removal commits, so its absence proves no
+	// removal ever survived and the matcher's no-removal fast path is safe.
+	var flags uint16
+	if s.liveRemovals.Load() {
+		flags = 1
+	}
+	buf = binary.LittleEndian.AppendUint16(buf, flags)
 	buf = binary.LittleEndian.AppendUint64(buf, s.safeSource.Load())
 	for _, def := range s.defs {
 		buf = binary.LittleEndian.AppendUint16(buf, uint16(def.Namespace))
@@ -265,38 +287,39 @@ func (s *Store) writeManifest() error {
 }
 
 // readSchema loads and validates the unified manifest and schema. It returns
-// the schema, the recorded safe watermark, and a dense per-namespace
-// generation slice indexed by namespace number.
-func readSchema(dir string) (*common.Schema, uint64, []uint64, error) {
+// the schema, the recorded safe watermark, the header flags, and a dense
+// per-namespace generation slice indexed by namespace number.
+func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, storeBinName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, nil, fmt.Errorf("%w: %s missing", ErrInvalidSchema, storeBinName)
+			return nil, 0, 0, nil, fmt.Errorf("%w: %s missing", ErrInvalidSchema, storeBinName)
 		}
-		return nil, 0, nil, err
+		return nil, 0, 0, nil, err
 	}
-	if len(raw) < 16+4 || binary.LittleEndian.Uint32(raw[0:4]) != storeMagic {
-		return nil, 0, nil, ErrCorrupt
+	if len(raw) < 18+4 || binary.LittleEndian.Uint32(raw[0:4]) != storeMagic {
+		return nil, 0, 0, nil, ErrCorrupt
 	}
 	if v := binary.LittleEndian.Uint16(raw[4:6]); v != storeVersion {
-		return nil, 0, nil, fmt.Errorf("%w: version %d", ErrUnsupportedVersion, v)
+		return nil, 0, 0, nil, fmt.Errorf("%w: version %d", ErrUnsupportedVersion, v)
 	}
 	if storage.Checksum(raw[:len(raw)-4]) != binary.LittleEndian.Uint32(raw[len(raw)-4:]) {
-		return nil, 0, nil, ErrCorrupt
+		return nil, 0, 0, nil, ErrCorrupt
 	}
 	count := int(binary.LittleEndian.Uint16(raw[6:8]))
-	safe := binary.LittleEndian.Uint64(raw[8:16])
-	body := raw[16 : len(raw)-4]
+	flags := binary.LittleEndian.Uint16(raw[8:10])
+	safe := binary.LittleEndian.Uint64(raw[10:18])
+	body := raw[18 : len(raw)-4]
 	if len(body) != count*10 {
-		return nil, 0, nil, ErrCorrupt
+		return nil, 0, 0, nil, ErrCorrupt
 	}
 	schemaBytes, err := os.ReadFile(filepath.Join(dir, schemaBinName))
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, 0, nil, err
 	}
 	schema := common.NewSchema()
 	if err := schema.UnmarshalBinary(schemaBytes); err != nil {
-		return nil, 0, nil, errors.Join(ErrCorrupt, err)
+		return nil, 0, 0, nil, errors.Join(ErrCorrupt, err)
 	}
 	var maxNS common.Namespace
 	for _, def := range schema.Defs() {
@@ -310,12 +333,12 @@ func readSchema(dir string) (*common.Schema, uint64, []uint64, error) {
 		ns := common.Namespace(binary.LittleEndian.Uint16(body[i*10:]))
 		gen := binary.LittleEndian.Uint64(body[i*10+2:])
 		if _, ok := schema.Lookup(ns); !ok || int(ns) >= len(gens) || seen[ns] {
-			return nil, 0, nil, ErrCorrupt
+			return nil, 0, 0, nil, ErrCorrupt
 		}
 		seen[ns] = true
 		gens[ns] = gen
 	}
-	return schema, safe, gens, nil
+	return schema, safe, flags, gens, nil
 }
 
 func writeFileAtomic(dir, name string, data []byte) error {

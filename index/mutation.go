@@ -206,10 +206,14 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 	return nil
 }
 
-// advanceTouchedCompleteness records that every namespace the batch touched is
-// complete through gen, and persists gen into each touched timeidx namespace's
-// own watermark. It returns whether any namespace advanced.
+// advanceTouchedCompleteness establishes a durability barrier for every
+// touched namespace, then records that they are complete through gen. The
+// engine sync happens before the unified manifest records gen, so a manifest
+// claim of completeness can never outrun durable engine data.
 func (s *Store) advanceTouchedCompleteness(gen uint64) (bool, error) {
+	if err := s.syncTouchedForCompleteness(); err != nil {
+		return false, err
+	}
 	advanced := false
 	for w, word := range s.pvSet {
 		for bit := 0; bit < 64; bit++ {
@@ -233,9 +237,13 @@ func (s *Store) advanceTouchedCompleteness(gen uint64) (bool, error) {
 	return advanced, nil
 }
 
-// advanceAllCompleteness records that every healthy namespace is complete
-// through gen. It is used by an empty generation-only batch.
+// advanceAllCompleteness establishes a durability barrier for every healthy
+// namespace, then records that all are complete through gen. It is used by an
+// empty generation-only batch.
 func (s *Store) advanceAllCompleteness(gen uint64) error {
+	if err := s.syncAllForCompleteness(); err != nil {
+		return err
+	}
 	for _, def := range s.defs {
 		if !s.health[def.Namespace].Available || s.isDegraded(def.Namespace) {
 			continue
@@ -250,6 +258,75 @@ func (s *Store) advanceAllCompleteness(gen uint64) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// syncNamespace durably persists one healthy namespace. It reports whether the
+// namespace lives in the shared bitmap store, which is checkpointed once.
+func (s *Store) syncNamespace(ns common.Namespace) (bitmapTouched bool, err error) {
+	def, ok := s.schema.Lookup(ns)
+	if !ok || !s.health[ns].Available || s.isDegraded(ns) {
+		return false, nil
+	}
+	switch familyOf(def.Kind) {
+	case familyGeo:
+		if idx, ok := s.reg.geoIndex(ns); ok {
+			err = idx.Checkpoint()
+		}
+	case familySim:
+		if st, ok := s.reg.simStore(ns); ok {
+			err = st.Checkpoint()
+		}
+	case familyRadix:
+		if idx, ok := s.reg.radixIndex(ns); ok {
+			err = idx.Checkpoint()
+		}
+	case familyVector:
+		if v, ok := s.reg.vectorIndex(ns); ok {
+			err = v.Checkpoint()
+		}
+	case familyBitmap:
+		return true, nil
+	case familyTime:
+		// timeidx ApplyWithGeneration is synchronous.
+	}
+	return false, err
+}
+
+func (s *Store) syncTouchedForCompleteness() error {
+	// Any staged liveness change lives in the shared bitmap store; checkpoint it
+	// once alongside the routed namespaces.
+	bitmap := len(s.stage.live) > 0
+	for w, word := range s.pvSet {
+		for bit := 0; bit < 64; bit++ {
+			if word&(1<<uint(bit)) == 0 {
+				continue
+			}
+			b, err := s.syncNamespace(common.Namespace(w*64 + bit))
+			if err != nil {
+				return err
+			}
+			bitmap = bitmap || b
+		}
+	}
+	if bitmap && s.bitmapStore != nil {
+		return s.bitmapStore.Checkpoint()
+	}
+	return nil
+}
+
+func (s *Store) syncAllForCompleteness() error {
+	bitmap := len(s.stage.live) > 0
+	for _, def := range s.defs {
+		b, err := s.syncNamespace(def.Namespace)
+		if err != nil {
+			return err
+		}
+		bitmap = bitmap || b
+	}
+	if bitmap && s.bitmapStore != nil {
+		return s.bitmapStore.Checkpoint()
 	}
 	return nil
 }
@@ -346,10 +423,11 @@ func (s *Store) stageEntry(e Entry) error {
 		s.stageHash(v, e.ValueID, s.routeEntity(v.Namespace))
 	}
 	for _, v := range e.Vectors {
-		if err := s.applyVectorValue(v, e.ValueID); err != nil {
-			return err
-		}
-		s.stageLiveAdd(s.routeEntity(v.Namespace), e.ValueID)
+		// vectoridx Add rejects a live duplicate node id, so an upsert deletes
+		// the existing node before re-adding it. Deleting an absent node is a
+		// no-op.
+		s.stageVectorDelete(v.Namespace, e.ValueID)
+		s.stageVector(v, e.ValueID, s.routeEntity(v.Namespace))
 	}
 	for _, v := range e.Bitmaps {
 		s.stageBitmap(v, e.ValueID, s.routeEntity(v.Namespace))
@@ -389,18 +467,13 @@ func (s *Store) stageChange(c Change) error {
 			s.stageHashDelete(bv, id)
 		}
 	}
-	for _, v := range c.After.Vectors {
-		if err := s.applyVectorValue(v, id); err != nil {
-			return err
-		}
-		s.stageLiveAdd(s.routeEntity(v.Namespace), id)
-	}
+	// Vector replacement is delete-then-add: always stage the old node's
+	// deletion first (a no-op if absent), then any new node.
 	for _, bv := range c.Before.Vectors {
-		if !hasVectorNS(c.After.Vectors, bv.Namespace) {
-			if err := s.deleteVector(bv.Namespace, id); err != nil {
-				return err
-			}
-		}
+		s.stageVectorDelete(bv.Namespace, id)
+	}
+	for _, v := range c.After.Vectors {
+		s.stageVector(v, id, s.routeEntity(v.Namespace))
 	}
 	for _, bv := range c.Before.Bitmaps {
 		if !hasBitmap(c.After.Bitmaps, bv) {
@@ -423,9 +496,7 @@ func (s *Store) stageDelete(d DeleteOp) error {
 		case familyTime:
 			s.stageTimeDelete(common.Namespace(ns), d.ID)
 		case familyVector:
-			if err := s.deleteVector(common.Namespace(ns), d.ID); err != nil {
-				return err
-			}
+			s.stageVectorDelete(common.Namespace(ns), d.ID)
 		}
 	}
 	return nil
@@ -1021,6 +1092,10 @@ func (s *Store) deleteVector(ns common.Namespace, id common.ValueID) error {
 	if err != nil {
 		return err
 	}
+	return deleteVectorIndex(idx, id)
+}
+
+func deleteVectorIndex(idx *vectoridx.VectorIdx, id common.ValueID) error {
 	if id > math.MaxUint32 {
 		return fmt.Errorf("%w: %d", ErrValueIDTooLarge, id)
 	}

@@ -101,14 +101,17 @@ mutations publish before liveness on additions and after liveness on deletions,
 so an incomplete entity is never searchable.
 
 `ApplyWithGeneration` records a per-namespace completeness generation with
-checksummed versioned persistence in `store.bin`. The store-wide
+checksummed versioned persistence in `store.bin`. Before the manifest records a
+generation, every touched namespace is **checkpointed** (a verified durability
+barrier): the engine data is made durable first, so a manifest claim of
+completeness can never outrun recoverable engine data. The store-wide
 `SourceGeneration()` is the **minimum** across declared namespaces, so a partial
 namespace change cannot overstate completeness. For timeidx namespaces the
 generation is also persisted into the engine's own watermark and validated
-against it on reopen; a timeidx engine that recovered an older watermark than
-the manifest recorded marks that namespace stale (`ErrIndexStale`), never
-corrupt. Empty generation-only batches claim completeness for every healthy
-namespace.
+against it on reopen; an engine that recovered an older watermark than the
+manifest recorded marks that namespace stale (`ErrIndexStale`), never corrupt.
+Empty generation-only batches checkpoint every healthy namespace and claim
+completeness for all of them.
 
 ## Search integration
 
@@ -148,11 +151,20 @@ hits, err := m.Match(dst, items, index.MatchParams{PHashDistance: 4, PDQDistance
   ranking fusion.
 - Deleted images are filtered by the entity-liveness bitmap, and stale hash
   associations are already removed by `Update`, so neither can be returned.
-- `MatchItem` carries optional SHA256/BLAKE3/pHash/PDQ inputs; per-call liveness
-  is cached by version, so steady-state exact matching is allocation-free and
-  perceptual matching is at parity with the underlying engines. Until this
-  process commits a liveness removal the filter is skipped entirely (every
-  engine record is live); a reopened store filters conservatively.
+- `MatchItem` carries optional SHA256/BLAKE3/pHash/PDQ inputs; the live-entity
+  bitmap is cached with a version-consistent protocol (build, then re-check the
+  version; retry on a race), so a stale snapshot is never published as a newer
+  generation. Until a liveness removal is durably recorded the filter is
+  skipped entirely; the flag is written to the manifest before the first
+  removal commits, so reopening a store with no deletes keeps the fast path
+  while a store with deletes filters conservatively.
+- `MatchWithWorkspace` accepts caller-owned `MatchWorkspace{Exact, Similar}`
+  scratch; with adequate capacity, duplicate-heavy exact and perceptual
+  matching allocate nothing (versus a stack/`sync.Pool` fallback in `Match`).
+- A namespace degraded after the matcher is built is rejected with
+  `ErrNamespaceUnavailable` for the operations that need it (checked lazily, so
+  a single-family call pays one lock-free check); unrelated healthy families
+  keep working.
 - Results are deterministic: index hits in ascending ID order, then intra-batch
   peers in ascending item order. `DetectIntraBatch` reports duplicates among the
   incoming items (`Match.Intra` with `Match.Peer`).
@@ -186,6 +198,12 @@ hits, err := m.Match(dst, items, index.MatchParams{PHashDistance: 4, PDQDistance
   `Engine.Hash`/`Engine.Sim`/`Engine.Vector` accessors remain for compatibility.
 - **Matcher atomicity.** Import matching does not commit; it only reports live
   matches. There is no match-and-commit transaction.
+- **Matcher degradation check cost.** Each required family pays one lock-free
+  degradation check per call (~2 ns for a single exact lookup), preserving the
+  zero-allocation path; the direct engine path is unchanged.
+- **First-delete manifest write.** The first liveness removal in a store writes
+  the manifest (write-ahead flag) once, adding one directory sync to that
+  delete; subsequent deletes and steady-state matching are unaffected.
 - **Unified-layer allocations.** Operation staging allocates one engine batch
   per affected namespace; batch scratch reuse is not yet complete, so
   zero-allocation single mutations are not guaranteed.
