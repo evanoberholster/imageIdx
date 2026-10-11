@@ -3,7 +3,7 @@ package geoidx
 import (
 	"cmp"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,21 +18,25 @@ import (
 type persistStage uint8
 
 const (
-	persistCreate persistStage = iota
-	persistWrite
-	persistSync
-	persistCommit
-	persistPublish
-	persistReclaim
-	persistRemove
+	persistCreate    persistStage = iota // extent allocation
+	persistGrow                          // file extension
+	persistMmap                          // mapping creation
+	persistWrite                         // shard data
+	persistDirectory                     // directory
+	persistSync                          // data sync
+	persistCommit                        // inactive superblock write
+	persistSuperSync                     // superblock sync
+	persistPublish                       // view publication
+	persistRetire                        // region retirement
+	persistReclaim                       // free-space reclamation
+	persistRemove                        // post-reclaim cleanup
 )
 
 // persistFail is a test seam; production leaves it nil.
 var persistFail func(persistStage) error
 
-// commitSuperblockFunc is a test seam for the durable superblock write;
-// production copies the slot into the mapping (the following Sync makes it
-// durable).
+// commitSuperblockFunc is a test seam for the superblock write; production
+// copies the slot into the mapping (the following sync makes it durable).
 var commitSuperblockFunc = func(arena []byte, offset uint64, slot []byte) error {
 	copy(arena[offset:offset+storage.SuperblockSlotBytes], slot)
 	return nil
@@ -48,31 +52,62 @@ func failStage(stage persistStage) error {
 const (
 	geoidxFile           = "geoidx.dat"
 	geoidxMagic   uint32 = 0x47454f32 // "GEO2"
-	geoidxVersion uint16 = 1
+	geoidxVersion uint16 = 2          // v2: reconstructible allocator, prior generation retained
 
 	superblockSlots = 2
 	superblockBytes = storage.SuperblockSlotBytes
 
-	// directoryHeaderBlocks reserves block 1 (the second superblock slot) in the
-	// allocator; block 0 is reserved as the null Ref by pagealloc.
+	// secondSuperblockRef reserves block 1 (the second superblock slot); block 0
+	// is reserved as the null Ref by pagealloc.
 	secondSuperblockRef pagealloc.Ref = 1
 
-	// superblockPayloadBytes is the geoidx payload: dirOffset(8)+dirCount(4)+
-	// reserved(4)+metaOffset(8)+metaLength(4)+reserved(4)+totalEntries(8)+
-	// liveBytes(8)+arenaBytes(8).
-	superblockPayloadBytes = 56
+	// superblockPayloadBytes is dirOffset(8)+dirCount(4)+reserved(4)+
+	// totalEntries(8)+liveBytes(8)+arenaBytes(8).
+	superblockPayloadBytes = 40
 
 	// dirEntryBytes is one shard reference: firstKey(8)+firstID(8)+offset(8)+
-	// count(4)+reserved(4)+minID(8)+maxID(8)+crc(4)+reserved(4).
+	// count(4)+keyCRC(4)+idCRC(4)+reserved(4)+minID(8)+maxID(8).
 	dirEntryBytes = 56
 
 	lockName = "geoidx.lock"
+
+	// growAlignment keeps arena growth coarse.
+	growAlignment = 4 << 20
 )
 
-// superblockOffset is the file offset of one superblock slot.
-func superblockOffset(slot int) uint64 { return uint64(slot) * superblockBytes }
+// region is one mmap of the single file. The current region receives new
+// writes; a retired region stays mapped until no published shard references it
+// and prior readers have drained.
+type region struct {
+	mf   *storage.MappedFile
+	data []byte
+}
 
-// extentRef identifies an allocated extent for rollback and retirement.
+func createRegion(path string, size int64) (*region, error) {
+	mf, err := storage.CreateMapped(path, size)
+	if err != nil {
+		return nil, err
+	}
+	return &region{mf: mf, data: mf.Bytes()}, nil
+}
+
+func openRegion(path string) (*region, error) {
+	mf, err := storage.OpenMapped(path)
+	if err != nil {
+		return nil, err
+	}
+	return &region{mf: mf, data: mf.Bytes()}, nil
+}
+
+func (r *region) close() {
+	if r == nil || r.mf == nil {
+		return
+	}
+	_ = r.mf.Close()
+	r.mf, r.data = nil, nil
+}
+
+// extentRef identifies an allocated extent for the durable live set.
 type extentRef struct {
 	ref  pagealloc.Ref
 	size uint32
@@ -80,7 +115,18 @@ type extentRef struct {
 
 // shardExtent returns the extent reference and payload size of a persistent shard.
 func shardExtent(s *shard) extentRef {
-	return extentRef{ref: pagealloc.Ref(s.offset / uint64(pagealloc.MinBlockSize)), size: uint32(s.count()) * shardBytesPerRecord}
+	return extentRef{
+		ref:  pagealloc.Ref(s.offset / uint64(pagealloc.MinBlockSize)),
+		size: uint32(s.count()) * shardBytesPerRecord,
+	}
+}
+
+// roundUp rounds v up to a multiple of align.
+func roundUp(v, align uint64) uint64 {
+	if align == 0 {
+		return v
+	}
+	return (v + align - 1) / align * align
 }
 
 // encodeDirectory serializes shard references into a compact sorted directory.
@@ -101,8 +147,9 @@ func encodeDirectory(shards []*shard) []byte {
 }
 
 // decodeDirectory rebuilds shard views from a directory extent and validates
-// every referenced extent against the allocator state.
-func decodeDirectory(arena []byte, dirOffset uint64, dirCount uint32, alloc *pagealloc.Allocator) ([]*shard, error) {
+// every referenced extent's bounds, ordering, and checksums. Overlap between
+// extents is detected when the allocator marks the live set.
+func decodeDirectory(arena []byte, dirOffset uint64, dirCount uint32) ([]*shard, error) {
 	if dirCount == 0 {
 		return nil, nil
 	}
@@ -113,7 +160,7 @@ func decodeDirectory(arena []byte, dirOffset uint64, dirCount uint32, alloc *pag
 	buf := arena[dirOffset : dirOffset+length]
 	shards := make([]*shard, dirCount)
 	for n := range shards {
-		s, err := decodeDirEntry(arena, buf[n*dirEntryBytes:(n+1)*dirEntryBytes], alloc)
+		s, err := decodeDirEntry(arena, buf[n*dirEntryBytes:(n+1)*dirEntryBytes])
 		if err != nil {
 			return nil, err
 		}
@@ -122,7 +169,7 @@ func decodeDirectory(arena []byte, dirOffset uint64, dirCount uint32, alloc *pag
 	return shards, nil
 }
 
-func decodeDirEntry(arena, entry []byte, alloc *pagealloc.Allocator) (*shard, error) {
+func decodeDirEntry(arena, entry []byte) (*shard, error) {
 	firstKey := binary.LittleEndian.Uint64(entry[0:8])
 	firstID := binary.LittleEndian.Uint64(entry[8:16])
 	offset := binary.LittleEndian.Uint64(entry[16:24])
@@ -135,10 +182,8 @@ func decodeDirEntry(arena, entry []byte, alloc *pagealloc.Allocator) (*shard, er
 		return nil, ErrCorrupt
 	}
 	length := uint64(count) * shardBytesPerRecord
-	if offset%uint64(pagealloc.MinBlockSize) != 0 || offset+length > uint64(len(arena)) {
-		return nil, ErrCorrupt
-	}
-	if used, err := alloc.Used(pagealloc.Ref(offset/uint64(pagealloc.MinBlockSize)), uint32(length)); err != nil || !used {
+	// Checked arithmetic: offset + length must not overflow or leave the arena.
+	if offset%uint64(pagealloc.MinBlockSize) != 0 || length > uint64(len(arena)) || offset > uint64(len(arena))-length {
 		return nil, ErrCorrupt
 	}
 	keys, err := storage.View[S2Key](arena, offset, uint64(count), ErrCorrupt, ErrCorrupt)
@@ -160,7 +205,6 @@ func decodeDirEntry(arena, entry []byte, alloc *pagealloc.Allocator) (*shard, er
 	if checksumKeys(s) != keyCRC || checksumIDs(s) != idCRC {
 		return nil, ErrCorrupt
 	}
-	s.keyCRC, s.idCRC = keyCRC, idCRC
 	if uint64(keys[0]) != firstKey || uint64(ids[0]) != firstID {
 		return nil, ErrCorrupt
 	}
@@ -170,58 +214,38 @@ func decodeDirEntry(arena, entry []byte, alloc *pagealloc.Allocator) (*shard, er
 	if minOfIDs(ids) != s.minID {
 		return nil, ErrCorrupt
 	}
+	s.keyCRC, s.idCRC = keyCRC, idCRC
 	return s, nil
 }
 
-func encodeSuperblockPayload(dst []byte, arenaBytes, dirOffset uint64, dirCount uint32, metaOffset uint64, metaLength uint32, totalEntries, liveBytes uint64) {
+func encodeSuperblockPayload(dst []byte, arenaBytes, dirOffset uint64, dirCount uint32, totalEntries, liveBytes uint64) {
 	binary.LittleEndian.PutUint64(dst[0:8], dirOffset)
 	binary.LittleEndian.PutUint32(dst[8:12], dirCount)
 	binary.LittleEndian.PutUint32(dst[12:16], 0)
-	binary.LittleEndian.PutUint64(dst[16:24], metaOffset)
-	binary.LittleEndian.PutUint32(dst[24:28], metaLength)
-	binary.LittleEndian.PutUint32(dst[28:32], 0)
-	binary.LittleEndian.PutUint64(dst[32:40], totalEntries)
-	binary.LittleEndian.PutUint64(dst[40:48], liveBytes)
-	binary.LittleEndian.PutUint64(dst[48:56], arenaBytes)
+	binary.LittleEndian.PutUint64(dst[16:24], totalEntries)
+	binary.LittleEndian.PutUint64(dst[24:32], liveBytes)
+	binary.LittleEndian.PutUint64(dst[32:40], arenaBytes)
 }
 
-func decodeSuperblockPayload(payload []byte) (arenaBytes, dirOffset uint64, dirCount uint32, metaOffset uint64, metaLength uint32, totalEntries, liveBytes uint64, ok bool) {
+func decodeSuperblockPayload(payload []byte) (arenaBytes, dirOffset uint64, dirCount uint32, totalEntries, liveBytes uint64, ok bool) {
 	if len(payload) < superblockPayloadBytes {
-		return 0, 0, 0, 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, false
 	}
-	return binary.LittleEndian.Uint64(payload[48:56]),
+	return binary.LittleEndian.Uint64(payload[32:40]),
 		binary.LittleEndian.Uint64(payload[0:8]),
 		binary.LittleEndian.Uint32(payload[8:12]),
 		binary.LittleEndian.Uint64(payload[16:24]),
-		binary.LittleEndian.Uint32(payload[24:28]),
-		binary.LittleEndian.Uint64(payload[32:40]),
-		binary.LittleEndian.Uint64(payload[40:48]),
+		binary.LittleEndian.Uint64(payload[24:32]),
 		true
 }
 
-// selectSuperblock returns the highest-generation valid superblock in the arena.
-func selectSuperblock(arena []byte) (slot int, header storage.SuperblockHeader, payload []byte, ok bool) {
-	slot = -1
-	for candidate := 0; candidate < superblockSlots; candidate++ {
-		offset := superblockOffset(candidate)
-		if offset+superblockBytes > uint64(len(arena)) {
-			continue
-		}
-		h, p, valid := storage.DecodeSuperblock(arena[offset:offset+superblockBytes], geoidxMagic, geoidxVersion)
-		if !valid {
-			continue
-		}
-		if slot == -1 || h.Generation > header.Generation {
-			slot, header, payload = candidate, h, p
-		}
-	}
-	return slot, header, payload, slot != -1
-}
+func superblockOffset(slot int) uint64 { return uint64(slot) * superblockBytes }
 
-// buildAllocMetadata builds the durable allocator state for one generation: a
-// fresh bitmap with only the second superblock and the live extents marked used.
-// Retired and uncommitted extents are free, so a reopen reclaims them.
-func buildAllocMetadata(arenaBytes uint64, live []extentRef) ([]byte, error) {
+// allocatorFromLive builds a fresh allocator over arenaBytes marking the second
+// superblock and every live extent used. This is the durable allocator state:
+// recovery reconstructs it from the committed directory set, so no separate
+// free-space database is persisted. Duplicate or overlapping extents fail.
+func allocatorFromLive(arenaBytes uint64, live []extentRef) (*pagealloc.Allocator, error) {
 	alloc, err := pagealloc.New(arenaBytes)
 	if err != nil {
 		return nil, err
@@ -229,12 +253,48 @@ func buildAllocMetadata(arenaBytes uint64, live []extentRef) ([]byte, error) {
 	if err := alloc.Reserve(secondSuperblockRef, pagealloc.MinBlockSize); err != nil {
 		return nil, err
 	}
+	seen := make(map[pagealloc.Ref]struct{}, len(live))
 	for _, e := range live {
+		if e.size == 0 {
+			continue
+		}
+		if _, ok := seen[e.ref]; ok {
+			continue
+		}
+		seen[e.ref] = struct{}{}
 		if err := alloc.Reserve(e.ref, e.size); err != nil {
 			return nil, err
 		}
 	}
-	return alloc.Encode(), nil
+	return alloc, nil
+}
+
+// liveOf returns the extents referenced by a shard set and its directory.
+func liveOf(shards []*shard, dirOffset uint64, dirLength uint32) []extentRef {
+	live := make([]extentRef, 0, len(shards)+1)
+	for _, s := range shards {
+		if s.offset != 0 {
+			live = append(live, shardExtent(s))
+		}
+	}
+	if dirLength > 0 {
+		live = append(live, extentRef{ref: pagealloc.Ref(dirOffset / uint64(pagealloc.MinBlockSize)), size: dirLength})
+	}
+	return live
+}
+
+// dedupExtents removes duplicate extent references.
+func dedupExtents(live []extentRef) []extentRef {
+	seen := make(map[pagealloc.Ref]struct{}, len(live))
+	out := live[:0]
+	for _, e := range live {
+		if _, ok := seen[e.ref]; ok {
+			continue
+		}
+		seen[e.ref] = struct{}{}
+		out = append(out, e)
+	}
+	return out
 }
 
 // New creates a persistent, empty single-file index in dir.
@@ -256,16 +316,9 @@ func New(dir string, config Config) (*Index, error) {
 }
 
 func newPersistent(dir string, lock *os.File, cfg Config) (*Index, error) {
-	alloc, err := pagealloc.New(uint64(cfg.MaxFileBytes))
+	size := int64(roundUp(uint64(cfg.MaxFileBytes), growAlignment))
+	r, err := createRegion(filepath.Join(dir, geoidxFile), size)
 	if err != nil {
-		return nil, err
-	}
-	mapped, err := storage.CreateMapped(filepath.Join(dir, geoidxFile), int64(alloc.TotalBytes()))
-	if err != nil {
-		return nil, err
-	}
-	if err := alloc.Reserve(secondSuperblockRef, pagealloc.MinBlockSize); err != nil {
-		_ = mapped.Close()
 		return nil, err
 	}
 	index := &Index{
@@ -273,13 +326,11 @@ func newPersistent(dir string, lock *os.File, cfg Config) (*Index, error) {
 		persistent: true,
 		dir:        dir,
 		lock:       lock,
-		arena:      mapped,
-		alloc:      alloc,
-		arenaBytes: alloc.TotalBytes(),
-		gen:        1,
+		arena:      r,
+		arenaBytes: uint64(len(r.data)),
 	}
 	if err := index.createEmptyLocked(); err != nil {
-		_ = mapped.Close()
+		r.close()
 		return nil, err
 	}
 	return index, nil
@@ -304,14 +355,21 @@ func Open(dir string, config Config) (*Index, error) {
 		}
 		return nil, ErrCorrupt
 	}
-	mapped, err := storage.OpenMapped(filepath.Join(dir, geoidxFile))
+	r, err := openRegion(filepath.Join(dir, geoidxFile))
 	if err != nil {
 		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
-	index := &Index{config: cfg, persistent: true, dir: dir, lock: lock, arena: mapped}
+	index := &Index{
+		config:     cfg,
+		persistent: true,
+		dir:        dir,
+		lock:       lock,
+		arena:      r,
+		arenaBytes: uint64(len(r.data)),
+	}
 	if err := index.loadLocked(); err != nil {
-		_ = mapped.Close()
+		r.close()
 		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
@@ -319,27 +377,15 @@ func Open(dir string, config Config) (*Index, error) {
 }
 
 func (i *Index) createEmptyLocked() error {
-	arena := i.arena.Bytes()
-	metaSize, err := pagealloc.EncodedSize(i.arenaBytes)
+	alloc, err := allocatorFromLive(i.arenaBytes, nil)
 	if err != nil {
 		return err
 	}
-	metaRef, metaCapacity, err := i.alloc.Alloc(uint32(metaSize))
-	if err != nil {
-		return err
-	}
-	metaOffset := uint64(metaRef) * uint64(pagealloc.MinBlockSize)
-	blob, err := buildAllocMetadata(i.arenaBytes, []extentRef{{ref: metaRef, size: metaCapacity}})
-	if err != nil {
-		return err
-	}
-	copy(arena[metaOffset:metaOffset+uint64(len(blob))], blob)
-	if err := i.arena.Sync(); err != nil {
-		return err
-	}
-	i.metaOffset, i.metaLength = metaOffset, uint32(len(blob))
+	i.alloc = alloc
+	i.live = nil
 	i.dirOffset, i.dirLength = 0, 0
-	if err := i.commitSuperblock(0, i.gen, 0, 0, i.metaOffset, i.metaLength, 0, 0); err != nil {
+	i.gen = 1
+	if err := i.commitSuperblock(0, i.gen, 0, 0, 0, 0, i.arenaBytes); err != nil {
 		return err
 	}
 	i.slot = 0
@@ -347,54 +393,94 @@ func (i *Index) createEmptyLocked() error {
 	return nil
 }
 
-// loadLocked validates the committed generation and publishes the recovered view.
+// loadLocked selects the newest fully valid generation (falling back to an
+// older one), reconstructs the allocator from the selected and next-older
+// generations, and publishes the recovered view.
 func (i *Index) loadLocked() error {
-	arena := i.arena.Bytes()
+	arena := i.arena.data
 	if uint64(len(arena)) < 2*superblockBytes {
 		return ErrCorrupt
 	}
-	slot, header, payload, ok := selectSuperblock(arena)
-	if !ok {
-		return ErrCorrupt
+	type candidate struct {
+		slot    int
+		gen     uint64
+		payload []byte
 	}
-	arenaBytes, dirOffset, dirCount, metaOffset, metaLength, totalEntryCount, _, ok := decodeSuperblockPayload(payload)
-	if !ok || arenaBytes != uint64(len(arena)) {
-		return ErrCorrupt
+	var candidates []candidate
+	for slot := 0; slot < superblockSlots; slot++ {
+		off := superblockOffset(slot)
+		if off+superblockBytes > uint64(len(arena)) {
+			continue
+		}
+		// A v1 superblock means the older single-file layout; rebuild required.
+		if _, _, ok := storage.DecodeSuperblock(arena[off:off+superblockBytes], geoidxMagic, 1); ok {
+			return ErrLegacyFormat
+		}
+		header, payload, ok := storage.DecodeSuperblock(arena[off:off+superblockBytes], geoidxMagic, geoidxVersion)
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, candidate{slot: slot, gen: header.Generation, payload: payload})
 	}
-	if metaOffset+uint64(metaLength) > uint64(len(arena)) {
-		return ErrCorrupt
+	slices.SortFunc(candidates, func(a, b candidate) int { return cmp.Compare(b.gen, a.gen) })
+	fileBytes := uint64(len(arena))
+	for ci, c := range candidates {
+		shards, dirOffset, dirCount, err := decodeGeneration(arena, c.payload, fileBytes)
+		if err != nil {
+			continue
+		}
+		live := liveOf(shards, dirOffset, uint32(dirCount)*dirEntryBytes)
+		// Retain the next-older valid generation so it stays recoverable.
+		for _, older := range candidates[ci+1:] {
+			if older.gen >= c.gen {
+				continue
+			}
+			oldShards, oldDir, oldCount, oerr := decodeGeneration(arena, older.payload, fileBytes)
+			if oerr != nil {
+				continue
+			}
+			live = append(live, liveOf(oldShards, oldDir, uint32(oldCount)*dirEntryBytes)...)
+			break
+		}
+		live = dedupExtents(live)
+		alloc, aerr := allocatorFromLive(fileBytes, live)
+		if aerr != nil {
+			continue
+		}
+		i.alloc = alloc
+		i.live = live
+		i.shards = shards
+		i.dirOffset, i.dirLength = dirOffset, uint32(dirCount)*dirEntryBytes
+		i.gen = c.gen
+		i.slot = c.slot
+		i.publishLocked()
+		return nil
 	}
-	alloc, err := pagealloc.Decode(arena[metaOffset : metaOffset+uint64(metaLength)])
-	if err != nil {
-		return ErrCorrupt
-	}
-	if used, err := alloc.Used(secondSuperblockRef, pagealloc.MinBlockSize); err != nil || !used {
-		return ErrCorrupt
-	}
-	shards, err := decodeDirectory(arena, dirOffset, dirCount, alloc)
-	if err != nil {
-		return ErrCorrupt
-	}
-	if !validateDirectory(shards) {
-		return ErrCorrupt
-	}
-	if uint64(totalEntryCount) != uint64(totalEntries(shards)) {
-		return ErrCorrupt
-	}
-	i.arenaBytes = arenaBytes
-	i.alloc = alloc
-	i.shards = shards
-	i.dirOffset, i.dirLength = dirOffset, uint32(dirCount)*dirEntryBytes
-	i.metaOffset, i.metaLength = metaOffset, metaLength
-	i.gen = header.Generation
-	i.slot = slot
-	i.publishLocked()
-	return nil
+	return ErrCorrupt
 }
 
-func (i *Index) commitSuperblock(slot int, generation uint64, dirOffset uint64, dirCount uint32, metaOffset uint64, metaLength uint32, totalEntries, liveBytes uint64) error {
+// decodeGeneration validates one superblock payload and its directory.
+func decodeGeneration(arena, payload []byte, fileBytes uint64) ([]*shard, uint64, uint32, error) {
+	arenaBytes, dirOffset, dirCount, totalEntryCount, _, ok := decodeSuperblockPayload(payload)
+	if !ok || arenaBytes > fileBytes {
+		return nil, 0, 0, ErrCorrupt
+	}
+	shards, err := decodeDirectory(arena, dirOffset, dirCount)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if !validateDirectory(shards) {
+		return nil, 0, 0, ErrCorrupt
+	}
+	if uint64(totalEntries(shards)) != totalEntryCount {
+		return nil, 0, 0, ErrCorrupt
+	}
+	return shards, dirOffset, dirCount, nil
+}
+
+func (i *Index) commitSuperblock(slot int, generation, dirOffset uint64, dirCount uint32, totalEntries, liveBytes, arenaBytes uint64) error {
 	var payload [superblockPayloadBytes]byte
-	encodeSuperblockPayload(payload[:], i.arenaBytes, dirOffset, dirCount, metaOffset, metaLength, totalEntries, liveBytes)
+	encodeSuperblockPayload(payload[:], arenaBytes, dirOffset, dirCount, totalEntries, liveBytes)
 	var slotBytes [storage.SuperblockSlotBytes]byte
 	if err := storage.EncodeSuperblock(slotBytes[:], storage.SuperblockHeader{
 		Magic:      geoidxMagic,
@@ -403,16 +489,33 @@ func (i *Index) commitSuperblock(slot int, generation uint64, dirOffset uint64, 
 	}, payload[:]); err != nil {
 		return err
 	}
-	if err := commitSuperblockFunc(i.arena.Bytes(), superblockOffset(slot), slotBytes[:]); err != nil {
+	if err := commitSuperblockFunc(i.arena.data, superblockOffset(slot), slotBytes[:]); err != nil {
 		return err
 	}
-	return i.arena.Sync()
+	if err := failStage(persistSuperSync); err != nil {
+		return err
+	}
+	return i.arena.mf.Sync()
 }
 
-// writeSuperblock persists the current committed state into a slot. It is used
-// only by tests and recovery, not by ordinary compaction.
-func (i *Index) writeSuperblock(slot int) error {
-	return i.commitSuperblock(slot, i.gen, i.dirOffset, uint32(len(i.shards)), i.metaOffset, i.metaLength, uint64(totalEntries(i.shards)), liveBytes(i.shards))
+// committedGeneration returns the highest committed generation in the arena.
+func (i *Index) committedGeneration() (uint64, int, bool) {
+	best := -1
+	var bestGen uint64
+	for slot := 0; slot < superblockSlots; slot++ {
+		off := superblockOffset(slot)
+		if off+superblockBytes > uint64(len(i.arena.data)) {
+			continue
+		}
+		header, _, ok := storage.DecodeSuperblock(i.arena.data[off:off+superblockBytes], geoidxMagic, geoidxVersion)
+		if !ok {
+			continue
+		}
+		if best == -1 || header.Generation > bestGen {
+			best, bestGen = slot, header.Generation
+		}
+	}
+	return bestGen, best, best != -1
 }
 
 // liveBytes sums the shard payload bytes.
@@ -424,8 +527,7 @@ func liveBytes(shards []*shard) uint64 {
 	return total
 }
 
-// shardPlan is one output slot of a compaction: either an existing shard kept
-// unchanged, or new heap content to write.
+// shardPlan is one output slot of a compaction.
 type shardPlan struct {
 	keep *shard
 	keys []S2Key
@@ -447,8 +549,8 @@ func planArrays(p shardPlan) ([]S2Key, []common.ImageID) {
 }
 
 // prepareShards selects the affected shards for a frozen delta and rebuilds only
-// those. Unaffected shards are kept by reference. A rebuilt shard larger than
-// MaxShardBytes is split, and adjacent underutilized plans are coalesced.
+// those. After a growth the whole directory is rewritten once (migrateAll) so the
+// old mapping can be released.
 func (i *Index) prepareShards(current []*shard, frozen []mutation) ([]shardPlan, error) {
 	adds := sortedByKey(frozen)
 	shadow := newMutationSet(frozen, totalEntries(current))
@@ -457,28 +559,33 @@ func (i *Index) prepareShards(current []*shard, frozen []mutation) ([]shardPlan,
 	}
 	addSlices, dirty := partitionAdds(current, adds)
 
-	// A shard is affected by a delete or move only when one of its base IDs is
-	// named by the delta. The delta's [min,max] ImageID prunes shards whose own
-	// [minID,maxID] does not overlap, which is the common case for monotonically
-	// increasing or geographically clustered IDs.
-	deltaMin, deltaMax := deltaIDRange(frozen)
-	scanned := 0
-	for j, s := range current {
-		if dirty[j] {
-			continue
+	if i.migrateAll {
+		for j := range dirty {
+			dirty[j] = true
 		}
-		if deltaMax < s.minID || deltaMin > s.maxID {
-			continue
-		}
-		scanned++
-		for _, id := range s.ids {
-			if shadow.touched(id) {
-				dirty[j] = true
-				break
+	} else {
+		// A shard is affected by a delete or move only when one of its base IDs
+		// is named by the delta. The delta's [min,max] ImageID prunes shards
+		// whose own [minID,maxID] does not overlap.
+		deltaMin, deltaMax := deltaIDRange(frozen)
+		scanned := 0
+		for j, s := range current {
+			if dirty[j] {
+				continue
+			}
+			if deltaMax < s.minID || deltaMin > s.maxID {
+				continue
+			}
+			scanned++
+			for _, id := range s.ids {
+				if shadow.touched(id) {
+					dirty[j] = true
+					break
+				}
 			}
 		}
+		i.lastScannedShards = scanned
 	}
-	i.lastScannedShards = scanned
 
 	targetRecords := recordsForBytes(i.config.TargetShardBytes)
 	plans := make([]shardPlan, 0, len(current)+1)
@@ -507,7 +614,7 @@ func (i *Index) prepareShards(current []*shard, frozen []mutation) ([]shardPlan,
 }
 
 // deltaIDRange returns the min and max ImageID named by the delta. An empty
-// delta yields a range that never prunes (min=MaxUint64, max=0).
+// delta yields a range that never prunes.
 func deltaIDRange(frozen []mutation) (common.ImageID, common.ImageID) {
 	if len(frozen) == 0 {
 		return common.ImageID(^uint64(0)), 0
@@ -548,8 +655,7 @@ func shardsFromAdds(adds []mutation, cfg Config) []shardPlan {
 }
 
 // coalescePlans merges adjacent plans while their combined payload fits the
-// target and at least one is below the minimum, so normal-sized shards are left
-// alone and split/merge cannot cycle.
+// target and at least one is below the minimum.
 func coalescePlans(plans []shardPlan, cfg Config) []shardPlan {
 	out := make([]shardPlan, 0, len(plans))
 	for _, p := range plans {
@@ -579,8 +685,9 @@ func concatPlans(a, b shardPlan) shardPlan {
 	return shardPlan{keys: keys, ids: ids}
 }
 
-// materialize turns plans into shards. For a persistent index it writes new
-// content into freshly allocated in-file extents and records them for rollback.
+// materialize turns plans into shards, writing new content into freshly
+// allocated in-file extents. It returns pagealloc.ErrOutOfSpace so the caller
+// can grow the arena and retry.
 func (i *Index) materialize(plans []shardPlan, gen uint64) ([]*shard, []extentRef, error) {
 	shards := make([]*shard, 0, len(plans))
 	allocated := make([]extentRef, 0, len(plans))
@@ -603,16 +710,16 @@ func (i *Index) materialize(plans []shardPlan, gen uint64) ([]*shard, []extentRe
 		ref, capacity, err := i.alloc.Alloc(size)
 		if err != nil {
 			i.rollback(allocated)
-			return nil, nil, fmt.Errorf("%w: %v", ErrOverflow, err)
+			return nil, nil, err
 		}
 		offset := uint64(ref) * uint64(pagealloc.MinBlockSize)
-		arena := i.arena.Bytes()
-		keys, err := storage.View[S2Key](arena, offset, uint64(len(p.keys)), ErrCorrupt, ErrCorrupt)
+		data := i.arena.data
+		keys, err := storage.View[S2Key](data, offset, uint64(len(p.keys)), ErrCorrupt, ErrCorrupt)
 		if err != nil {
 			i.rollback(append(allocated, extentRef{ref, capacity}))
 			return nil, nil, err
 		}
-		ids, err := storage.View[common.ImageID](arena, offset+uint64(len(p.keys))*8, uint64(len(p.keys)), ErrCorrupt, ErrCorrupt)
+		ids, err := storage.View[common.ImageID](data, offset+uint64(len(p.keys))*8, uint64(len(p.keys)), ErrCorrupt, ErrCorrupt)
 		if err != nil {
 			i.rollback(append(allocated, extentRef{ref, capacity}))
 			return nil, nil, err
@@ -621,7 +728,7 @@ func (i *Index) materialize(plans []shardPlan, gen uint64) ([]*shard, []extentRe
 		copy(ids, p.ids)
 		s := &shard{
 			keys: keys, ids: ids, offset: offset, length: capacity, gen: gen,
-			minID: minOfIDs(ids), maxID: maxOfIDs(ids),
+			minID: minOfIDs(ids), maxID: maxOfIDs(ids), region: i.arena,
 		}
 		s.keyCRC, s.idCRC = checksumKeys(s), checksumIDs(s)
 		shards = append(shards, s)
@@ -637,8 +744,7 @@ func (i *Index) rollback(allocated []extentRef) {
 	}
 }
 
-// writeDirectory writes a new directory extent for shards and returns its offset
-// and payload length.
+// writeDirectory writes a new directory extent for shards.
 func (i *Index) writeDirectory(shards []*shard, allocated *[]extentRef) (uint64, uint32, error) {
 	if len(shards) == 0 {
 		return 0, 0, nil
@@ -650,40 +756,70 @@ func (i *Index) writeDirectory(shards []*shard, allocated *[]extentRef) (uint64,
 	}
 	*allocated = append(*allocated, extentRef{ref, capacity})
 	offset := uint64(ref) * uint64(pagealloc.MinBlockSize)
-	copy(i.arena.Bytes()[offset:offset+uint64(len(buf))], buf)
+	copy(i.arena.data[offset:offset+uint64(len(buf))], buf)
 	return offset, uint32(len(buf)), nil
 }
 
-// writeMetadata builds the durable allocator state for the new generation and
-// writes it into a meta extent that includes itself in the live set.
-func (i *Index) writeMetadata(shards []*shard, dirOffset uint64, dirLength uint32, allocated *[]extentRef) (uint64, uint32, error) {
-	metaSize, err := pagealloc.EncodedSize(i.arenaBytes)
+// growArena extends the file, maps a new region, retires the old mapping, and
+// rebuilds the allocator over the larger arena with the durable live set. It
+// never remaps in place, so existing reader slices stay valid.
+func (i *Index) growArena(need uint64) error {
+	target := i.arenaBytes * 2
+	if minTarget := i.arenaBytes + 2*need; minTarget > target {
+		target = minTarget
+	}
+	target = roundUp(target, growAlignment)
+	if target <= i.arenaBytes {
+		target = i.arenaBytes + growAlignment
+	}
+	path := filepath.Join(i.dir, geoidxFile)
+	if err := failStage(persistGrow); err != nil {
+		return err
+	}
+	if err := os.Truncate(path, int64(target)); err != nil {
+		return err
+	}
+	if err := failStage(persistMmap); err != nil {
+		return err
+	}
+	nr, err := openRegion(path)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
-	metaRef, metaCapacity, err := i.alloc.Alloc(uint32(metaSize))
+	old := i.arena
+	i.arena = nr
+	i.arenaBytes = uint64(len(nr.data))
+	i.retired = append(i.retired, old)
+	alloc, err := allocatorFromLive(i.arenaBytes, i.live)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
-	live := make([]extentRef, 0, len(shards)+3)
-	live = append(live, extentRef{ref: metaRef, size: metaCapacity})
-	if dirLength > 0 {
-		live = append(live, extentRef{ref: pagealloc.Ref(dirOffset / uint64(pagealloc.MinBlockSize)), size: dirLength})
+	i.alloc = alloc
+	i.migrateAll = true
+	return nil
+}
+
+// releaseRetiredRegions unmaps retired mappings that no published shard
+// references. Callers have already drained prior readers.
+func (i *Index) releaseRetiredRegions() {
+	if len(i.retired) == 0 {
+		return
 	}
-	for _, s := range shards {
-		if s.offset != 0 {
-			live = append(live, shardExtent(s))
+	used := make(map[*region]struct{}, 4)
+	for _, s := range i.shards {
+		if s.region != nil {
+			used[s.region] = struct{}{}
 		}
 	}
-	blob, err := buildAllocMetadata(i.arenaBytes, live)
-	if err != nil {
-		i.rollback(append(*allocated, extentRef{metaRef, metaCapacity}))
-		return 0, 0, err
+	keep := i.retired[:0]
+	for _, r := range i.retired {
+		if _, ok := used[r]; ok {
+			keep = append(keep, r)
+			continue
+		}
+		r.close()
 	}
-	offset := uint64(metaRef) * uint64(pagealloc.MinBlockSize)
-	copy(i.arena.Bytes()[offset:offset+uint64(len(blob))], blob)
-	*allocated = append(*allocated, extentRef{metaRef, metaCapacity})
-	return offset, uint32(len(blob)), nil
+	i.retired = keep
 }
 
 // runCompaction advances one compaction through its phases.
@@ -693,61 +829,97 @@ func (i *Index) runCompaction() {
 	frozen := i.frozen
 	i.mu.Unlock()
 
+	gen := i.gen + 1
 	if err := failStage(persistCreate); err != nil {
 		i.finishCompaction(err)
 		return
 	}
-	plans, err := i.prepareShards(snapshot, frozen)
-	if err != nil {
-		i.finishCompaction(err)
-		return
-	}
-
-	newGen := i.gen + 1
-	newShards, allocated, err := i.materialize(plans, newGen)
-	if err != nil {
-		i.finishCompaction(err)
-		return
-	}
 	if !i.persistent {
-		i.publishCompaction(newShards, newGen, 0, 0, 0, 0)
-		i.finishReclaim(nil, extentRef{}, extentRef{})
+		plans, err := i.prepareShards(snapshot, frozen)
+		if err != nil {
+			i.finishCompaction(err)
+			return
+		}
+		newShards, _, err := i.materialize(plans, gen)
+		if err != nil {
+			i.finishCompaction(err)
+			return
+		}
+		i.publishResult(newShards, gen, 0, 0, nil)
+		i.finishReclaim()
 		return
 	}
 
-	if err := failStage(persistWrite); err != nil {
-		i.rollback(allocated)
-		i.finishCompaction(err)
-		return
+	var (
+		newShards []*shard
+		allocated []extentRef
+		dirOffset uint64
+		dirLength uint32
+	)
+	for attempt := 0; ; attempt++ {
+		plans, err := i.prepareShards(snapshot, frozen)
+		if err != nil {
+			i.finishCompaction(err)
+			return
+		}
+		if err := failStage(persistWrite); err != nil {
+			i.finishCompaction(err)
+			return
+		}
+		newShards, allocated, err = i.materialize(plans, gen)
+		if err != nil {
+			if errors.Is(err, pagealloc.ErrOutOfSpace) && attempt < 8 {
+				if gerr := i.growArena(uint64(i.config.MaxShardBytes)); gerr != nil {
+					i.finishCompaction(gerr)
+					return
+				}
+				continue
+			}
+			i.finishCompaction(err)
+			return
+		}
+		if err := failStage(persistDirectory); err != nil {
+			i.rollback(allocated)
+			i.finishCompaction(err)
+			return
+		}
+		dirOffset, dirLength, err = i.writeDirectory(newShards, &allocated)
+		if err != nil {
+			if errors.Is(err, pagealloc.ErrOutOfSpace) && attempt < 8 {
+				i.rollback(allocated)
+				if gerr := i.growArena(uint64(i.config.MaxShardBytes)); gerr != nil {
+					i.finishCompaction(gerr)
+					return
+				}
+				continue
+			}
+			i.rollback(allocated)
+			i.finishCompaction(err)
+			return
+		}
+		break
 	}
-	dirOffset, dirLength, err := i.writeDirectory(newShards, &allocated)
-	if err != nil {
-		i.rollback(allocated)
-		i.finishCompaction(err)
-		return
-	}
-	metaOffset, metaLength, err := i.writeMetadata(newShards, dirOffset, dirLength, &allocated)
-	if err != nil {
-		i.rollback(allocated)
-		i.finishCompaction(err)
-		return
-	}
+
 	if err := failStage(persistSync); err != nil {
 		i.rollback(allocated)
 		i.finishCompaction(err)
 		return
 	}
-	if err := i.arena.Sync(); err != nil {
+	if err := i.arena.mf.Sync(); err != nil {
 		i.rollback(allocated)
 		i.finishCompaction(err)
 		return
 	}
 
-	oldDir := extentRef{}
-	if i.dirLength > 0 {
-		oldDir = extentRef{ref: pagealloc.Ref(i.dirOffset / uint64(pagealloc.MinBlockSize)), size: i.dirLength}
+	// Durable live set: this generation plus the previously committed one, so the
+	// prior generation stays recoverable until its slot is overwritten.
+	combined := dedupExtents(append(liveOf(newShards, dirOffset, dirLength), liveOf(snapshot, i.dirOffset, i.dirLength)...))
+	nextAlloc, err := allocatorFromLive(i.arenaBytes, combined)
+	if err != nil {
+		i.rollback(allocated)
+		i.finishCompaction(err)
+		return
 	}
-	oldMeta := extentRef{ref: pagealloc.Ref(i.metaOffset / uint64(pagealloc.MinBlockSize)), size: i.metaLength}
 
 	i.mu.Lock()
 	if cerr := failStage(persistCommit); cerr != nil {
@@ -756,82 +928,58 @@ func (i *Index) runCompaction() {
 		i.finishCompaction(cerr)
 		return
 	}
-	if err := i.commitSuperblock(i.slot^1, newGen, dirOffset, uint32(len(newShards)), metaOffset, metaLength, uint64(totalEntries(newShards)), liveBytes(newShards)); err != nil {
+	if err := i.commitSuperblock(i.slot^1, gen, dirOffset, uint32(len(newShards)), uint64(totalEntries(newShards)), liveBytes(newShards), i.arenaBytes); err != nil {
 		// A post-write sync error can still have committed the slot. Reconcile
 		// with what is actually durable before treating it as uncommitted.
-		gen, _, _, ok := i.committedGeneration()
-		if !ok || gen != newGen {
+		gotGen, _, ok := i.committedGeneration()
+		if !ok || gotGen != gen {
 			i.mu.Unlock()
 			i.rollback(allocated)
 			i.finishCompaction(err)
 			return
 		}
-		_ = i.arena.Sync()
+		_ = i.arena.mf.Sync()
 	}
 	_ = failStage(persistPublish)
-	old := i.shards
 	i.shards = newShards
 	i.frozen = nil
 	i.compactionErr = nil
-	i.gen = newGen
+	i.gen = gen
 	i.slot ^= 1
 	i.dirOffset, i.dirLength = dirOffset, dirLength
-	i.metaOffset, i.metaLength = metaOffset, metaLength
+	i.alloc = nextAlloc
+	i.live = combined
+	i.migrateAll = false
 	i.deltaMax = maxImageID(i.maxShardIDLocked(), nil, i.layers, i.active)
 	i.publishLocked()
 	i.mu.Unlock()
 
-	i.finishReclaim(old, oldDir, oldMeta)
+	i.finishReclaim()
 }
 
-// publishCompaction installs a new in-memory (heap) directory.
-func (i *Index) publishCompaction(newShards []*shard, newGen uint64, _ uint64, _ uint32, _ uint64, _ uint32) {
+// publishResult installs a new in-memory (heap) directory for a memory index.
+func (i *Index) publishResult(newShards []*shard, gen uint64, _ uint64, _ uint32, _ []extentRef) {
 	i.mu.Lock()
 	i.shards = newShards
 	i.frozen = nil
 	i.compactionErr = nil
-	i.gen = newGen
+	i.gen = gen
 	i.deltaMax = maxImageID(i.maxShardIDLocked(), nil, i.layers, i.active)
 	i.publishLocked()
 	i.mu.Unlock()
 }
 
-// finishReclaim retires replaced extents and reclaims them after readers drain.
-func (i *Index) finishReclaim(old []*shard, oldDir, oldMeta extentRef) {
-	if i.persistent {
-		current := map[*shard]struct{}{}
-		for _, s := range i.shards {
-			current[s] = struct{}{}
-		}
-		for _, s := range old {
-			if _, ok := current[s]; ok || s.offset == 0 {
-				continue
-			}
-			_ = i.alloc.Retire(shardExtent(s).ref, shardExtent(s).size)
-		}
-		if oldDir.size > 0 {
-			_ = i.alloc.Retire(oldDir.ref, oldDir.size)
-		}
-		if oldMeta.size > 0 {
-			_ = i.alloc.Retire(oldMeta.ref, oldMeta.size)
-		}
-	}
+// finishReclaim drains prior readers and releases mappings no longer referenced.
+func (i *Index) finishReclaim() {
 	_ = failStage(persistReclaim)
 	i.tracker.WaitForPriorReaders()
-	if i.persistent {
-		_ = i.alloc.Reclaim()
-	}
+	_ = failStage(persistRetire)
+	i.releaseRetiredRegions()
 	_ = failStage(persistRemove)
 	i.mu.Lock()
 	i.compacting = false
 	close(i.compactionDone)
 	i.mu.Unlock()
-}
-
-// committedGeneration returns the highest committed generation in the arena.
-func (i *Index) committedGeneration() (uint64, int, []byte, bool) {
-	slot, header, payload, ok := selectSuperblock(i.arena.Bytes())
-	return header.Generation, slot, payload, ok
 }
 
 // finishCompaction records a pre-commit failure, retains the frozen snapshot so
@@ -862,9 +1010,13 @@ func (i *Index) Close() error {
 	i.tracker.WaitForPriorReaders()
 	var err error
 	if i.arena != nil {
-		err = i.arena.Close()
+		err = i.arena.mf.Close()
 		i.arena = nil
 	}
+	for _, r := range i.retired {
+		r.close()
+	}
+	i.retired = nil
 	i.shards = nil
 	if i.lock != nil {
 		if releaseErr := storage.ReleaseLock(i.lock); err == nil {
@@ -885,6 +1037,7 @@ type StorageStats struct {
 	LargestFree  uint64
 	FreeRuns     uint64
 	RetiredBytes uint64
+	Mappings     int
 }
 
 // StorageStats returns the current allocation and fragmentation metrics.
@@ -899,12 +1052,13 @@ func (i *Index) StorageStats() StorageStats {
 		live += uint64(s.count()) * shardBytesPerRecord
 	}
 	return StorageStats{
-		ArenaBytes:   i.alloc.TotalBytes(),
+		ArenaBytes:   i.arenaBytes,
 		LiveBytes:    live,
 		FreeBytes:    i.alloc.FreeBytes(),
 		LargestFree:  i.alloc.LargestFreeBytes(),
 		FreeRuns:     i.alloc.FreeRunCount(),
 		RetiredBytes: i.alloc.RetiredBytes(),
+		Mappings:     1 + len(i.retired),
 	}
 }
 
@@ -950,9 +1104,8 @@ func minOfIDs(ids []common.ImageID) common.ImageID {
 	return best
 }
 
-// validateBase reports whether a shard's records are well-formed (strict
-// (key, id) order, valid S2 level-19 keys, no reserved zero ID) and its recorded
-// maximum ImageID matches. It returns ErrCorrupt on any violation.
+// validateBase reports whether a shard's records are well-formed and its
+// recorded maximum ImageID matches.
 func validateBase(keys []S2Key, ids []common.ImageID, maxID common.ImageID) error {
 	if !validateShardOrder(keys, ids) {
 		return ErrCorrupt
@@ -964,10 +1117,7 @@ func validateBase(keys []S2Key, ids []common.ImageID, maxID common.ImageID) erro
 }
 
 // exactCount returns the number of live (key, imageID) pairs after applying the
-// delta. It mirrors mergeInto's traversal exactly (one pass over the two
-// (key, id)-sorted sequences), so a run of identical S2Keys is walked a single
-// time instead of being rescanned per insertion, and it allocates no index-sized
-// temporary.
+// delta. It mirrors mergeInto's traversal exactly.
 func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) uint64 {
 	count := uint64(0)
 	baseIndex, addIndex := 0, 0
@@ -1004,8 +1154,7 @@ func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, 
 }
 
 // mergeInto writes the retained base entries and additions into keys and ids in
-// (key, id) order, skipping base entries shadowed by the delta and
-// de-duplicating equal pairs. It mirrors exactCount's traversal exactly.
+// (key, id) order, skipping base entries shadowed by the delta.
 func mergeInto(keys []S2Key, ids []common.ImageID, baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) int {
 	baseIndex, addIndex, out := 0, 0, 0
 	for baseIndex < len(baseKeys) || addIndex < len(adds) {

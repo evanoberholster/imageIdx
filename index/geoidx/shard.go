@@ -29,6 +29,9 @@ type shard struct {
 	// re-encoded on compaction without re-hashing unchanged shards.
 	keyCRC uint32
 	idCRC  uint32
+	// region is the mapping holding keys/ids (persistent); it keeps the mapping
+	// alive until the shard is replaced and readers drain.
+	region *region
 }
 
 // count is the number of records in the shard.

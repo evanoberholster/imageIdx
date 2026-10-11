@@ -100,8 +100,9 @@
 //   - commit (locked) writes the inactive superblock slot: the durable
 //     linearization point.
 //   - publish (locked) swaps in the new directory.
-//   - reclaim (off-lock) drains readers, retires the replaced extents, and
-//     returns them to the allocator for reuse.
+//   - reclaim (off-lock) drains readers and releases superseded mappings; replaced
+//     extents become reusable once the generation that referenced them is no
+//     longer a recoverable fallback.
 //
 // The writer is not blocked by a rebuild and continues accepting mutations into
 // fresh layers. Frozen and active mutations are never lost: a failure before the
@@ -114,19 +115,30 @@
 //
 // # Persistence
 //
-// A file-backed index stores everything in one sparse mmap file (geoidx.dat):
-// two alternating CRC32C superblock slots, and a pagealloc-managed arena holding
-// every shard extent, the shard directory, and the allocator metadata. A shard is
-// one independently replaceable in-file extent, so compaction rewrites only the
-// affected extents and reuses free space instead of growing the file. The active
-// superblock is the durable commit point and references the live directory and
-// allocator state; the inactive slot holds the previous generation, so a failure
-// before the commit leaves the previous generation recoverable. The arena is
-// mapped once at a fixed capacity (Config.MaxFileBytes) and never re-mapped while
-// the index is open, so reader slices into it stay valid; obsolete extents are
-// reclaimed after a reader grace period. Persistence is checkpoint-based:
-// mutations are runtime state and become durable on Checkpoint/Compact. Close
-// does not checkpoint. A pre-shard monolithic or multi-file directory is rejected
-// with ErrLegacyFormat rather than reinterpreted; rebuild by re-inserting from
+// A file-backed index stores everything in one mmap file (geoidx.dat): two
+// alternating CRC32C superblock slots and a pagealloc-managed arena holding every
+// shard extent and the shard directory. A shard is one independently replaceable
+// in-file extent, so compaction rewrites only the affected extents and reuses
+// free space. The active superblock is the durable commit point and references
+// the live directory; the inactive slot holds the previous generation.
+//
+// Allocator state is reconstructed rather than stored as a second database: the
+// committed directory (plus the one previous generation, retained for fallback)
+// is the authoritative live-extent set, and recovery rebuilds the free-space map
+// as its complement. An extent is reusable only after it is unreachable from the
+// two recoverable generations and the reader grace period has passed; an
+// uncommitted allocation is free after a crash because no committed directory
+// references it.
+//
+// The arena is mapped once at a fixed capacity (Config.MaxFileBytes). When it
+// must grow, the file is extended and a new mapping is established; the old
+// mapping is kept until no published shard references it and prior readers have
+// drained, then unmapped. Existing mappings are never re-mapped in place, so
+// reader slices stay valid.
+//
+// Persistence is checkpoint-based: mutations are runtime state and become durable
+// on Checkpoint/Compact. Close does not checkpoint. A pre-shard monolithic or
+// multi-file directory, or an older single-file layout, is rejected with
+// ErrLegacyFormat rather than reinterpreted; rebuild by re-inserting from
 // canonical image metadata.
 package geoidx

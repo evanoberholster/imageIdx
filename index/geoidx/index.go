@@ -216,17 +216,18 @@ type Index struct {
 	lock       *os.File
 
 	// Persistent arena state, touched only under mu (except the immutable arena
-	// data, which readers access lock-free). One fixed-size mmap holds every
-	// shard, the directory, and allocator metadata; it is never re-mapped while
-	// the index is open, so reader slices stay valid.
-	arena      *storage.MappedFile
+	// data, which readers access lock-free). The current mapping is never
+	// re-mapped in place; growth adds a new mapping and retires the old one until
+	// no published shard references it and prior readers have drained.
+	arena      *region
+	retired    []*region
 	alloc      *pagealloc.Allocator
+	live       []extentRef // durable live set of the two committed generations
 	slot       int
 	arenaBytes uint64
 	dirOffset  uint64
 	dirLength  uint32
-	metaOffset uint64
-	metaLength uint32
+	migrateAll bool
 }
 
 // NewMemory returns an empty heap-backed index.

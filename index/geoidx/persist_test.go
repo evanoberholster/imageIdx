@@ -67,9 +67,9 @@ func TestValidateBase(t *testing.T) {
 }
 
 // TestOpenRejectsMalformed checks that a damaged superblock, shard extent,
-// directory, or allocator metadata yields an error rather than a panic.
+// directory, or truncated file yields an error rather than a panic.
 func TestOpenRejectsMalformed(t *testing.T) {
-	build := func(t *testing.T) (dir string, config Config, shardOffset, dirOffset, metaOffset uint64) {
+	build := func(t *testing.T) (dir string, config Config, shardOffset, dirOffset uint64) {
 		t.Helper()
 		dir = t.TempDir()
 		config = Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
@@ -84,11 +84,11 @@ func TestOpenRejectsMalformed(t *testing.T) {
 		if shards := index.view.Load().shards; len(shards) > 0 {
 			shardOffset = shards[0].offset
 		}
-		dirOffset, metaOffset = index.dirOffset, index.metaOffset
+		dirOffset = index.dirOffset
 		if err := index.Close(); err != nil {
 			t.Fatal(err)
 		}
-		return dir, config, shardOffset, dirOffset, metaOffset
+		return dir, config, shardOffset, dirOffset
 	}
 	corrupt := func(t *testing.T, dir string, offset uint64) {
 		t.Helper()
@@ -108,37 +108,47 @@ func TestOpenRejectsMalformed(t *testing.T) {
 	}
 
 	t.Run("superblock", func(t *testing.T) {
-		dir, config, _, _, _ := build(t)
-		// Corrupt both slots so no valid generation remains.
-		corrupt(t, dir, 0)
-		corrupt(t, dir, superblockBytes)
+		dir, config, _, _ := build(t)
+		corrupt(t, dir, 0)               // slot 0
+		corrupt(t, dir, superblockBytes) // slot 1: no valid generation remains
 		if _, err := Open(dir, config); err == nil {
 			t.Fatal("Open accepted a corrupt superblock")
 		}
 	})
-	t.Run("shard", func(t *testing.T) {
-		dir, config, shardOffset, _, _ := build(t)
+	t.Run("shard-falls-back", func(t *testing.T) {
+		dir, config, shardOffset, _ := build(t)
 		corrupt(t, dir, shardOffset)
-		if _, err := Open(dir, config); err == nil {
-			t.Fatal("Open accepted a corrupt shard extent")
+		index, err := Open(dir, config)
+		if err != nil {
+			t.Fatalf("Open should fall back to the previous generation: %v", err)
+		}
+		defer index.Close()
+		if !validateDirectory(index.view.Load().shards) {
+			t.Fatal("fallback directory invalid")
+		}
+		// The corrupt newest generation must be rejected: the fallback here is the
+		// empty generation created before the Checkpoint.
+		if got := index.Len(); got != 0 {
+			t.Fatalf("corrupt newest generation not rejected: Len = %d, want 0", got)
 		}
 	})
-	t.Run("directory", func(t *testing.T) {
-		dir, config, _, dirOffset, _ := build(t)
+	t.Run("directory-falls-back", func(t *testing.T) {
+		dir, config, _, dirOffset := build(t)
 		corrupt(t, dir, dirOffset+16) // the first entry's offset field
-		if _, err := Open(dir, config); err == nil {
-			t.Fatal("Open accepted a corrupt directory")
+		index, err := Open(dir, config)
+		if err != nil {
+			t.Fatalf("Open should fall back to the previous generation: %v", err)
 		}
-	})
-	t.Run("metadata", func(t *testing.T) {
-		dir, config, _, _, metaOffset := build(t)
-		corrupt(t, dir, metaOffset+16)
-		if _, err := Open(dir, config); err == nil {
-			t.Fatal("Open accepted corrupt allocator metadata")
+		defer index.Close()
+		if !validateDirectory(index.view.Load().shards) {
+			t.Fatal("fallback directory invalid")
+		}
+		if got := index.Len(); got != 0 {
+			t.Fatalf("corrupt newest generation not rejected: Len = %d, want 0", got)
 		}
 	})
 	t.Run("truncated", func(t *testing.T) {
-		dir, config, _, _, _ := build(t)
+		dir, config, _, _ := build(t)
 		if err := os.Truncate(filepath.Join(dir, geoidxFile), 64); err != nil {
 			t.Fatal(err)
 		}

@@ -512,9 +512,12 @@ func TestCompactionFailureStages(t *testing.T) {
 	}{
 		{"create", persistCreate},
 		{"write", persistWrite},
+		{"directory", persistDirectory},
 		{"sync", persistSync},
 		{"commit", persistCommit},
+		{"super-sync", persistSuperSync},
 		{"publish", persistPublish},
+		{"retire", persistRetire},
 		{"reclaim", persistReclaim},
 		{"remove", persistRemove},
 	} {
