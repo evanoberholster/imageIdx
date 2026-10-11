@@ -236,13 +236,14 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 
 // crashDurableDuringApply reports whether an engine's Apply makes its data
 // recoverable without an explicit Checkpoint, under the process-crash (not
-// power-loss) contract the engines document. timeidx synchronizes its COW
-// generation and bitmapidx replays its WAL tail on reopen. simhash new-record
-// appends, vectoridx inserts, radixhash and geoidx all depend on a later
-// Checkpoint/manifest write to be visible after reopen, so they are treated as
-// checkpoint-dependent.
+// power-loss) contract the engines document. Verified by
+// TestEnginePersistenceBoundaries: timeidx synchronizes its COW generation,
+// bitmapidx replays its WAL tail, and vectoridx replays its WAL on reopen.
+// radixhash and geoidx need an explicit Checkpoint; simhash new-record appends
+// need the manifest write, so they are checkpoint-dependent. A simhash *update*
+// is journaled and does survive (see pvSimUpdate).
 func crashDurableDuringApply(kind common.NamespaceKind) bool {
-	return kind == common.KindTimestamp || kind.IsBitmap()
+	return kind == common.KindTimestamp || kind == common.KindVector || kind.IsBitmap()
 }
 
 // batchMayPartiallyPersist reports whether a crash mid-batch could leave some
@@ -270,6 +271,12 @@ func (s *Store) batchMayPartiallyPersist() bool {
 	// operations in one namespace are not a single atomic unit.
 	if s.pvVectorOps >= 2 {
 		units += s.pvVectorOps - 1
+		anyDurable = true
+	}
+	// A simhash update is journaled and survives a crash even though a new
+	// append does not; if this batch updates existing simhash records the
+	// simhash unit is durable.
+	if s.pvSimUpdate {
 		anyDurable = true
 	}
 	return units >= 2 && anyDurable
@@ -616,6 +623,7 @@ func (s *Store) prevalidate(entries []Entry, changes []Change, deletes []DeleteO
 	clear(s.pvSet)
 	s.pvCursors = s.pvCursors[:0]
 	s.pvVectorOps = 0
+	s.pvSimUpdate = false
 
 	for i := range deletes {
 		d := deletes[i]
@@ -738,6 +746,10 @@ func (s *Store) pvSim(ns common.Namespace, id common.ValueID) error {
 	}
 	s.pvMark(ns)
 	n := idx.Len()
+	if id <= n {
+		// Updating an existing record is journaled and crash-durable.
+		s.pvSimUpdate = true
+	}
 	for i := range s.pvCursors {
 		if s.pvCursors[i].ns == ns {
 			switch {

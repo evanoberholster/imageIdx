@@ -114,11 +114,16 @@ compact durable **recovery marker**. Commit units are the distinct user
 namespaces (each engine's per-namespace `Apply` is atomic; vectoridx, which
 applies one operation at a time, counts each vector operation). Liveness shares
 the bitmap store and the entity's rebuild, so it is not a separate unit. A unit
-is crash-durable during apply for `timeidx` (synchronized COW) and `bitmapidx`
-(WAL tail replayed on reopen); simhash new-record appends, vectoridx inserts,
-radixhash and geoidx are checkpoint-dependent. A batch is risky exactly when it
-spans two or more units and at least one is crash-durable — a single unit, or a
-batch of checkpoint-dependent units only, stays consistent without a marker. The
+is crash-durable during apply for `timeidx` (synchronized COW), `bitmapidx`
+(WAL tail replayed on reopen) and `vectoridx` (WAL replayed on reopen); a
+simhash *update* is journaled and durable while a new-record append needs the
+manifest; radixhash and geoidx are checkpoint-dependent. Verified by
+`TestEnginePersistenceBoundaries`. A batch is risky exactly when it spans two or
+more units and at least one is crash-durable — a single unit, or a batch of
+checkpoint-dependent units only, stays consistent without a marker. A
+single-namespace mutation with internal liveness leaves only benign states (the
+entity is not live, so it is not searchable, or it is live without a value), so
+it does not need a marker (`TestSingleNamespaceLivenessFailureIsBenign`). The
 marker (`recovery.bin`) lists the intended
 (`recovery.bin`) listing the intended namespaces *before* the first engine can
 persist, and clears it only after the touched engines are durable. If the

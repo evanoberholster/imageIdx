@@ -86,6 +86,7 @@ type Store struct {
 	pvSet       []uint64
 	pvCursors   []simCursor
 	pvVectorOps int
+	pvSimUpdate bool
 	stage       stageState
 	flush       flushScratch
 
