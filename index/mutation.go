@@ -221,9 +221,8 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 			}
 		}
 	} else if risky {
-		// Ordinary Apply does not otherwise checkpoint; make the touched engines
-		// durable before clearing the marker so a crash cannot lose the marker
-		// while leaving some engines ahead.
+		// Make the checkpoint-dependent engines durable, then clear the marker,
+		// so a successful batch reopens clean.
 		if err := s.syncTouchedForCompleteness(); err != nil {
 			s.degradeIntended(err)
 			return err
@@ -235,28 +234,45 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 	return nil
 }
 
-// batchMayPartiallyPersist reports whether the batch touches at least two
-// namespaces and includes an engine that can become durable during apply
-// (timeidx always; any engine under DurabilitySync). Only then can a crash
-// leave some engines ahead of others.
+// crashDurableDuringApply reports whether an engine's Apply makes its data
+// recoverable without an explicit Checkpoint, under the process-crash (not
+// power-loss) contract the engines document. timeidx synchronizes its COW
+// generation and bitmapidx replays its WAL tail on reopen. simhash new-record
+// appends, vectoridx inserts, radixhash and geoidx all depend on a later
+// Checkpoint/manifest write to be visible after reopen, so they are treated as
+// checkpoint-dependent.
+func crashDurableDuringApply(kind common.NamespaceKind) bool {
+	return kind == common.KindTimestamp || kind.IsBitmap()
+}
+
+// batchMayPartiallyPersist reports whether a crash mid-batch could leave some
+// commit units durable and others not. A single engine batch is atomic, so only
+// batches spanning two or more units (distinct user namespaces, or multiple
+// non-atomic vector operations in one namespace) with at least one crash-durable
+// unit qualify. Liveness lives in the crash-durable bitmap store and shares the
+// entity's rebuild, so it is not counted as a separate unit. If every unit is
+// checkpoint-dependent, none survives a crash and the state stays consistent.
 func (s *Store) batchMayPartiallyPersist() bool {
-	intended := 0
-	syncFamily := false
+	units := 0
+	anyDurable := false
 	for w, word := range s.pvSet {
 		for bit := 0; bit < 64; bit++ {
 			if word&(1<<uint(bit)) == 0 {
 				continue
 			}
-			intended++
-			if def, ok := s.schema.Lookup(common.Namespace(w*64 + bit)); ok && def.Kind == common.KindTimestamp {
-				syncFamily = true
+			units++
+			if def, ok := s.schema.Lookup(common.Namespace(w*64 + bit)); ok && crashDurableDuringApply(def.Kind) {
+				anyDurable = true
 			}
 		}
 	}
-	if intended < 2 {
-		return false
+	// vectoridx applies one operation at a time, so two or more vector
+	// operations in one namespace are not a single atomic unit.
+	if s.pvVectorOps >= 2 {
+		units += s.pvVectorOps - 1
+		anyDurable = true
 	}
-	return syncFamily || s.opts.Durability == common.DurabilitySync
+	return units >= 2 && anyDurable
 }
 
 // pendingAddSet unions the current intended set into the durable recovery
@@ -356,71 +372,47 @@ func (s *Store) advanceAllCompleteness(gen uint64) error {
 	return nil
 }
 
-// syncNamespace durably persists one healthy namespace. It reports whether the
-// namespace lives in the shared bitmap store, which is checkpointed once.
-func (s *Store) syncNamespace(ns common.Namespace) (bitmapTouched bool, err error) {
+// syncNamespace makes one healthy namespace durable. Only the
+// checkpoint-dependent engines (radixhash, geoidx) need work; the others'
+// Apply already left crash-recoverable state, so re-checkpointing them would be
+// redundant write amplification.
+func (s *Store) syncNamespace(ns common.Namespace) error {
 	def, ok := s.schema.Lookup(ns)
 	if !ok || !s.health[ns].Available || s.isDegraded(ns) {
-		return false, nil
+		return nil
 	}
 	switch familyOf(def.Kind) {
 	case familyGeo:
 		if idx, ok := s.reg.geoIndex(ns); ok {
-			err = idx.Checkpoint()
-		}
-	case familySim:
-		if st, ok := s.reg.simStore(ns); ok {
-			err = st.Checkpoint()
+			return idx.Checkpoint()
 		}
 	case familyRadix:
 		if idx, ok := s.reg.radixIndex(ns); ok {
-			err = idx.Checkpoint()
+			return idx.Checkpoint()
 		}
-	case familyVector:
-		if v, ok := s.reg.vectorIndex(ns); ok {
-			err = v.Checkpoint()
-		}
-	case familyBitmap:
-		return true, nil
-	case familyTime:
-		// timeidx ApplyWithGeneration is synchronous.
 	}
-	return false, err
+	return nil
 }
 
 func (s *Store) syncTouchedForCompleteness() error {
-	// Any staged liveness change lives in the shared bitmap store; checkpoint it
-	// once alongside the routed namespaces.
-	bitmap := len(s.stage.live) > 0
 	for w, word := range s.pvSet {
 		for bit := 0; bit < 64; bit++ {
 			if word&(1<<uint(bit)) == 0 {
 				continue
 			}
-			b, err := s.syncNamespace(common.Namespace(w*64 + bit))
-			if err != nil {
+			if err := s.syncNamespace(common.Namespace(w*64 + bit)); err != nil {
 				return err
 			}
-			bitmap = bitmap || b
 		}
-	}
-	if bitmap && s.bitmapStore != nil {
-		return s.bitmapStore.Checkpoint()
 	}
 	return nil
 }
 
 func (s *Store) syncAllForCompleteness() error {
-	bitmap := len(s.stage.live) > 0
 	for _, def := range s.defs {
-		b, err := s.syncNamespace(def.Namespace)
-		if err != nil {
+		if err := s.syncNamespace(def.Namespace); err != nil {
 			return err
 		}
-		bitmap = bitmap || b
-	}
-	if bitmap && s.bitmapStore != nil {
-		return s.bitmapStore.Checkpoint()
 	}
 	return nil
 }
@@ -623,6 +615,7 @@ func (s *Store) prevalidate(entries []Entry, changes []Change, deletes []DeleteO
 	s.pvSet = s.pvSet[:words]
 	clear(s.pvSet)
 	s.pvCursors = s.pvCursors[:0]
+	s.pvVectorOps = 0
 
 	for i := range deletes {
 		d := deletes[i]
@@ -697,6 +690,7 @@ func (s *Store) prevalidateEntry(e Entry) error {
 		if err := s.pvVector(v, e.ValueID); err != nil {
 			return err
 		}
+		s.pvVectorOps++
 	}
 	for _, v := range e.Bitmaps {
 		if err := s.pvBitmap(v); err != nil {

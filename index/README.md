@@ -109,9 +109,17 @@ its mutations and its watermark in one engine transaction.
 
 ### Interrupted mutations
 
-A batch that could leave one engine durable and another not (two or more
-namespaces including a synchronously durable family such as timeidx, or any
-engine under `DurabilitySync`) writes a compact durable **recovery marker**
+A batch that could leave one commit unit durable and another not writes a
+compact durable **recovery marker**. Commit units are the distinct user
+namespaces (each engine's per-namespace `Apply` is atomic; vectoridx, which
+applies one operation at a time, counts each vector operation). Liveness shares
+the bitmap store and the entity's rebuild, so it is not a separate unit. A unit
+is crash-durable during apply for `timeidx` (synchronized COW) and `bitmapidx`
+(WAL tail replayed on reopen); simhash new-record appends, vectoridx inserts,
+radixhash and geoidx are checkpoint-dependent. A batch is risky exactly when it
+spans two or more units and at least one is crash-durable — a single unit, or a
+batch of checkpoint-dependent units only, stays consistent without a marker. The
+marker (`recovery.bin`) lists the intended
 (`recovery.bin`) listing the intended namespaces *before* the first engine can
 persist, and clears it only after the touched engines are durable. If the
 process is interrupted, `Open` reads the marker and marks those namespaces

@@ -196,19 +196,32 @@ func (m *Matcher) Match(dst []Match, items []MatchItem, params MatchParams) ([]M
 	return dst, nil
 }
 
-// validateBindings checks, once per batch, that every namespace the batch needs
-// is currently available. Unrelated healthy families are not affected.
+// validateBindings checks, once per batch, that the Store is open, that every
+// requested matching family is configured, and that every needed namespace is
+// currently available. Unrelated healthy families are not affected.
 func (m *Matcher) validateBindings(items []MatchItem) error {
+	if m.store.closed.Load() {
+		return ErrClosed
+	}
 	var needSHA, needBLAKE, needPer bool
 	for i := range items {
 		it := &items[i]
-		if it.SHA256 != nil && m.sha256 != nil {
+		if it.SHA256 != nil {
+			if m.sha256 == nil {
+				return fmt.Errorf("%w: SHA256 namespace not configured", ErrMatcherNamespace)
+			}
 			needSHA = true
 		}
-		if it.BLAKE3 != nil && m.blake3 != nil {
+		if it.BLAKE3 != nil {
+			if m.blake3 == nil {
+				return fmt.Errorf("%w: BLAKE3 namespace not configured", ErrMatcherNamespace)
+			}
 			needBLAKE = true
 		}
-		if (it.PHash != nil || it.PDQ != nil) && m.perceptual != nil {
+		if it.PHash != nil || it.PDQ != nil {
+			if m.perceptual == nil {
+				return fmt.Errorf("%w: perceptual namespace not configured", ErrMatcherNamespace)
+			}
 			needPer = true
 		}
 	}

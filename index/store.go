@@ -83,10 +83,11 @@ type Store struct {
 
 	// Writer-owned scratch for batch prevalidation and staged, grouped
 	// application. All are only touched under mu and reused across batches.
-	pvSet     []uint64
-	pvCursors []simCursor
-	stage     stageState
-	flush     flushScratch
+	pvSet       []uint64
+	pvCursors   []simCursor
+	pvVectorOps int
+	stage       stageState
+	flush       flushScratch
 
 	// flushSourceGen / flushExplicit let the timeidx flush commit mutations and
 	// the completeness watermark in one engine transaction instead of a second
@@ -414,7 +415,22 @@ func (s *Store) persistRecovery() error {
 			}
 		}
 	}
-	return writeFileAtomic(s.dir, recoveryName, binary.LittleEndian.AppendUint32(buf, storage.Checksum(buf)))
+	// The engines' contract is process-crash safety, not power-loss safety, so
+	// the marker needs only an atomic rename in the page cache, not a directory
+	// fsync. The rename keeps the marker from being observed torn.
+	return writeFileNoSync(s.dir, recoveryName, binary.LittleEndian.AppendUint32(buf, storage.Checksum(buf)))
+}
+
+// writeFileNoSync writes data atomically via a temp file and rename but skips
+// the directory fsync. It is used for the recovery marker, which must survive a
+// process crash (write/rename are in the page cache) but not a power loss, to
+// match the engines' documented durability contract at low cost.
+func writeFileNoSync(dir, name string, data []byte) error {
+	tmp := filepath.Join(dir, "."+name+".tmp")
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, name))
 }
 
 // readRecovery loads the recovery marker, returning nil when absent.
@@ -961,7 +977,7 @@ func (s *Store) Sync() error {
 	for _, v := range s.reg.vectors {
 		err = errors.Join(err, v.Sync())
 	}
-	return err
+	return errors.Join(err, s.clearRecoveryAfterDurability())
 }
 
 // Checkpoint flushes every engine's durable checkpoint. It serializes with
@@ -989,7 +1005,17 @@ func (s *Store) Checkpoint() error {
 	for _, v := range s.reg.vectors {
 		err = errors.Join(err, v.Checkpoint())
 	}
-	return err
+	return errors.Join(err, s.clearRecoveryAfterDurability())
+}
+
+// clearRecoveryAfterDurability drops the recovery marker once every engine has
+// been made durable. The caller holds mu.
+func (s *Store) clearRecoveryAfterDurability() error {
+	if len(s.pendingSet) == 0 {
+		return nil
+	}
+	s.pendingSet = s.pendingSet[:0]
+	return s.persistRecovery()
 }
 
 // Compact compacts every engine that supports it. It serializes with mutations

@@ -2,6 +2,7 @@ package index_test
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,6 +12,7 @@ import (
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
+	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
 	"github.com/evanoberholster/imageIdx/internal/storage"
@@ -116,6 +118,8 @@ func TestRecoveryMarkerClearedOnSuccess(t *testing.T) {
 	if err := db.Add(index.Entry{ValueID: 1, Times: []index.TimeValue{{Namespace: 1, Timestamp: 5}}, Hashes: []index.HashValue{{Namespace: 4, Hash: radixhash.Hash{1}}}}); err != nil {
 		t.Fatal(err)
 	}
+	// The batch mixes a durable (time) and a checkpoint-dependent (radixhash)
+	// engine; the touched engines are made durable and the marker cleared.
 	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); !os.IsNotExist(err) {
 		t.Fatalf("marker present after a successful batch: %v", err)
 	}
@@ -132,6 +136,109 @@ func TestRecoveryMarkerClearedOnSuccess(t *testing.T) {
 	}
 	if _, ok := reopened.Time(1); !ok {
 		t.Fatal("time namespace unavailable after a clean batch")
+	}
+}
+
+// Section 1: a single-namespace batch is atomic, so it does not write a
+// recovery marker (liveness is not a separate unit).
+func TestSingleNamespaceBatchAvoidsMarker(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: testSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	batch := db.NewBatch(3)
+	for i := 1; i <= 3; i++ {
+		if err := batch.Add(index.Entry{ValueID: common.ValueID(i), Times: []index.TimeValue{{Namespace: 1, Timestamp: uint64(i)}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Apply(batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); !os.IsNotExist(err) {
+		t.Fatalf("recovery marker written for a single-namespace batch: %v", err)
+	}
+	ti, _ := db.Time(1)
+	if got := ti.Search(nil, 0, 10); len(got) != 3 {
+		t.Fatalf("single-namespace records = %v, want 3", got)
+	}
+}
+
+// Section 1: a batch spanning a durable (time) and a bitmap namespace is risky
+// but succeeds, so the marker is written and then cleared.
+func TestMultiNamespaceRiskyBatchClearsMarker(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: testSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	batch := db.NewBatch(2)
+	if err := batch.Add(index.Entry{ValueID: 1, Times: []index.TimeValue{{Namespace: 1, Timestamp: 5}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Add(index.Entry{ValueID: 2, Bitmaps: []index.BitmapValue{{Namespace: 6, Value: bitmapidx.EnumStringValue("x")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Apply(batch); err != nil {
+		t.Fatal(err)
+	}
+	// A successful risky batch is made durable and its marker cleared.
+	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); !os.IsNotExist(err) {
+		t.Fatalf("recovery marker not cleared after a successful risky batch: %v", err)
+	}
+	if _, ok := db.Time(1); !ok {
+		t.Fatal("time namespace missing")
+	}
+	if tags, ok := db.Bitmap(6); !ok {
+		t.Fatal("bitmap namespace missing")
+	} else if bm, _ := tags.MatchValues(bitmapidx.EnumStringValue("x")); !bm.Contains(2) {
+		t.Fatal("bitmap value missing")
+	}
+}
+
+// Section 2: requesting an unconfigured matching family is an explicit error.
+func TestMatcherUnconfiguredFamilyRejected(t *testing.T) {
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{1}
+	if _, err := m.MatchOne(nil, index.MatchItem{BLAKE3: &h}, index.MatchParams{}); !errors.Is(err, index.ErrMatcherNamespace) {
+		t.Fatalf("unconfigured BLAKE3 err = %v, want ErrMatcherNamespace", err)
+	}
+	q := uint64(1)
+	if _, err := m.MatchOne(nil, index.MatchItem{PHash: &q}, index.MatchParams{}); !errors.Is(err, index.ErrMatcherNamespace) {
+		t.Fatalf("unconfigured perceptual err = %v, want ErrMatcherNamespace", err)
+	}
+	if _, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{}); err != nil {
+		t.Fatalf("configured SHA256 match failed: %v", err)
+	}
+}
+
+// Section 2: matching against a closed Store returns ErrClosed.
+func TestMatcherClosedStore(t *testing.T) {
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{1}
+	if _, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{}); !errors.Is(err, index.ErrClosed) {
+		t.Fatalf("closed-store err = %v, want ErrClosed", err)
 	}
 }
 
