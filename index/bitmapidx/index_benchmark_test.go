@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 
 	common "github.com/evanoberholster/imageIdx/common"
 )
@@ -172,6 +173,155 @@ func BenchmarkNamespaceRange(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
+		if _, err := index.Range(bounds); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// continuousEntries builds (distinct values) x (per value) memberships starting
+// at grid value 0.
+func continuousEntries(distinct, per int) []Entry {
+	entries := make([]Entry, 0, distinct*per)
+	for v := 0; v < distinct; v++ {
+		for j := 0; j < per; j++ {
+			entries = append(entries, Entry{ImageID: common.ImageID(v*per + j + 1), Value: IntValue(int64(v))})
+		}
+	}
+	return entries
+}
+
+// benchmarkContinuousRangeIndex builds an in-memory continuous namespace with
+// the given value shape.
+func benchmarkContinuousRangeIndex(b *testing.B, distinct, per int) *Index {
+	b.Helper()
+	index, err := NewMemory(continuousNamespace(testFocalLength), NamespaceConfig{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = index.Close() })
+	bt := index.NewBatch()
+	if err := bt.Add(continuousEntries(distinct, per)...); err != nil {
+		b.Fatal(err)
+	}
+	if err := bt.Apply(); err != nil {
+		b.Fatal(err)
+	}
+	if err := index.Barrier(); err != nil {
+		b.Fatal(err)
+	}
+	return index
+}
+
+// BenchmarkNamespaceRangeShapes measures continuous union materialization
+// across value shapes: sparse (many tiny postings), dense (few large postings),
+// and mixed.
+func BenchmarkNamespaceRangeShapes(b *testing.B) {
+	datasets := []struct {
+		name          string
+		distinct, per int
+	}{
+		{"sparse-100k-1", 100_000, 1},
+		{"dense-16-6250", 16, 6_250},
+		{"mixed-5k-20", 5_000, 20},
+	}
+	for _, ds := range datasets {
+		index := benchmarkContinuousRangeIndex(b, ds.distinct, ds.per)
+		shapes := []struct {
+			name   string
+			lo, hi int64
+		}{
+			{"narrow", 0, int64(ds.distinct)/50 + 1},
+			{"wide", 0, int64(ds.distinct)},
+		}
+		for _, shape := range shapes {
+			b.Run(ds.name+"/"+shape.name, func(b *testing.B) {
+				bounds := Between(shape.lo, shape.hi)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := index.Range(bounds); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkNamespaceCountRange measures the count-only continuous path.
+func BenchmarkNamespaceCountRange(b *testing.B) {
+	index := benchmarkContinuousRangeIndex(b, 10_000, 10)
+	shapes := []struct {
+		name   string
+		lo, hi int64
+	}{
+		{"narrow", 1_000, 2_000},
+		{"wide", 0, 10_000},
+	}
+	for _, shape := range shapes {
+		b.Run(shape.name, func(b *testing.B) {
+			bounds := Between(shape.lo, shape.hi)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := index.CountRange(bounds); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkNamespaceRangeDelta measures continuous ranges with a live active
+// delta, where every in-range key must fold its corrections. Moves create both
+// additions and removals across 256 distinct keys (the default delta bound).
+func BenchmarkNamespaceRangeDelta(b *testing.B) {
+	// Keep the delta in the visible layers: no synchronous fold, no rotation,
+	// and a delayed background compaction so the timed loop sees stable deltas.
+	config := NamespaceConfig{ActiveTarget: 1 << 20, HardDeltaLimit: 1 << 30, MaxDeltaValues: 1 << 20, CompactDelay: time.Hour}
+	index, err := NewMemory(continuousNamespace(testFocalLength), config)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = index.Close() })
+	seed := index.NewBatch()
+	if err := seed.Add(continuousEntries(10_000, 10)...); err != nil {
+		b.Fatal(err)
+	}
+	if err := seed.Apply(); err != nil {
+		b.Fatal(err)
+	}
+	if err := index.Barrier(); err != nil {
+		b.Fatal(err)
+	}
+	// The delta corrects keys 1000..1255 with both additions and removals, so
+	// the range [1000,1256] must fold a corrected posting for each one.
+	const base = 1_000
+	const keys = 256
+	bt := index.NewBatch()
+	moves := make([]Move, 0, keys*7)
+	nextID := common.ImageID(1_000_000)
+	for k := 0; k < keys; k++ {
+		moves = append(moves, Move{ImageID: common.ImageID((base+k)*10 + 1), From: int64(base + k), To: int64(base + k + 50_000)})
+		for j := 0; j < 6; j++ {
+			moves = append(moves, Move{ImageID: nextID, From: 0, To: int64(base + k)})
+			nextID++
+		}
+	}
+	if err := bt.Move(moves...); err != nil {
+		b.Fatal(err)
+	}
+	if err := bt.Apply(); err != nil {
+		b.Fatal(err)
+	}
+	if err := index.Barrier(); err != nil {
+		b.Fatal(err)
+	}
+	bounds := Between(base, base+keys)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
 		if _, err := index.Range(bounds); err != nil {
 			b.Fatal(err)
 		}

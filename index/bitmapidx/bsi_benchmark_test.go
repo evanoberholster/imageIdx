@@ -81,14 +81,24 @@ func buildBSIBench(b *testing.B, width uint8, dist bsiBenchDist, n int) (*Index,
 			b.Fatal(err)
 		}
 		if batch.Len() >= 4096 {
-			_ = batch.Apply()
-			_ = index.Barrier()
-			batch.Reset()
+			if err := batch.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := index.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+			if err := batch.Reset(); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 	if !batch.Empty() {
-		_ = batch.Apply()
-		_ = index.Barrier()
+		if err := batch.Apply(); err != nil {
+			b.Fatal(err)
+		}
+		if err := index.Barrier(); err != nil {
+			b.Fatal(err)
+		}
 	}
 	return index, ids
 }
@@ -109,12 +119,18 @@ func fillBSIBench(b *testing.B, index *Index, values []uint32) {
 			if err := index.Barrier(); err != nil {
 				b.Fatal(err)
 			}
-			_ = batch.Reset()
+			if err := batch.Reset(); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 	if !batch.Empty() {
-		_ = batch.Apply()
-		_ = index.Barrier()
+		if err := batch.Apply(); err != nil {
+			b.Fatal(err)
+		}
+		if err := index.Barrier(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -171,6 +187,37 @@ func BenchmarkBSIRange(b *testing.B) {
 	}
 }
 
+func BenchmarkBSICountRange(b *testing.B) {
+	max16 := bsiMaxValue(BSIWidth16)
+	max32 := bsiMaxValue(BSIWidth32)
+	cases := []struct {
+		name   string
+		width  uint8
+		lo, hi uint64
+	}{
+		{"narrow", BSIWidth16, max16 / 2, max16/2 + max16/100},
+		{"wide", BSIWidth16, max16 / 8, max16 * 7 / 8},
+		{"full", BSIWidth16, 0, max16},
+		{"narrow", BSIWidth32, max32 / 2, max32/2 + max32/100},
+		{"wide", BSIWidth32, max32 / 8, max32 * 7 / 8},
+		{"full", BSIWidth32, 0, max32},
+	}
+	for _, size := range []int{10_000, 100_000} {
+		for _, tc := range cases {
+			b.Run(tc.name+"-"+sizeName(tc.width, size), func(b *testing.B) {
+				index, _ := buildBSIBench(b, tc.width, bsiDistUniform, size)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := index.BSICountRange(ValuesBetween(tc.lo, tc.hi)); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkBSIFilterRange(b *testing.B) {
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
 		for _, size := range []int{10_000, 100_000} {
@@ -198,49 +245,245 @@ func BenchmarkBSIFilterRange(b *testing.B) {
 func BenchmarkBSISet(b *testing.B) {
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
 		b.Run(sizeName(width, 0), func(b *testing.B) {
-			index, err := NewMemory(bsiNamespace(testBSI16Namespace, width), NamespaceConfig{})
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() { _ = index.Close() })
+			index := bsiBenchIndex(b, width)
+			max := bsiMaxValue(width)
 			// Pre-insert ids so the timed loop measures replacement.
 			for i := 1; i <= 4096; i++ {
-				_ = index.Set(common.ValueID(i), uint64(i))
+				if err := index.Set(common.ValueID(i), uint64(i)&max); err != nil {
+					b.Fatal(err)
+				}
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_ = index.Set(common.ValueID(i%4096+1), uint64(i+1))
+				if err := index.Set(common.ValueID(i%4096+1), uint64(i+1)&max); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
 }
 
-func BenchmarkBSIBatch64(b *testing.B) {
-	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
-		b.Run(sizeName(width, 0), func(b *testing.B) {
-			index, err := NewMemory(bsiNamespace(testBSI16Namespace, width), NamespaceConfig{})
+// bsiBatchSizes spans the small-batch regime the writer targets.
+var bsiBatchSizes = []int{1, 8, 32, 64, 256}
+
+const (
+	// bsiBatchDomain bounds the upsert/delete working set so postings do not
+	// grow without bound across benchmark iterations.
+	bsiBatchDomain = 100_000
+	// bsiChurnDomain bounds the insert working set.
+	bsiChurnDomain = 1 << 20
+)
+
+func bsiBenchIndex(b *testing.B, width uint8) *Index {
+	b.Helper()
+	index, err := NewMemory(bsiNamespace(testBSI16Namespace, width), NamespaceConfig{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = index.Close() })
+	return index
+}
+
+// stageUpserts stages size Set-semantics upserts over the bounded domain.
+func stageUpserts(batch *Batch, seed, size int) error {
+	for j := 0; j < size; j++ {
+		id := common.ValueID((seed+j)%bsiBatchDomain + 1)
+		if err := batch.Add(Entry{ImageID: id, Value: Uint32Value(uint32((seed + j) & 0xFFFF))}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// benchBSIBatch measures a complete batch commit: staging, preparation,
+// expansion, delta composition, WAL encoding (for a store), publication, and
+// the durability barrier. op selects the mutation kind; maintenance needed to
+// keep each kind meaningful runs untimed.
+func benchBSIBatch(b *testing.B, index *Index, size int, op string) {
+	b.Helper()
+	batch := index.NewBatch()
+	b.ReportAllocs()
+	b.ResetTimer()
+	seed := 0
+	for i := 0; i < b.N; i++ {
+		if err := batch.Reset(); err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < size; j++ {
+			id := common.ValueID((seed+j)%bsiBatchDomain + 1)
+			var err error
+			switch op {
+			case "insert":
+				err = batch.BSIMove(BSIMove{ID: common.ValueID((seed+j)%bsiChurnDomain + 1), To: uint32((seed + j) & 0xFFFF), HasTo: true})
+			case "delete":
+				err = batch.Remove(Entry{ImageID: id, Value: Uint32Value(0)})
+			case "mixed":
+				if j%2 == 0 {
+					err = batch.Add(Entry{ImageID: id, Value: Uint32Value(uint32((seed + j) & 0xFFFF))})
+				} else {
+					err = batch.Remove(Entry{ImageID: id, Value: Uint32Value(0)})
+				}
+			default: // upsert (insert or replace)
+				err = batch.Add(Entry{ImageID: id, Value: Uint32Value(uint32((seed + j) & 0xFFFF))})
+			}
 			if err != nil {
 				b.Fatal(err)
 			}
-			b.Cleanup(func() { _ = index.Close() })
-			batch := index.NewBatch()
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				batch.Reset()
-				for j := 0; j < 64; j++ {
-					id := common.ValueID((i*64+j)%100_000 + 1)
-					if err := batch.Add(Entry{ImageID: id, Value: Uint32Value(uint32((i + j) & 0xFFFF))}); err != nil {
+		}
+		if err := batch.Apply(); err != nil {
+			b.Fatal(err)
+		}
+		if err := index.Barrier(); err != nil {
+			b.Fatal(err)
+		}
+		// Untimed maintenance keeps each op kind meaningful without inflating
+		// the measured commit.
+		b.StopTimer()
+		if err := batch.Reset(); err != nil {
+			b.Fatal(err)
+		}
+		switch op {
+		case "insert":
+			for j := 0; j < size; j++ {
+				if err := batch.Remove(Entry{ImageID: common.ValueID((seed+j)%bsiChurnDomain + 1), Value: Uint32Value(0)}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if err := batch.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := index.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+		case "delete":
+			for j := 0; j < size; j++ {
+				if err := batch.Add(Entry{ImageID: common.ValueID((seed+j)%bsiBatchDomain + 1), Value: Uint32Value(uint32(seed + j))}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if err := batch.Apply(); err != nil {
+				b.Fatal(err)
+			}
+			if err := index.Barrier(); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StartTimer()
+		seed += size
+		if seed > bsiChurnDomain {
+			seed = 0
+		}
+	}
+}
+
+// BenchmarkBSIBatchPrepare measures staging only: validation, duplicate
+// detection, and buffer growth, without any commit.
+func BenchmarkBSIBatchPrepare(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, size := range bsiBatchSizes {
+			b.Run(sizeName(width, size), func(b *testing.B) {
+				index := bsiBenchIndex(b, width)
+				batch := index.NewBatch()
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := batch.Reset(); err != nil {
+						b.Fatal(err)
+					}
+					if err := stageUpserts(batch, i*size, size); err != nil {
 						b.Fatal(err)
 					}
 				}
-				b.StopTimer()
-				_ = batch.Apply()
-				_ = index.Barrier()
-				b.StartTimer()
-			}
-		})
+				_ = batch.Close()
+			})
+		}
+	}
+}
+
+// BenchmarkBSIBatchCommitMemory measures a full in-memory commit.
+func BenchmarkBSIBatchCommitMemory(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, size := range bsiBatchSizes {
+			b.Run(sizeName(width, size), func(b *testing.B) {
+				benchBSIBatch(b, bsiBenchIndex(b, width), size, "upsert")
+			})
+		}
+	}
+}
+
+// BenchmarkBSIBatchCommitPersistent measures a full commit through a store WAL
+// without an explicit fsync (DurabilityOS).
+func BenchmarkBSIBatchCommitPersistent(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, size := range bsiBatchSizes {
+			b.Run(sizeName(width, size), func(b *testing.B) {
+				store, err := NewStore(b.TempDir(), []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, common.DurabilityOS)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Cleanup(func() { _ = store.Close() })
+				index, _ := store.Lookup(testBSI16Namespace)
+				benchBSIBatch(b, index, size, "upsert")
+			})
+		}
+	}
+}
+
+// BenchmarkBSIBatchCommitDurable measures a full commit including the WAL
+// fsync (DurabilitySync).
+func BenchmarkBSIBatchCommitDurable(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, size := range bsiBatchSizes {
+			b.Run(sizeName(width, size), func(b *testing.B) {
+				store, err := NewStore(b.TempDir(), []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, common.DurabilitySync)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Cleanup(func() { _ = store.Close() })
+				index, _ := store.Lookup(testBSI16Namespace)
+				benchBSIBatch(b, index, size, "upsert")
+			})
+		}
+	}
+}
+
+// BenchmarkBSIBatchInsert measures complete batches of true inserts (absent
+// IDs) with untimed cleanup deletes.
+func BenchmarkBSIBatchInsert(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, size := range bsiBatchSizes {
+			b.Run(sizeName(width, size), func(b *testing.B) {
+				benchBSIBatch(b, bsiBenchIndex(b, width), size, "insert")
+			})
+		}
+	}
+}
+
+// BenchmarkBSIBatchDelete measures complete batches of deletes with untimed
+// cleanup re-inserts.
+func BenchmarkBSIBatchDelete(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, size := range bsiBatchSizes {
+			b.Run(sizeName(width, size), func(b *testing.B) {
+				index := bsiBenchIndex(b, width)
+				// Seed the working set so deletes are of present IDs.
+				values := bsiBenchValues(bsiDistUniform, width, bsiBatchDomain)
+				fillBSIBench(b, index, values)
+				benchBSIBatch(b, index, size, "delete")
+			})
+		}
+	}
+}
+
+// BenchmarkBSIBatchMixed measures complete batches mixing upserts and deletes.
+func BenchmarkBSIBatchMixed(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, size := range bsiBatchSizes {
+			b.Run(sizeName(width, size), func(b *testing.B) {
+				benchBSIBatch(b, bsiBenchIndex(b, width), size, "mixed")
+			})
+		}
 	}
 }
 
@@ -249,7 +492,9 @@ func BenchmarkBSIDelete(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = index.Delete(ids[i%len(ids)])
+		if err := index.Delete(ids[i%len(ids)]); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -262,11 +507,18 @@ func BenchmarkBSIPersistent(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				index, _ := store.Lookup(testBSI16Namespace)
+				index, ok := store.Lookup(testBSI16Namespace)
+				if !ok {
+					b.Fatal("namespace missing")
+				}
 				values := bsiBenchValues(bsiDistUniform, width, size)
 				fillBSIBench(b, index, values)
-				_ = store.Checkpoint()
-				_ = store.Close()
+				if err := store.Checkpoint(); err != nil {
+					b.Fatal(err)
+				}
+				if err := store.Close(); err != nil {
+					b.Fatal(err)
+				}
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					reopened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
@@ -274,9 +526,16 @@ func BenchmarkBSIPersistent(b *testing.B) {
 						b.Fatal(err)
 					}
 					// A query forces lazy structures to be touched.
-					got, _ := reopened.Lookup(testBSI16Namespace)
-					_, _ = got.BSIRange(0, bsiMaxValue(width)/2)
-					_ = reopened.Close()
+					got, ok := reopened.Lookup(testBSI16Namespace)
+					if !ok {
+						b.Fatal("namespace missing after reopen")
+					}
+					if _, err := got.BSIRange(0, bsiMaxValue(width)/2); err != nil {
+						b.Fatal(err)
+					}
+					if err := reopened.Close(); err != nil {
+						b.Fatal(err)
+					}
 				}
 			})
 		}
@@ -299,8 +558,12 @@ func BenchmarkBSICompact(b *testing.B) {
 						b.Fatal(err)
 					}
 				}
-				_ = batch.Apply()
-				_ = index.Barrier()
+				if err := batch.Apply(); err != nil {
+					b.Fatal(err)
+				}
+				if err := index.Barrier(); err != nil {
+					b.Fatal(err)
+				}
 				b.StartTimer()
 				if err := index.Compact(); err != nil {
 					b.Fatal(err)
@@ -319,7 +582,10 @@ func BenchmarkBSICheckpoint(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			index, _ := store.Lookup(testBSI16Namespace)
+			index, ok := store.Lookup(testBSI16Namespace)
+			if !ok {
+				b.Fatal("namespace missing")
+			}
 			values := bsiBenchValues(bsiDistUniform, width, n)
 			fillBSIBench(b, index, values)
 			b.ReportAllocs()
@@ -330,7 +596,9 @@ func BenchmarkBSICheckpoint(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-			_ = store.Close()
+			if err := store.Close(); err != nil {
+				b.Fatal(err)
+			}
 		})
 	}
 }
@@ -345,7 +613,9 @@ func BenchmarkBSIVsContinuousRange(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, _ = index.BSIRange(max/8, max*7/8)
+			if _, err := index.BSIRange(max/8, max*7/8); err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 	b.Run("continuous", func(b *testing.B) {
@@ -356,20 +626,34 @@ func BenchmarkBSIVsContinuousRange(b *testing.B) {
 		b.Cleanup(func() { _ = index.Close() })
 		batch := index.NewBatch()
 		for i, value := range values {
-			_ = batch.Add(Entry{ImageID: common.ImageID(i + 1), Value: IntValue(int64(value))})
+			if err := batch.Add(Entry{ImageID: common.ImageID(i + 1), Value: IntValue(int64(value))}); err != nil {
+				b.Fatal(err)
+			}
 			if batch.Len() >= 4096 {
-				_ = batch.Apply()
-				_ = index.Barrier()
-				batch.Reset()
+				if err := batch.Apply(); err != nil {
+					b.Fatal(err)
+				}
+				if err := index.Barrier(); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Reset(); err != nil {
+					b.Fatal(err)
+				}
 			}
 		}
-		_ = batch.Apply()
-		_ = index.Barrier()
+		if err := batch.Apply(); err != nil {
+			b.Fatal(err)
+		}
+		if err := index.Barrier(); err != nil {
+			b.Fatal(err)
+		}
 		bounds := Between(int64(max/8), int64(max*7/8))
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, _ = index.Range(bounds)
+			if _, err := index.Range(bounds); err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }
