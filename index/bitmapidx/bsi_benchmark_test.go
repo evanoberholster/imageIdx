@@ -551,9 +551,12 @@ func BenchmarkBSICompact(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
+				// A bounded delta keeps the untimed setup proportional to the
+				// timed compaction rather than to b.N.
 				batch := index.NewBatch()
-				for j := 0; j < 4096; j++ {
-					id := ids[(i*4096+j)%n]
+				const churn = 512
+				for j := 0; j < churn; j++ {
+					id := ids[(i*churn+j)%n]
 					if err := batch.Add(Entry{ImageID: id, Value: Uint32Value(uint32(j))}); err != nil {
 						b.Fatal(err)
 					}

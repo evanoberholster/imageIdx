@@ -139,6 +139,9 @@ func (i *Index) resolveBSIBatch(view *namespaceView, ops []bsiOp) ([]stagedChang
 				return nil, nil, 0, err
 			}
 		}
+		// Read the current value with per-bit probes: resolving every slice
+		// here would fold (and allocate) untouched corrected postings for a
+		// batch that usually touches only a few.
 		current, present := view.bsiValueAt(spec.Namespace, spec.BSIWidth, op.id)
 		if err := bsiExpand(&deltas, op, current, present); err != nil {
 			return nil, nil, 0, err

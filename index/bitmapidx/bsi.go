@@ -2,6 +2,7 @@ package bitmapidx
 
 import (
 	"math/bits"
+	"sync"
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
@@ -91,98 +92,226 @@ func (v *namespaceView) bsiValueAt(ns common.Namespace, width uint8, id common.V
 	return value, true
 }
 
-// bsiEqual returns the ValueIDs whose value equals value exactly.
-func (v *namespaceView) bsiEqual(ns common.Namespace, width uint8, value uint64) roar.Bitmap {
-	equal, ok := v.bsiExists(ns)
-	if !ok {
-		return roar.Bitmap{}
+// bsiSlices holds the resolved postings for one BSI namespace: existence and
+// each value bit. A query resolves them once, so it never repeats the generic
+// posting lookup (binary search plus delta folding) for the same slice, and it
+// reuses the resolved references across every bit operation.
+type bsiSlices struct {
+	exists    roar.Bitmap
+	hasExists bool
+	bits      [32]roar.Bitmap
+	hasBit    [32]bool
+	width     uint8
+}
+
+// resolveBSISlices fills out with the namespace's effective slice postings.
+// Absent slices stay zero, which the comparison kernels treat as an empty set.
+func (v *namespaceView) resolveBSISlices(ns common.Namespace, width uint8, out *bsiSlices) {
+	out.width = width
+	out.hasExists = false
+	out.exists = roar.Bitmap{}
+	for bit := range out.hasBit {
+		out.hasBit[bit] = false
+		out.bits[bit] = roar.Bitmap{}
+	}
+	if b, ok := v.bsiSlice(bsiSliceKey(ns, bsiExistsSlice)); ok {
+		out.exists, out.hasExists = b, true
 	}
 	for bit := uint8(0); bit < width; bit++ {
-		if equal.IsEmpty() {
-			break
+		if b, ok := v.bsiSlice(bsiSliceKey(ns, uint64(bit)+1)); ok {
+			out.bits[bit], out.hasBit[bit] = b, true
 		}
-		slice, has := v.bsiSlice(bsiSliceKey(ns, uint64(bit)+1))
+	}
+}
+
+// bitAt returns id's value bit, treating an absent slice as all zeros.
+func (s *bsiSlices) bitAt(id common.ValueID, bit uint8) bool {
+	if bit >= s.width || !s.hasBit[bit] {
+		return false
+	}
+	return s.bits[bit].Contains(id)
+}
+
+// bsiScratch is one reusable query workspace: recycled accumulators plus the
+// resolved slice view. Accumulators recycle a single owned result buffer, so
+// repeated bit operations allocate only on growth instead of once per bit.
+type bsiScratch struct {
+	slices bsiSlices
+	equal  *roar.MutableBitmap
+	less   *roar.MutableBitmap
+	zero   *roar.MutableBitmap
+	res    *roar.MutableBitmap
+}
+
+// bsiScratchMaxRetained bounds a pooled workspace so one huge query cannot pin
+// megabytes process-wide.
+const bsiScratchMaxRetained = 1 << 20
+
+var bsiScratchPool = sync.Pool{New: func() any {
+	return &bsiScratch{
+		equal: roar.NewMutableBitmap(),
+		less:  roar.NewMutableBitmap(),
+		zero:  roar.NewMutableBitmap(),
+		res:   roar.NewMutableBitmap(),
+	}
+}}
+
+func acquireBSIScratch() *bsiScratch {
+	s := bsiScratchPool.Get().(*bsiScratch)
+	s.equal.Reset()
+	s.less.Reset()
+	s.zero.Reset()
+	s.res.Reset()
+	return s
+}
+
+func releaseBSIScratch(s *bsiScratch) {
+	retained := s.equal.RetainedBytes() + s.less.RetainedBytes() + s.zero.RetainedBytes() + s.res.RetainedBytes()
+	if retained > bsiScratchMaxRetained {
+		return
+	}
+	bsiScratchPool.Put(s)
+}
+
+// ownBSI detaches a scratch-aliasing result: empty stays empty, otherwise a
+// clone owned by the caller.
+func ownBSI(b roar.Bitmap) roar.Bitmap {
+	if b.IsEmpty() {
+		return roar.Bitmap{}
+	}
+	return b.Clone()
+}
+
+// bsiEqualInto fills m with the IDs whose value equals value. The result aliases
+// m and is valid until m is reused.
+func bsiEqualInto(s *bsiSlices, value uint64, m *roar.MutableBitmap) roar.Bitmap {
+	m.Reset()
+	if !s.hasExists {
+		return roar.Bitmap{}
+	}
+	m.Or(s.exists)
+	for bit := uint8(0); bit < s.width; bit++ {
 		if value&(uint64(1)<<bit) != 0 {
-			if !has {
+			if !s.hasBit[bit] {
 				return roar.Bitmap{}
 			}
-			equal = roar.And(equal, slice)
-		} else if has {
-			equal = roar.AndNot(equal, slice)
+			m.And(s.bits[bit])
+		} else if s.hasBit[bit] {
+			m.AndNot(s.bits[bit])
 		}
-	}
-	return equal
-}
-
-// bsiLess returns the ValueIDs whose value is strictly less than value.
-// Slices are processed most-significant first; equal tracks IDs still equal to
-// the processed prefix and less accumulates IDs already known to be smaller.
-// Processing stops as soon as equal is empty.
-func (v *namespaceView) bsiLess(ns common.Namespace, width uint8, value uint64) roar.Bitmap {
-	equal, ok := v.bsiExists(ns)
-	if !ok {
-		return roar.Bitmap{}
-	}
-	// Values at or above the width maximum are all smaller. Callers rely on
-	// this for the max+1 bound of LessOrEqual and Range.
-	if value > bsiMaxValue(width) {
-		return equal
-	}
-	var less roar.Bitmap
-	for bit := int(width) - 1; bit >= 0; bit-- {
-		if equal.IsEmpty() {
+		if m.Freeze().IsEmpty() {
 			break
 		}
-		slice, has := v.bsiSlice(bsiSliceKey(ns, uint64(bit)+1))
-		if value&(uint64(1)<<uint(bit)) != 0 {
-			// Equal-prefix IDs with a clear bit here are strictly smaller.
-			if has {
-				zero := roar.AndNot(equal, slice)
-				if !zero.IsEmpty() {
-					less = roar.Or(less, zero)
-				}
-				equal = roar.And(equal, slice)
-			} else {
-				less = roar.Or(less, equal)
-				equal = roar.Bitmap{}
-			}
-		} else if has {
-			equal = roar.AndNot(equal, slice)
-		}
 	}
-	return less
+	return m.Freeze()
 }
 
-// bsiRange returns the ValueIDs inside r, restricted to existence.
-func (v *namespaceView) bsiRange(ns common.Namespace, width uint8, r ValueRange) roar.Bitmap {
-	exists, ok := v.bsiExists(ns)
-	if !ok || r.empty() {
+// bsiLessInto fills less with the IDs whose value is strictly less than value.
+// Slices are processed most-significant first; equal tracks IDs still equal to
+// the processed prefix and less accumulates IDs already known to be smaller.
+// Processing stops as soon as equal is empty. The result aliases less.
+func bsiLessInto(s *bsiSlices, value uint64, equal, less, zero *roar.MutableBitmap) roar.Bitmap {
+	equal.Reset()
+	less.Reset()
+	zero.Reset()
+	if !s.hasExists {
 		return roar.Bitmap{}
 	}
-	result := exists
-	if r.HasLo {
-		if r.LoInclusive {
-			lower := v.bsiLess(ns, width, r.Lo)
-			result = roar.AndNot(result, lower)
-		} else {
-			// value > Lo  <=>  NOT (value <= Lo) = NOT (value < Lo+1)
-			lower := v.bsiLess(ns, width, r.Lo+1)
-			result = roar.AndNot(result, lower)
+	equal.Or(s.exists)
+	// Values at or above the width maximum are all smaller. Callers rely on
+	// this for the max+1 bound of LessOrEqual and Range.
+	if value > bsiMaxValue(s.width) {
+		return equal.Freeze()
+	}
+	for bit := int(s.width) - 1; bit >= 0; bit-- {
+		if equal.Freeze().IsEmpty() {
+			break
+		}
+		if value&(uint64(1)<<uint(bit)) != 0 {
+			// Equal-prefix IDs with a clear bit here are strictly smaller.
+			if s.hasBit[bit] {
+				zero.Or(equal.Freeze())
+				zero.AndNot(s.bits[bit])
+				less.Or(zero.Freeze())
+				equal.And(s.bits[bit])
+			} else {
+				less.Or(equal.Freeze())
+				equal.Reset()
+			}
+		} else if s.hasBit[bit] {
+			equal.AndNot(s.bits[bit])
 		}
 	}
-	if result.IsEmpty() {
-		return result
+	return less.Freeze()
+}
+
+// bsiRangeInto fills res with the IDs whose value lies in r. The result aliases
+// res.
+func bsiRangeInto(s *bsiSlices, r ValueRange, sc *bsiScratch) roar.Bitmap {
+	sc.res.Reset()
+	if !s.hasExists || r.empty() {
+		return roar.Bitmap{}
+	}
+	res := sc.res
+	res.Or(s.exists)
+	if r.HasLo {
+		bound := r.Lo
+		if !r.LoInclusive {
+			bound++
+		}
+		res.AndNot(bsiLessInto(s, bound, sc.equal, sc.less, sc.zero))
+		if res.Freeze().IsEmpty() {
+			return roar.Bitmap{}
+		}
 	}
 	if r.HasHi {
-		var upper roar.Bitmap
+		bound := r.Hi
 		if r.HiInclusive {
-			upper = v.bsiLess(ns, width, r.Hi+1)
-		} else {
-			upper = v.bsiLess(ns, width, r.Hi)
+			bound++
 		}
-		result = roar.And(result, upper)
+		res.And(bsiLessInto(s, bound, sc.equal, sc.less, sc.zero))
 	}
-	return result
+	return res.Freeze()
+}
+
+// bsiCandidateInRange reports whether one candidate's value lies in r without
+// materializing a range bitmap or reconstructing the full value: each bound is
+// tested most-significant-bit first and stops at the first differing bit.
+func bsiCandidateInRange(s *bsiSlices, id common.ValueID, r ValueRange) bool {
+	if !s.hasExists || !s.exists.Contains(id) {
+		return false
+	}
+	if r.HasLo && !bsiCandidateAtLeast(s, id, r.Lo, r.LoInclusive) {
+		return false
+	}
+	if r.HasHi && !bsiCandidateAtMost(s, id, r.Hi, r.HiInclusive) {
+		return false
+	}
+	return true
+}
+
+// bsiCandidateAtLeast reports value >= bound (or > bound when !inclusive).
+func bsiCandidateAtLeast(s *bsiSlices, id common.ValueID, bound uint64, inclusive bool) bool {
+	for bit := int(s.width) - 1; bit >= 0; bit-- {
+		c := s.bitAt(id, uint8(bit))
+		b := bound&(uint64(1)<<uint(bit)) != 0
+		if c != b {
+			return c
+		}
+	}
+	return inclusive
+}
+
+// bsiCandidateAtMost reports value <= bound (or < bound when !inclusive).
+func bsiCandidateAtMost(s *bsiSlices, id common.ValueID, bound uint64, inclusive bool) bool {
+	for bit := int(s.width) - 1; bit >= 0; bit-- {
+		c := s.bitAt(id, uint8(bit))
+		b := bound&(uint64(1)<<uint(bit)) != 0
+		if c != b {
+			return !c
+		}
+	}
+	return inclusive
 }
 
 // ValueRange is an unsigned, inclusive/exclusive value range over a BSI
@@ -271,135 +400,139 @@ func (i *Index) bsiSpec() (NamespaceSpec, error) {
 	return spec, nil
 }
 
-// detachBSI clones a query result when the index is store-owned, because a
-// result can alias the mmap mapping that a checkpoint may unmap.
-func (i *Index) detachBSI(result roar.Bitmap) roar.Bitmap {
-	if i.owner != nil && !result.IsEmpty() {
-		return result.Clone()
+// bsiAcquire resolves the namespace's slice postings into pooled scratch. The
+// caller must release the returned workspace.
+func (i *Index) bsiAcquire(spec NamespaceSpec, view *namespaceView) *bsiScratch {
+	sc := acquireBSIScratch()
+	view.resolveBSISlices(spec.Namespace, spec.BSIWidth, &sc.slices)
+	return sc
+}
+
+// bsiValidateSpec returns the BSI namespace definition after checking that
+// value fits its width.
+func (i *Index) bsiValidateSpec(value uint64) (NamespaceSpec, error) {
+	spec, err := i.bsiSpec()
+	if err != nil {
+		return NamespaceSpec{}, err
 	}
-	return result
+	if err := checkBSIValue(spec.BSIWidth, value); err != nil {
+		return NamespaceSpec{}, err
+	}
+	return spec, nil
+}
+
+// bsiLessQuery returns ids whose value is strictly less than bound. The bound
+// is not width-checked: callers pass a validated value or value+1 <= max+1.
+func (i *Index) bsiLessQuery(spec NamespaceSpec, bound uint64) (roar.Bitmap, error) {
+	view, token, ok := i.bsiRead()
+	if !ok {
+		return roar.Bitmap{}, nil
+	}
+	sc := i.bsiAcquire(spec, view)
+	result := ownBSI(bsiLessInto(&sc.slices, bound, sc.equal, sc.less, sc.zero))
+	releaseBSIScratch(sc)
+	i.readers.Release(token)
+	return result, nil
+}
+
+// bsiExcludeLess returns exists minus the set of ids with value < bound.
+func (i *Index) bsiExcludeLess(spec NamespaceSpec, bound uint64) (roar.Bitmap, error) {
+	view, token, ok := i.bsiRead()
+	if !ok {
+		return roar.Bitmap{}, nil
+	}
+	sc := i.bsiAcquire(spec, view)
+	sc.res.Reset()
+	if sc.slices.hasExists {
+		sc.res.Or(sc.slices.exists)
+		sc.res.AndNot(bsiLessInto(&sc.slices, bound, sc.equal, sc.less, sc.zero))
+	}
+	result := ownBSI(sc.res.Freeze())
+	releaseBSIScratch(sc)
+	i.readers.Release(token)
+	return result, nil
+}
+
+// bsiExcludeEqual returns exists minus the set of ids with value == value.
+func (i *Index) bsiExcludeEqual(spec NamespaceSpec, value uint64) (roar.Bitmap, error) {
+	view, token, ok := i.bsiRead()
+	if !ok {
+		return roar.Bitmap{}, nil
+	}
+	sc := i.bsiAcquire(spec, view)
+	sc.res.Reset()
+	if sc.slices.hasExists {
+		sc.res.Or(sc.slices.exists)
+		sc.res.AndNot(bsiEqualInto(&sc.slices, value, sc.equal))
+	}
+	result := ownBSI(sc.res.Freeze())
+	releaseBSIScratch(sc)
+	i.readers.Release(token)
+	return result, nil
 }
 
 // Equal returns the ValueIDs whose BSI value equals value. The result is a
 // roaring bitmap of common.ValueID, ready for use in the unified search API.
 func (i *Index) Equal(value uint64) (roar.Bitmap, error) {
-	spec, err := i.bsiSpec()
+	spec, err := i.bsiValidateSpec(value)
 	if err != nil {
-		return roar.Bitmap{}, err
-	}
-	if err := checkBSIValue(spec.BSIWidth, value); err != nil {
 		return roar.Bitmap{}, err
 	}
 	view, token, ok := i.bsiRead()
 	if !ok {
 		return roar.Bitmap{}, nil
 	}
-	result := view.bsiEqual(spec.Namespace, spec.BSIWidth, value)
+	sc := i.bsiAcquire(spec, view)
+	result := ownBSI(bsiEqualInto(&sc.slices, value, sc.equal))
+	releaseBSIScratch(sc)
 	i.readers.Release(token)
-	return i.detachBSI(result), nil
+	return result, nil
 }
 
 // Less returns the ValueIDs whose BSI value is strictly less than value.
 func (i *Index) Less(value uint64) (roar.Bitmap, error) {
-	spec, err := i.bsiSpec()
+	spec, err := i.bsiValidateSpec(value)
 	if err != nil {
 		return roar.Bitmap{}, err
 	}
-	if err := checkBSIValue(spec.BSIWidth, value); err != nil {
-		return roar.Bitmap{}, err
-	}
-	view, token, ok := i.bsiRead()
-	if !ok {
-		return roar.Bitmap{}, nil
-	}
-	result := view.bsiLess(spec.Namespace, spec.BSIWidth, value)
-	i.readers.Release(token)
-	return i.detachBSI(result), nil
+	return i.bsiLessQuery(spec, value)
 }
 
 // LessOrEqual returns the ValueIDs whose BSI value is at most value.
 func (i *Index) LessOrEqual(value uint64) (roar.Bitmap, error) {
-	spec, err := i.bsiSpec()
+	spec, err := i.bsiValidateSpec(value)
 	if err != nil {
 		return roar.Bitmap{}, err
 	}
-	if err := checkBSIValue(spec.BSIWidth, value); err != nil {
-		return roar.Bitmap{}, err
-	}
-	view, token, ok := i.bsiRead()
-	if !ok {
-		return roar.Bitmap{}, nil
-	}
 	// <= value is < value+1; no stored value can equal the (width-fit) bound.
-	result := view.bsiLess(spec.Namespace, spec.BSIWidth, value+1)
-	i.readers.Release(token)
-	return i.detachBSI(result), nil
+	return i.bsiLessQuery(spec, value+1)
 }
 
 // Greater returns the ValueIDs whose BSI value is strictly greater than value.
 func (i *Index) Greater(value uint64) (roar.Bitmap, error) {
-	spec, err := i.bsiSpec()
+	spec, err := i.bsiValidateSpec(value)
 	if err != nil {
 		return roar.Bitmap{}, err
 	}
-	if err := checkBSIValue(spec.BSIWidth, value); err != nil {
-		return roar.Bitmap{}, err
-	}
-	view, token, ok := i.bsiRead()
-	if !ok {
-		return roar.Bitmap{}, nil
-	}
-	exists, has := view.bsiExists(spec.Namespace)
-	var result roar.Bitmap
-	if has {
-		result = roar.AndNot(exists, view.bsiLess(spec.Namespace, spec.BSIWidth, value+1))
-	}
-	i.readers.Release(token)
-	return i.detachBSI(result), nil
+	return i.bsiExcludeLess(spec, value+1)
 }
 
 // GreaterOrEqual returns the ValueIDs whose BSI value is at least value.
 func (i *Index) GreaterOrEqual(value uint64) (roar.Bitmap, error) {
-	spec, err := i.bsiSpec()
+	spec, err := i.bsiValidateSpec(value)
 	if err != nil {
 		return roar.Bitmap{}, err
 	}
-	if err := checkBSIValue(spec.BSIWidth, value); err != nil {
-		return roar.Bitmap{}, err
-	}
-	view, token, ok := i.bsiRead()
-	if !ok {
-		return roar.Bitmap{}, nil
-	}
-	exists, has := view.bsiExists(spec.Namespace)
-	var result roar.Bitmap
-	if has {
-		result = roar.AndNot(exists, view.bsiLess(spec.Namespace, spec.BSIWidth, value))
-	}
-	i.readers.Release(token)
-	return i.detachBSI(result), nil
+	return i.bsiExcludeLess(spec, value)
 }
 
 // NotEqual returns the ValueIDs whose BSI value differs from value.
 func (i *Index) NotEqual(value uint64) (roar.Bitmap, error) {
-	spec, err := i.bsiSpec()
+	spec, err := i.bsiValidateSpec(value)
 	if err != nil {
 		return roar.Bitmap{}, err
 	}
-	if err := checkBSIValue(spec.BSIWidth, value); err != nil {
-		return roar.Bitmap{}, err
-	}
-	view, token, ok := i.bsiRead()
-	if !ok {
-		return roar.Bitmap{}, nil
-	}
-	exists, has := view.bsiExists(spec.Namespace)
-	var result roar.Bitmap
-	if has {
-		result = roar.AndNot(exists, view.bsiEqual(spec.Namespace, spec.BSIWidth, value))
-	}
-	i.readers.Release(token)
-	return i.detachBSI(result), nil
+	return i.bsiExcludeEqual(spec, value)
 }
 
 // Range returns the ValueIDs whose BSI value lies in the inclusive range
@@ -408,42 +541,60 @@ func (i *Index) BSIRange(min, max uint64) (roar.Bitmap, error) {
 	return i.BSIRangeQuery(ValuesBetween(min, max))
 }
 
-// RangeQuery returns the ValueIDs whose BSI value lies inside r, honoring
-// inclusive/exclusive ends.
-func (i *Index) BSIRangeQuery(r ValueRange) (roar.Bitmap, error) {
+// bsiRangeSpec returns the BSI definition after validating the range bounds
+// against the namespace width.
+func (i *Index) bsiRangeSpec(r ValueRange) (NamespaceSpec, error) {
 	spec, err := i.bsiSpec()
 	if err != nil {
-		return roar.Bitmap{}, err
+		return NamespaceSpec{}, err
 	}
 	if r.HasLo {
 		if err := checkBSIValue(spec.BSIWidth, r.Lo); err != nil {
-			return roar.Bitmap{}, err
+			return NamespaceSpec{}, err
 		}
 	}
 	if r.HasHi {
 		if err := checkBSIValue(spec.BSIWidth, r.Hi); err != nil {
-			return roar.Bitmap{}, err
+			return NamespaceSpec{}, err
 		}
 	}
-	if r.empty() {
-		return roar.Bitmap{}, nil
+	return spec, nil
+}
+
+// BSIRangeQuery returns the ValueIDs whose BSI value lies inside r, honoring
+// inclusive/exclusive ends.
+func (i *Index) BSIRangeQuery(r ValueRange) (roar.Bitmap, error) {
+	spec, err := i.bsiRangeSpec(r)
+	if err != nil || r.empty() {
+		return roar.Bitmap{}, err
 	}
 	view, token, ok := i.bsiRead()
 	if !ok {
 		return roar.Bitmap{}, nil
 	}
-	result := view.bsiRange(spec.Namespace, spec.BSIWidth, r)
+	sc := i.bsiAcquire(spec, view)
+	result := ownBSI(bsiRangeInto(&sc.slices, r, sc))
+	releaseBSIScratch(sc)
 	i.readers.Release(token)
-	return i.detachBSI(result), nil
+	return result, nil
 }
 
-// CountRange returns the number of ValueIDs inside r without appending them.
+// BSICountRange returns the number of ValueIDs inside r without appending them
+// or materializing a caller-owned result bitmap.
 func (i *Index) BSICountRange(r ValueRange) (uint64, error) {
-	result, err := i.BSIRangeQuery(r)
-	if err != nil {
+	spec, err := i.bsiRangeSpec(r)
+	if err != nil || r.empty() {
 		return 0, err
 	}
-	return result.Cardinality(), nil
+	view, token, ok := i.bsiRead()
+	if !ok {
+		return 0, nil
+	}
+	sc := i.bsiAcquire(spec, view)
+	count := bsiRangeInto(&sc.slices, r, sc).Cardinality()
+	releaseBSIScratch(sc)
+	i.readers.Release(token)
+	return count, nil
 }
 
 // bsiCandidateFactor selects between reconstructing candidate values and
@@ -458,33 +609,31 @@ const bsiCandidateFactor = 2
 // Small candidate sets reconstruct each value; larger sets materialize the
 // range bitmap once and probe it.
 func (i *Index) BSIFilterRange(dst, candidates []common.ValueID, r ValueRange) ([]common.ValueID, error) {
-	spec, err := i.bsiSpec()
-	if err != nil {
+	spec, err := i.bsiRangeSpec(r)
+	if err != nil || r.empty() || len(candidates) == 0 {
 		return dst, err
-	}
-	if r.empty() || len(candidates) == 0 {
-		return dst, nil
 	}
 	view, token, ok := i.bsiRead()
 	if !ok {
 		return dst, nil
 	}
 	defer i.readers.Release(token)
-
-	exists, has := view.bsiExists(spec.Namespace)
-	if !has {
+	sc := i.bsiAcquire(spec, view)
+	defer releaseBSIScratch(sc)
+	s := &sc.slices
+	if !s.hasExists {
 		return dst, nil
 	}
-	threshold := exists.Cardinality() / uint64(bsiCandidateFactor) / uint64(spec.BSIWidth)
+	threshold := s.exists.Cardinality() / uint64(bsiCandidateFactor) / uint64(spec.BSIWidth)
 	if uint64(len(candidates)) <= threshold {
 		for _, id := range candidates {
-			if value, present := view.bsiValueAt(spec.Namespace, spec.BSIWidth, id); present && r.contains(value) {
+			if bsiCandidateInRange(s, id, r) {
 				dst = append(dst, id)
 			}
 		}
 		return dst, nil
 	}
-	bit := view.bsiRange(spec.Namespace, spec.BSIWidth, r)
+	bit := bsiRangeInto(s, r, sc)
 	return filterBitmap(dst, candidates, bit), nil
 }
 

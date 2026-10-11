@@ -4,10 +4,53 @@ import (
 	"bytes"
 	"slices"
 	"sort"
+	"sync"
 
 	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/roar"
 )
+
+// rangeEffectiveTmpPool recycles the accumulator used to fold delta-corrected
+// keys during range queries, so the allocation count does not grow with the
+// number of corrected keys.
+var rangeEffectiveTmpPool = sync.Pool{New: func() any { return roar.NewMutableBitmap() }}
+
+// maxPooledRangeEffectiveBytes bounds a pooled range accumulator.
+const maxPooledRangeEffectiveBytes = 1 << 20
+
+// rangeUnion returns the union of the effective postings for keys, which must
+// be the sorted, unique in-range key set, and whether the result is heap-owned.
+// Base-only keys union through the posting kernel; keys touched by a delta are
+// folded into a reusable accumulator and enumerated once, so the allocation
+// count stays independent of the number of corrected keys.
+func (v *namespaceView) rangeUnion(keys []NamespaceKey) (roar.Bitmap, bool) {
+	postings := acquirePostings(len(keys))
+	ids := acquireIDs(0)
+	tmp := rangeEffectiveTmpPool.Get().(*roar.MutableBitmap)
+	for _, key := range keys {
+		if v.deltaTouches(key) {
+			if p, ok := v.effectiveInto(key, tmp); ok {
+				*ids = p.AppendTo(*ids)
+			}
+			continue
+		}
+		if p, ok := v.base.get(key); ok {
+			*postings = append(*postings, p)
+		}
+	}
+	base, owned := unionPostings(*postings)
+	releasePostings(postings)
+	if len(*ids) != 0 {
+		corr := roar.FromUnsorted(*ids)
+		base = roar.Or(base, corr)
+		owned = true
+	}
+	releaseIDs(ids)
+	if tmp.RetainedBytes() <= maxPooledRangeEffectiveBytes {
+		rangeEffectiveTmpPool.Put(tmp)
+	}
+	return base, owned
+}
 
 // NumericRange is an explicit integer range over a continuous namespace's
 // stored grid domain. Open ends and inclusivity are explicit booleans, so
@@ -304,14 +347,7 @@ func (i *Index) Range(bounds NumericRange) (result roar.Bitmap, resultErr error)
 	if len(keys) == 0 {
 		return roar.Bitmap{}, nil
 	}
-	postings := acquirePostings(len(keys))
-	defer releasePostings(postings)
-	for _, key := range keys {
-		if p, ok := view.effective(key); ok {
-			*postings = append(*postings, p)
-		}
-	}
-	out, owned := unionPostings(*postings)
+	out, owned := view.rangeUnion(keys)
 	i.detachOwned(&out, owned)
 	return out, nil
 }
@@ -441,14 +477,11 @@ func (i *Index) CountRange(bounds NumericRange) (uint64, error) {
 		return roar.OrMany(*bitmaps...).Cardinality(), nil
 	}
 	keys := view.continuousKeys(bounds)
-	bitmaps := acquireBitmaps(len(keys))
-	defer releaseBitmaps(bitmaps)
-	for _, key := range keys {
-		if p, ok := view.effective(key); ok {
-			*bitmaps = append(*bitmaps, p.bitmap())
-		}
+	if len(keys) == 0 {
+		return 0, nil
 	}
-	return roar.OrMany(*bitmaps...).Cardinality(), nil
+	out, _ := view.rangeUnion(keys)
+	return out.Cardinality(), nil
 }
 
 // FilterValues appends the candidates holding every supplied value to
@@ -494,14 +527,7 @@ func (i *Index) FilterRange(dst, candidates []common.ImageID, bounds NumericRang
 		keys = view.continuousKeys(bounds)
 	}
 	if len(keys) > 1 && uint64(len(keys))*uint64(len(candidates)) > 4*view.estimateKeys(keys) {
-		postings := acquirePostings(len(keys))
-		defer releasePostings(postings)
-		for _, key := range keys {
-			if p, ok := view.effective(key); ok {
-				*postings = append(*postings, p)
-			}
-		}
-		bit, _ := unionPostings(*postings)
+		bit, _ := view.rangeUnion(keys)
 		return filterBitmap(dst, candidates, bit), nil
 	}
 	for _, id := range candidates {
