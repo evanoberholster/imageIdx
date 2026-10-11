@@ -3,6 +3,8 @@ package index_test
 import (
 	"errors"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	common "github.com/evanoberholster/imageIdx/common"
@@ -274,5 +276,169 @@ func TestMatcherBatchOf64(t *testing.T) {
 		if mt.ImageID != common.ValueID(1000+mt.Item) {
 			t.Fatalf("item %d matched %d", mt.Item, mt.ImageID)
 		}
+	}
+}
+
+func mustMatch(t *testing.T, m *index.Matcher, h radixhash.Hash) []index.Match {
+	t.Helper()
+	got, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// TestMatcherDeleteVisibleImmediately verifies that once Delete returns, the
+// matcher must not return the deleted ID.
+func TestMatcherDeleteVisibleImmediately(t *testing.T) {
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{0x33}
+	for i := 1; i <= 16; i++ {
+		if err := db.Add(index.Entry{ValueID: common.ValueID(i), Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i <= 16; i++ {
+		if err := db.Delete(common.EntityImage, common.ValueID(i)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(matchIDs(got), common.ValueID(i)) {
+			t.Fatalf("deleted id %d still matched after Delete returned: %v", i, got)
+		}
+	}
+}
+
+// TestMatcherFastPathSurvivesReopen verifies the no-removal fast path is safe
+// across reopen because the persisted flag is only set when a removal is
+// durably recorded.
+func TestMatcherFastPathSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	db, err := index.Create(dir, index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{1}
+	if err := db.Add(index.Entry{ValueID: 100, Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m, err := reopened.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{100}) {
+		t.Fatalf("reopened fast-path matches = %v, want [100]", ids)
+	}
+}
+
+// TestMatcherConcurrentMutation verifies concurrent Add/Delete and Match do not
+// race or return deleted IDs.
+func TestMatcherConcurrentMutation(t *testing.T) {
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4, Perceptual: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{0x5A}
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for r := 0; r < 3; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				_, _ = m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{})
+				q := uint64(1)
+				_, _ = m.MatchOne(nil, index.MatchItem{PHash: &q}, index.MatchParams{PHashDistance: 1})
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		id := common.ValueID(i%32 + 1)
+		if err := db.Add(index.Entry{ValueID: id, Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
+			t.Fatal(err)
+		}
+		if i%3 == 0 {
+			if err := db.Delete(common.EntityImage, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+}
+
+// TestMatcherUnconfiguredFamilyRejected verifies requesting an unconfigured
+// matching family is an explicit error.
+func TestMatcherUnconfiguredFamilyRejected(t *testing.T) {
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{1}
+	if _, err := m.MatchOne(nil, index.MatchItem{BLAKE3: &h}, index.MatchParams{}); !errors.Is(err, index.ErrMatcherNamespace) {
+		t.Fatalf("unconfigured BLAKE3 err = %v, want ErrMatcherNamespace", err)
+	}
+	q := uint64(1)
+	if _, err := m.MatchOne(nil, index.MatchItem{PHash: &q}, index.MatchParams{}); !errors.Is(err, index.ErrMatcherNamespace) {
+		t.Fatalf("unconfigured perceptual err = %v, want ErrMatcherNamespace", err)
+	}
+	if _, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{}); err != nil {
+		t.Fatalf("configured SHA256 match failed: %v", err)
+	}
+}
+
+// TestMatcherClosedStore verifies matching against a closed Store returns
+// ErrClosed.
+func TestMatcherClosedStore(t *testing.T) {
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: matchSchema(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := db.Matcher(index.MatcherSpec{SHA256: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h := radixhash.Hash{1}
+	if _, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{}); !errors.Is(err, index.ErrClosed) {
+		t.Fatalf("closed-store err = %v, want ErrClosed", err)
 	}
 }
