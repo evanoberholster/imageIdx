@@ -4,6 +4,8 @@ import (
 	"errors"
 	"slices"
 	"testing"
+
+	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 )
 
 func TestCOWExtentUnionAndAllocator(t *testing.T) {
@@ -77,6 +79,46 @@ func TestCOWCommitOutcomes(t *testing.T) {
 		}
 		if got != want || (err == nil) != (stage == "ok") {
 			t.Fatal(stage, got, err)
+		}
+	}
+}
+
+func TestSortedExtentMergeMatchesGeneralUnion(t *testing.T) {
+	for n := 0; n < 100; n++ {
+		var a, b []Extent
+		for ref := 2; ref < 80; ref++ {
+			e := Extent{Ref: pagealloc.Ref(ref), Size: 512}
+			if (ref+n)%3 == 0 {
+				a = append(a, e)
+			}
+			if (ref+n)%5 == 0 {
+				b = append(b, e, e)
+			}
+		}
+		originalA, originalB := slices.Clone(a), slices.Clone(b)
+		got, err := UnionExtents(a, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Three sets deliberately use the general concatenate/sort path.
+		want, err := UnionExtents(a, b, nil)
+		if err != nil || !slices.Equal(got, want) {
+			t.Fatal(got, want, err)
+		}
+		if len(got) > 0 {
+			got[0].Size = 1
+		}
+		if !slices.Equal(a, originalA) || !slices.Equal(b, originalB) {
+			t.Fatal("merge aliases inputs")
+		}
+	}
+	for _, pair := range [][2][]Extent{
+		{{{Ref: 2, Size: 512}}, {{Ref: 2, Size: 1024}}},
+		{{{Ref: 2, Size: 512}, {Ref: 2, Size: 1024}}, nil},
+		{nil, {{Ref: 2}}},
+	} {
+		if _, err := UnionExtents(pair[0], pair[1]); err == nil {
+			t.Fatal("invalid sorted extents accepted", pair)
 		}
 	}
 }

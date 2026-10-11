@@ -29,6 +29,7 @@ type Index struct {
 	lock        *os.File
 	alloc       *pagealloc.Allocator
 	live        []storage.Extent
+	currentLive []storage.Extent // immutable extents of the published generation; writer-owned
 	root        storage.Extent
 	slot        int
 	// Per-index seams are nil in production and never shared by namespaces.

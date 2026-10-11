@@ -24,10 +24,29 @@ func UnionExtents(sets ...[]Extent) ([]Extent, error) {
 		count += len(set)
 	}
 	out := make([]Extent, 0, count)
-	for _, set := range sets {
-		out = append(out, set...)
+	compare := func(a, b Extent) int { return cmp.Compare(a.Ref, b.Ref) }
+	if len(sets) == 2 && slices.IsSortedFunc(sets[0], compare) && slices.IsSortedFunc(sets[1], compare) {
+		// COW publishers can retain address-sorted generation lists. Merge
+		// those without sorting an already ordered input again. The result
+		// still owns its storage; validation/deduplication below is identical.
+		a, b := sets[0], sets[1]
+		for len(a) != 0 && len(b) != 0 {
+			if a[0].Ref <= b[0].Ref {
+				out = append(out, a[0])
+				a = a[1:]
+			} else {
+				out = append(out, b[0])
+				b = b[1:]
+			}
+		}
+		out = append(out, a...)
+		out = append(out, b...)
+	} else {
+		for _, set := range sets {
+			out = append(out, set...)
+		}
+		slices.SortFunc(out, compare)
 	}
-	slices.SortFunc(out, func(a, b Extent) int { return cmp.Compare(a.Ref, b.Ref) })
 	unique := out[:0]
 	for _, e := range out {
 		if e.Size == 0 {

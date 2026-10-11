@@ -94,9 +94,9 @@ func BenchmarkScalePreparation(b *testing.B) {
 							if s.offset == 0 {
 								rewritten++
 							}
-							if rows != count-batchSize || rewritten > batchSize {
-								b.Fatal("incorrect or whole-index deletion", rows, rewritten)
-							}
+						}
+						if rows != count-batchSize || rewritten > batchSize {
+							b.Fatal("incorrect or whole-index deletion", rows, rewritten)
 						}
 						b.ReportAllocs()
 						b.ResetTimer()

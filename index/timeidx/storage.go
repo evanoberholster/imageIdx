@@ -74,6 +74,10 @@ func createStore(dir string, spec Spec, config Config, durability Durability, co
 	if configure != nil {
 		configure(i)
 	}
+	if err := i.inject("create-file"); err != nil {
+		_ = storage.ReleaseLock(lock)
+		return nil, err
+	}
 	f, err := os.OpenFile(i.path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		_ = storage.ReleaseLock(lock)
@@ -436,6 +440,8 @@ func (i *Index) load(data []byte) error {
 		}
 		i.alloc = a
 		i.live = live
+		i.currentLive = g.live
+		slices.SortFunc(i.currentLive, func(a, b storage.Extent) int { return cmp.Compare(a.Ref, b.Ref) })
 		i.root = g.root
 		i.slot = g.slot
 		i.flags = g.flags
@@ -565,7 +571,8 @@ func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 				allocated = append(allocated, storage.Extent{Ref: ref, Size: capacity})
 				root = storage.Extent{Ref: ref, Size: length}
 				dir := i.file.Bytes()[uint64(ref)*512 : uint64(ref)*512+uint64(length)]
-				clear(dir)
+				// EncodeShardDescriptor writes all 56 bytes, including reserved
+				// padding. No preliminary zeroing pass is necessary.
 				for n, s := range shards {
 					e := dir[n*directoryEntrySize : (n+1)*directoryEntrySize]
 					storage.EncodeShardDescriptor(e, storage.ShardDescriptor{FirstKey: s.times[0], FirstID: s.ids[0], Offset: s.offset, Count: uint32(len(s.times)), KeyCRC: s.timeCRC, IDCRC: s.idCRC, MinID: s.minID, MaxID: s.maxID})
@@ -603,11 +610,12 @@ func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 		return err
 	}
 	newLive := shardLive(shards, root)
-	previous := shardLive(i.view.Load().shards, i.root)
-	// During creation the heap initial view has no persistent extents.
-	if gen == 1 {
-		previous = nil
-	}
+	slices.SortFunc(newLive, func(a, b storage.Extent) int { return cmp.Compare(a.Ref, b.Ref) })
+	// The last successfully published generation already owns this immutable
+	// extent list. Reusing it avoids another O(shards) traversal/allocation.
+	// It is nil during creation, unchanged on abort/uncertainty, and recovered
+	// with the chosen root on open. Readers never access these extent lists.
+	previous := i.currentLive
 	live, err := storage.UnionExtents(newLive, previous)
 	if err != nil {
 		rollback()
@@ -668,6 +676,7 @@ func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 	i.root = root
 	i.slot = slot
 	i.live = live
+	i.currentLive = newLive
 	i.view.Store(&snapshot{shards: shards, generation: gen, sourceGeneration: sourceGeneration, count: total})
 	if i.crash != nil {
 		i.crash("reclaim")

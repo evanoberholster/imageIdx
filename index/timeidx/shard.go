@@ -155,16 +155,21 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 		}
 		return splitShards(nil, times, ids, maxRecords)
 	}
-	if cap(scratch.starts) < len(current)+1 {
-		scratch.starts = make([]int, len(current)+1)
-	}
-	starts := scratch.starts[:len(current)+1]
-	clear(starts)
-	for _, a := range adds {
-		starts[shardFor(current, a.to, a.imageID)+1]++
-	}
-	for n := 1; n < len(starts); n++ {
-		starts[n] += starts[n-1]
+	var starts []int
+	// Deletes have no destination routing. Avoid clearing and prefix-summing
+	// the entire directory merely to produce an all-zero starts array.
+	if len(adds) != 0 {
+		if cap(scratch.starts) < len(current)+1 {
+			scratch.starts = make([]int, len(current)+1)
+		}
+		starts = scratch.starts[:len(current)+1]
+		clear(starts)
+		for _, a := range adds {
+			starts[shardFor(current, a.to, a.imageID)+1]++
+		}
+		for n := 1; n < len(starts); n++ {
+			starts[n] += starts[n-1]
+		}
 	}
 	out := make([]*shard, 0, len(current)+1)
 	minID, maxID := ops[0].imageID, ops[len(ops)-1].imageID
@@ -201,9 +206,12 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 		return ok
 	}
 	for n, s := range current {
-		a := adds[starts[n]:starts[n+1]]
+		a := adds[:0]
+		if len(starts) != 0 {
+			a = adds[starts[n]:starts[n+1]]
+		}
 		dirty := len(a) != 0
-		if !dirty && s.maxID >= ops[0].imageID && s.minID <= ops[len(ops)-1].imageID {
+		if !dirty && s.maxID >= minID && s.minID <= maxID {
 			for _, id := range s.ids {
 				if touched(id) {
 					dirty = true
@@ -216,23 +224,26 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 			continue
 		}
 		times, ids := scratch.columns(len(s.times)+len(a), reuse)
-		bi, ai := 0, 0
-		for bi < len(s.times) || ai < len(a) {
-			for bi < len(s.times) && touched(s.ids[bi]) {
-				bi++
+		ai := 0
+		// Filter each old row once, then emit all additions preceding it.
+		// Advancing additions must not repeat membership checks on the same
+		// retained row (or the old-row exhaustion tests) for every addition.
+		for bi, ts := range s.times {
+			id := s.ids[bi]
+			if touched(id) {
+				continue
 			}
-			if bi == len(s.times) && ai == len(a) {
-				break
-			}
-			if ai < len(a) && (bi == len(s.times) || pairLess(a[ai].to, a[ai].imageID, s.times[bi], s.ids[bi])) {
+			for ai < len(a) && pairLess(a[ai].to, a[ai].imageID, ts, id) {
 				times = append(times, a[ai].to)
 				ids = append(ids, a[ai].imageID)
 				ai++
-			} else {
-				times = append(times, s.times[bi])
-				ids = append(ids, s.ids[bi])
-				bi++
 			}
+			times = append(times, ts)
+			ids = append(ids, id)
+		}
+		for _, add := range a[ai:] {
+			times = append(times, add.to)
+			ids = append(ids, add.imageID)
 		}
 		out = splitShards(out, times, ids, maxRecords)
 	}
