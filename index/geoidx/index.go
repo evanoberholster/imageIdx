@@ -33,11 +33,25 @@ type Config struct {
 	// compaction instead of growing without bound. Values <= 0 select
 	// 2*CompactionTrigger.
 	MaxDelta int
+	// TargetShardBytes is the preferred payload size of one shard; a merge or
+	// split aims for this. Values <= 0 select defaultTargetShardBytes (16 MiB).
+	TargetShardBytes int64
+	// MaxShardBytes is the payload size above which a shard is split. It bounds
+	// the maximum single rewrite. Values <= 0 select defaultMaxShardBytes
+	// (32 MiB).
+	MaxShardBytes int64
+	// MinShardBytes is the payload below which adjacent shards are candidates for
+	// merging. Values <= 0 select defaultMinShardBytes (4 MiB).
+	MinShardBytes int64
 }
 
 const (
 	optimizedBatchEntries    = 64
 	defaultCompactionTrigger = 4096
+
+	defaultTargetShardBytes = 16 << 20 // 16 MiB
+	defaultMaxShardBytes    = 32 << 20 // 32 MiB
+	defaultMinShardBytes    = 4 << 20  // 4 MiB
 )
 
 func (c Config) withDefaults() (Config, error) {
@@ -56,10 +70,30 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MaxDelta <= 0 {
 		c.MaxDelta = 2 * c.CompactionTrigger
 	}
+	if c.TargetShardBytes <= 0 {
+		c.TargetShardBytes = defaultTargetShardBytes
+	}
+	if c.MaxShardBytes <= 0 {
+		c.MaxShardBytes = defaultMaxShardBytes
+	}
+	if c.MinShardBytes <= 0 {
+		c.MinShardBytes = defaultMinShardBytes
+	}
 	if c.MaxDelta < c.CompactionTrigger || c.CompactionTrigger < c.TargetDelta {
 		return Config{}, ErrInvalidConfig
 	}
+	if c.MinShardBytes > c.TargetShardBytes || c.TargetShardBytes > c.MaxShardBytes {
+		return Config{}, ErrInvalidConfig
+	}
 	return c, nil
+}
+
+// recordsForBytes converts a shard byte budget to a record count.
+func recordsForBytes(bytes int64) int {
+	if bytes < shardBytesPerRecord {
+		return 1
+	}
+	return int(bytes / shardBytesPerRecord)
 }
 
 // mutation is one insert or delete. id is authoritative; key is the asserted
@@ -69,17 +103,6 @@ type mutation struct {
 	id  common.ImageID
 	key S2Key
 	add bool
-}
-
-// base is the immutable sorted (key, imageID) representation. keys and ids are
-// parallel and share an arena when mf is non-nil. maxID bounds the ImageID
-// domain for the optional bitset accelerator.
-type base struct {
-	keys  []S2Key
-	ids   []common.ImageID
-	mf    *storage.MappedFile
-	gen   uint64
-	maxID common.ImageID
 }
 
 // mutationSet is an id membership test over a mutation layer sorted by id. It
@@ -129,17 +152,18 @@ func (s mutationSet) touched(id common.ImageID) bool {
 	return touched
 }
 
-// view is one immutable reader snapshot. Its slices are never mutated after
-// publication; a writer replaces the whole view. active and layers are the live
-// pending mutations (active is newest), and frozen is the compaction snapshot.
-// delta is the lazily merged effective delta, computed once per view.
+// view is one immutable reader snapshot. Its shard slice and mutation layers are
+// never mutated after publication; a writer replaces the whole view. active and
+// layers are the live pending mutations (active is newest), and frozen is the
+// compaction snapshot. delta is the lazily merged effective delta, computed once
+// per view.
 type view struct {
-	keys   []S2Key
-	ids    []common.ImageID
-	frozen []mutation
-	layers [][]mutation
-	active []mutation
-	maxID  common.ImageID
+	shards  []*shard
+	frozen  []mutation
+	layers  [][]mutation
+	active  []mutation
+	maxID   common.ImageID
+	entries int
 
 	deltaOnce sync.Once
 	delta     []mutation
@@ -158,11 +182,13 @@ type Index struct {
 	tracker storage.ReaderTracker
 
 	// Writer-owned state, touched only under mu.
-	base     base
+	shards   []*shard
 	active   []mutation
 	layers   [][]mutation
 	frozen   []mutation
 	deltaMax common.ImageID
+	dirGen   uint64
+	nextGen  uint64
 
 	compacting     bool
 	compactionDone chan struct{}
@@ -179,7 +205,7 @@ func NewMemory(config Config) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	index := &Index{config: cfg}
+	index := &Index{config: cfg, dirGen: 1, nextGen: 2}
 	index.publishLocked()
 	return index, nil
 }
@@ -235,7 +261,7 @@ func viewDelta(v *view) []mutation {
 			return cmp.Compare(a.id, b.id)
 		})
 		v.deltaAdds = adds
-		v.deltaSet = newMutationSet(v.delta, len(v.keys))
+		v.deltaSet = newMutationSet(v.delta, v.entries)
 	})
 	return v.delta
 }
@@ -247,20 +273,25 @@ func deltaTouched(v *view, id common.ImageID) bool {
 }
 
 func (i *Index) publishLocked() {
-	// The layer list is copied so the writer can keep appending/merging while
-	// readers iterate the published snapshot. The inner layers are immutable.
+	// The layer slice is copied so the writer can keep appending/merging while
+	// readers iterate the published snapshot. The shard slice is replaced
+	// wholesale by compaction (never appended to in place), so it can be shared.
 	layers := append([][]mutation(nil), i.layers...)
 	maxID := i.deltaMax
-	if i.base.maxID > maxID {
-		maxID = i.base.maxID
+	entries := 0
+	for _, s := range i.shards {
+		entries += s.count()
+		if s.maxID > maxID {
+			maxID = s.maxID
+		}
 	}
 	i.view.Store(&view{
-		keys:   i.base.keys,
-		ids:    i.base.ids,
-		frozen: i.frozen,
-		layers: layers,
-		active: i.active,
-		maxID:  maxID,
+		shards:  i.shards,
+		frozen:  i.frozen,
+		layers:  layers,
+		active:  i.active,
+		maxID:   maxID,
+		entries: entries,
 	})
 }
 
@@ -511,13 +542,36 @@ func (i *Index) freezeLocked() {
 
 // compactionTrigger returns the pending-delta size that starts a background
 // compaction: at least base/8, so write amplification stays bounded, and at
-// least the configured floor.
+// least the configured floor. It is evaluated against the whole sharded base, so
+// the per-mutation rewrite ratio is unchanged by sharding; sharding bounds the
+// size of each individual rewrite instead.
 func (i *Index) compactionTrigger() int {
 	trigger := i.config.CompactionTrigger
-	if fraction := len(i.base.keys) / 8; fraction > trigger {
+	if fraction := i.baseEntriesLocked() / 8; fraction > trigger {
 		trigger = fraction
 	}
 	return trigger
+}
+
+// baseEntriesLocked sums the committed record counts. The caller holds mu.
+func (i *Index) baseEntriesLocked() int {
+	n := 0
+	for _, s := range i.shards {
+		n += s.count()
+	}
+	return n
+}
+
+// maxShardIDLocked returns the largest ImageID among committed shards. The caller
+// holds mu.
+func (i *Index) maxShardIDLocked() common.ImageID {
+	var best common.ImageID
+	for _, s := range i.shards {
+		if s.maxID > best {
+			best = s.maxID
+		}
+	}
+	return best
 }
 
 // hardDelta caps pending mutations; the writer waits for compaction at the
@@ -604,11 +658,11 @@ func (i *Index) Checkpoint() error {
 // Sync is an alias for Checkpoint, matching the other index packages.
 func (i *Index) Sync() error { return i.Checkpoint() }
 
-// Generation returns the current base generation.
+// Generation returns the current committed directory generation.
 func (i *Index) Generation() uint64 {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	return i.base.gen
+	return i.dirGen
 }
 
 // Namespace returns the namespace configured for this index.
@@ -626,9 +680,11 @@ func (i *Index) Len() uint64 {
 	v := i.view.Load()
 	viewDelta(v)
 	count := uint64(0)
-	for n := range v.keys {
-		if !v.deltaSet.touched(v.ids[n]) {
-			count++
+	for _, s := range v.shards {
+		for n := range s.keys {
+			if !v.deltaSet.touched(s.ids[n]) {
+				count++
+			}
 		}
 	}
 	for n := range v.delta {

@@ -45,54 +45,62 @@ func viewTouched(v *view, id common.ImageID) (present, touched bool) {
 // with pending additions last. It imposes no ImageID ordering. ranges must be
 // normalized. fn returning false stops the scan.
 func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
-	if viewDelta(v) == nil {
-		position := 0
+	useDelta := viewDelta(v) != nil
+	if !scanShards(v.shards, ranges, useDelta, v, fn) {
+		return false
+	}
+	if useDelta {
+		// Additions come from the cached key-sorted insert list, so only the
+		// adds inside the ranges are visited.
+		adds := v.deltaAdds
 		for _, r := range ranges {
-			position += sort.Search(len(v.keys)-position, func(k int) bool {
-				return v.keys[position+k] >= r.Start
-			})
-			for position < len(v.keys) && v.keys[position] <= r.End {
-				if id := v.ids[position]; id != 0 {
-					if !fn(v.keys[position], id) {
+			low := sort.Search(len(adds), func(i int) bool { return adds[i].key >= r.Start })
+			for low < len(adds) && adds[low].key <= r.End {
+				if !fn(adds[low].key, adds[low].id) {
+					return false
+				}
+				low++
+			}
+		}
+	}
+	return true
+}
+
+// scanShards walks the shard directory in global key order, visiting base
+// entries inside ranges. When useDelta is set, base entries named by the delta
+// are shadowed. The range cursor advances monotonically across shards, so a
+// range that spans shards is continued rather than restarted. A repeated S2Key
+// spanning shards is visited in every shard that holds part of its run.
+func scanShards(shards []*shard, ranges []Range, useDelta bool, v *view, fn func(S2Key, common.ImageID) bool) bool {
+	if len(ranges) == 0 {
+		return true
+	}
+	ri := 0
+	for si := firstShardAtOrAfter(shards, ranges[0].Start); si < len(shards); si++ {
+		s := shards[si]
+		if len(s.keys) == 0 {
+			continue
+		}
+		firstKey := s.keys[0]
+		for ri < len(ranges) && ranges[ri].End < firstKey {
+			ri++
+		}
+		if ri == len(ranges) {
+			return true
+		}
+		lastKey := s.keys[len(s.keys)-1]
+		for j := ri; j < len(ranges) && ranges[j].Start <= lastKey; j++ {
+			r := ranges[j]
+			low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= r.Start })
+			for low < len(s.keys) && s.keys[low] <= r.End {
+				id := s.ids[low]
+				if id != 0 && (!useDelta || !deltaTouched(v, id)) {
+					if !fn(s.keys[low], id) {
 						return false
 					}
 				}
-				position++
+				low++
 			}
-		}
-		return true
-	}
-	return scanRangesEff(v, ranges, fn)
-}
-
-// scanRangesEff scans a view with pending mutations. Base entries shadowed by
-// the effective delta are skipped via the cached membership bitset (or a binary
-// search), and additions come from the cached key-sorted insert list so only the
-// adds inside the ranges are visited.
-func scanRangesEff(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
-	position := 0
-	for _, r := range ranges {
-		position += sort.Search(len(v.keys)-position, func(k int) bool {
-			return v.keys[position+k] >= r.Start
-		})
-		for position < len(v.keys) && v.keys[position] <= r.End {
-			id := v.ids[position]
-			if id != 0 && !deltaTouched(v, id) {
-				if !fn(v.keys[position], id) {
-					return false
-				}
-			}
-			position++
-		}
-	}
-	adds := v.deltaAdds
-	for _, r := range ranges {
-		low := sort.Search(len(adds), func(i int) bool { return adds[i].key >= r.Start })
-		for low < len(adds) && adds[low].key <= r.End {
-			if !fn(adds[low].key, adds[low].id) {
-				return false
-			}
-			low++
 		}
 	}
 	return true
@@ -114,13 +122,33 @@ func normalizeResult(stack *[DefaultMaxCells]Range, ranges []Range) []Range {
 }
 
 // appendBaseRanges appends the base ImageIDs covered by normalized ranges using
-// a bulk copy per range. Callers use it only when no mutation layers exist.
+// a bulk copy per shard-range overlap. Callers use it only when no mutation
+// layers exist.
 func appendBaseRanges(dst []common.ImageID, v *view, ranges []Range) []common.ImageID {
-	for _, r := range ranges {
-		low := sort.Search(len(v.keys), func(i int) bool { return v.keys[i] >= r.Start })
-		high := sort.Search(len(v.keys), func(i int) bool { return v.keys[i] > r.End })
-		if high > low {
-			dst = append(dst, v.ids[low:high]...)
+	if len(ranges) == 0 {
+		return dst
+	}
+	ri := 0
+	for si := firstShardAtOrAfter(v.shards, ranges[0].Start); si < len(v.shards); si++ {
+		s := v.shards[si]
+		if len(s.keys) == 0 {
+			continue
+		}
+		firstKey := s.keys[0]
+		for ri < len(ranges) && ranges[ri].End < firstKey {
+			ri++
+		}
+		if ri == len(ranges) {
+			break
+		}
+		lastKey := s.keys[len(s.keys)-1]
+		for j := ri; j < len(ranges) && ranges[j].Start <= lastKey; j++ {
+			r := ranges[j]
+			low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= r.Start })
+			high := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] > r.End })
+			if high > low {
+				dst = append(dst, s.ids[low:high]...)
+			}
 		}
 	}
 	return dst
@@ -157,7 +185,7 @@ func (i *Index) SearchRanges(dst []common.ImageID, ranges []Range) []common.Imag
 		if viewDelta(v) == nil {
 			dst = appendBaseRanges(dst, v, normalized)
 		} else {
-			scanRangesEff(v, normalized, func(_ S2Key, id common.ImageID) bool {
+			scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
 				dst = append(dst, id)
 				return true
 			})
@@ -613,11 +641,13 @@ func (i *Index) EstimateRanges(ranges []Range) uint64 {
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
-		for _, r := range normalized {
-			low := sort.Search(len(v.keys), func(k int) bool { return v.keys[k] >= r.Start })
-			high := sort.Search(len(v.keys), func(k int) bool { return v.keys[k] > r.End })
-			if high > low {
-				estimate += uint64(high - low)
+		for _, s := range v.shards {
+			for _, r := range normalized {
+				low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= r.Start })
+				high := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] > r.End })
+				if high > low {
+					estimate += uint64(high - low)
+				}
 			}
 		}
 		for n := range v.frozen {
@@ -649,9 +679,14 @@ func (i *Index) Contains(key S2Key, id common.ImageID) bool {
 			found = present && layerKey(v, id) == key
 			return
 		}
-		low := sort.Search(len(v.keys), func(k int) bool { return v.keys[k] >= key })
-		for low < len(v.keys) && v.keys[low] == key {
-			if v.ids[low] == id {
+		si := shardFor(v.shards, key, id)
+		if si < 0 {
+			return
+		}
+		s := v.shards[si]
+		low := sort.Search(len(s.keys), func(k int) bool { return s.keys[k] >= key })
+		for low < len(s.keys) && s.keys[low] == key {
+			if s.ids[low] == id {
 				found = true
 				return
 			}

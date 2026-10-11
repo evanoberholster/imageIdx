@@ -109,11 +109,11 @@ func TestOpenRejectsMalformed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		generation, _, ok := decodeManifest(manifest)
-		if !ok {
+		_, entries, _, ok := decodeManifest(manifest)
+		if !ok || len(entries) == 0 {
 			t.Fatal("decode manifest")
 		}
-		path := basePath(dir, generation)
+		path := shardPath(dir, entries[0].gen)
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatal(err)
@@ -129,8 +129,11 @@ func TestOpenRejectsMalformed(t *testing.T) {
 	t.Run("base-magic", func(t *testing.T) {
 		dir, config := build(t)
 		manifest, _ := os.ReadFile(filepath.Join(dir, "manifest"))
-		generation, _, _ := decodeManifest(manifest)
-		path := basePath(dir, generation)
+		_, entries, _, _ := decodeManifest(manifest)
+		if len(entries) == 0 {
+			t.Fatal("decode manifest")
+		}
+		path := shardPath(dir, entries[0].gen)
 		f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 		if err != nil {
 			t.Fatal(err)
@@ -232,6 +235,6 @@ func TestPersistentSize(t *testing.T) {
 	if err := index.Close(); err != nil {
 		t.Fatal(err)
 	}
-	size := storage.DirSize(dir, "manifest", "base.*.dat")
+	size := storage.DirSize(dir, "manifest", "shard.*.dat")
 	t.Logf("geoidx persistent 1M uniform: %d bytes (%d B/image)", size, size/uint64(n))
 }

@@ -37,6 +37,9 @@ var (
 	ErrInvalidConfig = errors.New("geoidx: invalid configuration")
 	// ErrCorrupt reports a corrupt base file, superblock, or manifest.
 	ErrCorrupt = errors.New("geoidx: corrupt index")
+	// ErrLegacyFormat reports a pre-shard (monolithic) persistent index. It is
+	// not read implicitly; rebuild it by re-inserting from canonical metadata.
+	ErrLegacyFormat = errors.New("geoidx: legacy monolithic index; rebuild required")
 )
 
 const (

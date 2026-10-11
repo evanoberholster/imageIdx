@@ -354,8 +354,8 @@ func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
 	insertKeys(t, index, testKeys(100), 1)
 	before := index.Generation()
 
-	writeManifestFunc = func(dir string, gen, count uint64) error {
-		if err := writeManifest(dir, gen, count); err != nil {
+	writeManifestFunc = func(dir string, data []byte) error {
+		if err := writeManifest(dir, data); err != nil {
 			return err
 		}
 		return errors.New("simulated post-rename sync failure")
@@ -452,9 +452,9 @@ func TestSlowReaderDelaysReclamation(t *testing.T) {
 		index.withView(func(v *view) {
 			close(readerEntered)
 			<-readerRelease
-			if len(v.keys) > 0 {
-				_ = v.keys[0]
-				_ = v.ids[0]
+			if len(v.shards) > 0 && v.shards[0].count() > 0 {
+				_ = v.shards[0].keys[0]
+				_ = v.shards[0].ids[0]
 			}
 		})
 	}()

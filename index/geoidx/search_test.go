@@ -216,7 +216,7 @@ func TestDeltaBounded(t *testing.T) {
 	}
 	index.mu.Lock()
 	pending := index.pendingLocked()
-	generation := index.base.gen
+	generation := index.dirGen
 	index.mu.Unlock()
 	if pending != 0 {
 		t.Fatalf("pending delta %d not drained by Compact", pending)

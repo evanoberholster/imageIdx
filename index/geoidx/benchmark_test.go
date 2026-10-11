@@ -913,6 +913,18 @@ func buildGeoBase(tb testing.TB, n int, spread float64) *Index {
 	return index
 }
 
+// flattenView concatenates a view's shards into one (keys, ids) pair. Benchmarks
+// that need a single flat SoA array use it outside their timed loop.
+func flattenView(v *view) ([]S2Key, []common.ImageID) {
+	keys := make([]S2Key, 0, v.entries)
+	ids := make([]common.ImageID, 0, v.entries)
+	for _, s := range v.shards {
+		keys = append(keys, s.keys...)
+		ids = append(ids, s.ids...)
+	}
+	return keys, ids
+}
+
 // pageDir is a compact single-level directory over the flat sorted key array.
 type pageDir struct {
 	firstKeys   []S2Key
@@ -1040,8 +1052,7 @@ func TestPageDirLocateMatchesFlat(t *testing.T) {
 // directory over the same data.
 func BenchmarkPagedLookup(b *testing.B) {
 	index := buildGeoBase(b, 1_000_000, geoBenchSpan)
-	v := index.view.Load()
-	keys, ids := v.keys, v.ids
+	keys, ids := flattenView(index.view.Load())
 	exactKey, _ := KeyFromLatLng(geoBenchLat, geoBenchLng)
 	exact := []Range{{Start: exactKey, End: exactKey}}
 	multi := CoverCap(nil, geoNewCap(2000), CoverOptions{MaxCells: 16})
@@ -1107,13 +1118,13 @@ func TestPageWriteAmplification(t *testing.T) {
 		{"uniform", geoBenchSpan, geoBenchSpan},
 	} {
 		index := buildGeoBase(t, 1_000_000, tc.spread)
-		v := index.view.Load()
+		keys, _ := flattenView(index.view.Load())
 		const (
 			batch   = 64
 			batches = 200
 		)
 		for _, pr := range []int{256, 512, 1024, 2048} {
-			dir := buildPageDir(v.keys, pr)
+			dir := buildPageDir(keys, pr)
 			rng := rand.New(rand.NewSource(42))
 			totalPages := 0
 			for b := 0; b < batches; b++ {
@@ -1125,7 +1136,7 @@ func TestPageWriteAmplification(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					seen[dir.locate(v.keys, key)/pr] = struct{}{}
+					seen[dir.locate(keys, key)/pr] = struct{}{}
 				}
 				totalPages += len(seen)
 			}
@@ -1142,7 +1153,7 @@ func TestPageWriteAmplification(t *testing.T) {
 // little headroom.
 func BenchmarkKeyScan(b *testing.B) {
 	index := buildGeoBase(b, 1_000_000, geoBenchSpan)
-	keys := index.view.Load().keys
+	keys, _ := flattenView(index.view.Load())
 	var sink uint64
 	b.SetBytes(int64(len(keys) * 8))
 	b.ReportAllocs()
@@ -1193,12 +1204,16 @@ func BenchmarkRepeatedKeyCompaction(b *testing.B) {
 			}
 			slices.SortFunc(frozen, compareMutationID)
 
-			index := &Index{}
-			base := base{keys: baseKeys, ids: baseIDs, maxID: common.ImageID(n)}
+			cfg, err := Config{}.withDefaults()
+			if err != nil {
+				b.Fatal(err)
+			}
+			index := &Index{config: cfg}
+			one := &shard{keys: baseKeys, ids: baseIDs, maxID: common.ImageID(n)}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := index.prepareBase(base, frozen); err != nil {
+				if _, err := index.prepareShards([]*shard{one}, frozen); err != nil {
 					b.Fatal(err)
 				}
 			}
