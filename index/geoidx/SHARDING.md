@@ -133,20 +133,43 @@ adjacent underutilized plans coalesce; emptied shards leave the directory.
 
 ## Results (Apple M4 Pro)
 
-Query latency is unchanged from the unsharded PR #15: exact cell 31.6 ns / 0
-allocs; 2 km multi-range 5.48 µs / 0; nearest k=10 87.7 µs; filter initial
-5.42 µs / 0; clustered range 50.9 µs.
+Query latency is unchanged from the unsharded PR #15 (multi-run, `-count=3`):
+exact cell 30.7–31.0 ns / 0 allocs; 2 km multi-range 5.26–5.34 µs / 0; filter
+initial 5.24–5.30 µs / 0; filter medium 2.63–2.66 µs / 0 allocs; nearest k=10
+83.0–84.7 µs; clustered range 49.6–54.2 µs / 1 alloc; 64-entry insert batch
+8.5–9.5 µs / 4 allocs.
+
+Scale (memory index, `GEOIDX_SCALE=1`):
+
+| n | shards | 2 km range | nearest k=10 | build+query |
+|---:|---:|---:|---:|---:|
+| 10M | 10 | 666 µs | 16.3 µs | — |
+| 20M | 20 | 63,271 ids | ok | 3.8 s |
+| 30M | 29 | 94,904 ids | ok | 5.7 s |
+
+Persistent 1M: one sparse file, arena 1 GiB, live 16 MB (16 B/image), 1 free run,
+open/validate 9 ms.
 
 `BenchmarkAffectedShardSelection` (one delete on a 1M memory index, 62 shards):
 
 | distribution | ns/op | shards scanned |
 |---|---:|---:|
-| monotonic ImageIDs | 81 µs | 1 |
-| clustered/random IDs | 5.39 ms | 62 |
+| monotonic ImageIDs | 69–81 µs | 1 |
+| clustered/random IDs | 5.0–5.4 ms | 62 |
 
-`BenchmarkSingleFileCompact` (persistent, 500k, fixed arena, one update +
-`Compact`): 1 MiB target rewrites 1.18 MB/op (7 free runs, largest 75 MB); 4 MiB
-target 4.46 MB/op (3 runs, largest 67 MB). Reused, not grown.
+`BenchmarkShardTargetSize`, 4M (query latency is flat across targets; a one-image
+update + `Compact` allocates):
+
+| target | shards | range | exact | transient alloc |
+|---|---:|---:|---:|---:|
+| single | 1 | 270 µs | 35.6 ns | 64.3 MB |
+| 8 MiB | 8 | 274 µs | 33.8 ns | 8.3 MB |
+| 16 MiB | 4 | 270 µs | 34.4 ns | 16.3 MB |
+| 32 MiB | 2 | 270 µs | 35.5 ns | 32.3 MB |
+
+`BenchmarkSingleFileCompact` (persistent, 500k, fixed arena): 1 MiB target rewrites
+1.15–1.18 MB/op (6–7 free runs, largest 75 MB); 4 MiB target 4.4 MB/op (3 runs,
+largest 67 MB). Bytes are logical/allocated, not physical device writes.
 
 ## Correctness tests
 
@@ -200,5 +223,8 @@ image metadata.
   them.
 - **Per-mutation write amplification** (~128 B at `base/8`) is unchanged; sharding
   bounds each rewrite.
-- **Checksums validate the whole base on open**, so open is O(base) read.
-- 20M/30M datasets were not run here; 4M/1M exercised multiple shards and growth.
+- **Checksums validate the whole base on open**, so open is O(base) read
+  (persistent 1M validates in ~9 ms).
+- **Scale was verified in memory up to 30M** (20/29 shards); persistent indexes
+  at 20M/30M were not run here, so production-scale persistent performance is
+  otherwise unverified.

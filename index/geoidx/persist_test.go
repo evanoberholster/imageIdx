@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	common "github.com/evanoberholster/imageIdx/common"
 )
@@ -320,4 +321,17 @@ func TestPersistentSize(t *testing.T) {
 	}
 	t.Logf("geoidx persistent 1M: file=%d arena=%d live=%d free=%d largestFree=%d runs=%d (%d B/image)",
 		info.Size(), stats.ArenaBytes, stats.LiveBytes, stats.FreeBytes, stats.LargestFree, stats.FreeRuns, stats.LiveBytes/uint64(n))
+
+	// Recovery cost: reopen validates the superblock, directory, and every shard.
+	start := time.Now()
+	reopened, err := Open(dir, Config{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	openDuration := time.Since(start)
+	defer reopened.Close()
+	if got := reopened.Len(); got != n {
+		t.Fatalf("reopened Len = %d, want %d", got, n)
+	}
+	t.Logf("geoidx persistent 1M: open/validate %v, %d shards", openDuration, len(reopened.view.Load().shards))
 }

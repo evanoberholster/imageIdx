@@ -770,7 +770,9 @@ func (i *Index) materialize(plans []shardPlan, gen uint64) ([]*shard, []extentRe
 	return shards, allocated, nil
 }
 
-// rollback frees extents allocated for an aborted compaction.
+// rollback frees extents allocated for an aborted compaction. The extents were
+// just allocated by this compaction, so Free is infallible by construction; the
+// caller already holds the primary error being unwound.
 func (i *Index) rollback(allocated []extentRef) {
 	for _, e := range allocated {
 		_ = i.alloc.Free(e.ref, e.size)
@@ -884,7 +886,7 @@ func (i *Index) runCompaction() {
 			i.finishCompaction(err)
 			return
 		}
-		i.publishResult(newShards, gen, 0, 0, nil)
+		i.publishResult(newShards, gen)
 		i.finishReclaim()
 		return
 	}
@@ -1015,7 +1017,7 @@ func (i *Index) runCompaction() {
 }
 
 // publishResult installs a new in-memory (heap) directory for a memory index.
-func (i *Index) publishResult(newShards []*shard, gen uint64, _ uint64, _ uint32, _ []extentRef) {
+func (i *Index) publishResult(newShards []*shard, gen uint64) {
 	i.mu.Lock()
 	i.shards = newShards
 	i.frozen = nil
