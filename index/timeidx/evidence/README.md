@@ -22,8 +22,8 @@ Extract into an empty directory with `tar -xzf pr16-final.tar.gz`.
   growth/rebuild test output.
 
 Some `environment.txt` diff metadata reflects the uncommitted candidate on
-reviewed HEAD, not a different implementation. See `../FINAL_REVIEW.md` for the
-authoritative final measurement tables and candidate identity. All timings
+reviewed HEAD, not a different implementation. See `../BENCHMARKS.md` for the
+current measurement tables and candidate identity. All timings
 are specific to the documented Apple M4 Pro / darwin-arm64 / Go 1.27.0 machine.
 Short matrix samples are diagnostic and do not establish latency percentiles.
 CPU profiles are investigative evidence, not independent benchmark samples.

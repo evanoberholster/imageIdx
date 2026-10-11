@@ -117,10 +117,7 @@ func (i *Index) apply(b *Batch, sourceGeneration uint64, explicit bool) error {
 		if !advance {
 			return nil
 		}
-		if old.generation == ^uint64(0) {
-			return ErrInvalidConfig
-		}
-		return i.publish(old.shards, old.generation+1, sourceGeneration)
+		return i.advanceGeneration(old, sourceGeneration)
 	}
 	var stack [64]Mutation
 	ops := stack[:0]
@@ -165,13 +162,11 @@ func (i *Index) apply(b *Batch, sourceGeneration uint64, explicit bool) error {
 		if !advance {
 			return nil
 		}
-		if old.generation == ^uint64(0) {
-			return ErrInvalidConfig
-		}
-		return i.publish(old.shards, old.generation+1, sourceGeneration)
+		return i.advanceGeneration(old, sourceGeneration)
 	}
-	if old.generation == ^uint64(0) {
-		return ErrInvalidConfig
+	gen, err := nextGeneration(old)
+	if err != nil {
+		return err
 	}
 	shards := prepare(old.shards, changed, int(i.config.MaxShardBytes/recordBytes), &i.scratch, i.file != nil)
 	if len(shards) == len(old.shards) {
@@ -186,5 +181,25 @@ func (i *Index) apply(b *Batch, sourceGeneration uint64, explicit bool) error {
 			return nil
 		} // deleting absent IDs does not commit a new root
 	}
-	return i.publish(shards, old.generation+1, sourceGeneration)
+	return i.publish(shards, gen, sourceGeneration)
+}
+
+// advanceGeneration publishes unchanged shards at the next generation. It is
+// the shared tail for empty and no-op batches that still advance the source
+// watermark. Unchanged shards are reused, so this never rewrites payloads.
+func (i *Index) advanceGeneration(old *snapshot, sourceGeneration uint64) error {
+	gen, err := nextGeneration(old)
+	if err != nil {
+		return err
+	}
+	return i.publish(old.shards, gen, sourceGeneration)
+}
+
+// nextGeneration reports the generation following published state, refusing to
+// wrap the uint64 generation counter.
+func nextGeneration(old *snapshot) (uint64, error) {
+	if old.generation == ^uint64(0) {
+		return 0, ErrInvalidConfig
+	}
+	return old.generation + 1, nil
 }

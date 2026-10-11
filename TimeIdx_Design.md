@@ -3,14 +3,13 @@
 **Format update:** Source-watermark work introduces format 5. Version 4 is
 explicitly unsupported, not silently upgraded. Bytes 56–63 of the payload now
 hold `SourceGeneration`, atomically committed with the directory. See
-`index/timeidx/SOURCE_AND_LIFECYCLE.md` for the authoritative completeness,
-staleness, rebuild and exported-method lifecycle contract.
+[`index/timeidx/README.md`](index/timeidx/README.md) for the authoritative
+completeness, staleness, rebuild and lifecycle contract.
 
-**Lifecycle update:** The final alignment changes use startup-only registration,
-`SealStartup` (or `InitializeStore`), and an immutable sorted runtime registry.
+**Lifecycle update:** Registration is startup-only through `SealStartup` (or
+`InitializeStore`), and the runtime registry is immutable and sorted.
 `Namespace` is the lock-free lookup API; runtime creation/removal is rejected.
-See `index/timeidx/FINAL_REVIEW.md` for current changes and outstanding gates;
-the initial lifecycle description below is historical where it differs.
+The initial lifecycle description below is historical where it differs.
 
 ## Confirmed decisions
 

@@ -101,7 +101,7 @@ type Metadata struct {
 
 type Config struct {
 	// MaxShardBytes is the maximum SoA payload per shard (default 4 KiB,
-	// retained after clustered/historical sweeps; see SCALE_BENCHMARKS.md).
+	// retained after clustered/historical sweeps; see BENCHMARKS.md).
 	MaxShardBytes int64
 	// MaxFileBytes is initial sparse arena capacity, NOT a growth limit.
 	MaxFileBytes int64
