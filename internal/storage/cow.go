@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"cmp"
 	"errors"
+	"slices"
 
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 )
@@ -14,26 +16,32 @@ type Extent struct {
 }
 
 // UnionExtents retains all recoverable allocations, deduplicating shared
-// extents. Conflicting sizes at the same address are corruption.
+// extents. The result is address-sorted and owns its storage; input sets are
+// untouched. Conflicting sizes at the same address are corruption.
 func UnionExtents(sets ...[]Extent) ([]Extent, error) {
-	seen := make(map[pagealloc.Ref]uint32)
-	var out []Extent
+	count := 0
 	for _, set := range sets {
-		for _, e := range set {
-			if e.Size == 0 {
-				return nil, errors.New("storage: empty extent")
-			}
-			if size, ok := seen[e.Ref]; ok {
-				if size != e.Size {
-					return nil, errors.New("storage: conflicting extents")
-				}
-				continue
-			}
-			seen[e.Ref] = e.Size
-			out = append(out, e)
-		}
+		count += len(set)
 	}
-	return out, nil
+	out := make([]Extent, 0, count)
+	for _, set := range sets {
+		out = append(out, set...)
+	}
+	slices.SortFunc(out, func(a, b Extent) int { return cmp.Compare(a.Ref, b.Ref) })
+	unique := out[:0]
+	for _, e := range out {
+		if e.Size == 0 {
+			return nil, errors.New("storage: empty extent")
+		}
+		if len(unique) != 0 && unique[len(unique)-1].Ref == e.Ref {
+			if unique[len(unique)-1].Size != e.Size {
+				return nil, errors.New("storage: conflicting extents")
+			}
+			continue
+		}
+		unique = append(unique, e)
+	}
+	return unique, nil
 }
 
 // ReconstructAllocator reserves both superblocks and the union of recoverable

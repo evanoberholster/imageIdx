@@ -1,5 +1,8 @@
 # TimeIdx before/after measurements
 
+For the subsequent GeoIdx/TimeIdx review and shared-kernel optimizations against
+the initial modernization commit, see [PERSISTENCE_REVIEW.md](PERSISTENCE_REVIEW.md).
+
 Baseline: `ae8fda19018d9ea76eed990a963aa40a8536a4b3` (merged GeoIdx PR #15).
 After: the namespace-aware version 4 implementation in this change.
 Machine: Apple M4 Pro, Go 1.27.0, darwin/arm64, 12 benchmark workers. Five samples per

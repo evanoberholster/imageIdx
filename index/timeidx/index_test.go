@@ -15,6 +15,18 @@ import (
 const testQuantum = uint64(1) << TimestampShift // benchmark fixture spacing, NOT encoding
 const testNamespace common.Namespace = 9
 
+func TestSoAColumnCapacityIsolation(t *testing.T) {
+	times, ids := makeColumns(4)
+	ids = append(ids, 10, 20, 30, 40)
+	times = append(times, 1, 2, 3, 4, 5) // must grow, not overwrite IDs
+	if !slices.Equal(ids, []uint64{10, 20, 30, 40}) {
+		t.Fatal(ids)
+	}
+	if !slices.Equal(times, []uint64{1, 2, 3, 4, 5}) {
+		t.Fatal(times)
+	}
+}
+
 func mustNewIndex(t *testing.T, entries []Entry, offset uint64, cfg Config) *Index {
 	t.Helper()
 	i, err := NewMemory(Spec{Entries: entries, Offset: offset}, cfg)

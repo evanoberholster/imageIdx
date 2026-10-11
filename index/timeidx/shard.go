@@ -37,12 +37,19 @@ type shardBuffer struct {
 	ids   []common.ValueID
 }
 
+// One backing allocation, two non-overlapping SoA columns. Limit each column's
+// capacity so appending to times can never overwrite the ID plane.
+func makeColumns(count int) ([]uint64, []common.ValueID) {
+	data := make([]uint64, 2*count)
+	return data[:0:count], data[count : count : 2*count]
+}
+
 // Persistent commits copy these private columns to mmap before publication,
 // so their temporary merge buffers can be reused. Heap snapshots instead own
 // fresh columns, using the same merge algorithm and never reusing reader data.
 func (scratch *writeScratch) columns(count int, reuse bool) ([]uint64, []common.ValueID) {
 	if !reuse {
-		return make([]uint64, 0, count), make([]common.ValueID, 0, count)
+		return makeColumns(count)
 	}
 	if scratch.nextBuffer == len(scratch.buffers) {
 		scratch.buffers = append(scratch.buffers, shardBuffer{})
@@ -50,10 +57,7 @@ func (scratch *writeScratch) columns(count int, reuse bool) ([]uint64, []common.
 	b := &scratch.buffers[scratch.nextBuffer]
 	scratch.nextBuffer++
 	if cap(b.times) < count {
-		b.times = make([]uint64, 0, count)
-	}
-	if cap(b.ids) < count {
-		b.ids = make([]common.ValueID, 0, count)
+		b.times, b.ids = makeColumns(count)
 	}
 	return b.times[:0], b.ids[:0]
 }
@@ -107,7 +111,8 @@ func initialShards(entries []Entry, maxRecords int) ([]*shard, error) {
 		}
 		return cmp.Compare(a.ImageID, b.ImageID)
 	})
-	times, ids := make([]uint64, len(entries)), make([]common.ValueID, len(entries))
+	times, ids := makeColumns(len(entries))
+	times, ids = times[:len(entries)], ids[:len(entries)]
 	for n, e := range entries {
 		times[n], ids[n] = e.Timestamp, e.ImageID
 	}
@@ -221,8 +226,11 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 			p := merged[len(merged)-1]
 			if p.offset == 0 && s.offset == 0 && len(p.times)+len(s.times) <= maxRecords &&
 				(min(len(p.times), len(s.times)) < maxRecords/4) {
-				t := append(slices.Clone(p.times), s.times...)
-				ids := append(slices.Clone(p.ids), s.ids...)
+				t, ids := scratch.columns(len(p.times)+len(s.times), reuse)
+				t = append(t, p.times...)
+				t = append(t, s.times...)
+				ids = append(ids, p.ids...)
+				ids = append(ids, s.ids...)
 				merged[len(merged)-1] = newShard(t, ids)
 				continue
 			}

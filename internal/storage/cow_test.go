@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -24,6 +25,25 @@ func TestCOWExtentUnionAndAllocator(t *testing.T) {
 	}
 	if _, err := ReconstructAllocator(1<<42, nil); err == nil {
 		t.Fatal("ref overflow")
+	}
+}
+
+func TestCOWExtentUnionDoesNotAliasInputs(t *testing.T) {
+	a := []Extent{{Ref: 8, Size: 512}, {Ref: 2, Size: 512}, {Ref: 8, Size: 512}}
+	original := slices.Clone(a)
+	got, err := UnionExtents(a, []Extent{{Ref: 4, Size: 1024}, {Ref: 2, Size: 512}})
+	if err != nil || !slices.Equal(got, []Extent{{Ref: 2, Size: 512}, {Ref: 4, Size: 1024}, {Ref: 8, Size: 512}}) {
+		t.Fatal(got, err)
+	}
+	if !slices.Equal(a, original) {
+		t.Fatal("mutated input")
+	}
+	got[0].Size = 1
+	if !slices.Equal(a, original) {
+		t.Fatal("aliased input")
+	}
+	if _, err := UnionExtents([]Extent{{Ref: 2}}); err == nil {
+		t.Fatal("accepted empty extent")
 	}
 }
 
