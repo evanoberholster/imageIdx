@@ -58,6 +58,9 @@ func TestNamespaceManagementAndIsolation(t *testing.T) {
 	if !slices.Equal(a.Search(nil, 42, 44), []uint64{8, 7}) {
 		t.Fatal(a.Search(nil, 42, 44))
 	}
+	if err := s.SealStartup(); err != nil {
+		t.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	for n := 0; n < 10; n++ {
 		wg.Add(1)
@@ -121,6 +124,9 @@ func TestConcurrentNamespaceCreationAndWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := s.SealStartup(); err != nil {
+		t.Fatal(err)
+	}
 	for ns := common.Namespace(1); ns < 5; ns++ {
 		wg.Add(1)
 		go func(ns common.Namespace) {
@@ -158,7 +164,7 @@ func TestNamespaceIdentityAndLegacyRejection(t *testing.T) {
 	if err := os.Rename(filepath.Join(dir, NamespaceFilename(1)), filepath.Join(dir, NamespaceFilename(2))); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenNamespace(dir, 2, Config{}, DurabilitySync); err != ErrNamespaceMismatch {
+	if _, err := OpenNamespace(dir, 2, Config{}, DurabilitySync); !errors.Is(err, ErrNamespaceMismatch) || !errors.Is(err, ErrRebuildRequired) {
 		t.Fatal(err)
 	}
 	legacy := t.TempDir()

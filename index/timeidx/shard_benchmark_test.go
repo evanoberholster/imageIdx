@@ -65,6 +65,9 @@ func BenchmarkNamespaceParallel(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+	if err := s.SealStartup(); err != nil {
+		b.Fatal(err)
+	}
 	var sequence atomic.Uint64
 	b.ReportAllocs()
 	b.ResetTimer()

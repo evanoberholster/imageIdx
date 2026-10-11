@@ -8,6 +8,17 @@ import (
 
 type ExactTimestampFunc func(common.ValueID) (uint64, bool)
 
+func (s *shard) rangeIndexes(start, end uint64) (int, int) {
+	lo, hi := 0, len(s.times)
+	if s.times[0] < start {
+		lo = sort.Search(hi, func(n int) bool { return s.times[n] >= start })
+	}
+	if s.times[hi-1] >= end {
+		hi = sort.Search(hi, func(n int) bool { return s.times[n] >= end })
+	}
+	return lo, hi
+}
+
 // Search appends exact [start,end) matches in (TimeKey, ValueID) order. All
 // shards come from one pinned snapshot. With sufficient dst capacity it does
 // not allocate. start>=end is empty; MaxUint64 as end excludes that key.
@@ -28,7 +39,7 @@ func (i *Index) search(dst []common.ValueID, start, end uint64, lookup ExactTime
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
-	if i.closed.Load() {
+	if i.isClosed() {
 		return dst
 	}
 	shards := i.view.Load().shards
@@ -37,8 +48,7 @@ func (i *Index) search(dst []common.ValueID, start, end uint64, lookup ExactTime
 		if s.times[0] >= end {
 			break
 		}
-		lo := sort.Search(len(s.times), func(n int) bool { return s.times[n] >= start })
-		hi := sort.Search(len(s.times), func(n int) bool { return s.times[n] >= end })
+		lo, hi := s.rangeIndexes(start, end)
 		if lookup == nil {
 			dst = append(dst, s.ids[lo:hi]...)
 			continue
@@ -58,7 +68,7 @@ func (i *Index) EstimateRange(start, end uint64) uint64 {
 	}
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
-	if i.closed.Load() {
+	if i.isClosed() {
 		return 0
 	}
 	shards := i.view.Load().shards
@@ -68,8 +78,7 @@ func (i *Index) EstimateRange(start, end uint64) uint64 {
 		if s.times[0] >= end {
 			break
 		}
-		lo := sort.Search(len(s.times), func(n int) bool { return s.times[n] >= start })
-		hi := sort.Search(len(s.times), func(n int) bool { return s.times[n] >= end })
+		lo, hi := s.rangeIndexes(start, end)
 		count += uint64(hi - lo)
 	}
 	return count

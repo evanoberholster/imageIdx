@@ -30,6 +30,7 @@ type writeScratch struct {
 	starts     []int
 	buffers    []shardBuffer
 	nextBuffer int
+	mutations  []Mutation
 }
 
 type shardBuffer struct {

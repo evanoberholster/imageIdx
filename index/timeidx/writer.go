@@ -86,7 +86,7 @@ func (i *Index) Apply(b *Batch) error {
 	defer b.inFlight.Store(false)
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed.Load() {
+	if i.isClosed() {
 		return ErrClosed
 	}
 	if i.failed != nil {
@@ -98,7 +98,10 @@ func (i *Index) Apply(b *Batch) error {
 	var stack [64]Mutation
 	ops := stack[:0]
 	if len(b.ops) > len(stack) {
-		ops = make([]Mutation, 0, len(b.ops))
+		if cap(i.scratch.mutations) < len(b.ops) {
+			i.scratch.mutations = make([]Mutation, 0, len(b.ops))
+		}
+		ops = i.scratch.mutations[:0]
 	}
 	ops = append(ops, b.ops...)
 	for _, m := range ops {

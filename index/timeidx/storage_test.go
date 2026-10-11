@@ -288,7 +288,7 @@ func TestPersistentEqualTimesAndIndependentGrowth(t *testing.T) {
 func TestPersistentRandomizedReferenceAndSparseIDs(t *testing.T) {
 	i := persistent(t, Config{MaxShardBytes: 256})
 	dir := filepath.Dir(i.path)
-	reference := map[uint64]uint64{}
+	var reference referenceIndex
 	rng := rand.New(rand.NewSource(64))
 	for _, size := range []int{1, 8, 32, 64} {
 		for round := 0; round < 10; round++ {
@@ -298,13 +298,13 @@ func TestPersistentRandomizedReferenceAndSparseIDs(t *testing.T) {
 				switch rng.Intn(3) {
 				case 0:
 					b.Append(Delete(id, 0))
-					delete(reference, id)
+					reference.set(id, 0, true)
 				case 1:
 					b.Append(Insert(id, ts))
-					reference[id] = ts
+					reference.set(id, ts, false)
 				default:
 					b.Append(Move(id, 0, ts))
-					reference[id] = ts
+					reference.set(id, ts, false)
 				}
 			}
 			if err := i.Apply(b); err != nil {

@@ -166,14 +166,7 @@ func encodeDirectory(shards []*shard) []byte {
 	buf := make([]byte, len(shards)*dirEntryBytes)
 	for n, s := range shards {
 		entry := buf[n*dirEntryBytes : (n+1)*dirEntryBytes]
-		binary.LittleEndian.PutUint64(entry[0:8], uint64(s.keys[0]))
-		binary.LittleEndian.PutUint64(entry[8:16], uint64(s.ids[0]))
-		binary.LittleEndian.PutUint64(entry[16:24], s.offset)
-		binary.LittleEndian.PutUint32(entry[24:28], uint32(s.count()))
-		binary.LittleEndian.PutUint32(entry[28:32], s.keyCRC)
-		binary.LittleEndian.PutUint32(entry[32:36], s.idCRC)
-		binary.LittleEndian.PutUint64(entry[40:48], uint64(s.minID))
-		binary.LittleEndian.PutUint64(entry[48:56], uint64(s.maxID))
+		storage.EncodeShardDescriptor(entry, storage.ShardDescriptor{FirstKey: uint64(s.keys[0]), FirstID: uint64(s.ids[0]), Offset: s.offset, Count: uint32(s.count()), KeyCRC: s.keyCRC, IDCRC: s.idCRC, MinID: uint64(s.minID), MaxID: uint64(s.maxID)})
 	}
 	return buf
 }
@@ -209,14 +202,8 @@ func decodeDirectory(arena []byte, dirOffset uint64, dirCount uint32) ([]*shard,
 }
 
 func decodeDirEntry(arena, entry []byte) (*shard, error) {
-	firstKey := binary.LittleEndian.Uint64(entry[0:8])
-	firstID := binary.LittleEndian.Uint64(entry[8:16])
-	offset := binary.LittleEndian.Uint64(entry[16:24])
-	count := binary.LittleEndian.Uint32(entry[24:28])
-	keyCRC := binary.LittleEndian.Uint32(entry[28:32])
-	idCRC := binary.LittleEndian.Uint32(entry[32:36])
-	minID := binary.LittleEndian.Uint64(entry[40:48])
-	maxID := binary.LittleEndian.Uint64(entry[48:56])
+	d := storage.DecodeShardDescriptor(entry)
+	firstKey, firstID, offset, count, keyCRC, idCRC, minID, maxID := d.FirstKey, d.FirstID, d.Offset, d.Count, d.KeyCRC, d.IDCRC, d.MinID, d.MaxID
 	if count == 0 {
 		return nil, ErrCorrupt
 	}

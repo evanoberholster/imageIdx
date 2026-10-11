@@ -13,23 +13,24 @@ import (
 )
 
 type Index struct {
-	namespace common.Namespace
-	flags     uint32
-	offset    uint64 // compatibility metadata only
-	config    Config
-	mu        sync.Mutex
-	view      atomic.Pointer[snapshot]
-	closed    atomic.Bool
-	readers   storage.ReaderTracker
-	failed    error
-	file      *storage.MappedFile
-	retired   []*storage.MappedFile
-	path      string
-	lock      *os.File
-	alloc     *pagealloc.Allocator
-	live      []storage.Extent
-	root      storage.Extent
-	slot      int
+	namespace   common.Namespace
+	flags       uint32
+	offset      uint64 // compatibility metadata only
+	config      Config
+	mu          sync.Mutex
+	view        atomic.Pointer[snapshot]
+	closed      atomic.Bool
+	ownerClosed *atomic.Bool
+	readers     storage.ReaderTracker
+	failed      error
+	file        *storage.MappedFile
+	retired     []*storage.MappedFile
+	path        string
+	lock        *os.File
+	alloc       *pagealloc.Allocator
+	live        []storage.Extent
+	root        storage.Extent
+	slot        int
 	// Per-index seams are nil in production and never shared by namespaces.
 	fault     func(string) error
 	crash     func(string)
@@ -42,6 +43,10 @@ type CommitStats struct {
 	AllocatedBytes      uint64
 	RewrittenShards     int
 	FileBytes           uint64
+}
+
+func (i *Index) isClosed() bool {
+	return i.closed.Load() || (i.ownerClosed != nil && i.ownerClosed.Load())
 }
 
 func (i *Index) CommitStats() CommitStats { i.mu.Lock(); defer i.mu.Unlock(); return i.lastStats }
@@ -77,7 +82,7 @@ func (i *Index) WaitIdle(ctx context.Context) error { return ctx.Err() }
 func (i *Index) Checkpoint() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed.Load() {
+	if i.isClosed() {
 		return ErrClosed
 	}
 	if i.failed != nil {
@@ -93,7 +98,7 @@ func (i *Index) Vacuum() error { return i.Checkpoint() }
 func (i *Index) Compact() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.closed.Load() {
+	if i.isClosed() {
 		return ErrClosed
 	}
 	return i.failed

@@ -71,6 +71,9 @@ func ExampleStore() {
 	if err != nil {
 		panic(err)
 	}
+	if err := store.SealStartup(); err != nil {
+		panic(err)
+	}
 	key, err := timeidx.EncodeTime(time.Date(1960, 1, 1, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		panic(err)

@@ -59,6 +59,9 @@ var (
 	ErrCorruptWAL         = errors.New("timeidx: obsolete WAL format") // deprecated; no WAL in v4
 	ErrNamespaceMismatch  = errors.New("timeidx: namespace identity mismatch")
 	ErrInvalidNamespace   = errors.New("timeidx: invalid namespace")
+	ErrStartupRequired    = errors.New("timeidx: namespace registry has not been published")
+	ErrNamespaceFrozen    = errors.New("timeidx: namespace membership is immutable after startup")
+	ErrRebuildRequired    = errors.New("timeidx: index rebuild required")
 	ErrNamespaceNotFound  = errors.New("timeidx: namespace does not exist")
 	ErrNamespaceExists    = storage.ErrExists
 	ErrAmbiguousNamespace = errors.New("timeidx: specify a namespace when opening a multi-namespace directory")

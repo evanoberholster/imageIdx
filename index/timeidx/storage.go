@@ -17,7 +17,7 @@ const (
 	fileMagic          uint32 = 0x54494d34 // TIM4
 	fileVersion        uint16 = 4
 	payloadBytes              = 64
-	directoryEntrySize        = 56
+	directoryEntrySize        = storage.ShardDescriptorBytes
 	formatAlignment           = 8
 	growAlignment      uint64 = 4096
 )
@@ -205,7 +205,7 @@ func openNamespace(dir string, ns common.Namespace, config Config, durability Du
 	if err != nil {
 		_ = storage.ReleaseLock(lock)
 		if errors.Is(err, storage.ErrMappedSize) {
-			return nil, errors.Join(ErrCorrupt, err)
+			return nil, errors.Join(ErrRebuildRequired, ErrCorrupt, err)
 		}
 		return nil, err
 	}
@@ -213,9 +213,18 @@ func openNamespace(dir string, ns common.Namespace, config Config, durability Du
 	if err = i.load(mf.Bytes()); err != nil {
 		_ = mf.Close()
 		_ = storage.ReleaseLock(lock)
-		return nil, err
+		return nil, rebuildError(err)
 	}
 	return i, nil
+}
+
+// Only integrity failures require a rebuild. Never classify I/O, unsupported
+// format or platform/configuration errors as corruption.
+func rebuildError(err error) error {
+	if errors.Is(err, ErrCorrupt) || errors.Is(err, ErrNamespaceMismatch) {
+		return errors.Join(ErrRebuildRequired, err)
+	}
+	return err
 }
 
 type generation struct {
@@ -300,8 +309,8 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 	}
 	for n := range shards {
 		e := dir[n*directoryEntrySize : (n+1)*directoryEntrySize]
-		off := binary.LittleEndian.Uint64(e[16:24])
-		num := binary.LittleEndian.Uint32(e[24:28])
+		d := storage.DecodeShardDescriptor(e)
+		off, num := d.Offset, d.Count
 		bytes := uint64(num) * recordBytes
 		if num == 0 || bytes > maxShard || bytes > uint64(len(data)) || off < 1024 || off%512 != 0 || off > uint64(len(data))-bytes {
 			return generation{}, ErrCorrupt
@@ -314,7 +323,7 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 		if err != nil {
 			return generation{}, err
 		}
-		tcrc, icrc := binary.LittleEndian.Uint32(e[28:32]), binary.LittleEndian.Uint32(e[32:36])
+		tcrc, icrc := d.KeyCRC, d.IDCRC
 		if storage.Checksum(data[off:off+uint64(num)*8]) != tcrc || storage.Checksum(data[off+uint64(num)*8:off+bytes]) != icrc {
 			return generation{}, ErrCorrupt
 		}
@@ -323,7 +332,7 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 		s.length = uint32(bytes)
 		s.timeCRC = tcrc
 		s.idCRC = icrc
-		if times[0] != binary.LittleEndian.Uint64(e[:8]) || ids[0] != binary.LittleEndian.Uint64(e[8:16]) || s.minID != binary.LittleEndian.Uint64(e[40:48]) || s.maxID != binary.LittleEndian.Uint64(e[48:56]) {
+		if times[0] != d.FirstKey || ids[0] != d.FirstID || s.minID != d.MinID || s.maxID != d.MaxID {
 			return generation{}, ErrCorrupt
 		}
 		for k, id := range ids {
@@ -556,14 +565,7 @@ func (i *Index) publish(plans []*shard, gen uint64) error {
 				clear(dir)
 				for n, s := range shards {
 					e := dir[n*directoryEntrySize : (n+1)*directoryEntrySize]
-					binary.LittleEndian.PutUint64(e[:8], s.times[0])
-					binary.LittleEndian.PutUint64(e[8:16], s.ids[0])
-					binary.LittleEndian.PutUint64(e[16:24], s.offset)
-					binary.LittleEndian.PutUint32(e[24:28], uint32(len(s.times)))
-					binary.LittleEndian.PutUint32(e[28:32], s.timeCRC)
-					binary.LittleEndian.PutUint32(e[32:36], s.idCRC)
-					binary.LittleEndian.PutUint64(e[40:48], s.minID)
-					binary.LittleEndian.PutUint64(e[48:56], s.maxID)
+					storage.EncodeShardDescriptor(e, storage.ShardDescriptor{FirstKey: s.times[0], FirstID: s.ids[0], Offset: s.offset, Count: uint32(len(s.times)), KeyCRC: s.timeCRC, IDCRC: s.idCRC, MinID: s.minID, MaxID: s.maxID})
 				}
 				dirCRC = storage.Checksum(dir)
 				stats.LogicalBytesWritten += uint64(length)
@@ -704,5 +706,5 @@ func VerifyNamespace(dir string, ns common.Namespace) error {
 	}
 	defer storage.Unmap(data)
 	i := &Index{namespace: ns}
-	return i.load(data)
+	return rebuildError(i.load(data))
 }

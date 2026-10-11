@@ -1,5 +1,11 @@
 # TimeIdx namespace-aware mmap design and implementation
 
+**Lifecycle update:** The final alignment changes use startup-only registration,
+`SealStartup` (or `InitializeStore`), and an immutable sorted runtime registry.
+`Namespace` is the lock-free lookup API; runtime creation/removal is rejected.
+See `index/timeidx/FINAL_REVIEW.md` for current changes and outstanding gates;
+the initial lifecycle description below is historical where it differs.
+
 ## Confirmed decisions
 
 | Decision | Answer | Source |

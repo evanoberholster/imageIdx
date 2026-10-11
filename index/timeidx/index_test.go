@@ -48,9 +48,28 @@ func equalIDSet(got, want []common.ValueID) bool {
 	return slices.Equal(got, want)
 }
 
-func referenceRange(reference map[uint64]uint64, start, end uint64) []uint64 {
+type referenceIndex []Entry
+
+func (r *referenceIndex) set(id, ts uint64, remove bool) {
+	for n, e := range *r {
+		if e.ImageID == id {
+			if remove {
+				*r = slices.Delete(*r, n, n+1)
+			} else {
+				(*r)[n].Timestamp = ts
+			}
+			return
+		}
+	}
+	if !remove {
+		*r = append(*r, Entry{Timestamp: ts, ImageID: id})
+	}
+}
+
+func referenceRange(reference referenceIndex, start, end uint64) []uint64 {
 	var entries []Entry
-	for id, ts := range reference {
+	for _, e := range reference {
+		id, ts := e.ImageID, e.Timestamp
 		if ts >= start && ts < end {
 			entries = append(entries, Entry{Timestamp: ts, ImageID: id})
 		}
@@ -139,7 +158,7 @@ func TestDifferentialBatches(t *testing.T) {
 	for _, batchSize := range []int{1, 8, 32, 64} {
 		t.Run(string(rune('A'+batchSize)), func(t *testing.T) {
 			i := mustNewIndex(t, nil, 0, Config{MaxShardBytes: 256})
-			reference := map[uint64]uint64{}
+			var reference referenceIndex
 			rng := rand.New(rand.NewSource(7))
 			for round := 0; round < 100; round++ {
 				b := NewBatch(batchSize)
@@ -148,13 +167,13 @@ func TestDifferentialBatches(t *testing.T) {
 					switch rng.Intn(3) {
 					case 0:
 						b.Append(Delete(id, 999))
-						delete(reference, id)
+						reference.set(id, 0, true)
 					case 1:
 						b.Append(Move(id, 999, ts))
-						reference[id] = ts
+						reference.set(id, ts, false)
 					default:
 						b.Append(Insert(id, ts))
-						reference[id] = ts
+						reference.set(id, ts, false)
 					}
 				}
 				if err := i.Apply(b); err != nil {
