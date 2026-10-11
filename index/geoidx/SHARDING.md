@@ -73,20 +73,45 @@ overlapping live extents. `StorageStats` exposes the resulting fragmentation.
 10. Release superseded mappings.
 
 A failure before step 5 frees the new extents and keeps the previous generation
-authoritative; the frozen snapshot is retained for retry. A write that committed
-but reported a sync error is reconciled by re-reading the slots. The newest slot
-is validated end to end (directory bounds, ordering, checksums); if it fails, an
-older valid generation is selected instead.
+authoritative; the frozen snapshot is retained for retry. A slot write failure
+aborts cleanly (`commitAborted`). A slot written but not synchronized is an
+**uncertain commit** (`errCommitUncertain`): durability is never inferred from
+mmap contents. On uncertainty the index keeps the previous generation
+authoritative in memory, protects both generations' extents (plus any prior
+uncertain extents) so none is reused, and returns the error so the caller can
+retry. The retry overwrites the same inactive slot, resolving the uncertainty.
+The newest slot is validated end to end (directory bounds, ordering, checksums)
+on open; if it fails, an older valid generation is selected instead.
 
 ## Safe mmap growth
 
 The arena is mapped at a fixed capacity (`MaxFileBytes`). When it must grow, the
 file is extended with `os.Truncate`, a **new** mapping is created (the old one is
 never re-mapped), and the allocator is rebuilt over the larger arena with the
-current live set. The old mapping is appended to a retired list and unmapped only
-after `WaitForPriorReaders` and only when no published shard references it. A
-growth marks the directory for a one-time full migration so the old mapping is
-released on the next commit, bounding mapping accumulation.
+current durable live set — **both recoverable generations are preserved**, so no
+committed extent is freed by growth. The rebuild happens before the new mapping
+is swapped in, so a failed growth leaves the mapping and allocator consistent and
+retryable. The old mapping is appended to a retired list and unmapped only after
+`WaitForPriorReaders` and only when no published shard references it. A growth
+marks the directory for a one-time full migration so the old mapping is released
+on the next commit, bounding mapping accumulation.
+
+Growth is the one case where the whole index is rewritten (the migration), so it
+temporarily raises write amplification. Measured (50k seed, 400k batch, 4 MiB
+arena): selective compaction keeps the arena at 4 MiB with 800 KB live; the growth
+migration rewrites a full copy (live delta 6.4 MB) into a 16 MiB arena and releases
+the old mapping (one mapping retained). These are logical/allocated bytes, not
+physical device writes.
+
+## Extent identity
+
+`allocatorFromLive` reserves every live extent; the shared allocator rejects
+overlapping runs, and `dedupExtents` rejects a shared offset with mismatched
+lengths while still allowing two generations to share an identical extent.
+Offsets must be 512-aligned, extents must be in bounds (`offset + length` is
+checked without overflow), and the reserved superblock region is rejected.
+Corrupt directories, unaligned offsets, and out-of-bounds offsets fail recovery
+and fall back to the previous generation.
 
 ## Compaction and pruning
 
@@ -121,15 +146,20 @@ target 4.46 MB/op (3 runs, largest 67 MB). Reused, not grown.
   differential vs a reference; split/merge; empty-shard removal; selective
   compaction; prune correctness with stale-key deletes; multi-shard moves.
 - Corruption: malformed superblock, shard extent, directory, truncated file;
-  every compaction failure stage (allocate, grow, mmap, write, directory, data
-  sync, commit, superblock sync, publish, retire, reclaim, remove) with reopen;
+  unaligned and out-of-bounds extents; extent-identity rejection (same offset with
+  mismatched length, partial overlap, zero length, superblock overlap); every
+  compaction failure stage (allocate, grow, mmap, write, directory, data sync,
+  commit, superblock sync, publish, retire, reclaim, remove) with reopen;
   **fallback** to the previous generation when the newest is corrupt.
+- Commit-state injection: before slot write, during slot write, before sync,
+  during sync, and after sync/before publish, each with retry and reopen.
 - Growth: forced growth with four concurrent readers (`-race`); injected file
-  extension and mapping failures with retry; growth reuses/releases mappings.
+  extension and mapping failures with retry; second-generation crash during growth
+  recovered by subprocess; growth reuses/releases mappings.
 - Crash: subprocess hard-exit at the commit and superblock-sync boundaries, then
   reopen and read.
-- Stress: 600 repeated shard replacements reach a steady-state arena (no
-  unbounded growth).
+- Stress: 600 repeated shard replacements reach a steady-state arena; concurrent
+  searches with repeated replacement, forced growth, and shutdown (`-race`).
 
 ```
 go test ./...
@@ -149,8 +179,11 @@ image metadata.
   trading space for crash fallback safety.
 - **Affected-shard selection is O(base)** when ImageID ranges overlap heavily; it
   allocates nothing and is far cheaper than a rewrite.
-- **Growth is a new full-file mapping** (old mapping retained), not windowed
-  mapping; growth is rare and followed by a full migration.
+- **Growth requires a full migration.** Single-file sharding does *not* eliminate
+  all full-index rewrites: growth extends the file and rewrites every shard into
+  the new arena once, then releases the old mapping. Routine compaction remains
+  selective. Bounded mmap windows are a future option only if benchmarks justify
+  them.
 - **Per-mutation write amplification** (~128 B at `base/8`) is unchanged; sharding
   bounds each rewrite.
 - **Checksums validate the whole base on open**, so open is O(base) read.

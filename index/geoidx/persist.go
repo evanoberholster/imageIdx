@@ -35,12 +35,20 @@ const (
 // persistFail is a test seam; production leaves it nil.
 var persistFail func(persistStage) error
 
-// commitSuperblockFunc is a test seam for the superblock write; production
-// copies the slot into the mapping (the following sync makes it durable).
-var commitSuperblockFunc = func(arena []byte, offset uint64, slot []byte) error {
+// errCommitUncertain reports that the inactive superblock slot was written but
+// its synchronization failed, so durability is unknown. The caller must protect
+// both generations and retry; durability is never inferred from mmap contents.
+var errCommitUncertain = errors.New("geoidx: superblock sync failed; commit outcome uncertain")
+
+// writeSuperblockSlotFunc is a test seam for the superblock slot write;
+// production copies the slot into the mapping.
+var writeSuperblockSlotFunc = func(arena []byte, offset uint64, slot []byte) error {
 	copy(arena[offset:offset+storage.SuperblockSlotBytes], slot)
 	return nil
 }
+
+// syncArenaFunc is a test seam for the durability barrier.
+var syncArenaFunc = func(mf *storage.MappedFile) error { return mf.Sync() }
 
 func failStage(stage persistStage) error {
 	if persistFail == nil {
@@ -242,9 +250,9 @@ func decodeSuperblockPayload(payload []byte) (arenaBytes, dirOffset uint64, dirC
 func superblockOffset(slot int) uint64 { return uint64(slot) * superblockBytes }
 
 // allocatorFromLive builds a fresh allocator over arenaBytes marking the second
-// superblock and every live extent used. This is the durable allocator state:
-// recovery reconstructs it from the committed directory set, so no separate
-// free-space database is persisted. Duplicate or overlapping extents fail.
+// superblock and every live extent used. live must be deduplicated by
+// dedupExtents. This is the durable allocator state: recovery reconstructs it
+// from the committed directory set. Overlapping extents fail Reserve.
 func allocatorFromLive(arenaBytes uint64, live []extentRef) (*pagealloc.Allocator, error) {
 	alloc, err := pagealloc.New(arenaBytes)
 	if err != nil {
@@ -253,20 +261,34 @@ func allocatorFromLive(arenaBytes uint64, live []extentRef) (*pagealloc.Allocato
 	if err := alloc.Reserve(secondSuperblockRef, pagealloc.MinBlockSize); err != nil {
 		return nil, err
 	}
-	seen := make(map[pagealloc.Ref]struct{}, len(live))
 	for _, e := range live {
 		if e.size == 0 {
-			continue
+			return nil, ErrCorrupt
 		}
-		if _, ok := seen[e.ref]; ok {
-			continue
-		}
-		seen[e.ref] = struct{}{}
 		if err := alloc.Reserve(e.ref, e.size); err != nil {
-			return nil, err
+			return nil, ErrCorrupt
 		}
 	}
 	return alloc, nil
+}
+
+// dedupExtents collapses identical extent references and rejects a shared offset
+// with mismatched lengths. Two generations legitimately share the exact same
+// extent; anything else at the same offset is corruption.
+func dedupExtents(live []extentRef) ([]extentRef, error) {
+	seen := make(map[pagealloc.Ref]uint32, len(live))
+	out := live[:0]
+	for _, e := range live {
+		if size, ok := seen[e.ref]; ok {
+			if size != e.size {
+				return nil, ErrCorrupt
+			}
+			continue
+		}
+		seen[e.ref] = e.size
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // liveOf returns the extents referenced by a shard set and its directory.
@@ -281,20 +303,6 @@ func liveOf(shards []*shard, dirOffset uint64, dirLength uint32) []extentRef {
 		live = append(live, extentRef{ref: pagealloc.Ref(dirOffset / uint64(pagealloc.MinBlockSize)), size: dirLength})
 	}
 	return live
-}
-
-// dedupExtents removes duplicate extent references.
-func dedupExtents(live []extentRef) []extentRef {
-	seen := make(map[pagealloc.Ref]struct{}, len(live))
-	out := live[:0]
-	for _, e := range live {
-		if _, ok := seen[e.ref]; ok {
-			continue
-		}
-		seen[e.ref] = struct{}{}
-		out = append(out, e)
-	}
-	return out
 }
 
 // New creates a persistent, empty single-file index in dir.
@@ -385,7 +393,7 @@ func (i *Index) createEmptyLocked() error {
 	i.live = nil
 	i.dirOffset, i.dirLength = 0, 0
 	i.gen = 1
-	if err := i.commitSuperblock(0, i.gen, 0, 0, 0, 0, i.arenaBytes); err != nil {
+	if err := i.commit(0, i.gen, 0, 0, 0, 0, i.arenaBytes); err != nil {
 		return err
 	}
 	i.slot = 0
@@ -442,7 +450,10 @@ func (i *Index) loadLocked() error {
 			live = append(live, liveOf(oldShards, oldDir, uint32(oldCount)*dirEntryBytes)...)
 			break
 		}
-		live = dedupExtents(live)
+		live, derr := dedupExtents(live)
+		if derr != nil {
+			continue
+		}
 		alloc, aerr := allocatorFromLive(fileBytes, live)
 		if aerr != nil {
 			continue
@@ -478,7 +489,11 @@ func decodeGeneration(arena, payload []byte, fileBytes uint64) ([]*shard, uint64
 	return shards, dirOffset, dirCount, nil
 }
 
-func (i *Index) commitSuperblock(slot int, generation, dirOffset uint64, dirCount uint32, totalEntries, liveBytes, arenaBytes uint64) error {
+// commit writes the inactive superblock slot and synchronizes it. It returns nil
+// on a durable commit, errCommitUncertain when the slot was written but the sync
+// failed (durability unknown), and any other error when the slot write itself
+// failed (nothing durable changed).
+func (i *Index) commit(slot int, generation, dirOffset uint64, dirCount uint32, totalEntries, liveBytes, arenaBytes uint64) error {
 	var payload [superblockPayloadBytes]byte
 	encodeSuperblockPayload(payload[:], arenaBytes, dirOffset, dirCount, totalEntries, liveBytes)
 	var slotBytes [storage.SuperblockSlotBytes]byte
@@ -489,33 +504,16 @@ func (i *Index) commitSuperblock(slot int, generation, dirOffset uint64, dirCoun
 	}, payload[:]); err != nil {
 		return err
 	}
-	if err := commitSuperblockFunc(i.arena.data, superblockOffset(slot), slotBytes[:]); err != nil {
+	if err := writeSuperblockSlotFunc(i.arena.data, superblockOffset(slot), slotBytes[:]); err != nil {
 		return err
 	}
 	if err := failStage(persistSuperSync); err != nil {
-		return err
+		return errors.Join(errCommitUncertain, err)
 	}
-	return i.arena.mf.Sync()
-}
-
-// committedGeneration returns the highest committed generation in the arena.
-func (i *Index) committedGeneration() (uint64, int, bool) {
-	best := -1
-	var bestGen uint64
-	for slot := 0; slot < superblockSlots; slot++ {
-		off := superblockOffset(slot)
-		if off+superblockBytes > uint64(len(i.arena.data)) {
-			continue
-		}
-		header, _, ok := storage.DecodeSuperblock(i.arena.data[off:off+superblockBytes], geoidxMagic, geoidxVersion)
-		if !ok {
-			continue
-		}
-		if best == -1 || header.Generation > bestGen {
-			best, bestGen = slot, header.Generation
-		}
+	if err := syncArenaFunc(i.arena.mf); err != nil {
+		return errors.Join(errCommitUncertain, err)
 	}
-	return bestGen, best, best != -1
+	return nil
 }
 
 // liveBytes sums the shard payload bytes.
@@ -786,14 +784,20 @@ func (i *Index) growArena(need uint64) error {
 	if err != nil {
 		return err
 	}
-	old := i.arena
-	i.arena = nr
-	i.arenaBytes = uint64(len(nr.data))
-	i.retired = append(i.retired, old)
-	alloc, err := allocatorFromLive(i.arenaBytes, i.live)
+	newBytes := uint64(len(nr.data))
+	// Rebuild the allocator over the larger arena BEFORE swapping it in, so a
+	// failed rebuild leaves the index's mapping and allocator consistent and the
+	// growth can be retried safely. The durable live set (both recoverable
+	// generations) is preserved, so no committed extent is freed by migration.
+	alloc, err := allocatorFromLive(newBytes, i.live)
 	if err != nil {
+		nr.close()
 		return err
 	}
+	old := i.arena
+	i.arena = nr
+	i.arenaBytes = newBytes
+	i.retired = append(i.retired, old)
 	i.alloc = alloc
 	i.migrateAll = true
 	return nil
@@ -913,7 +917,12 @@ func (i *Index) runCompaction() {
 
 	// Durable live set: this generation plus the previously committed one, so the
 	// prior generation stays recoverable until its slot is overwritten.
-	combined := dedupExtents(append(liveOf(newShards, dirOffset, dirLength), liveOf(snapshot, i.dirOffset, i.dirLength)...))
+	combined, err := dedupExtents(append(liveOf(newShards, dirOffset, dirLength), liveOf(snapshot, i.dirOffset, i.dirLength)...))
+	if err != nil {
+		i.rollback(allocated)
+		i.finishCompaction(err)
+		return
+	}
 	nextAlloc, err := allocatorFromLive(i.arenaBytes, combined)
 	if err != nil {
 		i.rollback(allocated)
@@ -928,17 +937,29 @@ func (i *Index) runCompaction() {
 		i.finishCompaction(cerr)
 		return
 	}
-	if err := i.commitSuperblock(i.slot^1, gen, dirOffset, uint32(len(newShards)), uint64(totalEntries(newShards)), liveBytes(newShards), i.arenaBytes); err != nil {
-		// A post-write sync error can still have committed the slot. Reconcile
-		// with what is actually durable before treating it as uncommitted.
-		gotGen, _, ok := i.committedGeneration()
-		if !ok || gotGen != gen {
-			i.mu.Unlock()
-			i.rollback(allocated)
-			i.finishCompaction(err)
-			return
+	switch cerr := i.commit(i.slot^1, gen, dirOffset, uint32(len(newShards)), uint64(totalEntries(newShards)), liveBytes(newShards), i.arenaBytes); {
+	case errors.Is(cerr, errCommitUncertain):
+		// The slot was written but durability is unknown. Protect both generations
+		// (and any prior uncertain extents), keep the previous in-memory generation
+		// authoritative, and retain the frozen snapshot so the caller can retry.
+		// Never reuse the uncertain extents.
+		protected := combined
+		if u, uerr := dedupExtents(append(append([]extentRef(nil), combined...), i.live...)); uerr == nil {
+			protected = u
 		}
-		_ = i.arena.mf.Sync()
+		i.live = protected
+		if alloc, aerr := allocatorFromLive(i.arenaBytes, protected); aerr == nil {
+			i.alloc = alloc
+		}
+		i.mu.Unlock()
+		i.finishCompaction(cerr)
+		return
+	case cerr != nil:
+		// The slot write itself failed; nothing durable changed.
+		i.mu.Unlock()
+		i.rollback(allocated)
+		i.finishCompaction(cerr)
+		return
 	}
 	_ = failStage(persistPublish)
 	i.shards = newShards

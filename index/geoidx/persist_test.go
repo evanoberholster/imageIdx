@@ -1,12 +1,14 @@
 package geoidx
 
 import (
-	common "github.com/evanoberholster/imageIdx/common"
+	"encoding/binary"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func validKeys(t *testing.T, n int) []S2Key {
@@ -155,6 +157,68 @@ func TestOpenRejectsMalformed(t *testing.T) {
 		if _, err := Open(dir, config); err == nil {
 			t.Fatal("Open accepted a truncated file")
 		}
+	})
+}
+
+// TestOpenRejectsExtentAnomalies corrupts a directory entry's offset to be
+// unaligned or out of bounds. The newest generation must be rejected (falling
+// back to the empty previous generation); no panic.
+func TestOpenRejectsExtentAnomalies(t *testing.T) {
+	build := func(t *testing.T) (string, Config, uint64) {
+		t.Helper()
+		dir := t.TempDir()
+		config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
+		index, err := New(dir, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertKeys(t, index, validKeys(t, 50), 1)
+		if err := index.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		dirOffset := index.dirOffset
+		if err := index.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dir, config, dirOffset
+	}
+	writeOffset := func(t *testing.T, dir string, at, value uint64) {
+		t.Helper()
+		f, err := os.OpenFile(filepath.Join(dir, geoidxFile), os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], value)
+		if _, err := f.WriteAt(b[:], int64(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(t *testing.T, dir string, config Config) {
+		t.Helper()
+		index, err := Open(dir, config)
+		if err != nil {
+			return // acceptable: no valid generation
+		}
+		defer index.Close()
+		if !validateDirectory(index.view.Load().shards) {
+			t.Fatal("fallback directory invalid")
+		}
+		if got := index.Len(); got != 0 {
+			t.Fatalf("corrupt newest generation not rejected: Len = %d, want 0", got)
+		}
+	}
+
+	t.Run("unaligned-offset", func(t *testing.T) {
+		dir, config, dirOffset := build(t)
+		writeOffset(t, dir, dirOffset+16, 1_000_001) // not a multiple of 512
+		check(t, dir, config)
+	})
+	t.Run("out-of-bounds-offset", func(t *testing.T) {
+		dir, config, dirOffset := build(t)
+		writeOffset(t, dir, dirOffset+16, 1<<40)
+		check(t, dir, config)
 	})
 }
 

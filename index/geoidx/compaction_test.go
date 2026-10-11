@@ -342,9 +342,10 @@ func equalIDs(a, b []uint64) bool {
 	return true
 }
 
-// TestCompactionCommitReconcilesAfterRename simulates the superblock write
-// succeeding but the commit reporting an error (for example a sync failure).
-// The committed generation must be adopted, not discarded.
+// TestCompactionCommitReconcilesAfterRename simulates the superblock slot being
+// written but its synchronization failing. Durability is unknown, so Compact
+// reports errCommitUncertain, the previous generation stays authoritative in
+// memory, and a retry succeeds.
 func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
 	dir := t.TempDir()
 	config := Config{TargetDelta: 16, CompactionTrigger: 1 << 20, MaxDelta: 1 << 21}
@@ -355,18 +356,21 @@ func TestCompactionCommitReconcilesAfterRename(t *testing.T) {
 	insertKeys(t, index, testKeys(100), 1)
 	before := index.Generation()
 
-	original := commitSuperblockFunc
-	commitSuperblockFunc = func(arena []byte, offset uint64, slot []byte) error {
-		copy(arena[offset:offset+storage.SuperblockSlotBytes], slot)
-		return errors.New("simulated post-write sync failure")
+	original := syncArenaFunc
+	syncArenaFunc = func(mf *storage.MappedFile) error { return errors.New("simulated sync failure") }
+	if err := index.Compact(); !errors.Is(err, errCommitUncertain) {
+		t.Fatalf("Compact = %v, want errCommitUncertain", err)
 	}
-	defer func() { commitSuperblockFunc = original }()
+	if index.Generation() != before {
+		t.Fatal("uncertain commit advanced the durable generation")
+	}
+	syncArenaFunc = original
 
 	if err := index.Compact(); err != nil {
-		t.Fatalf("Compact returned %v despite a committed superblock", err)
+		t.Fatalf("retry Compact: %v", err)
 	}
 	if index.Generation() == before {
-		t.Fatal("generation not advanced after reconciled commit")
+		t.Fatal("generation not advanced after retry")
 	}
 	if got := index.Len(); got != 100 {
 		t.Fatalf("Len = %d, want 100", got)
