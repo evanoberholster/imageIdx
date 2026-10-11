@@ -41,11 +41,10 @@ func TestTimeSearchNoAlloc(t *testing.T) {
 		t.Fatalf("full-range search allocated %v allocs/run, want 0", allocs)
 	}
 
-	// A miss must not allocate either. Search filters by 24-bit timestamp
-	// marker, so the window must end on a marker boundary below the
-	// minimum timestamp, not merely below it, to exclude its bucket.
+	// A miss must not allocate either. Keys are exact; no bucket rounding is
+	// necessary to exclude the minimum timestamp.
 	minimum := slices.Min(timestamps)
-	missEnd := (minimum >> TimestampShift) << TimestampShift
+	missEnd := minimum
 	if allocs := testing.AllocsPerRun(100, func() {
 		dst = index.Search(dst[:0], 0, missEnd)
 	}); allocs != 0 {

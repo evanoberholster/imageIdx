@@ -109,14 +109,16 @@ func TestGrowFaultInjection(t *testing.T) {
 			committed := index.Len()
 
 			more := withNewIDs(shardedMemoryEntries(400_000), 1_000_000)
-			if err := index.InsertBatch(more); err != nil {
-				t.Fatal(err)
-			}
+			// Install the hook before InsertBatch can launch its background worker.
+			// Assigning it afterwards races the worker's failStage reads.
 			persistFail = func(s persistStage) error {
 				if s == stage {
 					return errors.New("injected " + map[persistStage]string{persistGrow: "grow", persistMmap: "mmap"}[stage])
 				}
 				return nil
+			}
+			if err := index.InsertBatch(more); err != nil {
+				t.Fatal(err)
 			}
 			if err := index.Compact(); err == nil {
 				t.Fatal("compaction succeeded despite injected growth failure")

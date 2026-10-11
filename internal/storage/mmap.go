@@ -31,6 +31,9 @@ func MapFile(path string, emptyErr error) ([]byte, error) {
 		}
 		return nil, nil
 	}
+	if info.Size() < 0 || uint64(info.Size()) > uint64(^uint(0)>>1) {
+		return nil, ErrMappedSize
+	}
 	return mmapFile(file, info.Size())
 }
 

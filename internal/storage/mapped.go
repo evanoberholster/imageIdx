@@ -5,8 +5,8 @@ import (
 	"os"
 )
 
-// ErrMappedSize reports a non-positive mapping size.
-var ErrMappedSize = errors.New("storage: mapped file size must be positive")
+// ErrMappedSize reports a non-positive size or one that cannot fit a Go slice.
+var ErrMappedSize = errors.New("storage: mapped file size must be positive and fit platform int")
 
 // errMmapUnsupported reports a platform without the requested mapping mode.
 var errMmapUnsupported = errors.New("storage: memory mapping unsupported on this platform")
@@ -24,7 +24,7 @@ type MappedFile struct {
 // disk or resident memory up front. Platform backends that lack a read-write
 // mapping fail with errMmapUnsupported.
 func CreateMapped(path string, size int64) (*MappedFile, error) {
-	if size <= 0 {
+	if size <= 0 || uint64(size) > uint64(^uint(0)>>1) {
 		return nil, ErrMappedSize
 	}
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -55,7 +55,7 @@ func OpenMapped(path string) (*MappedFile, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	if info.Size() <= 0 {
+	if info.Size() <= 0 || uint64(info.Size()) > uint64(^uint(0)>>1) {
 		_ = file.Close()
 		return nil, ErrMappedSize
 	}

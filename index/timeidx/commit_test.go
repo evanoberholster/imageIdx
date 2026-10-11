@@ -10,9 +10,8 @@ import (
 	common "github.com/evanoberholster/imageIdx/common"
 )
 
-// TestConcurrentSyncApplyReopen proves the writer-loop group contract: every
-// Apply that returned nil under DurabilitySync is durable and replays after a
-// reopen, even when many writers commit in shared groups.
+// Every Apply returning nil is recoverable after reopening, even when callers
+// contend for the namespace's serialized commit publisher.
 func TestConcurrentSyncApplyReopen(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := NewStore(dir, Spec{}, Config{DeltaCapacity: 4096}, DurabilitySync)

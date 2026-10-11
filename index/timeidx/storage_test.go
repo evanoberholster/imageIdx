@@ -3,334 +3,336 @@ package timeidx
 import (
 	"encoding/binary"
 	"errors"
-	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-func TestPersistentCheckpointAndMmapReopen(t *testing.T) {
-	const offset = uint64(1_000)
-	directory := t.TempDir()
-	index, err := NewStore(directory, Spec{Namespace: testNamespace, Flags: 3, Offset: offset, Entries: []Entry{
-		{Timestamp: offset + testQuantum, ImageID: 1},
-		{Timestamp: offset + 2*testQuantum, ImageID: 2},
-		{Timestamp: offset + 3*testQuantum, ImageID: 3},
-	}}, Config{BlockSize: 2, DeltaCapacity: 8}, DurabilitySync)
+func persistent(t testing.TB, cfg Config) *Index {
+	t.Helper()
+	i, err := NewStore(t.TempDir(), Spec{Namespace: 1}, cfg, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { i.Close() })
+	return i
+}
 
-	batch := NewBatch(3)
-	batch.Append(Move(1, offset+testQuantum, offset+4*testQuantum))
-	batch.Append(Delete(2, offset+2*testQuantum))
-	batch.Append(Insert(4, offset+5*testQuantum))
-	if err = index.Apply(batch); err != nil {
+func TestPersistentReopenSelectiveCompactionAndReuse(t *testing.T) {
+	i := persistent(t, Config{MaxShardBytes: 512, MaxFileBytes: 4096})
+	b := NewBatch(100)
+	for n := uint64(0); n < 100; n++ {
+		b.Append(Insert(n, n))
+	}
+	if err := i.Apply(b); err != nil {
 		t.Fatal(err)
 	}
-	if err = index.Checkpoint(); err != nil {
-		t.Fatal(err)
+	before := i.view.Load()
+	affected := shardFor(before.shards, 50, 50)
+	offsets := make([]uint64, len(before.shards))
+	for n, s := range before.shards {
+		offsets[n] = s.offset
 	}
-	generation := index.Metadata().Generation
-	markersPath, idsPath, blocksPath := generationPaths(directory, generation)
-	for _, path := range []string{markersPath, idsPath, blocksPath, filepath.Join(directory, "manifest")} {
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			t.Fatal(statErr)
-		}
-		if info.Size()%formatAlignment != 0 {
-			t.Fatalf("%s size = %d, want 8-byte alignment", filepath.Base(path), info.Size())
-		}
+	apply(t, i, Move(50, 50, 51))
+	if i.CommitStats().RewrittenShards != 1 {
+		t.Fatal("unrelated rewrite", i.CommitStats())
 	}
-	if err = index.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilitySync)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	if reopened.Metadata().Generation != generation {
-		t.Fatalf("generation = %d, want %d", reopened.Metadata().Generation, generation)
-	}
-	if reopened.Metadata().Namespace != testNamespace || reopened.Metadata().Flags != 3 {
-		t.Fatalf("metadata = %+v", reopened.Metadata())
-	}
-	if len(reopened.persistence.mappings) != 2 {
-		t.Fatalf("mapping count = %d, want 2", len(reopened.persistence.mappings))
-	}
-	got := reopened.Search(make([]common.ValueID, 0, 4), offset, offset+6*testQuantum)
-	if !equalIDSet(got, []common.ValueID{1, 3, 4}) {
-		t.Fatalf("reopened result = %v, want IDs 1, 3, and 4", got)
-	}
-
-	for _, entry := range reopened.directory.Load().entries {
-		if entry.meta.MarkerOffset%storageAlignment != 0 || entry.meta.IDOffset%storageAlignment != 0 {
-			t.Fatalf("unaligned offsets: marker=%d id=%d", entry.meta.MarkerOffset, entry.meta.IDOffset)
+	for n, s := range i.view.Load().shards {
+		if n != affected && s.offset != offsets[n] {
+			t.Fatal("unrelated shard moved")
 		}
 	}
-	if err = reopened.Vacuum(); err != nil {
+	for n := 0; n < 20; n++ {
+		apply(t, i, Move(50, 0, uint64(50+n%2)))
+	}
+	size := i.OnDiskBytes()
+	for n := 0; n < 20; n++ {
+		apply(t, i, Move(50, 0, uint64(50+n%2)))
+	}
+	if i.OnDiskBytes() != size {
+		t.Fatal("unbounded file growth")
+	}
+	path := i.path
+	dir := filepath.Dir(path)
+	generation := i.Generation()
+	if err := i.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if reopened.Metadata().Generation != generation+1 {
-		t.Fatalf("vacuum generation = %d, want %d", reopened.Metadata().Generation, generation+1)
+	j, err := OpenNamespace(dir, 1, Config{MaxShardBytes: 512}, DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	if j.Generation() != generation || j.Len() != 100 {
+		t.Fatal(j.Metadata())
+	}
+	if err := VerifyNamespace(dir, 1); err != nil {
+		t.Fatal(err)
+	}
+	apply(t, j, Delete(50, 0))
+	if j.Len() != 99 {
+		t.Fatal(j.Len())
 	}
 }
 
-func TestPersistentStructureAlignment(t *testing.T) {
-	for name, size := range map[string]int{
-		"manifest":    manifestSize,
-		"block entry": directoryEntrySize,
-		"WAL header":  walHeaderSize,
-		"WAL write":   walWriteSize,
-		"image ID":    8,
-	} {
-		if size%formatAlignment != 0 {
-			t.Fatalf("%s size = %d, want multiple of 8", name, size)
+func TestCommitFailureStages(t *testing.T) {
+	for _, stage := range []string{"allocate", "write", "directory", "data-sync", "commit", "partial-root", "root-sync"} {
+		t.Run(stage, func(t *testing.T) {
+			i := persistent(t, Config{MaxShardBytes: 256})
+			apply(t, i, Insert(1, 1))
+			oldGen := i.Generation()
+			i.fault = func(s string) error {
+				if s == stage {
+					return errors.New("injected")
+				}
+				return nil
+			}
+			b := NewBatch(1)
+			b.Append(Insert(2, 2))
+			err := i.Apply(b)
+			if err == nil || i.Generation() != oldGen || !slices.Equal(i.Search(nil, 0, 3), []uint64{1}) {
+				t.Fatal("failed commit published", err)
+			}
+			i.fault = nil
+			uncertain := stage == "partial-root" || stage == "root-sync"
+			if uncertain {
+				if !errors.Is(err, ErrRecoveryRequired) || !errors.Is(i.Apply(b), ErrRecoveryRequired) {
+					t.Fatal("uncertainty not latched")
+				}
+			} else {
+				if err := i.Apply(b); err != nil {
+					t.Fatal("retry", err)
+				}
+			}
+			dir := filepath.Dir(i.path)
+			i.Close()
+			j, err := OpenNamespace(dir, 1, Config{MaxShardBytes: 256}, DurabilitySync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer j.Close()
+			if j.Len() < 1 || j.Len() > 2 {
+				t.Fatal(j.Len())
+			}
+			apply(t, j, Insert(3, 3))
+		})
+	}
+}
+
+func TestGenerationFallbackAndCorruption(t *testing.T) {
+	for _, kind := range []string{"root", "directory", "shard", "truncate", "unaligned-file", "version", "overlap", "duplicate-id", "bounds"} {
+		t.Run(kind, func(t *testing.T) {
+			i := persistent(t, Config{MaxShardBytes: 16})
+			apply(t, i, Insert(1, 1), Insert(2, 2))
+			path := i.path
+			slot := i.slot
+			i.Close()
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			off := slot * 512
+			h, p, ok := storage.DecodeSuperblock(data[off:off+512], fileMagic, fileVersion)
+			if !ok {
+				t.Fatal("slot")
+			}
+			root := binary.LittleEndian.Uint64(p[8:16])
+			count := binary.LittleEndian.Uint32(p[16:20])
+			dir := data[root : root+uint64(count)*directoryEntrySize]
+			allBad := false
+			switch kind {
+			case "root":
+				data[off+20] ^= 1
+			case "directory":
+				dir[0] ^= 1
+			case "shard":
+				data[binary.LittleEndian.Uint64(dir[16:24])] ^= 1
+			case "truncate":
+				data = data[:100]
+				allBad = true
+			case "unaligned-file":
+				data = append(data, 0)
+				allBad = true
+			case "version":
+				h.Version++
+				storage.EncodeSuperblock(data[off:off+512], h, p)
+				allBad = true
+			case "overlap":
+				copy(dir[directoryEntrySize+16:directoryEntrySize+24], dir[16:24])
+				binary.LittleEndian.PutUint32(p[20:24], storage.Checksum(dir))
+				storage.EncodeSuperblock(data[off:off+512], h, p)
+			case "duplicate-id":
+				e := dir[directoryEntrySize:]
+				loc := binary.LittleEndian.Uint64(e[16:24])
+				binary.LittleEndian.PutUint64(data[loc+8:loc+16], 1)
+				binary.LittleEndian.PutUint64(e[8:16], 1)
+				binary.LittleEndian.PutUint64(e[40:48], 1)
+				binary.LittleEndian.PutUint64(e[48:56], 1)
+				binary.LittleEndian.PutUint32(e[32:36], storage.Checksum(data[loc+8:loc+16]))
+				binary.LittleEndian.PutUint32(p[20:24], storage.Checksum(dir))
+				storage.EncodeSuperblock(data[off:off+512], h, p)
+			case "bounds":
+				binary.LittleEndian.PutUint64(p[8:16], ^uint64(0)-7)
+				storage.EncodeSuperblock(data[off:off+512], h, p)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			j, err := OpenNamespace(filepath.Dir(path), 1, Config{}, DurabilitySync)
+			if allBad {
+				if err == nil {
+					j.Close()
+					t.Fatal("accepted malformed file")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal("fallback", err)
+			}
+			defer j.Close()
+			if j.Len() != 0 {
+				t.Fatal("did not fall back", j.Len())
+			}
+		})
+	}
+}
+
+func TestHistoricalPersistentDifferential(t *testing.T) {
+	i := persistent(t, Config{MaxShardBytes: 1024})
+	for _, size := range []int{1, 8, 32, 64} {
+		b := NewBatch(size)
+		for n := 0; n < size; n++ {
+			b.Append(Insert(uint64(n), uint64(n)*100000000000000000))
 		}
-	}
-	if size := binary.Size(timemarker(0)); size != 4 {
-		t.Fatalf("timemarker size = %d, want uint32 structure-of-arrays column", size)
-	}
-	if storageAlignment%formatAlignment != 0 {
-		t.Fatalf("storage alignment = %d, want multiple of 8", storageAlignment)
-	}
-}
-
-func TestWALRecoversWritesAfterLastCheckpoint(t *testing.T) {
-	const offset = uint64(100)
-	directory := t.TempDir()
-	index, err := NewStore(directory, Spec{Offset: offset, Entries: []Entry{
-		{Timestamp: offset + testQuantum, ImageID: 1},
-	}}, Config{DeltaCapacity: 8}, DurabilitySync)
-	if err != nil {
-		t.Fatal(err)
-	}
-	batch := NewBatch(2)
-	batch.Append(Move(1, offset+testQuantum, offset+3*testQuantum))
-	batch.Append(Insert(2, offset+2*testQuantum))
-	if err = index.Apply(batch); err != nil {
-		t.Fatal(err)
-	}
-	if err = index.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	recovered, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilitySync)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = recovered.Close() })
-	got := recovered.Search(make([]common.ValueID, 0, 3), offset, offset+4*testQuantum)
-	if !equalIDSet(got, []common.ValueID{1, 2}) {
-		t.Fatalf("recovered result = %v, want IDs 1 and 2", got)
-	}
-	old := recovered.Search(make([]common.ValueID, 0, 1), offset+testQuantum, offset+2*testQuantum)
-	if len(old) != 0 {
-		t.Fatalf("old timestamp survived WAL replay: %v", old)
-	}
-}
-
-func TestWALIgnoresIncompleteTailRecord(t *testing.T) {
-	directory := t.TempDir()
-	index, err := NewStore(directory, Spec{}, Config{DeltaCapacity: 8}, DurabilitySync)
-	if err != nil {
-		t.Fatal(err)
-	}
-	batch := NewBatch(1)
-	batch.Append(Insert(7, testQuantum))
-	if err = index.Apply(batch); err != nil {
-		t.Fatal(err)
-	}
-	if err = index.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	wal, err := os.OpenFile(walPath(directory, 1), os.O_WRONLY|os.O_APPEND, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = wal.Write([]byte{1, 2, 3, 4, 5}); err != nil {
-		t.Fatal(err)
-	}
-	if err = wal.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	recovered, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilityOS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = recovered.Close() })
-	got := recovered.Search(make([]common.ValueID, 0, 1), 0, 2*testQuantum)
-	if !equalIDSet(got, []common.ValueID{7}) {
-		t.Fatalf("result = %v, want [7]", got)
-	}
-}
-
-// TestManifestVersionRejected proves unknown manifest versions fail open
-// with ErrUnsupported instead of masquerading as corruption.
-func TestManifestVersionRejected(t *testing.T) {
-	directory := t.TempDir()
-	index, err := NewStore(directory, Spec{Offset: 1_000}, Config{}, DurabilityOS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := index.Close(); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(directory, "manifest")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data[4] ^= 0xff // version field; magic stays recognized
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenStore(directory, Config{}, DurabilityOS); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("versioned manifest error = %v, want ErrUnsupported", err)
-	}
-}
-
-func TestManifestChecksumRejectsCorruption(t *testing.T) {
-	directory := t.TempDir()
-	index, err := NewStore(directory, Spec{}, Config{}, DurabilityOS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = index.Close(); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(directory, "manifest")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data[16] ^= 0xff
-	if err = os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, err = OpenStore(directory, Config{}, DurabilityOS)
-	if !errors.Is(err, ErrCorruptManifest) {
-		t.Fatalf("error = %v, want %v", err, ErrCorruptManifest)
-	}
-}
-
-// TestVacuumRotatesWALAndRetainsLiveGeneration verifies that Vacuum rolls
-// the WAL to a fresh epoch carrying the post-checkpoint tail, keeps exactly
-// the published generation files, and leaves the index replayable.
-func TestVacuumRotatesWALAndRetainsLiveGeneration(t *testing.T) {
-	const offset = uint64(500)
-	directory := t.TempDir()
-	index, err := NewStore(directory, Spec{Offset: offset, Entries: []Entry{
-		{Timestamp: offset + testQuantum, ImageID: 1},
-	}}, Config{DeltaCapacity: 8}, DurabilitySync)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Two checkpoint generations plus WAL growth.
-	for round := uint64(0); round < 2; round++ {
-		batch := NewBatch(4)
-		for k := uint64(0); k < 4; k++ {
-			n := 10 + round*4 + k
-			if !batch.Append(Insert(common.ValueID(n), offset+n*testQuantum)) {
-				t.Fatal("batch append rejected")
+		if err := i.Apply(b); err != nil {
+			t.Fatal(err)
+		}
+		b.Reset()
+		for n := 0; n < size; n++ {
+			if n%3 == 0 {
+				b.Append(Delete(uint64(n), 0))
+			} else {
+				b.Append(Move(uint64(n), 0, uint64(63-n)*100000000000000000))
 			}
 		}
-		if err = index.Apply(batch); err != nil {
+		if err := i.Apply(b); err != nil {
 			t.Fatal(err)
 		}
-		if err = index.Checkpoint(); err != nil {
+		want := i.Search(nil, 0, ^uint64(0))
+		dir := filepath.Dir(i.path)
+		i.Close()
+		var err error
+		i, err = OpenNamespace(dir, 1, Config{MaxShardBytes: 1024}, DurabilitySync)
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	before := index.OnDiskBytes()
-	if err = index.Vacuum(); err != nil {
-		t.Fatal(err)
-	}
-	after := index.OnDiskBytes()
-	if after >= before {
-		t.Fatalf("OnDiskBytes before=%d after=%d, want vacuum to reclaim", before, after)
-	}
-	generation := index.Metadata().Generation
-	for pattern, want := range map[string]int{
-		"markers.*.base": 1, "ids.*.base": 1, "blocks.*.idx": 1, walGlob: 1,
-	} {
-		matches, globErr := filepath.Glob(filepath.Join(directory, pattern))
-		if globErr != nil {
-			t.Fatal(globErr)
-		}
-		if len(matches) != want {
-			t.Fatalf("%s files after vacuum = %v, want %d", pattern, matches, want)
+		if !slices.Equal(i.Search(nil, 0, ^uint64(0)), want) {
+			t.Fatal("recovery differential")
 		}
 	}
-	markersPath, idsPath, blocksPath := generationPaths(directory, generation)
-	for _, path := range []string{markersPath, idsPath, blocksPath} {
-		if _, statErr := os.Stat(path); statErr != nil {
-			t.Fatalf("live generation file missing: %s: %v", path, statErr)
-		}
-	}
-	// Writes after the vacuum must survive close/reopen via the new epoch.
-	batch := NewBatch(1)
-	if !batch.Append(Insert(999, offset+999*testQuantum)) {
-		t.Fatal("batch append rejected")
-	}
-	if err = index.Apply(batch); err != nil {
-		t.Fatal(err)
-	}
-	if err = index.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenStore(directory, Config{DeltaCapacity: 8}, DurabilitySync)
+	i.Close()
+}
+
+func TestPersistentEqualTimesAndIndependentGrowth(t *testing.T) {
+	dir := t.TempDir()
+	manager, err := NewNamespaceStore(dir, Config{MaxShardBytes: 512, MaxFileBytes: 4096}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	got := reopened.Search(make([]common.ValueID, 0, 16), offset, offset+1_000*testQuantum)
-	if !equalIDSet(got, []common.ValueID{1, 10, 11, 12, 13, 14, 15, 16, 17, 999}) {
-		t.Fatalf("reopened result = %v, want IDs 1, 10-17, and 999", got)
-	}
-	// A second vacuum must roll the epoch again without losing data.
-	if err = reopened.Vacuum(); err != nil {
+	defer manager.Close()
+	a, err := manager.CreateNamespace(1)
+	if err != nil {
 		t.Fatal(err)
 	}
-	matches, _ := filepath.Glob(filepath.Join(directory, walGlob))
-	if len(matches) != 1 {
-		t.Fatalf("WAL files after second vacuum = %v, want 1", matches)
+	b, err := manager.CreateNamespace(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(t, b, Insert(7, 42))
+	bs := b.CommitStats()
+	bg := b.Generation()
+	bytes := b.OnDiskBytes()
+	batch := NewBatch(100000)
+	for n := uint64(0); n < 100000; n++ {
+		batch.Append(Insert(n, 42))
+	}
+	if err := a.Apply(batch); err != nil {
+		t.Fatal(err)
+	}
+	if a.Metadata().BlockCount <= 1 || len(a.Search(nil, 42, 43)) != 100000 {
+		t.Fatal("equal-time split")
+	}
+	if b.CommitStats() != bs || b.Generation() != bg || b.OnDiskBytes() != bytes || !slices.Equal(b.Search(nil, 42, 43), []uint64{7}) {
+		t.Fatal("growth isolation")
+	}
+	apply(t, a, Move(7, 42, 43))
+	if len(a.Search(nil, 42, 43)) != 99999 || !slices.Equal(a.Search(nil, 43, 44), []uint64{7}) {
+		t.Fatal("move across equal-key shards")
+	}
+	if err := manager.CloseNamespace(1); err != nil {
+		t.Fatal(err)
+	}
+	a, err = manager.OpenNamespace(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Len() != 100000 || len(a.Search(nil, 42, 43)) != 99999 {
+		t.Fatal("reopen equal-key shards")
 	}
 }
 
-func TestDecodeManifestRejectsOversizedNamespace(t *testing.T) {
-	data := validManifestBytes()
-	binary.LittleEndian.PutUint64(data[16:24], uint64(math.MaxUint16)+1)
-	if _, err := decodeManifest(data); !errors.Is(err, ErrCorruptManifest) {
-		t.Fatalf("decode oversized namespace = %v, want ErrCorruptManifest", err)
+func TestPersistentRandomizedReferenceAndSparseIDs(t *testing.T) {
+	i := persistent(t, Config{MaxShardBytes: 256})
+	dir := filepath.Dir(i.path)
+	reference := map[uint64]uint64{}
+	rng := rand.New(rand.NewSource(64))
+	for _, size := range []int{1, 8, 32, 64} {
+		for round := 0; round < 10; round++ {
+			b := NewBatch(size)
+			for n := 0; n < size; n++ {
+				id, ts := uint64(rng.Intn(100))*100000000000000000, uint64(rng.Intn(64))*100000000000000000
+				switch rng.Intn(3) {
+				case 0:
+					b.Append(Delete(id, 0))
+					delete(reference, id)
+				case 1:
+					b.Append(Insert(id, ts))
+					reference[id] = ts
+				default:
+					b.Append(Move(id, 0, ts))
+					reference[id] = ts
+				}
+			}
+			if err := i.Apply(b); err != nil {
+				t.Fatal(err)
+			}
+			i.Close()
+			var err error
+			i, err = OpenNamespace(dir, 1, Config{MaxShardBytes: 256}, DurabilitySync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for start := uint64(0); start < 6400000000000000000; start += 1600000000000000000 {
+				want := referenceRange(reference, start, start+1600000000000000000)
+				if got := i.Search(nil, start, start+1600000000000000000); !slices.Equal(got, want) || i.EstimateRange(start, start+1600000000000000000) != uint64(len(want)) {
+					t.Fatalf("size %d round %d: %v != %v", size, round, got, want)
+				}
+			}
+		}
 	}
-}
-
-func TestOpenIgnoresUnpublishedManifestTemporary(t *testing.T) {
-	directory := t.TempDir()
-	index, err := NewStore(directory, Spec{Entries: []Entry{{Timestamp: testQuantum, ImageID: 1}}}, Config{}, DurabilityOS)
+	apply(t, i, Insert(^uint64(0), 1))
+	i.Close()
+	var err error
+	i, err = OpenNamespace(dir, 1, Config{}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = index.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(filepath.Join(directory, "manifest.tmp"), []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenStore(directory, Config{}, DurabilityOS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	got := reopened.Search(make([]common.ValueID, 0, 1), 0, 2*testQuantum)
-	if !equalIDSet(got, []common.ValueID{1}) {
-		t.Fatalf("result = %v, want [1]", got)
+	defer i.Close()
+	if !slices.Equal(i.Search(nil, 1, 2), []uint64{^uint64(0)}) {
+		t.Fatal("sparse ID recovery")
 	}
 }

@@ -9,10 +9,8 @@ import (
 	common "github.com/evanoberholster/imageIdx/common"
 )
 
-// Group-commit probes on a persistent index. DurabilitySync is the
-// interesting mode: the writer loop coalesces every batch queued while a
-// sync is in flight into one group sharing one fsync, while a lone writer
-// still pays one fsync per Apply.
+// Persistent COW probes retain their old names for before/after comparisons.
+// Each changed Apply now performs a data barrier and a root barrier.
 func BenchmarkApplyPersistentSyncSingle(b *testing.B) {
 	idx, err := NewStore(b.TempDir(), Spec{}, Config{DeltaCapacity: 4096}, DurabilitySync)
 	if err != nil {
