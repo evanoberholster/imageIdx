@@ -1,4 +1,177 @@
-# PR #16 source/lifecycle and scale review — not merge-ready
+# PR #16 final benchmark evidence
+
+**Final authoritative measurements:** see the opening section of
+`FINAL_REVIEW.md`. The tables below retain intermediate-candidate history.
+The final ten-process A/B measures historical memory64 −7.56% (p=.002) and
+10M sequential mutation1 −16.61% (p<.001), with no unexplained significant
+regression above 5%. Final scale preparation and the entire shard/storage
+matrix were rerun after both mutation-loop and delete-routing improvements.
+Raw evidence is durably archived in `evidence/pr16-final.tar.gz`.
+
+The final optimization pass supersedes the earlier provisional results and
+outstanding-work list below. See `FINAL_REVIEW.md` for validation, growth/rebuild
+results and the merge recommendation. Baseline remains `4c7847c`; reviewed
+starting HEAD is `a41eada`. The candidate adds cached sorted generation extents,
+a sorted two-list union fast path, removal of redundant directory clearing,
+and a profiled one-pass old-row/addition merge.
+No search or persistence-format change was made in this pass.
+
+## Final measurement protocol and regressions
+
+Apple M4 Pro / Go 1.27.0 / darwin-arm64 / GOMAXPROCS=12, same local temporary
+filesystem, serial runs. `benchmark_ab.sh` performs ten independent processes
+per tree with alternating A/B, B/A order. Benchstat uses x/perf revision
+`8e83ce0f7b1c`. The first unchanged-head A/B did not reproduce any reported
+regression. Final interleaved A/B medians:
+
+| Operation | Baseline → final | p-value | B/op / allocs/op baseline → final |
+|---|---:|---:|---|
+| Memory historical64 | 93.27 → 86.62 µs | .001 | ~353 KB / 252 → unchanged |
+| Durable historical64 | 9.962 → 10.089 ms | .315 | 103.23 → 96.22 KiB; ~293 → 291 |
+| Durable append64 | 8.184 → 8.123 ms | .631 | 21.41 → 18.28 KiB; 12 → 11 |
+| 10M sequential mutation1 | 19.49 → 18.38 ms | .052 | 1,983,376 → 1,663,888 bytes; 12 → 11 |
+| Reopen | 472.9 → 474.1 µs | .353 | 65.70 → 65.73 KiB; 436 → 436 |
+| Exact search | 16.17 → 16.20 ns | .753 | 0 / 0 → 0 / 0 |
+| Month search | 854.2 → 851.6 ns | .469 | 0 / 0 → 0 / 0 |
+
+Non-interleaved phase/preparation runs and the short expanded matrix showed
+slower single-ID preparation, encoding and some sequential commits. They were
+**not discarded**: a supplemental ten-process interleaved A/B retested them:
+
+| Operation | Baseline → final | p-value |
+|---|---:|---:|
+| 1M sequential prepare1 | 15.97 → 15.88 µs | .796 |
+| 1M random prepare1 | 2.773 → 2.767 ms | .579 |
+| 10M sequential prepare1 | 130.7 → 122.9 µs | .436 |
+| 10M random prepare1 | 11.77 → 11.64 ms | .029 |
+| 1M sequential durable1 | 10.243 → 9.448 ms | .011 |
+| 1M sequential durable8 | 14.43 → 10.94 ms | <.001 |
+| 10M sequential durable1 | 19.50 → 18.40 ms | .089 |
+| 10M sequential durable8 | 19.63 → 18.63 ms | .075 |
+| 10M directory encoding (no clear) | 386.3 → 386.4 µs | .853 |
+
+Those checks resolved the single-ID/encoding anomalies. A subsequent clean
+harness run reproduced memory historical64 +6.18% (p=.015). CPU profiles
+located hot work in the old-row/addition merge, including repeated membership/
+exhaustion checks, with equal allocations. The final one-pass merge above fixes
+that work: memory historical64 −7.13% (p=.001), unchanged 252 allocations.
+Original persistent benchmark probes are preserved in their original file;
+component probes use `commit_components_benchmark_test.go`.
+
+No significant regression above 5% remains in the final A/B. Day search has a
+small significant +1.34% drift (41.56 → 42.12 ns, p<.001), below the threshold,
+still zero allocation. Absolute fsync
+latencies drifted between runs; comparisons therefore use matched interleaving,
+not isolated run medians. Search code did not change: its measured exact-search
+difference is not credited to a new search algorithm. Reopen's ~32-byte increase
+is a fixed Index field, not per-shard growth. Isolated phase benchmarks identified
+additional avoidable directory work without removing correctness checks or
+either durability barrier.
+
+Supplemental patterns (repeat the same ten-process alternating protocol):
+
+```sh
+-bench '^BenchmarkScalePreparation$/N=(1000000|10000000)$/Random=(false|true)$/Batch=1$' -benchtime=200ms
+-bench '^BenchmarkScaleDurableBatches$/N=(1000000|10000000)$/Random=false$/Batch=(1|8)$' -benchtime=10x
+-bench '^BenchmarkCommitComponents$/N=10000000$/Encode/Clear=false$' -benchtime=200ms
+```
+
+## Directory cost, 10M rows / 4 KiB
+
+Ten phase samples per tree (diagnostics, not an additive model of a full commit):
+
+| Phase | Baseline → final median | Final B/op / allocs/op |
+|---|---:|---:|
+| Allocate/free directory | 17.42 → 18.55 µs | 0 / 0 |
+| Encode (no preliminary clear), interleaved | 386.3 → 386.4 µs | 0 / 0 |
+| Directory CRC32C | 187.12 → 189.51 µs | 0 / 0 |
+| Build previous extent list | 76.81 µs → eliminated in commits | eliminates 319,488 bytes / 1 allocation |
+| Union of sorted retained lists | 1950.71 → 185.88 µs | 630,784 / 1 |
+| Allocator reconstruction | 599.74 → 616.04 µs | 73,824 / 2 |
+| Dirty unpublished directory, one real sync | 7.627 → 8.040 ms | 0 / 0 |
+
+Encoding already uses precomputed CRCs and ID bounds and writes directly into
+an unpublished mmap extent. No heap directory buffer exists to reuse. Removing
+the clear avoids a full memory pass; its small speed effect varies across phase
+runs and is not claimed as a significant full-commit improvement. The large
+measured savings are sorted extent union and the cached prior list. Each new
+list is still sorted once, and the allocator is still reconstructed/validated.
+The union phase uses two mostly shared sorted lists; actual commits also pay
+new-list sorting and two sync barriers, captured by the full durable A/B.
+
+Flat directory write amplification is unchanged: 10M rows at 4 KiB require
+~2.19 MB per root directory, even for one-row/source-only commits. This remains
+O(shards), and sync is the largest remaining durable cost. No directory tree,
+extra data file, persistent reverse lookup or relaxed durability was added.
+
+## Final random-ID scaling
+
+Ten preparation samples; three-sample changed durable-commit matrix. Values in
+each tuple are batches **1 / 8 / 32 / 64**. Preparation B/op and allocs/op are
+identical before/after:
+
+| Rows | Prepare baseline ms | Prepare final ms | Final durable ms | Preparation bytes / allocations |
+|---|---|---|---|---|
+| 1M | 2.699 / 10.175 / 23.567 / 29.966 | 2.914 / 3.166 / 1.830 / 2.003 | 12.23 / 13.93 / 13.44 / 14.53 | 32,864 / 33,536 / 35,840 / 38,912 bytes; 2 / 9 / 33 / 65 allocs |
+| 10M | 11.648 / 136.541 / 235.388 / 289.631 | 12.043 / 23.897 / 19.419 / 19.755 | 25.38 / 37.77 / 32.47 / 34.44 | 319,584 / 320,256 / 322,560 / 325,632 bytes; 2 / 9 / 33 / 65 allocs |
+
+Single-ID preparation drifts in the ordered phase runs, but the supplemental
+interleaved comparison above does not reproduce a regression. Final full
+10M random commits allocate 1,663,888 / 1,665,424 / 1,670,800 / 1,677,968 bytes
+and 11 / 27 / 77 / 142 objects. Logical rewrite volume is unchanged:
+2,192,120 / 2,220,792 / 2,319,096 / 2,450,168 bytes per commit.
+
+Detection still visits 39,063 shards and inspects about 10M IDs at 10M rows,
+rewriting only the affected 1/8/32/64 deletion shards. At 1M it visits 3,907.
+There is no per-row allocation or unexpected whole-payload rewrite. O(records)
+random-ID detection is explicit. Measured batch64 throughput is approximately
+1.8K mutations/s at 10M on this machine, not an SLA/percentile guarantee.
+Explicit batching is appropriate for this measured workload; no evidence
+requires a reverse directory or queue. Higher-latency-sensitive applications
+must assess their own load rather than infer arbitrary-ID lookup is constant time.
+
+## Final shard-size decision: retain 4 KiB, configurable
+
+Three samples for all 40 scale/ID/repeated-time/bound combinations, plus new-ID
+chronological inserts and batches 1/8/32/64. Representative final random-ID
+historical64 medians show why there is no single dominant bound:
+
+| Bound | 1M ms / rewrite bytes | 10M ms / rewrite bytes | 10M wide search (2.5M IDs) | 10M directory bytes / entries |
+|---|---:|---:|---:|---:|
+| 4 KiB | 11.929 / 478,232 | 32.092 / 2,446,960 | 1.215 ms | 2,187,752 / 39,067 |
+| 16 KiB | 11.899 / 1,103,392 | 29.817 / 1,596,024 | .651 ms | 546,952 / 9,767 |
+| 64 KiB | 14.191 / 4,160,704 | 32.188 / 4,330,600 | .461 ms | 136,808 / 2,443 |
+| 256 KiB | 14.934 / 8,003,984 | 33.574 / 8,152,624 | .388 ms | 34,272 / 612 |
+| 1 MiB | 14.919 / 8,001,408 | 35.549 / 9,420,840 | .348 ms | 8,568 / 153 |
+
+Wide searches remain 0 B/op / 0 allocs/op, approximately 2.1 / 3.8 / 5.4 / 6.4 /
+7.2 billion returned IDs/s respectively (memory copy throughput, not QPS).
+16 KiB is attractive for 10M-row namespaces and larger bounds favor wide reads;
+4 KiB has ~2.3× lower logical historical write volume at 1M than 16 KiB, with
+similar measured latency. Dense repeated-time historical updates also favor
+4 KiB rewrite volume at 1M (328,536 versus 605,696 bytes for random IDs).
+Chronological new-ID inserts favor smaller directories at larger bounds; they
+do not outweigh scattered-update COW costs universally. Keep compatibility
+and the small/selective-update default; recommend evaluating 16 KiB explicitly
+for large namespaces. No adaptive sizing is needed.
+
+For 10M random IDs, reopen medians across the five bounds are 1.369 / 1.363 /
+1.366 / 1.362 / 1.366 seconds. Sorting IDs for duplicate validation dominates;
+temporary O(records) memory remains. File capacity is 274,595,840 bytes at
+4 KiB and 268,435,456 at larger bounds; all saw six initial/import remaps.
+Storage geometry/rewrite volumes are identical before/after. Sustained
+bounded-size growth/reuse is separately verified in `FINAL_REVIEW.md`.
+
+Raw final outputs in the approved session temp directory:
+`timeidx-final-ab-{baseline,final}.txt`, `timeidx-single-ab-{baseline,final}.txt`,
+and `timeidx-final-{baseline,final}-{CommitComponents,ScalePreparation,ScaleMatrix}.txt`.
+The exact harness and A/B script are committed; the tables above permanently
+record the decision evidence. Failed preparation-harness output was excluded
+and rerun after moving its untimed cardinality assertion outside the loop.
+
+---
+
+## Historical source/lifecycle review (provisional, superseded)
 
 Baseline: `4c7847cbe4e96e9cfb91ac55c5c474c78bd3b63d`.
 Candidate: source-generation, heap-only metadata and batch-local sparse-ID

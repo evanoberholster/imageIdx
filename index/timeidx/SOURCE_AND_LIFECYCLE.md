@@ -60,6 +60,16 @@ Runtime registry membership never changes. Replacing a runtime namespace require
 controlled shutdown/reinitialization; no active owner may reference the replaced
 file. Indexing has no database-specific replay code or automatic rebuild.
 
+Rebuild coverage includes per-call failures at final/staging lock acquisition,
+verification, staged sync, rename and both directory syncs, plus staged creation
+failures and foreign-namespace rejection. Before rename, failures leave both
+verified files unchanged and release ownership locks. After rename, any error
+is `ErrRecoveryRequired` joined with its original I/O cause, never success or
+corruption. Subprocess exits immediately before/after rename validate the old
+or replacement file on reopen, including its source generation. Process exit
+is not a simulated power failure; unsynced rename durability remains explicitly
+uncertain even when the replacement is visible after process termination.
+
 ## Exported lifecycle audit
 
 | Methods | Memory accessed | Protection / shutdown behavior |
