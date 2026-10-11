@@ -369,7 +369,13 @@ func (s *Store) flushLiveness(add bool) error {
 		_ = batch.Close()
 		return addErr
 	}
-	return applyBitmapBatch(live, batch)
+	if err := applyBitmapBatch(live, batch); err != nil {
+		return err
+	}
+	// Publish a new liveness version once the change is visible, so a matcher
+	// that starts after this batch returns rebuilds its cached live bitmap.
+	s.liveVersion.Add(1)
+	return nil
 }
 
 // vector staging applies immediately because vectoridx has no batch insertion

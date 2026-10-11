@@ -112,6 +112,9 @@ namespace.
 
 ## Search integration
 
+General Search is focused on **TimeIdx, GeoIdx, and BitmapIdx** (VectorIdx
+access is available through the typed accessor):
+
 ```go
 eng, err := search.New(db)                 // search package
 during, _ := eng.During(1, start, end)
@@ -124,6 +127,35 @@ deleted entities are excluded automatically. `Engine` also exposes typed
 `Time`/`Geo`/`Bitmap`/`Sim`/`Hash`/`Vector` accessors. Compiled-query execution
 resolves engines by namespace number from the immutable registry — no maps, no
 reflection, no string lookups (a routing lookup is 0 B/op and sub-nanosecond).
+
+RadixHash and SimHash are **not** Search clauses. They are dedicated to image
+import and are reached through the import matcher below.
+
+## Import matching
+
+`Store.Matcher` binds the duplicate/similarity engines for import:
+
+```go
+m, err := db.Matcher(index.MatcherSpec{SHA256: 4, BLAKE3: 5, Perceptual: 3})
+hits, err := m.Match(dst, items, index.MatchParams{PHashDistance: 4, PDQDistance: 28, DetectIntraBatch: true})
+```
+
+- SHA-256 and BLAKE3 are separate `KindHashExact` namespaces; perceptual (pHash
+  + PDQ) is a `KindHashPerceptual` namespace. All must carry `EntityImage`;
+  binding anything else returns `ErrMatcherNamespace`.
+- `Match` returns caller-owned `[]Match` with exact `ImageID`s and **native**
+  Hamming distances (0 for exact hits); there is no score normalization or
+  ranking fusion.
+- Deleted images are filtered by the entity-liveness bitmap, and stale hash
+  associations are already removed by `Update`, so neither can be returned.
+- `MatchItem` carries optional SHA256/BLAKE3/pHash/PDQ inputs; per-call liveness
+  is cached by version, so steady-state exact matching is allocation-free and
+  perceptual matching is at parity with the underlying engines.
+- Results are deterministic: index hits in ascending ID order, then intra-batch
+  peers in ascending item order. `DetectIntraBatch` reports duplicates among the
+  incoming items (`Match.Intra` with `Match.Peer`).
+- Grouping decisions and match-and-commit atomicity stay outside the matcher; a
+  match does not create StackIDs or AssetIDs.
 
 ## Performance
 
@@ -146,11 +178,12 @@ reflection, no string lookups (a routing lookup is 0 B/op and sub-nanosecond).
   `ErrNamespaceIDModel`. Prevalidation enforces this for a whole batch before
   any engine is mutated.
 - **Search clauses.** The `search` package compiles bitmap, timestamp, and
-  geographic clauses. Exact-hash, perceptual-hash, and vector results are
-  available through the typed accessors (`Engine.Hash`/`Sim`/`Vector`) and must
-  be filtered by liveness by the caller until dedicated clauses are added.
-  `Engine.Compile` rejects clause/entity mismatches and clauses bound to another
-  Store.
+  geographic clauses; exact-hash and perceptual-hash matching is intentionally
+  served by the import matcher instead of Search. `Engine.Compile` rejects
+  clause/entity mismatches and clauses bound to another Store. The typed
+  `Engine.Hash`/`Engine.Sim`/`Engine.Vector` accessors remain for compatibility.
+- **Matcher atomicity.** Import matching does not commit; it only reports live
+  matches. There is no match-and-commit transaction.
 - **Unified-layer allocations.** Operation staging allocates one engine batch
   per affected namespace; batch scratch reuse is not yet complete, so
   zero-allocation single mutations are not guaranteed.

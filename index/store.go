@@ -57,6 +57,11 @@ type Store struct {
 	nsSource   []uint64
 	safeSource atomic.Uint64
 
+	// liveVersion increments after every committed entity-liveness change. The
+	// import matcher uses it to cache the live-entity bitmap without serving
+	// stale state after a delete.
+	liveVersion atomic.Uint64
+
 	// degraded is an immutable bitset of namespaces known to be potentially
 	// incomplete after a partially failed batch. Readers consult it lock-free;
 	// the writer republishes a copy (a rare failure path) while holding mu.
