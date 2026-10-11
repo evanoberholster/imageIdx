@@ -181,6 +181,9 @@ func (s *Store) Close() error {
 type NamespaceInit struct {
 	Spec   Spec
 	Create bool
+	// RequiredSourceGeneration is a DB completeness watermark to check before
+	// publishing this namespace. Stale files remain intact but unavailable.
+	RequiredSourceGeneration uint64
 }
 type NamespaceResult struct {
 	Namespace common.Namespace
@@ -223,6 +226,12 @@ func InitializeStore(dir string, namespaces []NamespaceInit, config Config, dura
 			i, err = NewStore(dir, d.Spec, s.config, durability)
 		} else {
 			i, err = OpenNamespace(dir, d.Spec.Namespace, s.config, durability)
+		}
+		if i != nil {
+			if err = i.CheckSourceGeneration(d.RequiredSourceGeneration); err != nil {
+				_ = i.Close()
+				i = nil
+			}
 		}
 		if i != nil {
 			i.ownerClosed = &s.closed

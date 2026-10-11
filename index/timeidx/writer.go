@@ -77,6 +77,19 @@ func (b *Batch) Len() int {
 // calls synchronize data and root before returning, in BOTH durability modes.
 // A failed uncertain root publication latches writes until close/reopen.
 func (i *Index) Apply(b *Batch) error {
+	return i.apply(b, 0, false)
+}
+
+// ApplyWithGeneration atomically commits mutations and a contiguous source
+// completeness watermark. The application must supply ALL applicable changes
+// through this generation; it must coordinate concurrent/out-of-order DB batches.
+// Serialization cannot infer missing DB events. Decreases are rejected; equal
+// generations support retries. Empty/no-op batches still persist advancement.
+func (i *Index) ApplyWithGeneration(b *Batch, sourceGeneration uint64) error {
+	return i.apply(b, sourceGeneration, true)
+}
+
+func (i *Index) apply(b *Batch, sourceGeneration uint64, explicit bool) error {
 	if b == nil || b.ops == nil {
 		return ErrUninitializedBatch
 	}
@@ -92,8 +105,22 @@ func (i *Index) Apply(b *Batch) error {
 	if i.failed != nil {
 		return i.failed
 	}
+	old := i.view.Load()
+	if !explicit {
+		sourceGeneration = old.sourceGeneration
+	}
+	if sourceGeneration < old.sourceGeneration {
+		return ErrSourceGeneration
+	}
+	advance := sourceGeneration > old.sourceGeneration
 	if len(b.ops) == 0 {
-		return nil
+		if !advance {
+			return nil
+		}
+		if old.generation == ^uint64(0) {
+			return ErrInvalidConfig
+		}
+		return i.publish(old.shards, old.generation+1, sourceGeneration)
 	}
 	var stack [64]Mutation
 	ops := stack[:0]
@@ -118,7 +145,6 @@ func (i *Index) Apply(b *Batch) error {
 			unique = append(unique, m)
 		}
 	}
-	old := i.view.Load()
 	// Idempotent upserts need no new snapshot, allocations, or durability work.
 	// Composite routing makes this lookup local even when a time spans shards.
 	changed := unique[:0]
@@ -136,7 +162,13 @@ func (i *Index) Apply(b *Batch) error {
 		changed = append(changed, m)
 	}
 	if len(changed) == 0 {
-		return nil
+		if !advance {
+			return nil
+		}
+		if old.generation == ^uint64(0) {
+			return ErrInvalidConfig
+		}
+		return i.publish(old.shards, old.generation+1, sourceGeneration)
 	}
 	if old.generation == ^uint64(0) {
 		return ErrInvalidConfig
@@ -150,9 +182,9 @@ func (i *Index) Apply(b *Batch) error {
 				break
 			}
 		}
-		if same {
+		if same && !advance {
 			return nil
 		} // deleting absent IDs does not commit a new root
 	}
-	return i.publish(shards, old.generation+1)
+	return i.publish(shards, old.generation+1, sourceGeneration)
 }

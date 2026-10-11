@@ -1,5 +1,11 @@
 # TimeIdx namespace-aware mmap design and implementation
 
+**Format update:** Source-watermark work introduces format 5. Version 4 is
+explicitly unsupported, not silently upgraded. Bytes 56–63 of the payload now
+hold `SourceGeneration`, atomically committed with the directory. See
+`index/timeidx/SOURCE_AND_LIFECYCLE.md` for the authoritative completeness,
+staleness, rebuild and exported-method lifecycle contract.
+
 **Lifecycle update:** The final alignment changes use startup-only registration,
 `SealStartup` (or `InitializeStore`), and an immutable sorted runtime registry.
 `Namespace` is the lock-free lookup API; runtime creation/removal is rejected.
@@ -90,7 +96,7 @@ compatibility barriers, not generation-advancing rewrites; memory-backed
 checkpoint calls retain `ErrNotPersistent`. `Compact` is a no-op barrier;
 `WaitIdle` checks the context and pending-compaction count is zero.
 
-## Single-file binary format (version 4)
+## Single-file binary format (version 5)
 
 Four lower-case **hexadecimal** namespace digits name the data file, covering
 all uint16 namespace values without decimal-width ambiguity: `0001.timeidx`,
@@ -118,7 +124,7 @@ the existing Windows read-write backend remains unsupported.
 
 ### Superblock envelope
 
-The shared header stores magic `TIM4`, version 4, generation, payload length,
+The shared header stores family magic `TIM4`, version 5, generation, payload length,
 payload CRC32C and header CRC32C. The 64-byte TimeIdx payload is:
 
 | Offset | Width | Field |
@@ -133,7 +139,7 @@ payload CRC32C and header CRC32C. The 64-byte TimeIdx payload is:
 | 32 | 8 | Arena byte length at this generation |
 | 40 | 8 | Deprecated offset metadata, unused by encoding |
 | 48 | 8 | Maximum permitted shard payload for this generation |
-| 56 | 8 | Reserved, encoded zero |
+| 56 | 8 | SourceGeneration: application-supplied DB completeness watermark |
 
 The shard bound preserves the largest retained shard if a smaller runtime
 configuration is selected on reopen. New replacements use the new limit;

@@ -15,7 +15,7 @@ func TestProcessCrashRecovery(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		apply(t, i, Insert(1, 1))
+		sourceApply(t, i, 1, Insert(1, 1))
 		stage := os.Getenv("TIMEIDX_CRASH_STAGE")
 		i.crash = func(s string) {
 			if s == stage {
@@ -26,7 +26,7 @@ func TestProcessCrashRecovery(t *testing.T) {
 		for n := uint64(2); n < 1002; n++ {
 			b.Append(Insert(n, n))
 		}
-		_ = i.Apply(b)
+		_ = i.ApplyWithGeneration(b, 2)
 		os.Exit(0)
 	}
 	for _, stage := range []string{"write", "data-sync", "commit", "root-sync", "publish", "reclaim", "grow", "mmap"} {
@@ -51,8 +51,17 @@ func TestProcessCrashRecovery(t *testing.T) {
 					t.Fatal("lost durable candidate")
 				}
 			}
+			if stage == "write" || stage == "data-sync" || stage == "commit" || stage == "grow" || stage == "mmap" {
+				if i.Len() != 1 || i.SourceGeneration() != 1 {
+					t.Fatal("advanced before root publication", i.Len(), i.SourceGeneration())
+				}
+			}
+			// root-sync terminates before fsync: either coherent root is legal.
 			if i.Len() != 1 && i.Len() != 1001 {
 				t.Fatal("partial batch", i.Len())
+			}
+			if (i.Len() == 1 && i.SourceGeneration() != 1) || (i.Len() == 1001 && i.SourceGeneration() != 2) {
+				t.Fatal("partial watermark", i.Len(), i.SourceGeneration())
 			}
 			apply(t, i, Insert(100, 100))
 		})

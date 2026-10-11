@@ -20,9 +20,10 @@ type shard struct {
 }
 
 type snapshot struct {
-	shards     []*shard
-	generation uint64
-	count      uint64
+	shards           []*shard
+	generation       uint64
+	sourceGeneration uint64
+	count            uint64
 }
 
 type writeScratch struct {
@@ -66,6 +67,10 @@ func (scratch *writeScratch) columns(count int, reuse bool) ([]uint64, []common.
 func pairLess(at uint64, ai common.ValueID, bt uint64, bi common.ValueID) bool {
 	return at < bt || (at == bt && ai < bi)
 }
+
+// Batch-local negative filter only: a set bit still requires exact membership.
+// Mix high and low ID bits so aligned/sparse identifiers do not share one bit.
+func mutationBit(id uint64) uint64 { return ((id ^ (id >> 32)) * 0x9e3779b97f4a7c15) >> 52 }
 
 func shardFor(shards []*shard, timestamp uint64, id common.ValueID) int {
 	if len(shards) == 0 {
@@ -165,11 +170,17 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 	minID, maxID := ops[0].imageID, ops[len(ops)-1].imageID
 	var bitScratch [64]uint64
 	var touchedBits []uint64
+	var sparseBits [64]uint64
 	if maxID-minID < uint64(len(bitScratch)*64) {
 		touchedBits = bitScratch[:(maxID-minID)/64+1]
 		for _, op := range ops {
 			v := op.imageID - minID
 			touchedBits[v>>6] |= uint64(1) << (v & 63)
+		}
+	} else if len(ops) > 1 {
+		for _, op := range ops {
+			bit := mutationBit(op.imageID)
+			sparseBits[bit>>6] |= uint64(1) << (bit & 63)
 		}
 	}
 	touched := func(id common.ValueID) bool {
@@ -179,6 +190,12 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 		if touchedBits != nil {
 			v := id - minID
 			return touchedBits[v>>6]&(uint64(1)<<(v&63)) != 0
+		}
+		if len(ops) > 1 {
+			bit := mutationBit(id)
+			if sparseBits[bit>>6]&(uint64(1)<<(bit&63)) == 0 {
+				return false
+			}
 		}
 		_, ok := slices.BinarySearchFunc(ops, id, func(a Mutation, b common.ValueID) int { return cmp.Compare(a.imageID, b) })
 		return ok

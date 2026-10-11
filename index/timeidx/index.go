@@ -66,10 +66,24 @@ func NewMemory(spec Spec, config Config) (*Index, error) {
 }
 
 func (i *Index) Metadata() Metadata {
-	token := i.readers.Acquire()
-	defer i.readers.Release(token)
+	// Snapshot counters and the slice header live on the Go heap, not in mmap.
 	v := i.view.Load()
 	return Metadata{Namespace: i.namespace, Flags: i.flags, Offset: i.offset, Generation: v.generation, BaseCount: v.count, BlockCount: uint32(len(v.shards))}
+}
+
+// SourceGeneration is the contiguous database completeness watermark supplied
+// by the application. Zero means no application checkpoint has been recorded.
+func (i *Index) SourceGeneration() uint64 { return i.view.Load().sourceGeneration }
+
+// CheckSourceGeneration detects logical staleness, not structural corruption.
+func (i *Index) CheckSourceGeneration(required uint64) error {
+	if i.isClosed() {
+		return ErrClosed
+	}
+	if i.SourceGeneration() < required {
+		return ErrIndexStale
+	}
+	return nil
 }
 func (i *Index) Namespace() common.Namespace        { return i.namespace }
 func (i *Index) Generation() uint64                 { return i.view.Load().generation }
@@ -93,8 +107,14 @@ func (i *Index) Checkpoint() error {
 	}
 	return nil
 }
-func (i *Index) Sync() error   { return i.Checkpoint() }
+
+// Sync is a compatibility barrier: successful changed Apply calls already sync.
+func (i *Index) Sync() error { return i.Checkpoint() }
+
+// Vacuum is a compatibility barrier; it does not compact or shrink the file.
 func (i *Index) Vacuum() error { return i.Checkpoint() }
+
+// Compact is a compatibility barrier; accepted mutations are already compacted.
 func (i *Index) Compact() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()

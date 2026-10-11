@@ -1,5 +1,12 @@
 # Final alignment work — in progress
 
+The subsequent source-watermark/lifecycle work uses reviewed HEAD `4c7847c` as
+its benchmark baseline. See `SOURCE_AND_LIFECYCLE.md` for format 5 and its
+exported-method audit, and `SCALE_BENCHMARKS.md` for the large-scale evidence.
+The earlier outstanding-work list below records the previous review, not a
+claim that optional queues, relaxed durability or runtime replacement should
+be added. None has been introduced.
+
 Baseline: `bd0752f5c170a5b5aaf97efa791c54f5bfbdb59e`. PR #16 must remain
 unmerged until the expanded performance/recovery review is complete.
 
@@ -47,9 +54,10 @@ unmerged until the expanded performance/recovery review is complete.
 
 ## Decisions retained
 
-Synchronous durability remains the only mode: there is no application-supplied
-DB synchronization token, and checksums cannot detect a valid but stale index.
-No relaxed mode is safe to add without a synchronization contract. Reclamation
+Synchronous durability remains the only mode. Format 5 now persists the
+application-supplied source completeness watermark; checksums alone cannot
+detect a valid but stale index. No relaxed durability mode has been introduced.
+Reclamation
 still waits for pinned readers; no unbounded retirement list was introduced.
 The shard default remains 4 KiB pending the expanded workload matrix.
 

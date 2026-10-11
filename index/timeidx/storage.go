@@ -15,7 +15,7 @@ import (
 
 const (
 	fileMagic          uint32 = 0x54494d34 // TIM4
-	fileVersion        uint16 = 4
+	fileVersion        uint16 = 5          // v4 has no durable database watermark; rebuild explicitly
 	payloadBytes              = 64
 	directoryEntrySize        = storage.ShardDescriptorBytes
 	formatAlignment           = 8
@@ -92,7 +92,7 @@ func createStore(dir string, spec Spec, config Config, durability Durability, co
 	}
 	if err == nil {
 		i.slot = 1
-		err = i.publish(i.view.Load().shards, 1)
+		err = i.publish(i.view.Load().shards, 1, 0)
 	}
 	if err == nil {
 		err = i.inject("create-name")
@@ -279,7 +279,7 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 		if rootOffset != 0 || crc != storage.Checksum(nil) || entries != 0 {
 			return generation{}, ErrCorrupt
 		}
-		return generation{view: &snapshot{generation: gen}, flags: binary.LittleEndian.Uint32(payload[4:8]), offset: binary.LittleEndian.Uint64(payload[40:48])}, nil
+		return generation{view: &snapshot{generation: gen, sourceGeneration: binary.LittleEndian.Uint64(payload[56:64])}, flags: binary.LittleEndian.Uint32(payload[4:8]), offset: binary.LittleEndian.Uint64(payload[40:48])}, nil
 	}
 	if rootOffset < 1024 || rootOffset%512 != 0 {
 		return generation{}, ErrCorrupt
@@ -371,7 +371,7 @@ func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (ge
 		}
 	}
 	root := extent(rootOffset, uint32(length))
-	g := generation{view: &snapshot{shards: shards, generation: gen, count: total}, root: root, live: shardLive(shards, root), flags: binary.LittleEndian.Uint32(payload[4:8]), offset: binary.LittleEndian.Uint64(payload[40:48])}
+	g := generation{view: &snapshot{shards: shards, generation: gen, sourceGeneration: binary.LittleEndian.Uint64(payload[56:64]), count: total}, root: root, live: shardLive(shards, root), flags: binary.LittleEndian.Uint32(payload[4:8]), offset: binary.LittleEndian.Uint64(payload[40:48])}
 	if _, err := storage.ReconstructAllocator(arenaBytes, g.live); err != nil {
 		return generation{}, errors.Join(ErrCorrupt, err)
 	}
@@ -419,6 +419,9 @@ func (i *Index) load(data []byte) error {
 		sets := [][]storage.Extent{g.live}
 		if n+1 < len(gs) {
 			if gs[n+1].view.generation >= g.view.generation {
+				return ErrCorrupt
+			}
+			if gs[n+1].view.sourceGeneration > g.view.sourceGeneration {
 				return ErrCorrupt
 			}
 			sets = append(sets, gs[n+1].live)
@@ -473,13 +476,13 @@ func (i *Index) grow(need uint64) error {
 	return nil
 }
 
-func (i *Index) publish(plans []*shard, gen uint64) error {
+func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 	var total uint64
 	for _, s := range plans {
 		total += uint64(len(s.times))
 	}
 	if i.file == nil {
-		i.view.Store(&snapshot{shards: plans, generation: gen, count: total})
+		i.view.Store(&snapshot{shards: plans, generation: gen, sourceGeneration: sourceGeneration, count: total})
 		return nil
 	}
 	if uint64(len(plans))*directoryEntrySize > uint64(^uint32(0))-511 {
@@ -626,6 +629,7 @@ func (i *Index) publish(plans []*shard, gen uint64) error {
 	binary.LittleEndian.PutUint64(payload[32:40], uint64(len(i.file.Bytes())))
 	binary.LittleEndian.PutUint64(payload[40:48], i.offset)
 	binary.LittleEndian.PutUint64(payload[48:56], uint64(max(i.config.MaxShardBytes, largestShard(shards))))
+	binary.LittleEndian.PutUint64(payload[56:64], sourceGeneration)
 	if err = i.inject("commit"); err != nil {
 		rollback()
 		return err
@@ -664,7 +668,7 @@ func (i *Index) publish(plans []*shard, gen uint64) error {
 	i.root = root
 	i.slot = slot
 	i.live = live
-	i.view.Store(&snapshot{shards: shards, generation: gen, count: total})
+	i.view.Store(&snapshot{shards: shards, generation: gen, sourceGeneration: sourceGeneration, count: total})
 	if i.crash != nil {
 		i.crash("reclaim")
 	}

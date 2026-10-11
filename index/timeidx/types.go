@@ -49,6 +49,8 @@ var (
 	ErrInvalidBase        = errors.New("timeidx: invalid base arrays")
 	ErrInvalidConfig      = errors.New("timeidx: invalid configuration")
 	ErrInvalidMutation    = errors.New("timeidx: invalid mutation")
+	ErrSourceGeneration   = errors.New("timeidx: source generation cannot decrease")
+	ErrIndexStale         = errors.New("timeidx: index is behind the authoritative database")
 	ErrInvalidRange       = errors.New("timeidx: unsupported calendar time")
 	ErrNotPersistent      = errors.New("timeidx: index is not persistent")
 	ErrUninitializedBatch = errors.New("timeidx: write batch was not created with NewBatch")
@@ -56,7 +58,7 @@ var (
 	ErrUnsupported        = errors.New("timeidx: unsupported format; rebuild from canonical timestamps")
 	ErrCorrupt            = errors.New("timeidx: corrupt namespace file")
 	ErrCorruptManifest    = ErrCorrupt                                 // legacy error spelling
-	ErrCorruptWAL         = errors.New("timeidx: obsolete WAL format") // deprecated; no WAL in v4
+	ErrCorruptWAL         = errors.New("timeidx: obsolete WAL format") // deprecated; no WAL in current formats
 	ErrNamespaceMismatch  = errors.New("timeidx: namespace identity mismatch")
 	ErrInvalidNamespace   = errors.New("timeidx: invalid namespace")
 	ErrStartupRequired    = errors.New("timeidx: namespace registry has not been published")
@@ -99,7 +101,7 @@ type Metadata struct {
 
 type Config struct {
 	// MaxShardBytes is the maximum SoA payload per shard (default 4 KiB,
-	// selected by the clustered/historical shard sweeps; see BENCHMARKS.md).
+	// retained after clustered/historical sweeps; see SCALE_BENCHMARKS.md).
 	MaxShardBytes int64
 	// MaxFileBytes is initial sparse arena capacity, NOT a growth limit.
 	MaxFileBytes int64
