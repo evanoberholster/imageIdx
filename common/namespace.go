@@ -60,6 +60,9 @@ const (
 	KindVector NamespaceKind = 5
 	// KindKV is a Pebble-backed key-value collection.
 	KindKV NamespaceKind = 6
+	// KindGeo is an index/geoidx S2 geographic namespace. It is distinct from
+	// the retired KindBitmapGeo bitmap shape.
+	KindGeo NamespaceKind = 7
 )
 
 // String returns a stable human-readable kind name.
@@ -75,6 +78,8 @@ func (k NamespaceKind) String() string {
 		return "vector"
 	case KindKV:
 		return "kv"
+	case KindGeo:
+		return "geo-s2"
 	case KindBitmapEnum:
 		return "bitmap-enum"
 	case KindBitmapBool:
@@ -94,7 +99,7 @@ func (k NamespaceKind) String() string {
 
 // Valid reports whether k is a recognized namespace kind.
 func (k NamespaceKind) Valid() bool {
-	return k >= KindTimestamp && k <= KindKV ||
+	return k >= KindTimestamp && k <= KindGeo ||
 		k >= KindBitmapEnum && k <= KindBitmapBSI
 }
 

@@ -66,14 +66,60 @@ func decodeManifest(data []byte) (manifest, bool) {
 	}, true
 }
 
-func manifestPath(dir string) string { return filepath.Join(dir, manifestFilename) }
-
-func shardPath(dir string, index uint64) string {
-	return filepath.Join(dir, fmt.Sprintf("shard-%06d.bin", index))
+// layout derives every file path for one store. Directory mode keeps the
+// historical bare filenames so an existing store stays byte-for-byte
+// compatible; prefix mode namespaces every file by a caller-chosen prefix so
+// several independent stores can share one directory.
+type layout struct {
+	dir    string // directory that holds the store's files
+	prefix string // non-empty selects prefix mode
 }
 
-func readManifest(dir string) (manifest, bool, error) {
-	data, err := os.ReadFile(manifestPath(dir))
+// directoryLayout is legacy directory mode: manifest, shard-%06d.bin, and
+// updates.wal live directly under dir.
+func directoryLayout(dir string) layout { return layout{dir: dir} }
+
+// prefixLayout namespaces files by prefix. A prefix such as "dir/sim-0004"
+// yields dir/sim-0004.manifest, dir/sim-0004-shard-%06d.bin, and
+// dir/sim-0004.wal.
+func prefixLayout(prefix string) layout {
+	return layout{dir: filepath.Dir(prefix), prefix: filepath.Base(prefix)}
+}
+
+func (l layout) manifestName() string {
+	if l.prefix == "" {
+		return manifestFilename
+	}
+	return l.prefix + ".manifest"
+}
+
+func (l layout) manifestPath() string { return filepath.Join(l.dir, l.manifestName()) }
+
+func (l layout) shardName(index uint64) string {
+	if l.prefix == "" {
+		return fmt.Sprintf("shard-%06d.bin", index)
+	}
+	return fmt.Sprintf("%s-shard-%06d.bin", l.prefix, index)
+}
+
+func (l layout) shardPath(index uint64) string { return filepath.Join(l.dir, l.shardName(index)) }
+
+func (l layout) walName() string {
+	if l.prefix == "" {
+		return journalFilename
+	}
+	return l.prefix + ".wal"
+}
+
+func (l layout) walPath() string { return filepath.Join(l.dir, l.walName()) }
+
+// shardPath is the legacy directory-mode shard path helper.
+func shardPath(dir string, index uint64) string {
+	return directoryLayout(dir).shardPath(index)
+}
+
+func readManifest(l layout) (manifest, bool, error) {
+	data, err := os.ReadFile(l.manifestPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return manifest{}, false, nil
 	}
@@ -165,7 +211,7 @@ func (v *view) shardForHashPage(hashPage uint64) (*shard, uint64) {
 // Store is a sharded, mmap-backed similarity store with lock-free readers and
 // one serialized writer.
 type Store struct {
-	dir           string
+	layout        layout
 	config        Config
 	geo           geometry
 	pagesPerShard uint64
@@ -197,6 +243,23 @@ type Store struct {
 // generation from the manifest, validates every shard against it, resets the
 // runtime sequence counters, then replays the update journal.
 func Open(dir string, config Config) (*Store, error) {
+	return openLayout(directoryLayout(dir), config)
+}
+
+// OpenFile opens or creates a store whose files are namespaced by prefix, so
+// several independent stores can share one directory. The caller supplies an
+// absolute or rooted prefix such as "dir/sim-0004"; the store then owns
+// <prefix>.manifest, <prefix>-shard-%06d.bin, and <prefix>.wal. It otherwise
+// behaves exactly like Open: it creates the store when the manifest is absent
+// and recovers a checkpoint and WAL when present.
+func OpenFile(prefix string, config Config) (*Store, error) {
+	if prefix == "" {
+		return nil, ErrInvalidConfig
+	}
+	return openLayout(prefixLayout(prefix), config)
+}
+
+func openLayout(l layout, config Config) (*Store, error) {
 	cfg, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -213,12 +276,12 @@ func Open(dir string, config Config) (*Store, error) {
 	if size, ok := shardFileSize(pagesPerShard, geo); !ok || size > cfg.MaxShardBytes {
 		return nil, ErrInvalidConfig
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(l.dir, 0o755); err != nil {
 		return nil, err
 	}
-	st := &Store{dir: dir, config: cfg, geo: geo, pagesPerShard: pagesPerShard}
+	st := &Store{layout: l, config: cfg, geo: geo, pagesPerShard: pagesPerShard}
 
-	mf, ok, err := readManifest(dir)
+	mf, ok, err := readManifest(l)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +331,7 @@ func (st *Store) requiredShardCommitted(index uint64) uint64 {
 // generation was committed by the manifest (generation <= committedGeneration).
 // It rejects a shard that does not cover the committed records.
 func (st *Store) openShard(index uint64) (*shard, error) {
-	mapped, err := storage.OpenMapped(shardPath(st.dir, index))
+	mapped, err := storage.OpenMapped(st.layout.shardPath(index))
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +390,7 @@ func (st *Store) createShardLocked(index uint64) (*shard, error) {
 	if !ok {
 		return nil, ErrInvalidConfig
 	}
-	mapped, err := storage.CreateMapped(shardPath(st.dir, index), int64(size))
+	mapped, err := storage.CreateMapped(st.layout.shardPath(index), int64(size))
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +418,7 @@ func (st *Store) writeManifestLocked() error {
 		generation:      st.generation,
 		shardCount:      uint64(len(st.shards)),
 	})
-	return storage.WriteFileAtomic(st.dir, manifestFilename+".tmp", manifestFilename, data, 0o644)
+	return storage.WriteFileAtomic(st.layout.dir, st.layout.manifestName()+".tmp", st.layout.manifestName(), data, 0o644)
 }
 
 func (st *Store) publishLocked() {
@@ -389,7 +452,7 @@ func (st *Store) resetSequences() {
 // interrupted tail. Batches already committed by the manifest (a crash between
 // manifest publication and WAL reset) are skipped, so replay is idempotent.
 func (st *Store) recoverJournal() error {
-	path := filepath.Join(st.dir, journalFilename)
+	path := st.layout.walPath()
 	j, err := openJournal(path)
 	if err != nil {
 		return err

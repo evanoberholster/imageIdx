@@ -318,8 +318,25 @@ func liveOf(shards []*shard, dirOffset uint64, dirLength uint32) []extentRef {
 	return live
 }
 
-// New creates a persistent, empty single-file index in dir.
+// NewFile creates a persistent, empty single-file index at exactly path. Its
+// lock file is path+".lock". Unlike New, it does not require the containing
+// directory to be empty, so several indexes can share one directory.
+func NewFile(path string, config Config) (*Index, error) {
+	return createPersistent(path, filepath.Dir(path), filepath.Base(path)+".lock", false, config)
+}
+
+// New creates a persistent, empty single-file index in dir. It writes
+// <dir>/geoidx.dat and locks <dir>/geoidx.lock, matching NewFile with the
+// historical default file name while preserving the exclusive-directory check.
 func New(dir string, config Config) (*Index, error) {
+	return createPersistent(filepath.Join(dir, geoidxFile), dir, lockName, true, config)
+}
+
+// createPersistent validates config, acquires the lock named lockFile inside
+// lockDir, and creates the empty index file at path. When exclusiveDir is true
+// the lock acquisition also requires lockDir to be empty (the historical New
+// contract); otherwise any existing sibling files are left untouched.
+func createPersistent(path, lockDir, lockFile string, exclusiveDir bool, config Config) (*Index, error) {
 	cfg, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -327,41 +344,52 @@ func New(dir string, config Config) (*Index, error) {
 	if cfg.MaxFileBytes < cfg.MaxShardBytes {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := storage.AcquireLock(dir, lockName, true)
+	if !exclusiveDir {
+		if err := os.MkdirAll(lockDir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	lock, err := storage.AcquireLock(lockDir, lockFile, exclusiveDir)
 	if err != nil {
 		return nil, err
 	}
-	index, err := newPersistent(dir, lock, cfg)
+	size := int64(roundUp(uint64(cfg.MaxFileBytes), growAlignment))
+	r, err := createRegion(path, size)
 	if err != nil {
 		_ = storage.ReleaseLock(lock)
-		return nil, err
-	}
-	return index, nil
-}
-
-func newPersistent(dir string, lock *os.File, cfg Config) (*Index, error) {
-	size := int64(roundUp(uint64(cfg.MaxFileBytes), growAlignment))
-	r, err := createRegion(filepath.Join(dir, geoidxFile), size)
-	if err != nil {
 		return nil, err
 	}
 	index := &Index{
 		config:     cfg,
 		persistent: true,
-		dir:        dir,
+		path:       path,
 		lock:       lock,
 		arena:      r,
 		arenaBytes: uint64(len(r.data)),
 	}
 	if err := index.createEmptyLocked(); err != nil {
 		r.close()
+		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
 	return index, nil
 }
 
-// Open opens a persistent index created by New.
+// OpenFile opens the persistent index at exactly path, created by NewFile. Its
+// lock file is path+".lock".
+func OpenFile(path string, config Config) (*Index, error) {
+	return openPersistent(path, filepath.Dir(path), filepath.Base(path)+".lock", config)
+}
+
+// Open opens a persistent index created by New at <dir>/geoidx.dat, locking
+// <dir>/geoidx.lock.
 func Open(dir string, config Config) (*Index, error) {
+	return openPersistent(filepath.Join(dir, geoidxFile), dir, lockName, config)
+}
+
+// openPersistent validates config, acquires the lock named lockFile inside
+// lockDir, and opens the existing index file at path.
+func openPersistent(path, lockDir, lockFile string, config Config) (*Index, error) {
 	cfg, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -369,20 +397,20 @@ func Open(dir string, config Config) (*Index, error) {
 	if cfg.MaxFileBytes < cfg.MaxShardBytes {
 		return nil, ErrInvalidConfig
 	}
-	lock, err := storage.AcquireLock(dir, lockName, false)
+	lock, err := storage.AcquireLock(lockDir, lockFile, false)
 	if err != nil {
 		return nil, err
 	}
-	if _, statErr := os.Stat(filepath.Join(dir, geoidxFile)); statErr != nil {
+	if _, statErr := os.Stat(path); statErr != nil {
 		_ = storage.ReleaseLock(lock)
 		// A pre-shard multi-file directory (manifest + shard files) is a legacy
 		// format; report it explicitly rather than reinterpreting it.
-		if _, legacyErr := os.Stat(filepath.Join(dir, "manifest")); legacyErr == nil {
+		if _, legacyErr := os.Stat(filepath.Join(filepath.Dir(path), "manifest")); legacyErr == nil {
 			return nil, ErrLegacyFormat
 		}
 		return nil, ErrCorrupt
 	}
-	r, err := openRegion(filepath.Join(dir, geoidxFile))
+	r, err := openRegion(path)
 	if err != nil {
 		_ = storage.ReleaseLock(lock)
 		return nil, err
@@ -390,7 +418,7 @@ func Open(dir string, config Config) (*Index, error) {
 	index := &Index{
 		config:     cfg,
 		persistent: true,
-		dir:        dir,
+		path:       path,
 		lock:       lock,
 		arena:      r,
 		arenaBytes: uint64(len(r.data)),
@@ -789,7 +817,7 @@ func (i *Index) growArena(need uint64) error {
 	if target <= i.arenaBytes {
 		target = i.arenaBytes + growAlignment
 	}
-	path := filepath.Join(i.dir, geoidxFile)
+	path := i.path
 	if err := failStage(persistGrow); err != nil {
 		return err
 	}

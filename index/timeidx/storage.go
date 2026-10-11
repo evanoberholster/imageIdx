@@ -28,11 +28,17 @@ func NamespaceFilename(ns common.Namespace) string {
 	return string([]byte{hex[uint16(ns)>>12], hex[uint16(ns)>>8&15], hex[uint16(ns)>>4&15], hex[uint16(ns)&15]}) + ".timeidx"
 }
 
-// legacyManifestPresent reports a pre-namespace store directory. Such stores
-// must be rebuilt from canonical timestamps, never silently reinterpreted.
+// legacyManifestPresent reports a pre-namespace timeidx store directory. The
+// check is content-based on the legacy TSMF magic so a timeidx namespace can
+// share a directory with another index family that owns a file named
+// "manifest". Such stores must be rebuilt from canonical timestamps, never
+// silently reinterpreted.
 func legacyManifestPresent(dir string) bool {
-	_, err := os.Stat(filepath.Join(dir, "manifest"))
-	return err == nil
+	data, err := os.ReadFile(filepath.Join(dir, "manifest"))
+	if err != nil || len(data) < 4 {
+		return false
+	}
+	return binary.LittleEndian.Uint32(data[:4]) == 0x54534d46
 }
 
 // NewStore retains the standalone constructor. Namespace zero is supported

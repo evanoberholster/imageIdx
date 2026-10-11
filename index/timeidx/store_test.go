@@ -168,7 +168,10 @@ func TestNamespaceIdentityAndLegacyRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy := t.TempDir()
-	if err := os.WriteFile(filepath.Join(legacy, "manifest"), []byte("legacy"), 0o600); err != nil {
+	// A legacy timeidx store is identified by its TSMF manifest magic; a
+	// foreign "manifest" file must not be mistaken for one.
+	legacyManifest := append([]byte{0x46, 0x4d, 0x53, 0x54}, make([]byte, 76)...)
+	if err := os.WriteFile(filepath.Join(legacy, "manifest"), legacyManifest, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenStore(legacy, Config{}, DurabilitySync); err != ErrUnsupported {
