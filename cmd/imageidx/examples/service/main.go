@@ -1,9 +1,5 @@
-// Command service shows the long-lived path: one compiled Plan shared across
-// callers through search.Executor, which pools exclusive query workspaces.
-//
-// Usage:
-//
-//	go run ./cmd/imageidx/examples/service
+// Command service shares a unified-store Plan across queries through a pooled
+// search.Executor. Usage: go run ./cmd/imageidx/examples/service
 package main
 
 import (
@@ -13,6 +9,7 @@ import (
 	"os"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/search"
@@ -21,64 +18,60 @@ import (
 const quantum = uint64(1) << timeidx.TimestampShift
 
 func main() {
-	namespaceDir, err := os.MkdirTemp("", "imageidx-namespaces-")
+	schema := common.NewSchema()
+	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
+		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
+	}, "tags", common.EntityImage)
 	if err != nil {
 		log.Fatal(err)
 	}
-	namespaces, err := bitmapidx.NewStore(namespaceDir, []bitmapidx.NamespaceSpec{{
-		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum}}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() { _ = namespaces.Close(); _ = os.RemoveAll(namespaceDir) }()
-	favorites, ok := namespaces.Lookup(common.NamespaceTag)
-	if !ok {
-		log.Fatal("tag namespace missing")
-	}
-	favoritesBatch := favorites.NewBatch()
-	if err := favoritesBatch.Add(
-		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.EnumStringValue("favorite")},
-		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.EnumStringValue("favorite")},
-		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.EnumStringValue("favorite")},
+	if err := schema.RegisterAll(tags,
+		common.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: common.KindTimestamp, Entity: common.EntityImage},
 	); err != nil {
 		log.Fatal(err)
 	}
-	if err := favoritesBatch.Apply(); err != nil {
-		log.Fatal(err)
-	}
-	favoritesBatch.Close()
-	if err := favorites.Barrier(); err != nil {
-		log.Fatal(err)
-	}
-
-	times, err := timeidx.NewMemory(timeidx.Spec{
-		Namespace: common.Namespace(100),
-		Name:      "timestamp",
-		Entries: []timeidx.Entry{
-			{ImageID: 100, Timestamp: quantum},
-			{ImageID: 200, Timestamp: 2 * quantum},
-			{ImageID: 300, Timestamp: 3 * quantum},
-		},
-	}, timeidx.Config{})
+	dir, err := os.MkdirTemp("", "imageidx-service-")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer times.Close()
-
-	plan, err := search.Compile(
-		search.AllValues(favorites, bitmapidx.EnumStringValue("favorite")),
-		search.During(times, quantum, 3*quantum),
-	)
+	defer os.RemoveAll(dir)
+	db, err := index.Create(dir, index.Spec{Schema: schema})
 	if err != nil {
 		log.Fatal(err)
 	}
-
+	defer db.Close()
+	for _, row := range []struct {
+		id    common.ValueID
+		stamp uint64
+	}{{100, quantum}, {200, 2 * quantum}, {300, 3 * quantum}} {
+		if err := db.Add(index.Entry{ValueID: row.id,
+			Times:   []index.TimeValue{{Namespace: 100, Timestamp: row.stamp}},
+			Bitmaps: []index.BitmapValue{{Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}},
+		}); err != nil {
+			log.Fatal(err)
+		}
+	}
+	engine, err := search.New(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	favorites, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	during, err := engine.During(100, quantum, 3*quantum)
+	if err != nil {
+		log.Fatal(err)
+	}
+	plan, err := engine.Compile(common.EntityImage, favorites, during)
+	if err != nil {
+		log.Fatal(err)
+	}
 	executor, err := search.NewExecutor(search.ExecutorConfig{WorkspaceCapacity: 64})
 	if err != nil {
 		log.Fatal(err)
 	}
 	executor.Prewarm(2)
-
 	ctx := context.Background()
 	matches, err := executor.AppendIDs(ctx, nil, plan)
 	if err != nil {
@@ -90,12 +83,16 @@ func main() {
 	}
 	fmt.Printf("matches=%v count=%d empty=%v\n", matches, count, plan.IsEmpty())
 
-	// Timestamp writers own their batches independently of query execution.
-	batch := timeidx.NewBatch(16)
-	if ok := batch.Append(timeidx.Move(300, 3*quantum, 2*quantum)); !ok {
-		log.Fatal("batch full")
-	}
-	if err := times.Apply(batch); err != nil {
+	// A unified update moves the timestamp; the same plan reads its new view.
+	if err := db.Update(index.Change{
+		Before: index.Entry{ValueID: 300, Times: []index.TimeValue{{Namespace: 100, Timestamp: 3 * quantum}}},
+		After:  index.Entry{ValueID: 300, Times: []index.TimeValue{{Namespace: 100, Timestamp: 2 * quantum}}},
+	}); err != nil {
 		log.Fatal(err)
 	}
+	updated, err := executor.AppendIDs(ctx, nil, plan)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("after update=%v\n", updated)
 }

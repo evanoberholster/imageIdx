@@ -12,7 +12,7 @@ that caching and suits single-use queries only.
 
 ```go
 plan, err := search.Compile(
-    search.AllValues(tags, bitmapidx.StringValue("favorite")),
+    search.AllValues(tags, bitmapidx.EnumStringValue("favorite")),
     search.During(times, start, end),
     search.InCells(locations, cellIDs...),
 )
@@ -20,6 +20,21 @@ if err != nil { return err }
 
 var ws search.Workspace // reusable scratch; do not share across goroutines
 ```
+
+With a unified `index.Store`, use `search.New(db)` and `Engine.Compile` to
+include entity liveness automatically. For example, after registering a
+`KindBitmapBSI` namespace with width 16 in `common.Schema`:
+
+```go
+engine, err := search.New(db)
+if err != nil { return err }
+quality, err := engine.BSIRange(40, bitmapidx.ValuesBetween(40, 85))
+if err != nil { return err }
+plan, err := engine.Compile(common.EntityImage, quality)
+if err != nil { return err }
+```
+
+See `cmd/imageidx/examples/bitmaponly` for a runnable unified example.
 
 A full bulk search appends sorted, unique IDs while preserving the
 destination prefix. `Search` is the uninstrumented fast path and is
@@ -106,7 +121,9 @@ for _, stage := range metrics.Stages {
 ## Predicates and planning
 
 `AllValues` requires every value; `NamespaceText` requires every analyzed
-token; `NamespaceRange` uses stored-grid bounds; `During` uses `[start,end)`
+token; `NamespaceRange` uses signed stored-grid bounds; `NamespaceBSIRange`
+uses unsigned 16/32-bit BSI bounds (`bitmapidx.ValuesBetween` is inclusive);
+`During` uses `[start,end)`
 with optional `ExactTimestamp` verification; `InCells` expands S2 cells;
 `ExactHash` matches a 256-bit digest in a `radixhash` index. Validation
 happens at `Compile`. There are no OR/NOT combinators, except `WithACL`,
@@ -116,7 +133,7 @@ the store and authenticate group membership yourself.
 ```go
 plan, err := search.CompileWithStore(store,
     search.WithACL(userID, authenticatedGroupIDs...),
-    search.AllValues(tags, bitmapidx.StringValue("favorite")),
+    search.AllValues(tags, bitmapidx.EnumStringValue("favorite")),
 )
 ```
 
@@ -139,8 +156,12 @@ inside callbacks.
 `ExactHash` restricts results to a 256-bit digest held by an exact-content
 `radixhash` index (SHA-256 or BLAKE3-256). The digest is compared bit-exactly,
 duplicate content can map to several IDs, and the algorithm is a validation
-tag plus plan metadata — one `radixhash` index holds one algorithm, so pass
-the index built for it.
+tag plus plan metadata, **not** a check against persisted index metadata;
+pass the index intended for that algorithm. For a unified store, use
+`engine.ExactHash(ns, algorithm, digest)` followed by
+`engine.Compile(entity, clause)` to bind the namespace, verify entity
+ownership, and include liveness. Bare `ExactHash(index, ...)` works only with
+standalone `Compile`; supply liveness explicitly if needed.
 
 ```go
 import (

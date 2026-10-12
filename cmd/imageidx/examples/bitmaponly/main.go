@@ -1,9 +1,7 @@
-// Command bitmaponly exercises namespace-only execution shapes: AppendIDs,
-// Count, AppendPage, and Visit.
+// Command bitmaponly demonstrates unified image liveness, bitmap predicates,
+// and BSI range queries with one reusable search plan.
 //
-// Usage:
-//
-//	go run ./cmd/imageidx/examples/bitmaponly
+// Usage: go run ./cmd/imageidx/examples/bitmaponly
 package main
 
 import (
@@ -13,87 +11,79 @@ import (
 	"os"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
 func main() {
-	dir, err := os.MkdirTemp("", "imageidx-namespaces-")
+	schema := common.NewSchema()
+	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
+		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
+	}, "tags", common.EntityImage)
+	if err != nil {
+		log.Fatal(err)
+	}
+	quality, err := index.BitmapDef(bitmapidx.NamespaceSpec{
+		Namespace: 40, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+	}, "quality", common.EntityImage)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := schema.RegisterAll(tags, quality); err != nil {
+		log.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "imageidx-unified-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	store, err := bitmapidx.NewStore(dir, []bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
-		{Namespace: common.NamespaceAlbum, Kind: common.KindBitmapEnum},
-	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
+	db, err := index.Create(dir, index.Spec{Schema: schema})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer store.Close()
-	tags, _ := store.Lookup(common.NamespaceTag)
-	album, _ := store.Lookup(common.NamespaceAlbum)
-	tagsBatch := tags.NewBatch()
-	if err := tagsBatch.Add(
-		bitmapidx.Entry{ImageID: 1, Value: bitmapidx.EnumStringValue("favorite")},
-		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.EnumStringValue("favorite")},
-		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.EnumStringValue("favorite")},
-		bitmapidx.Entry{ImageID: 5, Value: bitmapidx.EnumStringValue("favorite")},
-	); err != nil {
-		log.Fatal(err)
-	}
-	if err := tagsBatch.Apply(); err != nil {
-		log.Fatal(err)
-	}
-	tagsBatch.Close()
-	if err := tags.Barrier(); err != nil {
-		log.Fatal(err)
-	}
-	albumBatch := album.NewBatch()
-	if err := albumBatch.Add(
-		bitmapidx.Entry{ImageID: 2, Value: bitmapidx.EnumStringValue("holiday")},
-		bitmapidx.Entry{ImageID: 3, Value: bitmapidx.EnumStringValue("holiday")},
-		bitmapidx.Entry{ImageID: 4, Value: bitmapidx.EnumStringValue("holiday")},
-	); err != nil {
-		log.Fatal(err)
-	}
-	if err := albumBatch.Apply(); err != nil {
-		log.Fatal(err)
-	}
-	albumBatch.Close()
-	if err := album.Barrier(); err != nil {
-		log.Fatal(err)
-	}
+	defer db.Close()
 
-	plan, err := search.Compile(
-		search.AllValues(tags, bitmapidx.EnumStringValue("favorite")),
-		search.AllValues(album, bitmapidx.EnumStringValue("holiday")),
-	)
+	for _, entry := range []struct {
+		id      common.ValueID
+		quality uint16
+	}{{1, 5}, {2, 40}, {3, 85}, {4, 100}} {
+		if err := db.Add(index.Entry{ValueID: entry.id, Bitmaps: []index.BitmapValue{
+			{Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")},
+			{Namespace: 40, Value: bitmapidx.Uint16Value(entry.quality)},
+		}}); err != nil {
+			log.Fatal(err)
+		}
+	}
+	engine, err := search.New(db)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	workspace := search.NewWorkspace(8)
+	favorites, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	rangeClause, err := engine.BSIRange(40, bitmapidx.ValuesBetween(40, 85))
+	if err != nil {
+		log.Fatal(err)
+	}
+	plan, err := engine.Compile(common.EntityImage, favorites, rangeClause)
+	if err != nil {
+		log.Fatal(err)
+	}
 	ctx := context.Background()
-	matches, err := plan.AppendIDs(ctx, nil, workspace)
+	ws := search.NewWorkspace(8)
+	ids, err := plan.AppendIDs(ctx, nil, ws)
 	if err != nil {
 		log.Fatal(err)
 	}
-	count, err := plan.Count(ctx, workspace)
+	count, err := plan.Count(ctx, ws)
 	if err != nil {
 		log.Fatal(err)
 	}
-	first, err := plan.AppendPage(ctx, nil, workspace, search.Page{Limit: 1})
+	page, err := plan.AppendPage(ctx, nil, ws, search.Page{Limit: 1})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("matches=%v\ncount=%d\nfirst=%v\n", matches, count, first)
-	fmt.Print("iterated=")
-	if err := plan.Visit(ctx, workspace, func(id search.ImageID) bool {
-		fmt.Printf("%d ", id)
-		return true
-	}); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println()
+	fmt.Printf("matches=%v count=%d first=%v\n", ids, count, page)
 }

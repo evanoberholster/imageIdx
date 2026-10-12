@@ -7,6 +7,7 @@ import (
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
+	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
 
@@ -47,6 +48,9 @@ func (e *Engine) Geo(ns common.Namespace) (*geoidx.Index, bool) { return e.db.Ge
 // Bitmap returns the bitmap engine for a namespace, or false if unavailable.
 func (e *Engine) Bitmap(ns common.Namespace) (*bitmapidx.Index, bool) { return e.db.Bitmap(ns) }
 
+// Hash returns an exact-hash engine for a namespace, or false if unavailable.
+func (e *Engine) Hash(ns common.Namespace) (*radixhash.Index, bool) { return e.db.Hash(ns) }
+
 // During builds a timestamp clause for a namespace.
 func (e *Engine) During(ns common.Namespace, start, end uint64, options ...TimestampOption) (Clause, error) {
 	idx, ok := e.db.Time(ns)
@@ -74,6 +78,25 @@ func (e *Engine) Values(ns common.Namespace, values ...bitmapidx.Value) (Clause,
 	return AllValues(idx, values...), nil
 }
 
+// BSIRange builds an unsigned range clause for a BSI bitmap namespace.
+func (e *Engine) BSIRange(ns common.Namespace, bounds bitmapidx.ValueRange) (Clause, error) {
+	idx, ok := e.db.Bitmap(ns)
+	if !ok {
+		return nil, ErrNamespaceUnavailable
+	}
+	return NamespaceBSIRange(idx, bounds), nil
+}
+
+// ExactHash binds a digest clause to an exact-hash namespace in this Store.
+// The algorithm is caller-supplied metadata; radixhash does not persist it.
+func (e *Engine) ExactHash(ns common.Namespace, algorithm HashAlgorithm, digest [32]byte) (Clause, error) {
+	idx, ok := e.db.Hash(ns)
+	if !ok {
+		return nil, ErrNamespaceUnavailable
+	}
+	return hashClause{index: idx, namespace: ns, algorithm: algorithm, hash: radixhash.Hash(digest)}, nil
+}
+
 // Compile compiles clauses and prepends the entity liveness restriction.
 //
 // Every entity-scoped clause must reference a namespace owned by the bound
@@ -83,9 +106,10 @@ func (e *Engine) Values(ns common.Namespace, values ...bitmapidx.Value) (Clause,
 // across entity kinds, this prevents logically invalid intersections such as an
 // Image namespace intersected with a Face namespace.
 //
-// WithACL clauses are entity-neutral access filters; when present the plan is
-// compiled against the Store's bitmap store so the dedicated ACL namespaces
-// resolve.
+// WithACL clauses use image-ID grants and are only accepted for EntityImage;
+// when present the plan uses the Store's dedicated bitmap ACL namespaces.
+// ExactHash clauses must be created through Engine.ExactHash so their owning
+// namespace can be validated.
 func (e *Engine) Compile(entity common.EntityKind, clauses ...Clause) (Plan, error) {
 	live, value, ok := e.db.Liveness(entity)
 	if !ok {
@@ -113,6 +137,9 @@ func (e *Engine) validateClauses(entity common.EntityKind, clauses []Clause) err
 		}
 		switch cl := c.(type) {
 		case namespaceClause:
+			if cl.index == nil {
+				return ErrInvalidClause
+			}
 			ns := cl.index.Spec().Namespace
 			idx, ok := e.db.Bitmap(ns)
 			if !ok {
@@ -125,6 +152,9 @@ func (e *Engine) validateClauses(entity common.EntityKind, clauses []Clause) err
 				return ErrIncompatibleEntity
 			}
 		case timestampClause:
+			if cl.index == nil {
+				return ErrInvalidClause
+			}
 			ns := cl.index.Namespace()
 			idx, ok := e.db.Time(ns)
 			if !ok {
@@ -137,6 +167,9 @@ func (e *Engine) validateClauses(entity common.EntityKind, clauses []Clause) err
 				return ErrIncompatibleEntity
 			}
 		case geoClause:
+			if cl.index == nil {
+				return ErrInvalidClause
+			}
 			ns := cl.index.Namespace()
 			idx, ok := e.db.Geo(ns)
 			if !ok {
@@ -149,7 +182,25 @@ func (e *Engine) validateClauses(entity common.EntityKind, clauses []Clause) err
 				return ErrIncompatibleEntity
 			}
 		case aclClause:
-			// Access control is orthogonal to entity kind.
+			// ACL postings contain image IDs; other entity kinds can reuse the
+			// same numeric IDs and must never inherit image grants.
+			if entity != common.EntityImage {
+				return ErrIncompatibleEntity
+			}
+		case hashClause:
+			if cl.index == nil || cl.namespace == 0 {
+				return ErrInvalidClause
+			}
+			idx, ok := e.db.Hash(cl.namespace)
+			if !ok {
+				return ErrNamespaceUnavailable
+			}
+			if idx != cl.index {
+				return ErrIncompatibleEntity
+			}
+			if ent, ok := e.db.EntityOf(cl.namespace); !ok || ent != entity {
+				return ErrIncompatibleEntity
+			}
 		default:
 			return ErrIncompatibleEntity
 		}

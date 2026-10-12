@@ -1,42 +1,25 @@
-# Combined Search Implementation
+# Combined search
 
-The `search` package is the only package that combines `bitmapidx` fields and
-`timeidx`. It compiles conjunctive clauses into a reusable execution plan. Geo
-is a `bitmapidx.KindGeo` field; there is no OR, reranking, or vector clause.
+`search.New(db)` binds a unified `index.Store`; `Engine.Compile(entity, ...)`
+adds the entity's liveness clause, rejects foreign/mismatched namespaces, and
+builds a reusable `Plan`. Prefer it to bare `search.Compile` when querying a
+unified store. For examples see `cmd/imageidx/examples/bitmaponly` and
+`search/README.md`.
 
-## Clauses
+| Index family | Search integration |
+|---|---|
+| `bitmapidx` | `AllValues`, `NamespaceText`, signed `NamespaceRange`, unsigned `NamespaceBSIRange` (`Engine.BSIRange`) |
+| `timeidx` | `During`; use `ExactTimestamp` to verify lossy candidates |
+| `geoidx` | `InCells` |
+| `radixhash` | `ExactHash` in standalone `Compile`; `Engine.ExactHash` binds a unified namespace and liveness |
+| `simhash` | import duplicate detection through `index.Matcher`, not a plan clause |
+| `vectoridx` | ANN outside the plan; `FilterRanked` filters candidate results |
 
-- `FieldValues(index, values...)`: every typed value must be present.
-- `FieldText(index, text)`: every analyzed token must be present.
-- `FieldRange(index, bounds)`: a `KindContinuous` field must fall inside the
-  supplied numeric range.
-- `During(index, start, end, options...)`: half-open exact timestamp range.
-  Ranges on the same index coalesce by intersection; `ExactTimestamp` adds an
-  optional canonical-data verification stage.
-- `WithinCells(index, cellIDs...)`: union of S2 cells on a `KindGeo` field.
-
-Clauses are sealed and unknown implementations are rejected. Empty queries
-return `ErrEmptyQuery`; invalid or nil field indexes return `ErrInvalidClause`.
-
-## Planning and execution
-
-`Compile` captures field, timestamp, and geo estimates and stably sorts stages
-by estimate. Estimates affect work order only. Field stages compile a reusable
-`bitmapidx.Query` or numeric range and use the field's collect/filter APIs.
-
-Execution collects the first stage, applies in-place field/exact-timestamp/geo
-filters, then collects and intersects remaining stages. Geo collection may use
-the workspace-owned transient `roar.MutableBitmap`; this is the only mutable
-bitmap used by the cross-index search path. Results are sorted and unique.
-
-`SearchLimit` truncates the sorted prefix. `Count` uses field count operations
-for single-field plans and otherwise executes into private scratch. `Iterate`
-materializes once. Reusing a plan, destination, and private workspace supports
-zero-allocation steady-state execution when capacities are sufficient.
-
-## Workspaces and service
-
-`Workspace` owns intermediate ID scratch and the transient geo accumulator. It
-is reusable but not safe for concurrent searches. `Service` pools workspaces
-and timestamp write batches; each agent gets a private workspace and result
-buffer. Field writes serialize inside their owning `bitmapidx.Index`.
+Plan stages are ordered by compile-time cardinality hints; call `Refresh`
+after substantial data changes. `AppendIDs` produces sorted unique IDs,
+`FilterIDs` preserves candidate order and duplicates, `Count` uses bitmap
+cardinality where possible, and `AppendPage`/`Visit`/ranking stream verified
+batches. `Workspace` is exclusive to one execution; `Executor` pools it for
+concurrent callers. Stages read current index views independently, not a
+database-wide snapshot. `WithACL` applies image grants only; authenticate
+group memberships before querying.

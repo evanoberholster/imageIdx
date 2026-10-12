@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
-	hashidx "github.com/evanoberholster/imageIdx/index/hashIdx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
 )
@@ -43,8 +43,8 @@ func integrationDefs(t *testing.T) []common.NamespaceDef {
 	return []common.NamespaceDef{
 		bitmapDef,
 		timeidx.Spec{Namespace: timelineNamespace, Name: "timeline"}.NamespaceDef(),
-		hashidx.ExactSpec{Namespace: exactHashNamespace, Name: "exact-content"}.NamespaceDef(),
-		hashidx.PerceptualSpec{Namespace: perceptualNamespace, Name: "perceptual"}.NamespaceDef(),
+		{Namespace: exactHashNamespace, Name: "exact-content", Kind: common.KindHashExact, Entity: common.EntityImage},
+		{Namespace: perceptualNamespace, Name: "perceptual", Kind: common.KindHashPerceptual, Entity: common.EntityImage},
 		vectorDef,
 	}
 }
@@ -116,8 +116,8 @@ func TestSchemaRegistersEveryIndexKind(t *testing.T) {
 
 // TestIndexesOpenWithSchemaNamespaces opens one in-memory index per package
 // with its registered namespace and verifies Metadata/config reports it.
-// hashidx has no exported in-memory constructor, so its Store is opened in a
-// t.TempDir; nothing else touches disk.
+// The unified Store routes the exact and perceptual hash namespaces to the
+// current radixhash and simhash engines.
 func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 	tagSpec := bitmapidx.NamespaceSpec{
 		Namespace: common.NamespaceTag,
@@ -156,23 +156,27 @@ func TestIndexesOpenWithSchemaNamespaces(t *testing.T) {
 		t.Fatalf("timeidx Metadata namespace = %d, want %d", got, timelineNamespace)
 	}
 
-	hashStore, err := hashidx.NewStore(t.TempDir(), hashidx.StoreSpec{
-		Perceptual: hashidx.PerceptualSpec{Namespace: perceptualNamespace, Name: "perceptual"},
-		Exact:      hashidx.ExactSpec{Namespace: exactHashNamespace, Name: "exact-content", Algorithm: hashidx.AlgorithmBLAKE3},
-	}, common.DurabilityOS)
+	hashSchema := common.NewSchema()
+	if err := hashSchema.RegisterAll(
+		common.NamespaceDef{Namespace: exactHashNamespace, Name: "exact-content", Kind: common.KindHashExact, Entity: common.EntityImage},
+		common.NamespaceDef{Namespace: perceptualNamespace, Name: "perceptual", Kind: common.KindHashPerceptual, Entity: common.EntityImage},
+	); err != nil {
+		t.Fatalf("register hash namespaces: %v", err)
+	}
+	hashStore, err := index.Create(t.TempDir(), index.Spec{Schema: hashSchema})
 	if err != nil {
-		t.Fatalf("hashidx.NewStore: %v", err)
+		t.Fatalf("index.Create: %v", err)
 	}
 	defer func() {
 		if err := hashStore.Close(); err != nil {
 			t.Errorf("hashStore.Close: %v", err)
 		}
 	}()
-	if got := hashStore.Perceptual().Metadata().Namespace; got != perceptualNamespace {
-		t.Fatalf("hashidx perceptual namespace = %d, want %d", got, perceptualNamespace)
+	if _, ok := hashStore.Sim(perceptualNamespace); !ok {
+		t.Fatalf("simhash namespace %d unavailable", perceptualNamespace)
 	}
-	if got := hashStore.Exact().Metadata().Namespace; got != exactHashNamespace {
-		t.Fatalf("hashidx exact namespace = %d, want %d", got, exactHashNamespace)
+	if _, ok := hashStore.Hash(exactHashNamespace); !ok {
+		t.Fatalf("radixhash namespace %d unavailable", exactHashNamespace)
 	}
 
 	vectors, err := vectoridx.NewMemory(vectoridx.Config{
