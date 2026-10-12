@@ -116,3 +116,31 @@ func TestStoreRejectsDifferentSchema(t *testing.T) {
 		t.Fatalf("invalid namespace: %v", err)
 	}
 }
+
+func TestExplicitAppendOnlySchemaExtension(t *testing.T) {
+	dir := t.TempDir()
+	base := []Spec{{Namespace: 1, Name: "photos"}}
+	s, err := Open(dir, base...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenWithExtension(dir, Spec{Namespace: 1, Name: "renamed"}, Spec{Namespace: 2, Name: "users"}); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("changed old definition: %v", err)
+	}
+	if _, err := Open(dir, base[0], Spec{Namespace: 2, Name: "users"}); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("implicit extension: %v", err)
+	}
+	s, err = OpenWithExtension(dir, base[0], Spec{Namespace: 2, Name: "users"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenWithExtension(dir, base...); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("removed definition: %v", err)
+	}
+}

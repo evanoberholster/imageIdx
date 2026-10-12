@@ -22,11 +22,15 @@ const (
 	EntityAsset
 	EntityCollection
 	EntityStack
+	// Added in allocator format v2. Never renumber persisted entity kinds.
+	EntityUser
+	EntityLocation
+	EntityTag
 
 	entityKindCount // sentinel; not a valid kind
 )
 
-// Valid reports whether e is one of the ten supported entity kinds.
+// Valid reports whether e is one of the supported entity kinds.
 func (e EntityKind) Valid() bool { return e >= EntityImage && e < entityKindCount }
 
 // String returns a stable lower-case name used for diagnostics and for the
@@ -53,6 +57,12 @@ func (e EntityKind) String() string {
 		return "collection"
 	case EntityStack:
 		return "stack"
+	case EntityUser:
+		return "user"
+	case EntityLocation:
+		return "location"
+	case EntityTag:
+		return "tag"
 	default:
 		return "invalid"
 	}
@@ -75,4 +85,6 @@ type (
 	AssetID      = ValueID
 	CollectionID = ValueID
 	StackID      = ValueID
+	LocationID   = ValueID
+	TagID        = ValueID
 )

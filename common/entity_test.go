@@ -11,6 +11,7 @@ func TestEntityKindValidityAndNames(t *testing.T) {
 	kinds := []EntityKind{
 		EntityImage, EntityFace, EntityPerson, EntityObject, EntityAlbum,
 		EntityEvent, EntityPlace, EntityAsset, EntityCollection, EntityStack,
+		EntityUser, EntityLocation, EntityTag,
 	}
 	if EntityKindCount != len(kinds) {
 		t.Fatalf("EntityKindCount = %d, want %d", EntityKindCount, len(kinds))
@@ -50,6 +51,8 @@ func TestEntityAliasesAreValueID(t *testing.T) {
 		_ AssetID      = ValueID(1)
 		_ CollectionID = ValueID(1)
 		_ StackID      = ValueID(1)
+		_ LocationID   = ValueID(1)
+		_ TagID        = ValueID(1)
 	)
 }
 

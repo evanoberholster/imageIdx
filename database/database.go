@@ -10,9 +10,11 @@ import (
 	"math"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
+	"github.com/evanoberholster/imageIdx/index/idalloc"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
@@ -54,6 +56,8 @@ type Options struct {
 type DB struct {
 	mu        sync.Mutex // serializes sequence allocation with the Pebble commit
 	values    *store.Store
+	ids       *idalloc.Allocator
+	idsClosed atomic.Bool
 	indexes   *index.Store
 	decode    Decoder
 	options   Options
@@ -83,7 +87,7 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if options.BatchSize > 64 {
 		return nil, fmt.Errorf("%w: batch size > 64", ErrInvalidMutation)
 	}
-	values, err := store.Open(dir, canonicalSpecs()...)
+	values, err := store.OpenWithExtension(dir, canonicalSpecs()...)
 	if err != nil {
 		return nil, err
 	}
@@ -91,11 +95,16 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 }
 
 func canonicalSpecs() []store.Spec {
-	specs := make([]store.Spec, 0, 12)
+	specs := make([]store.Spec, 0, common.EntityKindCount+2)
 	for e := common.EntityImage; e <= common.EntityStack; e++ {
-		specs = append(specs, store.Spec{Namespace: common.Namespace(e), Name: "entity-" + e.String()})
+		specs = append(specs, store.Spec{Namespace: common.Namespace(e), Name: "entity-" + e.String(), Entity: e})
 	}
 	specs = append(specs, store.Spec{Namespace: journalNS, Name: "mutation-journal"}, store.Spec{Namespace: metadataNS, Name: "database-generations"})
+	// Append new entity namespaces after the historical schema entries: the
+	// explicit additive schema upgrade checks their stable original prefix.
+	for e := common.EntityUser; e.Valid(); e++ {
+		specs = append(specs, store.Spec{Namespace: common.Namespace(e), Name: "entity-" + e.String(), Entity: e})
+	}
 	return specs
 }
 
@@ -116,6 +125,9 @@ func openWithValues(values *store.Store, indexDir string, decode Decoder, option
 	ready := false
 	defer func() {
 		if !ready {
+			if db.ids != nil {
+				_ = db.ids.Close()
+			}
 			if db.indexes != nil {
 				_ = db.indexes.Close()
 			}
@@ -140,6 +152,9 @@ func openWithValues(values *store.Store, indexDir string, decode Decoder, option
 		return nil, fmt.Errorf("%w: index cannot open: %v", ErrRecoveryRequired, openErr)
 	}
 	if err := db.persistSchema(); err != nil {
+		return nil, err
+	}
+	if err := db.openIDs(); err != nil {
 		return nil, err
 	}
 	idx = db.indexes
@@ -305,6 +320,14 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			return 0, err
 		}
 	}
+	// Legacy callers may provide IDs instead of obtaining them via NextID.
+	// Reconcile them before publishing canonical records, including deletions,
+	// so neither reopening nor future reservations can hand them out again.
+	for _, m := range mutations {
+		if err := db.ids.SkipThrough(m.Entity, m.ValueID); err != nil {
+			return 0, err
+		}
+	}
 	gen := db.committed + uint64(len(mutations))
 	if err := putGeneration(b, 1, gen); err != nil {
 		return 0, err
@@ -359,6 +382,19 @@ func (db *DB) DatabaseGeneration() uint64 { db.mu.Lock(); defer db.mu.Unlock(); 
 func (db *DB) IndexedGeneration() uint64  { db.mu.Lock(); defer db.mu.Unlock(); return db.indexed }
 func (db *DB) Index() *index.Store        { return db.indexes }
 
+// NextID reserves a unique entity ID before its canonical record is committed.
+// Abandoned IDs are never recycled. Close rejects new calls and drains those
+// already admitted before closing the backing Pebble database.
+func (db *DB) NextID(entity common.EntityKind) (common.ValueID, error) {
+	if !entity.Valid() {
+		return 0, idalloc.ErrKind
+	}
+	if db.idsClosed.Load() {
+		return 0, idalloc.ErrClosed
+	}
+	return db.ids.Next(entity)
+}
+
 // WaitIndexed waits without polling or per-waiter goroutines. Permanent
 // coordinator failures wake all waiters and preserve the unacknowledged journal.
 func (db *DB) WaitIndexed(ctx context.Context, generation uint64) error {
@@ -401,9 +437,11 @@ func (db *DB) Close() error {
 		return nil
 	}
 	db.closed = true
+	db.idsClosed.Store(true)
 	db.notify()
 	db.signal()
 	db.mu.Unlock()
+	_ = db.ids.Close()
 	<-db.done
 	return errors.Join(db.indexes.Close(), db.values.Close())
 }

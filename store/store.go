@@ -27,11 +27,12 @@ var (
 type Spec struct {
 	Namespace common.Namespace
 	Name      string
+	Entity    common.EntityKind
 }
 
 // NamespaceDef registers the collection in the shared namespace vocabulary.
 func (s Spec) NamespaceDef() common.NamespaceDef {
-	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindKV}
+	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindKV, Entity: s.Entity}
 }
 
 // Store owns one Pebble database. Pebble permits concurrent reads and writes.
@@ -47,6 +48,18 @@ var schemaKey = EncodeKey(Key{}) // namespace zero is reserved for metadata
 // are persisted on creation and must match on every subsequent open.
 // Writes are synchronized before they return.
 func Open(dir string, specs ...Spec) (*Store, error) {
+	return open(dir, false, specs...)
+}
+
+// OpenWithExtension explicitly allows an additive append-only namespace
+// upgrade. Existing namespace definitions must match byte-for-byte and the
+// replacement schema is synced before returning. Only call while the database
+// is closed; Pebble's writer lock excludes competing processes.
+func OpenWithExtension(dir string, specs ...Spec) (*Store, error) {
+	return open(dir, true, specs...)
+}
+
+func open(dir string, extend bool, specs ...Spec) (*Store, error) {
 	if dir == "" {
 		return nil, ErrInvalidDir
 	}
@@ -69,23 +82,46 @@ func Open(dir string, specs ...Spec) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := verifySchema(db, schemaBytes); err != nil {
+	if err := verifySchema(db, schemaBytes, extend); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return &Store{db: db, namespaces: namespaces}, nil
 }
 
-func verifySchema(db *pebble.DB, expected []byte) error {
+func verifySchema(db *pebble.DB, expected []byte, extend bool) error {
 	value, closer, err := db.Get(schemaKey[:])
 	switch {
 	case err == nil:
 		matches := bytes.Equal(value, expected)
+		canExtend := false
+		if !matches && extend {
+			var oldSchema, newSchema common.Schema
+			if oldSchema.UnmarshalBinary(value) == nil && newSchema.UnmarshalBinary(expected) == nil {
+				before, after := oldSchema.Defs(), newSchema.Defs()
+				canExtend = len(before) <= len(after)
+				changed := len(before) < len(after)
+				for i := 0; canExtend && i < len(before); i++ {
+					a, b := before[i], after[i]
+					ownerUpgrade := a.Entity == common.EntityInvalid && b.Entity.Valid() &&
+						b.Entity == common.EntityKind(b.Namespace) && b.Name == "entity-"+b.Entity.String()
+					if ownerUpgrade {
+						changed = true
+					}
+					canExtend = a.Namespace == b.Namespace && a.Name == b.Name && a.Kind == b.Kind &&
+						(a.Entity == b.Entity || ownerUpgrade) && bytes.Equal(a.Config, b.Config)
+				}
+				canExtend = canExtend && changed
+			}
+		}
 		if err := closer.Close(); err != nil {
 			return err
 		}
-		if !matches {
+		if !matches && !canExtend {
 			return ErrSchemaMismatch
+		}
+		if canExtend {
+			return db.Set(schemaKey[:], expected, pebble.Sync)
 		}
 		return nil
 	case !errors.Is(err, pebble.ErrNotFound):
