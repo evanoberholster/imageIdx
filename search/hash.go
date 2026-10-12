@@ -1,6 +1,9 @@
 package search
 
-import "github.com/evanoberholster/imageIdx/index/radixhash"
+import (
+	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/index/radixhash"
+)
 
 // HashAlgorithm names the 256-bit digest family an exact-hash clause searches.
 // A radixhash index holds exactly one algorithm, so the value is plan metadata
@@ -37,14 +40,16 @@ type hashClause struct {
 	index     *radixhash.Index
 	algorithm HashAlgorithm
 	hash      radixhash.Hash
+	namespace common.Namespace // zero for a standalone index
 }
 
 func (hashClause) searchClause() {}
 
 // ExactHash restricts results to images whose exact 256-bit digest is present
 // in index, an exact-content radixhash index. algorithm names the digest family
-// (HashSHA256 or HashBLAKE3) and must match the algorithm the index was built
-// with; the index itself is one radixhash shard.
+// (HashSHA256 or HashBLAKE3) and must match the digest family the caller stored
+// in this index; radixhash itself does not persist or validate that family.
+// For a unified Store, use Engine.ExactHash to bind the namespace.
 //
 // Compute the digest with crypto/sha256 or a BLAKE3 implementation and pass the
 // raw 32 bytes. Matching is exact: a one-bit difference is a miss. Deletions are

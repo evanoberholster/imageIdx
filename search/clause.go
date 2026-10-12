@@ -30,14 +30,16 @@ const (
 	namespaceValues namespaceClauseKind = iota + 1
 	namespaceText
 	namespaceRange
+	namespaceBSIRange
 )
 
 type namespaceClause struct {
-	index  *bitmapidx.Index
-	kind   namespaceClauseKind
-	values []bitmapidx.Value
-	text   string
-	bounds bitmapidx.NumericRange
+	index     *bitmapidx.Index
+	kind      namespaceClauseKind
+	values    []bitmapidx.Value
+	text      string
+	bounds    bitmapidx.NumericRange
+	bsiBounds bitmapidx.ValueRange
 }
 
 func (namespaceClause) searchClause() {}
@@ -57,6 +59,12 @@ func NamespaceText(index *bitmapidx.Index, text string) Clause {
 // NamespaceRange restricts a continuous namespace to bounds.
 func NamespaceRange(index *bitmapidx.Index, bounds bitmapidx.NumericRange) Clause {
 	return namespaceClause{index: index, kind: namespaceRange, bounds: bounds}
+}
+
+// NamespaceBSIRange restricts a 16- or 32-bit BSI namespace to an unsigned
+// range. Bounds are validated against the namespace width at Compile time.
+func NamespaceBSIRange(index *bitmapidx.Index, bounds bitmapidx.ValueRange) Clause {
+	return namespaceClause{index: index, kind: namespaceBSIRange, bsiBounds: bounds}
 }
 
 type aclClause struct {

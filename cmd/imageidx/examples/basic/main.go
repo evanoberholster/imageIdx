@@ -1,11 +1,5 @@
-// Command basic runs one combined bitmap + timestamp + geo query.
-//
-// It mirrors cmd/imageidx runOnce: seed three small indexes, compile a plan
-// once, and execute it with a reusable workspace and result buffer.
-//
-// Usage:
-//
-//	go run ./cmd/imageidx/examples/basic
+// Command basic runs one entity-scoped bitmap + timestamp + geo query against
+// a unified index.Store. Usage: go run ./cmd/imageidx/examples/basic
 package main
 
 import (
@@ -15,6 +9,7 @@ import (
 	"os"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
@@ -24,102 +19,81 @@ import (
 const quantum = uint64(1) << timeidx.TimestampShift
 
 func main() {
-	namespaceDir, err := os.MkdirTemp("", "imageidx-namespaces-")
+	schema := common.NewSchema()
+	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
+		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
+	}, "tags", common.EntityImage)
 	if err != nil {
 		log.Fatal(err)
 	}
-	namespaces, err := bitmapidx.NewStore(namespaceDir, []bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
-	}, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() { _ = namespaces.Close(); _ = os.RemoveAll(namespaceDir) }()
-	favorites, ok := namespaces.Lookup(common.NamespaceTag)
-	if !ok {
-		log.Fatal("tag namespace missing")
-	}
-	favoritesBatch := favorites.NewBatch()
-	if err := favoritesBatch.Add(
-		bitmapidx.Entry{ImageID: 100, Value: bitmapidx.EnumStringValue("favorite")},
-		bitmapidx.Entry{ImageID: 200, Value: bitmapidx.EnumStringValue("favorite")},
-		bitmapidx.Entry{ImageID: 300, Value: bitmapidx.EnumStringValue("favorite")},
+	if err := schema.RegisterAll(tags,
+		common.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: common.KindTimestamp, Entity: common.EntityImage},
+		common.NamespaceDef{Namespace: common.NamespaceLocation, Name: "location", Kind: common.KindGeo, Entity: common.EntityImage},
 	); err != nil {
 		log.Fatal(err)
 	}
-	if err := favoritesBatch.Apply(); err != nil {
-		log.Fatal(err)
-	}
-	favoritesBatch.Close()
-	if err := favorites.Barrier(); err != nil {
-		log.Fatal(err)
-	}
-	geo, err := geoidx.NewMemory(geoidx.Config{Namespace: common.NamespaceLocation})
+	dir, err := os.MkdirTemp("", "imageidx-basic-")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer geo.Close()
-	for _, entry := range []struct {
-		id  common.ImageID
-		lat float64
-		lng float64
-	}{
-		{100, 37.7749, -122.4194}, {200, 37.7749, -122.4194},
-		{300, 34.0522, -118.2437}, {400, 40.7128, -74.0060},
-	} {
-		key, err := geoidx.KeyFromLatLng(entry.lat, entry.lng)
+	defer os.RemoveAll(dir)
+	db, err := index.Create(dir, index.Spec{Schema: schema})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	canonical := map[common.ImageID]uint64{100: quantum, 200: 2 * quantum, 300: 3 * quantum, 400: 4 * quantum}
+	for _, row := range []struct {
+		id       common.ImageID
+		lat, lng float64
+	}{{100, 37.7749, -122.4194}, {200, 37.7749, -122.4194},
+		{300, 34.0522, -118.2437}, {400, 40.7128, -74.0060}} {
+		key, err := geoidx.KeyFromLatLng(row.lat, row.lng)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := geo.Insert(key, entry.id); err != nil {
+		entry := index.Entry{ValueID: row.id,
+			Times: []index.TimeValue{{Namespace: 100, Timestamp: canonical[row.id]}},
+			Geos:  []index.GeoValue{{Namespace: common.NamespaceLocation, Key: key}},
+		}
+		if row.id != 400 {
+			entry.Bitmaps = []index.BitmapValue{{Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}}
+		}
+		if err := db.Add(entry); err != nil {
 			log.Fatal(err)
 		}
 	}
-	if err := geo.Compact(); err != nil {
-		log.Fatal(err)
-	}
-
-	canonical := map[common.ImageID]uint64{
-		100: quantum,
-		200: 2 * quantum,
-		300: 3 * quantum,
-		400: 4 * quantum,
-	}
-	times, err := timeidx.NewMemory(timeidx.Spec{
-		Namespace: common.Namespace(100),
-		Name:      "timestamp",
-		Entries: []timeidx.Entry{
-			{ImageID: 100, Timestamp: canonical[100]},
-			{ImageID: 200, Timestamp: canonical[200]},
-			{ImageID: 300, Timestamp: canonical[300]},
-			{ImageID: 400, Timestamp: canonical[400]},
-		},
-	}, timeidx.Config{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer times.Close()
-
 	cellID, err := geoidx.CellIDFromLatLng(37.7749, -122.4194)
 	if err != nil {
 		log.Fatal(err)
 	}
-	plan, err := search.Compile(
-		search.AllValues(favorites, bitmapidx.EnumStringValue("favorite")),
-		search.During(times, quantum, 3*quantum,
-			search.ExactTimestamp(func(id common.ImageID) (uint64, bool) {
-				value, ok := canonical[id]
-				return value, ok
-			})),
-		search.InCells(geo, cellID),
-	)
+	engine, err := search.New(db)
 	if err != nil {
 		log.Fatal(err)
 	}
-
+	favorites, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	during, err := engine.During(100, quantum, 3*quantum,
+		search.ExactTimestamp(func(id common.ImageID) (uint64, bool) {
+			stamp, ok := canonical[id]
+			return stamp, ok
+		}))
+	if err != nil {
+		log.Fatal(err)
+	}
+	cells, err := engine.InCells(common.NamespaceLocation, cellID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	plan, err := engine.Compile(common.EntityImage, favorites, during, cells)
+	if err != nil {
+		log.Fatal(err)
+	}
 	workspace := search.NewWorkspace(64)
-	matches := make([]search.ImageID, 0, 16)
-	matches, err = plan.AppendIDs(context.Background(), matches, workspace)
+	matches, err := plan.AppendIDs(context.Background(), nil, workspace)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -1,17 +1,14 @@
-# AGENTS
+# Agent documentation
 
-Project-specific agent resources.
+Use the repository-root [AGENTS.md](../AGENTS.md) for workflow. The concise,
+current architecture notes are [BuildConcepts.MD](BuildConcepts.MD),
+[BitmapIndex.md](BitmapIndex.md), and [Search.md](Search.md). Package
+`index/README.md` and `search/README.md` contain public contracts and examples;
+source and tests are authoritative for API details.
 
-- [BuildConcepts.MD](BuildConcepts.MD) — how the project is organized, built,
-  tested, and extended. Read this first.
-- [BitmapIndex.md](BitmapIndex.md) — implemented `bitmapidx` design and format:
-  persistent typed fields (enum, bool, text, continuous, geo).
-- [Timeidx.md](Timeidx.md) — implemented `timeidx` design: exact 1900-epoch
-  nanoseconds, namespace-aware copy-on-write shards, and the source-completeness
-  watermark. Package detail lives in `index/timeidx/README.md` and
-  `index/timeidx/BENCHMARKS.md`.
-- [SimHash.md](SimHash.md) — implemented `simhash` design: exact
-  `pHash64 + PDQ256 + quality` similarity store, mmap columnar format, batch redo
-  WAL.
-- [Search.md](Search.md) — combined query planning and execution.
-- [RoarFormat.md](RoarFormat.md) — standalone zero-copy roaring format.
+Other files here are **historical design notes/proposals**, not instructions or
+verified API references. In particular `HashIdx2.MD` and `CryptoHash.MD`
+describe retired/alternative hash implementations: use `index/radixhash` and
+`index/simhash` instead. `Ranking.MD`, `VectorIdx.MD`, `RadixTreeHash.MD`,
+`SimHash.md`, `Timeidx.md`, `RoarFormat.md`, `BitmapKernel.MD`, and `Bench.MD`
+may be useful for design history but should be checked against current code.

@@ -1,384 +1,450 @@
 # imageIdx
 
-Image indexing in Go: typed bitmap namespaces, timestamp indexes, persistent
-vector search, and one query planner that combines them.
+Persistent, namespace-aware image indexing and search in Go. The primary public
+API is `index.Store` (all index families in one schema-defined root directory)
+plus `search.Engine` (entity-scoped, reusable conjunctive queries). The six
+engine packages also expose standalone APIs; `store` is a separate Pebble-backed
+key-value collection, **not** a namespace routed by `index.Store`.
 
-Every indexed collection is a `common.Namespace` — a unique number and name
-registered in a `common.Schema`. Packages: `common` (shared types),
-`bitmapidx` (enum/bool/text/continuous namespaces), `timeidx` (timestamp
-ranges), `vectoridx` (HNSW ANN), `simhash` (exact pHash64/PDQ256 similarity),
-`geoidx` (exact S2 geographic search), `store` (Pebble key-value collections),
-and `search` (combined queries).
+## Packages at a glance
 
-## Open an index
+| Import suffix | Role | Unified namespace kind |
+|---|---|---|
+| `common` | `Schema`, namespace/entity kinds, ID aliases, durability | — |
+| `index` | unified persistent store, typed routing, mutations, liveness, recovery, import matcher | owns the six families below |
+| `index/bitmapidx` | enum, bool, analyzed text, signed continuous grid, unsigned 16/32-bit bit-sliced index (BSI) | `KindBitmapEnum`, `KindBitmapBool`, `KindBitmapString`, `KindBitmapContinuous`, `KindBitmapBSI` |
+| `index/timeidx` | timestamp range index | `KindTimestamp` |
+| `index/geoidx` | level-19 S2 geographic index | `KindGeo` |
+| `index/radixhash` | exact 256-bit content-hash lookup | `KindHashExact` |
+| `index/simhash` | pHash64/PDQ256 perceptual matching | `KindHashPerceptual` |
+| `index/vectoridx` | HNSW vector search and exact reference search | `KindVector` |
+| `search`, `search/ranking` | AND query planning/execution, ranking and fusion | — |
+| `roar` | immutable, serialized bitmap sets | — |
+| `store` | independent Pebble key-value collections | `KindKV` in its **own** schema, not in the unified store |
 
-### Namespace index (enum, bool, text, continuous)
+All imports start with `github.com/evanoberholster/imageIdx/`. A
+`common.Namespace` is a nonzero `uint16`; its number and name must be unique
+within a `common.Schema`. Unified namespaces additionally have exactly one
+`common.EntityKind` (`EntityImage`, `EntityFace`, `EntityPerson`, `EntityObject`,
+`EntityAlbum`, `EntityEvent`, `EntityPlace`, `EntityAsset`, `EntityCollection`,
+or `EntityStack`). `common.ValueID` and `common.ImageID` alias `uint64`; zero
+is reserved. Numeric IDs can overlap across entity kinds without mixing their
+liveness. `common.UserID` and `common.GroupID` are separate defined types.
+
+## Quick start: unified store and search
+
+The snippets below use these imports:
 
 ```go
-store, err := bitmapidx.NewStore(
-	"./data/namespaces",
-	[]bitmapidx.NamespaceSpec{
-		{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum},
-		{Namespace: common.Namespace(101), Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1}},
-		{Namespace: common.Namespace(102), Kind: common.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion}},
-	},
-	bitmapidx.NamespaceConfig{},
-	common.DurabilityOS,
+import (
+    "context"
+
+    common "github.com/evanoberholster/imageIdx/common"
+    "github.com/evanoberholster/imageIdx/index"
+    "github.com/evanoberholster/imageIdx/index/bitmapidx"
+    "github.com/evanoberholster/imageIdx/index/geoidx"
+    "github.com/evanoberholster/imageIdx/index/timeidx"
+    "github.com/evanoberholster/imageIdx/search"
 )
-if err != nil {
-	log.Fatal(err)
-}
-defer store.Close()
-
-tags, _ := store.Lookup(common.NamespaceTag)
-focals, _ := store.Lookup(common.Namespace(101))
-titles, _ := store.Lookup(common.Namespace(102))
 ```
 
-Reopen the same store with `bitmapidx.OpenStore(dir, config, durability)`.
+The following fragments go inside a function returning `error`; `Create` is
+for a new directory (use `Open` on later runs).
 
-### Timestamp index
+Declare **all** namespaces before creating the store. `index.BitmapDef` and
+`index.VectorDef` encode validated family-specific configuration into the
+persisted definition; the time, geo and hash families use `NamespaceDef`
+directly. Check every returned error in application code.
 
 ```go
-times, err := timeidx.NewStore(
-	"./data/time",
-	timeidx.Spec{Namespace: common.Namespace(90), Name: "timeline"},
-	timeidx.Config{},
-	common.DurabilityOS,
+schema := common.NewSchema()
+tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
+    Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
+}, "tags", common.EntityImage)
+if err != nil { return err }
+quality, err := index.BitmapDef(bitmapidx.NamespaceSpec{
+    Namespace: 40, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+}, "quality", common.EntityImage)
+if err != nil { return err }
+err = schema.RegisterAll(tags, quality,
+    common.NamespaceDef{Namespace: 90, Name: "taken-at", Kind: common.KindTimestamp, Entity: common.EntityImage},
+    common.NamespaceDef{Namespace: 91, Name: "location", Kind: common.KindGeo, Entity: common.EntityImage},
+    common.NamespaceDef{Namespace: 92, Name: "sha256", Kind: common.KindHashExact, Entity: common.EntityImage},
 )
-if err != nil {
-	log.Fatal(err)
-}
-defer times.Close()
-```
+if err != nil { return err }
 
-Reopen with `timeidx.OpenStore(dir, config, durability)`; use
-`timeidx.NewMemory(spec, config)` for an in-memory index.
+db, err := index.Create("./data/index", index.Spec{Schema: schema},
+    index.WithDurability(common.DurabilityOS))
+if err != nil { return err }
+defer db.Close()
 
-### Vector index
-
-```go
-vectors, err := vectoridx.NewStore(
-	"./data/vectors",
-	vectoridx.Config{
-		Namespace:   common.Namespace(100),
-		Dimensions:  vectoridx.Dim512,
-		ElementType: vectoridx.ElementFloat32,
-	},
-	common.DurabilitySync,
-)
-if err != nil {
-	log.Fatal(err)
-}
-defer vectors.Close()
-```
-
-Reopen with `vectoridx.OpenStore(path, durability)`; use
-`vectoridx.NewMemory(config)` for an in-memory index.
-
-### Similarity index (pHash64 + PDQ256)
-
-```go
-hashes, err := simhash.Open(
-	"./data/simhash",
-	simhash.Config{
-		MaxShardBytes:   4 << 30,
-		SeqBlockRecords: 1024,
-		Durability:      common.DurabilityOS,
-	},
-)
-if err != nil {
-	log.Fatal(err)
-}
-defer hashes.Close()
-```
-
-Reopen with `simhash.Open(path, config)`. `Close` does not checkpoint; call
-`hashes.Checkpoint()` to make pending writes durable.
-
-### Geographic index (S2)
-
-```go
-places, err := geoidx.New("./data/geo", geoidx.Config{
-	Namespace: common.NamespaceLocation,
-})
-if err != nil {
-	log.Fatal(err)
-}
-defer places.Close()
-```
-
-Reopen with `geoidx.Open(dir, config)`; use `geoidx.NewMemory(config)` for an
-in-memory index. Geography is stored as fixed level-19 S2 keys (about 20 m
-cells); coordinates become keys with `geoidx.KeyFromLatLng`. `Close` does not
-checkpoint; call `places.Checkpoint()` to persist pending mutations.
-
-### Key-value store
-
-`store` is a Pebble-backed collection for values that are not bitmap indexes,
-timestamps, vectors, similarity hashes, or geographic locations. The schema is
-persisted on creation and verified on every open.
-
-```go
-kv, err := store.Open("./data/kv",
-	store.Spec{Namespace: common.Namespace(200), Name: "metadata"},
-)
-if err != nil {
-	log.Fatal(err)
-}
-defer kv.Close()
-```
-
-## Add items
-
-### Bitmap namespaces
-
-Stage one or more entries in a reusable `Batch`, `Apply` to queue them, then
-`Barrier` to wait until they are WAL-appended and visible. `Remove` wins over
-`Add` for the same image and value.
-
-```go
-batch := tags.NewBatch()
-if err := batch.Add(
-	bitmapidx.Entry{ImageID: 100, Value: bitmapidx.EnumStringValue("Trekking")},
-	bitmapidx.Entry{ImageID: 200, Value: bitmapidx.EnumStringValue("Travel")},
-); err != nil {
-	log.Fatal(err)
-}
-if err := batch.Apply(); err != nil {
-	log.Fatal(err)
-}
-batch.Close()
-if err := tags.Barrier(); err != nil {
-	log.Fatal(err)
-}
-```
-
-Other value shapes use the same batch: `batch.Remove(...)` for removals,
-`batch.Move(bitmapidx.Move{ImageID, From, To})` for continuous values, and
-`batch.ReplaceText(...)` for text. For a continuous value of zero, use
-`batch.Add` or `batch.Remove`; `Move` uses zero to mean no value.
-
-```go
-batch := focals.NewBatch()
-if err := batch.Move(bitmapidx.Move{ImageID: 300, From: 24, To: 50}); err != nil {
-	log.Fatal(err)
-}
-if err := batch.Apply(); err != nil {
-	log.Fatal(err)
-}
-batch.Close()
-if err := focals.Barrier(); err != nil {
-	log.Fatal(err)
-}
-```
-
-### Geographic locations
-
-Each `ImageID` has at most one location, stored as a fixed-level S2 key. A move
-is `Delete(oldKey, id)` then `Insert(newKey, id)`; the caller supplies `oldKey`
-from `imagemetadata`, so the index keeps no reverse lookup.
-
-```go
 key, err := geoidx.KeyFromLatLng(37.7749, -122.4194)
-if err != nil {
-	log.Fatal(err)
-}
-if err := places.Insert(key, 300); err != nil {
-	log.Fatal(err)
-}
-```
-
-### Timestamps
-
-```go
-batch := timeidx.NewBatch(16)
-if !batch.Append(timeidx.Insert(100, createdAt)) {
-	log.Fatal("batch full")
-}
-batch.Append(timeidx.Move(200, oldTimestamp, newTimestamp))
-batch.Append(timeidx.Delete(300, timestamp))
-if err := times.Apply(batch); err != nil {
-	log.Fatal(err)
-}
-batch.Reset()
-```
-
-### Vectors
-
-```go
-if err := vectors.AddFloat32(100, embedding); err != nil {
-	log.Fatal(err)
-}
-// Delete tombstones the node; re-adding the ID replaces and reconnects it.
-if err := vectors.Delete(100); err != nil {
-	log.Fatal(err)
-}
-```
-
-### Similarity hashes
-
-```go
-// AppendBatch assigns dense IDs in order and returns the first one.
-first, err := hashes.AppendBatch([]simhash.Record{
-	{PHash: phash, PDQ: pdq, Quality: quality},
+if err != nil { return err }
+takenAt := uint64(1) << timeidx.TimestampShift
+err = db.Add(index.Entry{ValueID: 100,
+    Times:   []index.TimeValue{{Namespace: 90, Timestamp: takenAt}},
+    Geos:    []index.GeoValue{{Namespace: 91, Key: key}},
+    Bitmaps: []index.BitmapValue{
+        {Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")},
+        {Namespace: 40, Value: bitmapidx.Uint16Value(85)},
+    },
 })
-if err != nil {
-	log.Fatal(err)
-}
+if err != nil { return err }
 
-// UpsertBatch overwrites existing records in place via the batch redo WAL.
-if err := hashes.UpsertBatch([]simhash.Update{
-	{ImageID: first, Record: updated},
-}); err != nil {
-	log.Fatal(err)
-}
+engine, err := search.New(db)
+if err != nil { return err }
+favorite, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+if err != nil { return err }
+score, err := engine.BSIRange(40, bitmapidx.ValuesBetween(50, 90)) // inclusive
+if err != nil { return err }
+plan, err := engine.Compile(common.EntityImage, favorite, score)
+if err != nil { return err }
+ws := search.NewWorkspace(256) // caller-owned; not shared concurrently
+ids, err := plan.AppendIDs(context.Background(), nil, ws) // [100]
+if err != nil { return err }
+_ = ids
 ```
 
-### Key-value store
+For a complete runnable example with time and geo predicates, see
+`cmd/imageidx/examples/basic`; `cmd/imageidx` provides one-shot JSON and an
+HTTP server, `examples/service` demonstrates `search.Executor`, and
+`examples/bitmaponly` covers BSI and pagination.
+
+### Schema and store configuration reference
+
+| API | Purpose / options |
+|---|---|
+| `common.NewSchema`, `Register`, `RegisterAll`, `Lookup`, `LookupName`, `Defs`, `Len` | Define unique namespace numbers/names before `index.Create`. `NamespaceDef` contains `Namespace`, `Name`, `Kind`, `Entity`, and optional persisted `Config`. |
+| `index.BitmapDef(spec, name, entity)` | Bitmap enum/bool/text/continuous/BSI; `NamespaceSpec` selects `Kind`, optional `Normalizer` (enum), `Analyzer` (text), `Quant` (continuous), or `BSIWidth` (BSI, 16 or 32). Geography uses `KindGeo`, **not** the retired `KindBitmapGeo`. |
+| `index.VectorDef(cfg, name, entity)` | Persists `Namespace`, `Dimensions`, `ElementType`, `Metric` from `vectoridx.Config`. `Dimensions` and `ElementType` must be valid. |
+| `index.Create(dir, index.Spec{Schema: schema}, opts...)` | Creates one directory and all declared indexes; schema cannot be extended at runtime. |
+| `index.Open(dir, opts...)` | Opens an existing store and its persisted schema. Inspect `Health()`; an unavailable namespace need not prevent other namespaces from opening. Keep the store open for any plans or matcher bound to it. |
+| `index.WithDurability(d)` | `common.DurabilityOS` (default) or `common.DurabilitySync`; timeidx commits synchronously independently of this setting. |
+| `index.WithRadixArenaBytes(n)` | Runtime capacity for each exact-hash namespace; default 64 MiB. |
+| `index.Option` / `index.Options.Vector` | An `Option` can configure vector runtime policy, e.g. `func(o *index.Options) { o.Vector.EfSearch = 128 }`. The persisted dimensions/type/metric come from `VectorDef`, not runtime overrides. |
+
+The reserved liveness bitmap namespace is internal; do not register it yourself.
+`Store.Schema()` and `Store.NamespaceDef(ns)` return defensive copies;
+`Store.EntityOf(ns)` reports ownership. `Bitmap`, `Time`, `Geo`, `Hash`, `Sim`,
+and `Vector` return typed engine pointers and `ok=false` when a namespace is
+missing or unavailable. `BitmapStore()` exposes the owning bitmap store for
+ACL compilation; `Liveness(entity)` exposes the internal live predicate.
+
+### Write API and lifecycle
+
+`index.Entry` groups associations for **one** nonzero `ValueID`:
+
+| Field | Slice element and key fields | Notes |
+|---|---|---|
+| `Times` | `index.TimeValue{Namespace, Timestamp uint64}` | Time is unsigned nanoseconds since 1900-01-01 UTC (`timeidx` encoding). |
+| `Geos` | `index.GeoValue{Namespace, Key geoidx.S2Key}` | Obtain a fixed-level key with `geoidx.KeyFromLatLng`. An update to another key in the same namespace replaces the location. |
+| `Sims` | `index.SimValue{Namespace, Record simhash.Record}` | Perceptual IDs must be dense and sequential starting at 1; incompatible IDs return `ErrNamespaceIDModel`. |
+| `Hashes` | `index.HashValue{Namespace, Hash radixhash.Hash}` | Raw 32-byte digest; keep SHA-256/BLAKE3 in separate namespaces and hash outside the index. |
+| `Vectors` | `index.VectorValue{Namespace, Element, Float32/Int8/Uint8/Int16/Uint16}` | Set only the slice corresponding to `Element`; `ValueID` must fit the vector `uint32` node range. |
+| `Bitmaps` | `index.BitmapValue{Namespace, Value bitmapidx.Value}` | Values are type-checked against the namespace; see the bitmap section below. |
+
+`db.Add(entry)` upserts associations and marks the relevant entity live.
+`db.Update(index.Change{Before: old, After: next})` requires the same
+`ValueID`; **only** namespaces present in either side are reconciled. Supply
+`Before` for removals, especially stale exact-hash associations; absent from
+both means unchanged. `db.Delete(entity, id)` clears entity liveness first,
+then removes ID-authoritative engine records where supported. Old simhash and
+radixhash records may remain physically present; use an entity-scoped plan or
+the matcher to exclude deleted IDs.
 
 ```go
-key := store.Key{Namespace: common.Namespace(200), ID: 100}
-if err := kv.Set(key, []byte("camera: X100V")); err != nil {
-	log.Fatal(err)
-}
-if err := kv.Delete(key); err != nil {
-	log.Fatal(err)
-}
+batch := db.NewBatch(64) // private, reusable; not safe for concurrent staging
+if err := batch.Add(entry); err != nil { return err }
+if err := batch.Update(index.Change{Before: old, After: next}); err != nil { return err }
+if err := batch.Delete(common.EntityImage, 7); err != nil { return err }
+if err := db.Apply(batch); err != nil { return err }
+if err := batch.Reset(); err != nil { return err }
 ```
 
-## Search
+`Batch.Len()` counts staged operations. `ApplyWithGeneration(batch, generation)`
+also records canonical-source completeness after a durability barrier;
+`SourceGeneration()` returns the minimum confirmed generation across declared
+namespaces and `CheckSourceGeneration(required)` returns `ErrIndexStale` if
+behind. Ordinary `Apply` does not advance this watermark.
 
-### Bitmap namespaces
+`Store.Sync`, `Checkpoint`, `Compact`, `Verify`, and `Close` serve different
+purposes: Sync flushes engines; Checkpoint writes their durable snapshots;
+Compact reduces supported engine deltas; Verify validates exposed files;
+Close drains owned engines. Check return values. `Dir`, `Generation`, `Health`,
+`HealthOf`, `DegradedNamespaces`, and `RecoveryNamespaces` aid diagnostics.
+After rebuilding affected namespaces from canonical data, `ClearRecovery`
+clears an interrupted-batch recovery marker—do not use it to declare damaged
+indexes healthy without rebuilding them.
 
-```go
-// MatchValues requires every supplied value (AND).
-match, err := tags.MatchValues(bitmapidx.EnumStringValue("Trekking"))
-if err != nil {
-	log.Fatal(err)
-}
-ids := match.AppendTo(nil)
+**Consistency:** the unified store serializes writes, but a multi-engine
+batch is not a database-wide atomic transaction and searches are not a
+cross-engine snapshot. Mutations are prevalidated; on a partial failure the
+intended namespaces become stale/unavailable. Additions publish values before
+liveness and deletions remove liveness first. A crash during a risky batch can
+leave a recovery marker that requires rebuilding the affected namespaces.
+See [`index/README.md`](index/README.md) for recovery and persistence details.
 
-travelers, err := tags.ValueIDs(nil, bitmapidx.EnumStringValue("Travel")) // one value, sorted IDs
-count, err := tags.CountValues(bitmapidx.EnumStringValue("Trekking"))
-```
+## Search API
 
-Continuous namespaces use range queries:
+`search.New(db)` binds a unified store. `engine.Compile(entity, clauses...)`
+checks namespace ownership, rejects foreign or mismatched indexes, and adds the
+entity's liveness predicate automatically. The plan keeps index pointers, so
+keep the store open. All clauses are conjunctive (AND); only ACL principals are
+unioned internally. Standalone `search.Compile(clauses...)` omits liveness;
+`search.CompileWithStore(bitmapStore, clauses...)` additionally resolves ACL
+postings; `search.SearchOnce(ctx, dst, clauses...)` is the single-use shortcut.
 
-```go
-match, err := focals.Range(bitmapidx.Between(24, 70)) // int64 grid bounds
-ids = match.AppendTo(nil)
-```
+### Clause constructors
 
-Text queries analyze the query and AND its tokens:
+| Unified `Engine` helper | Standalone clause | Meaning |
+|---|---|---|
+| `Values(ns, values...)` | `AllValues(idx, values...)` | Every typed bitmap value must be present; empty lists are invalid. |
+| Obtain `engine.Bitmap(ns)` then call constructor | `NamespaceText(idx, text)` | Require all analyzed tokens (string namespace). |
+| Obtain `engine.Bitmap(ns)` then call constructor | `NamespaceRange(idx, bitmapidx.Between(lo, hi))` | Signed continuous-grid range, `[lo,hi)`; `AtLeast`, `AtMost`, and explicit `NumericRange` select open/inclusive bounds. |
+| `BSIRange(ns, bitmapidx.ValuesBetween(lo, hi))` | `NamespaceBSIRange(idx, range)` | Unsigned BSI range, **inclusive** for `ValuesBetween`; `ValuesAtLeast`, `ValuesAtMost` or explicit `ValueRange` support open/exclusive bounds. Width mismatches error at compile. |
+| `During(ns, start, end, search.ExactTimestamp(lookup))` | `During(idx, start, end, options...)` | `[start,end)` timestamps; without an exact lookup coarse buckets can admit false positives. Empty ranges match nothing. |
+| `InCells(ns, cellIDs...)` | `InCells(idx, cellIDs...)` | Union S2 cells (level 19 or coarser; validated at compile). |
+| `ExactHash(ns, search.HashSHA256, digest)` | `ExactHash(idx, algorithm, digest)` | Bit-exact SHA-256/BLAKE3 digest; caller must match the label to the digest family: radixhash does **not** persist/verify the algorithm. Standalone clause is not bound to a unified namespace. |
+| — | `WithACL(userID, authenticatedGroupIDs...)` | One user OR authenticated groups, intersected with other clauses. `Engine.Compile` accepts ACL for `EntityImage` only. Configure `NamespaceUserACL`/`NamespaceGroupACL` as enum namespaces and authenticate group membership externally. |
 
-```go
-match, err := titles.MatchText("golden gate bridge")
-```
+`engine.Hash(ns)` retrieves an exact-hash engine; `engine.Time/Geo/Bitmap`
+retrieve the other supported clause engines. Perceptual matching uses
+`index.Matcher`, not a search clause. Vector ANN is a separate ranked source,
+not a plan clause. `search.HashUnknown` is invalid; use `HashSHA256` or
+`HashBLAKE3`.
 
-### Timestamps
+### Plan execution and buffers
 
-```go
-results := make([]timeidx.ImageID, 0, 256)
-results = times.Search(results, start, end) // half-open [start, end)
-```
+| Operation | Result / behavior |
+|---|---|
+| `AppendIDs(ctx, dst, ws)` / `Search(...)` | Append sorted, unique IDs; preserve any existing destination prefix. `SearchWithMetrics(..., *SearchMetrics)` instruments the same operation. |
+| `AppendPage(ctx, dst, ws, search.Page{AfterID, Limit})` | At most positive `Limit` IDs strictly after `AfterID`; cursor is by ID, not score. Updates between pages are visible. |
+| `FilterIDs(ctx, dst, candidates, ws)` | Keep input order and duplicates; `dst=candidates[:0]` is supported. `FilterIDsWithMetrics` reports stages. |
+| `Count(ctx, ws)`, `Exists(ctx, ws)` | Verified count or early existence; bitmap cardinality paths avoid an ID result slice where possible. |
+| `Visit(ctx, ws, func(id) bool)` | Stream sorted matches; return `false` to stop. Do not re-enter with the same workspace. |
+| `RankTime(ctx, dst, ws, lookup, target, k)` | Top-k by exact unsigned timestamp gap; `Result{ImageID, Score uint64}`. |
+| `RankGeo(ctx, dst, ws, lat, lng, lookup, k)` | Top-k by canonical-coordinate haversine meters; `GeoResult{ImageID, Score float64}`. |
+| `FilterRanked(ctx, dst, ws, ranked, imageID, score)` | Filter supplied ranked entries (e.g. vector ANN) while retaining order and score; over-fetch when selective filters might underfill. |
+| `Refresh(ctx)`, `Stages()`, `Estimate()`, `Len()`, `IsEmpty()` | Refresh ordering hints without recompiling predicates; inspect stage capabilities/estimates. `IsEmpty` is structural only. |
 
-### Vectors
-
-```go
-results, err := vectors.SearchFloat32(query, nil, 10) // nearest 10, squared L2
-if err != nil {
-	log.Fatal(err)
-}
-for _, r := range results {
-	log.Println(r.ValueID, r.Score)
-}
-```
-
-### Geographic (S2)
-
-```go
-ids, err := places.SearchRadius(nil, 37.7749, -122.4194, 2000) // within 2 km
-ids = places.SearchRect(nil, rect)                            // bounding box
-ids = places.SearchPolygon(nil, polygon)                      // polygon
-near, err := places.Nearest(nil, 37.7749, -122.4194, 10)       // []geoidx.Result
-```
-
-For precomputed covers, `places.SearchRanges(dst, ranges)` scans normalized
-`geoidx.Range` values. Results are in ascending `ImageID` order.
-`geoidx.Result.Distance` is the great-circle distance in meters from the query to
-the matched cell center; images in the same S2 cell are tied, and radius results
-require that distance to be within the radius.
-
-When geography filters an existing bitmap, use the FilterBy path so no sorted
-slice is built:
-
-```go
-// Geo ∩ existing candidate bitmap, in native S2 order (no global sort).
-mutable.Reset()
-places.FilterRect(mutable, candidates, rect)
-matched := mutable.AppendTo(matched[:0])
-
-// Direct collection geo → bitmap.
-mutable.Reset()
-_ = places.CollectRadius(mutable, 37.7749, -122.4194, 2000)
-```
-
-The same `Filter*` / `Collect*` pairs exist for cells, ranges, rectangles,
-polygons, and radii.
-
-Migration: the old `KindBitmapGeo` bitmap namespace is no longer supported and is
-not readable. Rebuild the geographic index from canonical image metadata —
-`geoidx.KeyFromLatLng` per image, `InsertBatch`, then `Compact`. Non-geographic
-bitmap namespaces are unchanged.
-
-### Similarity (pHash / PDQ)
+`RankTimeWithMetrics` and `RankGeoWithMetrics` add rank-phase measurements.
+`k == 0` returns an unchanged destination; `k < 0` ranks all matches. `FilterTime`
+and `FilterGeo` filter supplied candidate slices without a plan. Nil or zero
+value `Workspace` is valid; it is private to one execution and retains scratch
+between calls. Use `NewWorkspace(capacity)`, `EnsureCapacity`, `Reset`, `Cap`,
+`RetainedBytes`, and `Trim` to manage reuse. Plans can be shared across readers
+while the store remains open; there is no global snapshot.
 
 ```go
-phMatches := hashes.SearchPHash(nil, phash, 8) // pHash Hamming distance <= 8
-pdqMatches := hashes.SearchPDQ(nil, &pdq, 31)  // PDQ Hamming distance <= 31
-for _, m := range pdqMatches {
-	log.Println(m.ImageID, m.Distance)
-}
-```
-
-`simhash.Result` carries the exact Hamming `Distance` as `uint8`; results are in
-ascending `ImageID` order. The PDQ search radius is clamped to
-`simhash.MaxPDQSearchDistance` (128). `hashes.SearchPDQBulk(nil, &pdq, 31)` is
-the same query through the SIMD kernel and requires a quiescent store.
-
-### Key-value store
-
-```go
-value, err := kv.Get(store.Key{Namespace: common.Namespace(200), ID: 100})
-if err != nil {
-	log.Fatal(err)
-}
-log.Println(string(value))
-
-err = kv.Scan(common.Namespace(200), func(key store.Key, value []byte) error {
-	log.Println(key.ID, string(value))
-	return nil
+executor, err := search.NewExecutor(search.ExecutorConfig{
+    WorkspaceCapacity: 4096, MaxRetainedBytes: 8 << 20,
 })
+if err != nil { return err }
+executor.Prewarm(4)
+ids, err := executor.AppendIDs(ctx, nil, plan)
+count, err := executor.Count(ctx, plan)
 ```
 
-### Combined search
+`Executor` also offers `Search`, `SearchWithMetrics`, `AppendPage`,
+`FilterIDs`, `FilterIDsWithMetrics`, and `Exists`. `MaxRetainedBytes` is a
+**per-idle-workspace** cap, not a process cap. Metrics are opt-in and
+caller-owned (`search.NewSearchMetrics(plan)`); the uninstrumented path avoids
+timing overhead. See [`search/README.md`](search/README.md) for ranking fusion
+and [`search/PERFORMANCE.md`](search/PERFORMANCE.md) for benchmarks.
 
-Clauses are combined with AND semantics and executed in cardinality order:
+### ACL grants and principals
+
+`search.NewUserACL(common.UserID(id))` and `NewGroupACL(common.GroupID(id))`
+validate nonzero IDs and encode them as enum values for the dedicated bitmap
+namespaces. `WithACL` uses the user's posting plus postings for the supplied
+authenticated groups; it does not establish group membership. For grants,
+bind `search.NewUserGrants(userBitmap)` and
+`search.NewGroupGrants(groupBitmap)` to the dedicated namespaces, then call
+each handle's `Add(principalID, imageIDs...)` or `Remove(...)`. Grant helpers
+wait for the bitmap write barrier; granting an unknown image ID can create a
+posting, so the unified entity liveness filter remains essential. Compile
+against the unified store for automatic image liveness, or with
+`CompileWithStore` when using a standalone bitmap store. Do not apply image
+grants to non-image entities.
+
+## Import matching: exact and perceptual hashes
+
+`db.Matcher(index.MatcherSpec{SHA256: shaNS, BLAKE3: blakeNS, Perceptual: simNS})`
+binds image namespaces. Zero namespace numbers skip an unneeded family.
+`MatchItem` has optional `SHA256` and `BLAKE3` pointers to
+`radixhash.Hash`, `PHash *uint64`, and `PDQ *simhash.PDQHash`; nil fields are
+skipped. `MatchParams{PHashDistance, PDQDistance, DetectIntraBatch}` uses native
+Hamming radii, clamps PDQ distance to `simhash.MaxPDQSearchDistance`, and can
+report duplicates among incoming items. `Match`/`MatchOne` append live image
+hits; `MatchWithWorkspace` accepts reusable `MatchWorkspace{Exact, Similar}`
+scratch. `Match{Item, Kind, ImageID, Distance, Intra, Peer}` distinguishes
+stored hits from intra-batch peers. This import workflow does not create
+application stack/asset records.
+
+## Standalone engine API reference
+
+The unified store owns its engines and their lifecycle: do **not** close a
+pointer returned by `db.Bitmap/Time/Geo/Hash/Sim/Vector` separately. Standalone
+constructors below are for independent stores and experiments. They do not
+automatically share unified liveness or crash coordination.
+
+### `index/bitmapidx`
+
+`NewMemory(spec, NamespaceConfig{})` creates a single in-memory namespace;
+`NewStore(dir, []NamespaceSpec{...}, config, durability)` and
+`OpenStore(dir, config, durability)` manage a standalone persistent bitmap
+store. `NamespaceConfig` has `ActiveTarget` (rotate delta), `HardDeltaLimit`
+and `MaxDeltaValues` (bound visible deltas), and `CompactDelay` (delay
+background compaction); zero selects defaults.
+
+| Namespace shape | Values / writes | Reads |
+|---|---|---|
+| Enum | `EnumStringValue`, `EnumBytesValue`; `Batch.Add/Remove` | `MatchValues`, `ValueIDs`, `CountValues`, `FilterValues`, `Compile` |
+| Bool | `BoolValue`; `Batch.Add/Remove` | Same value-query methods; false differs from absent |
+| String | `NamespaceSpec.Analyzer` (`CodecSpec`); `Batch.ReplaceText` | `MatchText`, `CompileText` (all analyzed tokens) |
+| Continuous | `IntValue` on the stored signed grid; `Batch.Move` or Add/Remove | `Range`, `EstimateRange`, `CountRange`, `FilterRange`; `Between` is half-open |
+| BSI | `Uint16Value` / `Uint32Value` with configured `BSIWidth16/32`; `Set`, `Delete`, `Batch.BSIMove` | `Get`, `Equal`, `NotEqual`, `Less`, `LessOrEqual`, `Greater`, `GreaterOrEqual`, `BSIRangeQuery`, `BSICountRange`, `BSIFilterRange` |
+
+`BSIRange(min,max)` and `ValuesBetween(min,max)` include both endpoints;
+BSI zero is a stored value, distinct from absence. Width overflow errors,
+not truncates. Numeric `Quantizer{Code,Version,Scale,Offset}` documents how
+applications encode continuous values; the API takes the already-converted
+grid value. Text has no reverse document lookup: replacements need previous
+and new tokens. A namespace `Batch` supports `Add`, `Remove`, `Move`,
+`ReplaceText`, `BSIMove`, `Apply`, `Reset`, and `Close`; `Apply` queues work and
+`Index.Barrier()` waits for committed visibility. Standalone maintenance:
+`Compact`, `Vacuum`, `WaitIdle`, `Close`/store `Checkpoint`.
+
+### `index/timeidx`
+
+`NewMemory(spec, config)`, `NewStore(dir, spec, config, durability)`,
+`OpenStore(dir, config, durability)`, and `OpenNamespace(dir, ns, config,
+durability)` create/open timestamp indexes. Use `timeidx.NewBatch(capacity)`
+with `Insert(id, timestamp)`, `Move(id, before, after)`, `Delete(id,
+timestamp)` and `Index.Apply(batch)`; reset the batch for reuse. `Search(dst,
+start,end)` is a half-open candidate scan; `SearchExact(..., lookup)` verifies
+against canonical timestamps. `EstimateRange`, `Len`, `Sync`, `Checkpoint`,
+`Compact`, `Vacuum`, and generation checks are available. `Config.MaxShardBytes`
+sets the shard payload cap, `MaxFileBytes` the initial sparse arena;
+`BlockSize`, `DeltaCapacity`, `WriteQueueCapacity`, and `CompactionQueue` are
+legacy/deprecated tuning fields, not a preferred path.
+
+### `index/geoidx`
+
+Use `NewMemory(config)`, `New(dir, config)`, `Open(dir, config)`, or the
+single-file `NewFile`/`OpenFile` forms. `Config.Namespace` labels standalone
+indexes; `MaxCells` sets the default cover budget; `TargetDelta`,
+`CompactionTrigger`, `MaxDelta`, `TargetShardBytes`, `MinShardBytes`,
+`MaxShardBytes`, and `MaxFileBytes` control memory/write/storage bounds (zero
+selects defaults). Convert coordinates via `KeyFromLatLng` or
+`CellIDFromLatLng`. `Insert`, `Delete`, `InsertBatch`, `DeleteBatch`, and
+`Apply(inserts,deletes)` mutate keys. **Insertion is ID-authoritative**: an
+insert at a new key moves the ID without requiring a separate delete of its
+old key. A query uses `SearchCell`, `SearchRanges`, `SearchRect`,
+`SearchPolygon`, `SearchCover`, `SearchRadius`, `SearchRadiusResults`, or
+`Nearest`. Geography is resolved to S2 level 19 (~20 m); `Result.Distance`
+measures to the cell center, not an independently stored exact coordinate.
+`CoverOptions{MaxCells}` bounds region covers. For bitmap input/output, use
+`FilterCell/Ranges/Rect/Polygon/Cover/Radius` or the analogous `Collect*`
+methods with `roar.MutableBitmap`. `Sync`, `Checkpoint`, and `Compact` are
+separate; close is not a substitute for an explicit checkpoint.
+
+### `index/radixhash` and `index/simhash`
+
+Exact hashes: `radixhash.New(arenaBytes, config)`, `NewWithArena`,
+`NewMmap(path, arenaBytes, config)`, and `OpenMmap(path, config)`; use
+`Apply([]Entry)`, `Remove([]Entry)`, `Lookup(dst, hash)`, `LookupFiltered`,
+`Contains`, and `Count`. `Config.PromotionBytes`, `MaxLeafSlots`, and
+`AutoReclaimBytes` tune tree promotion/reclamation; zero selects defaults.
+`Sync`, `Checkpoint`, `Compact`, `Reclaim`, `Close` manage storage/lifetime.
+`radixhash` does not hash content or record an algorithm identifier.
+
+Perceptual hashes: `simhash.Open(dir, config)` opens or creates a store;
+`OpenFile(prefix, config)` names files within a shared directory. `Config` has
+`MaxShardBytes` (default 4 GiB), `SeqBlockRecords` (power of two dividing
+65,536; default 1024), and `Durability`. `Append`/`AppendBatch` assign dense
+IDs; `Upsert`/`UpsertBatch` update existing records; `Get`, `Quality`,
+`SearchPHash`, `SearchPDQ`, and `SearchPDQBulk` expose reads. Results carry
+exact native Hamming distance in ascending ID order. `Sync`, `Checkpoint`,
+`Close` are distinct; explicitly checkpoint as required by your durability
+policy.
+
+### `index/vectoridx`
+
+`NewMemory(config)`, `NewStore(path, config, durability, opts...)`, and
+`OpenStore(path, durability, opts...)` create/open a vector space. The
+`Config` requires a nonzero namespace, supported dimensions (`Dim512`,
+`Dim768`, `Dim1024`), and an explicit element type (`ElementInt8`,
+`ElementUint8`, `ElementInt16`, `ElementUint16`, `ElementFloat32`). `Metric`
+is `MetricL2` (default), `MetricCosine`, or `MetricDot`. Mutate with the
+type-matched `AddFloat32/Int8/Uint8/Int16/Uint16` or `Delete`; `AddAsync`
+and `DeleteAsync` queue background work. `SearchFloat32/Int8/Uint8/Int16/Uint16`
+and the corresponding `SearchInto*` methods return ranked `Result`s;
+`ExactSearchFloat32` is a full-scan reference. `CandidateFilter` (or nil for
+all live nodes) gates returned IDs, not graph traversal. `SearchWithFilterHint`
+allows an estimated filter cardinality. `Sync`, `Checkpoint`, `Compact`,
+`Vacuum`, `Verify`, `WaitIdle`, `Stats`, and `Metadata` support maintenance.
+
+| `vectoridx.Config` option | Meaning |
+|---|---|
+| `M`, `M0`, `EfConstruction`, `EfSearch` | Graph degree/build/search budget; zero selects defaults. |
+| `DynamicEfFactor`, `DynamicEfMin`, `DynamicEfMax` | Dynamic search budget; zero factor disables. |
+| `FlatSearchCutoff`, `FlatThreshold` | Exact-scan thresholds; zero defaults, negative disables/forces ANN as defined by each field. |
+| `OversampleFactor`, `FilterAware`, `DisableFilterAware` | Filtered search oversampling/filter-aware behavior. |
+| `UseHeuristic`, `DisableHeuristic` | Diversity-based neighbor selection; enabled by default unless disabled. |
+| `AutoCompactRatio`, `CompactMinNodes` | Async tombstone compaction; ratio zero disables. |
+| `AutoVacuumDeltas`, `AutoVacuumFragmentation` | Async delta vacuum triggers; zero disables. |
+
+Persistent vector constructor options include `vectoridx.WithSyncInterval`
+and `vectoridx.WithWALSegmentBytes`. The unified store routes vector values
+using `index.VectorValue` and applies its runtime `index.Options.Vector` policy.
+IDs must fit `uint32`; results identify `ValueID`/`NodeID` rather than an
+arbitrary application object. ANN results can be filtered through
+`search.Plan.FilterRanked` (provide an ID and integer-score projection), or
+ranked/fused with `search/ranking`.
+
+### `store`: separate key-value collection
+
+`store.Open(dir, specs ...store.Spec)` opens or creates a Pebble-backed store;
+on creation define each `Spec{Namespace, Name}` and keep them stable on reopen.
+This is **not** added to `index.Store` or searched by `search.Plan`.
 
 ```go
-plan, err := search.Compile(
-	search.AllValues(tags, bitmapidx.EnumStringValue("Trekking")),
-	search.During(times, start, end),
-	search.InCells(places, cellIDs...),
-)
-if err != nil {
-	log.Fatal(err)
-}
-
-matches := make([]search.ImageID, 0, 256)
-matches, err = plan.AppendIDs(ctx, matches, search.NewWorkspace(4_096))
+kv, err := store.Open("./data/kv", store.Spec{Namespace: 200, Name: "metadata"})
+if err != nil { return err }
+defer kv.Close()
+key := store.Key{Namespace: 200, ID: 100}
+if err := kv.Set(key, []byte("camera: X100V")); err != nil { return err }
+value, err := kv.Get(key)
+err = kv.Scan(200, func(key store.Key, value []byte) error { return nil })
+err = kv.Delete(key)
 ```
 
-For a one-off query, `search.SearchOnce(ctx, dst, clauses...)` compiles and
-executes immediately.
+Check each error before continuing in real code. See the package APIs for
+zero-copy/ownership details of returned values.
+
+## Ranking, performance and further references
+
+`Plan.RankTime` and `Plan.RankGeo` retain full-precision scores. For presentation,
+`search/ranking` encodes independent lanes to `uint16` ranks (`NoRank=0`,
+`MaxRank=65535`), with `EncodeDistance`, `EncodeGeoDistance`,
+`EncodeTimeDistance`, `QuantizeCosine`, and bulk helpers. `Signals` holds up to
+`MaxSignals` (4) positional lanes; `RRF.Fuse` performs reciprocal-rank fusion
+(`K` defaults to `DefaultRRFK=60`). `Sort` or `TopK` orders final IDs/ranks;
+callers own buffers and must not share an `RRF` instance concurrently. The
+`...WithMetrics` forms add opt-in rank-phase measurements.
+
+```sh
+go run ./cmd/imageidx
+go run ./cmd/imageidx/examples/basic
+go run ./cmd/imageidx/examples/service
+go run ./cmd/imageidx/examples/bitmaponly
+go build ./...
+go test ./...
+go test -race ./...
+```
+
+See [`index/README.md`](index/README.md) for crash/recovery details,
+[`search/README.md`](search/README.md) for planning/ranking examples, and
+[`AGENTS/README.md`](AGENTS/README.md) for current agent guidance versus
+historical design notes.

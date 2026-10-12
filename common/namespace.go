@@ -52,9 +52,9 @@ const (
 
 	// KindTimestamp is a timeidx timestamp index.
 	KindTimestamp NamespaceKind = 2
-	// KindHashExact is a hashidx exact-content 256-bit digest index.
+	// KindHashExact is a radixhash exact-content 256-bit digest index.
 	KindHashExact NamespaceKind = 3
-	// KindHashPerceptual is a hashidx perceptual index (pHash64 and PDQ).
+	// KindHashPerceptual is a simhash perceptual index (pHash64 and PDQ).
 	KindHashPerceptual NamespaceKind = 4
 	// KindVector is a vectoridx approximate-nearest-neighbor space.
 	KindVector NamespaceKind = 5

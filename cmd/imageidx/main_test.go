@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"slices"
 	"testing"
+
+	common "github.com/evanoberholster/imageIdx/common"
 )
 
 func TestRunOnce(t *testing.T) {
@@ -44,5 +46,29 @@ func TestSearchHandler(t *testing.T) {
 	}
 	if !slices.Equal(body.ImageIDs, []uint64{100, 200}) {
 		t.Fatalf("image IDs = %v", body.ImageIDs)
+	}
+}
+
+func TestSearchHandlerExcludesDeletedImages(t *testing.T) {
+	service, err := newDemoService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	if err := service.store.Delete(common.EntityImage, 100); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/search?start=%d&end=%d&cell=%d", demoQuantum, 3*demoQuantum, service.demoCell)
+	response := httptest.NewRecorder()
+	service.handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var body searchResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(body.ImageIDs, []common.ImageID{200}) {
+		t.Fatalf("image IDs after deletion = %v", body.ImageIDs)
 	}
 }

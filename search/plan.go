@@ -45,7 +45,7 @@ func (kind StageKind) String() string {
 type Stage struct {
 	Kind     StageKind
 	Estimate uint64
-	// Namespace is zero for timestamp, ACL, and hash stages. Predicate describes semantics.
+	// Namespace is zero for timestamp, ACL, and standalone hash stages.
 	Namespace        common.Namespace
 	Predicate        string
 	CanProbe         bool
@@ -62,10 +62,11 @@ type stage struct {
 	kind     StageKind
 	estimate uint64
 
-	namespaceIndex *bitmapidx.Index
-	namespaceKind  namespaceClauseKind
-	namespaceQuery bitmapidx.Query
-	namespaceRange bitmapidx.NumericRange
+	namespaceIndex    *bitmapidx.Index
+	namespaceKind     namespaceClauseKind
+	namespaceQuery    bitmapidx.Query
+	namespaceRange    bitmapidx.NumericRange
+	namespaceBSIRange bitmapidx.ValueRange
 
 	tsIndex *timeidx.Index
 	tsStart uint64
@@ -80,6 +81,7 @@ type stage struct {
 	hashIndex     *radixhash.Index
 	hashAlgorithm HashAlgorithm
 	hashValue     radixhash.Hash
+	hashNamespace common.Namespace
 }
 
 func (s *stage) metadata() Stage {
@@ -96,6 +98,8 @@ func (s *stage) metadata() Stage {
 			meta.Predicate = "all-tokens"
 		case namespaceRange:
 			meta.Predicate = "numeric-range"
+		case namespaceBSIRange:
+			meta.Predicate = "bsi-range"
 		}
 	case StageGeo:
 		meta.Namespace = s.geoIndex.Namespace()
@@ -105,6 +109,7 @@ func (s *stage) metadata() Stage {
 	case StageACL:
 		meta.Predicate = "any-principal"
 	case StageHash:
+		meta.Namespace = s.hashNamespace
 		meta.Predicate = "exact-hash"
 		meta.Algorithm = s.hashAlgorithm
 	}
@@ -145,6 +150,13 @@ func (s *stage) collect(dst []ImageID) ([]ImageID, error) {
 			}
 			return match.AppendTo(dst), nil
 		}
+		if s.namespaceKind == namespaceBSIRange {
+			match, err := s.namespaceIndex.BSIRangeQuery(s.namespaceBSIRange)
+			if err != nil {
+				return dst, err
+			}
+			return match.AppendTo(dst), nil
+		}
 		match, err := s.namespaceQuery.Match()
 		if err != nil {
 			return dst, err
@@ -176,6 +188,9 @@ func (s *stage) filter(dst, candidates, scratch []ImageID, ws *Workspace) ([]Ima
 		if s.namespaceKind == namespaceRange {
 			filtered, err := s.namespaceIndex.FilterRange(dst, candidates, s.namespaceRange)
 			return filtered, err
+		}
+		if s.namespaceKind == namespaceBSIRange {
+			return s.namespaceIndex.BSIFilterRange(dst, candidates, s.namespaceBSIRange)
 		}
 		filtered, err := s.namespaceQuery.Filter(dst, candidates)
 		return filtered, err
@@ -330,6 +345,9 @@ func compile(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 			case namespaceRange:
 				st.namespaceRange = value.bounds
 				st.estimate, err = value.index.EstimateRange(value.bounds)
+			case namespaceBSIRange:
+				st.namespaceBSIRange = value.bsiBounds
+				st.estimate, err = value.index.BSICountRange(value.bsiBounds)
 			default:
 				return Plan{}, ErrInvalidClause
 			}
@@ -407,6 +425,7 @@ func compile(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 					hashIndex:     value.index,
 					hashAlgorithm: value.algorithm,
 					hashValue:     value.hash,
+					hashNamespace: value.namespace,
 				},
 				order: clauseIndex,
 			})
@@ -463,6 +482,8 @@ func (plan Plan) Refresh(ctx context.Context) (Plan, error) {
 		case StageNamespace:
 			if st.namespaceKind == namespaceRange {
 				st.estimate, err = st.namespaceIndex.EstimateRange(st.namespaceRange)
+			} else if st.namespaceKind == namespaceBSIRange {
+				st.estimate, err = st.namespaceIndex.BSICountRange(st.namespaceBSIRange)
 			} else {
 				st.estimate = st.namespaceQuery.Estimate()
 			}

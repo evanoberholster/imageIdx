@@ -124,6 +124,8 @@ func (plan Plan) probe(ctx context.Context, candidates []ImageID, ws *Workspace,
 		case StageNamespace:
 			if st.namespaceKind == namespaceRange {
 				candidates, err = st.namespaceIndex.FilterRange(candidates[:0], candidates, st.namespaceRange)
+			} else if st.namespaceKind == namespaceBSIRange {
+				candidates, err = st.namespaceIndex.BSIFilterRange(candidates[:0], candidates, st.namespaceBSIRange)
 			} else {
 				candidates, err = st.namespaceQuery.Filter(candidates[:0], candidates)
 			}

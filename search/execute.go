@@ -38,6 +38,9 @@ func (plan Plan) Count(ctx context.Context, workspace *Workspace) (uint64, error
 		if stage.namespaceKind == namespaceRange {
 			return stage.namespaceIndex.CountRange(stage.namespaceRange)
 		}
+		if stage.namespaceKind == namespaceBSIRange {
+			return stage.namespaceIndex.BSICountRange(stage.namespaceBSIRange)
+		}
 		return stage.namespaceQuery.Count()
 	}
 	bitmapOnly := true

@@ -25,6 +25,9 @@ func (s *stage) bitmap() (roar.Bitmap, error) {
 	if s.namespaceKind == namespaceRange {
 		return s.namespaceIndex.Range(s.namespaceRange)
 	}
+	if s.namespaceKind == namespaceBSIRange {
+		return s.namespaceIndex.BSIRangeQuery(s.namespaceBSIRange)
+	}
 	return s.namespaceQuery.Match()
 }
 
