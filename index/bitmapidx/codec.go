@@ -70,6 +70,8 @@ func bitmapKindCode(kind common.NamespaceKind) byte {
 		return 3
 	case common.KindBitmapContinuous:
 		return 4
+	case common.KindBitmapBSI:
+		return 5
 	default:
 		return 0
 	}
@@ -85,6 +87,8 @@ func bitmapKindFromCode(code byte) common.NamespaceKind {
 		return common.KindBitmapString
 	case 4:
 		return common.KindBitmapContinuous
+	case 5:
+		return common.KindBitmapBSI
 	default:
 		return 0
 	}
@@ -98,9 +102,10 @@ func appendNamespace(out []byte, namespace NamespaceSpec) []byte {
 	out = binary.LittleEndian.AppendUint16(out, namespace.Quant.Version)
 	out = binary.LittleEndian.AppendUint64(out, uint64(namespace.Quant.Scale))
 	out = binary.LittleEndian.AppendUint64(out, uint64(namespace.Quant.Offset))
-	// Four reserved bytes replace the removed geo codec slot so the persisted
+	// The removed geo codec slot is repurposed: byte 0 carries the BSI width
+	// (zero for non-BSI kinds), the rest stay reserved so the persisted
 	// registry layout is unchanged.
-	out = append(out, 0, 0, 0, 0)
+	out = append(out, namespace.BSIWidth, 0, 0, 0)
 	out = appendCodec(out, namespace.Normalizer)
 	out = appendCodec(out, namespace.Analyzer)
 	return out
@@ -124,6 +129,7 @@ func decodeNamespace(data []byte, offset int) (NamespaceSpec, int, error) {
 	namespace := NamespaceSpec{
 		Namespace: common.Namespace(binary.LittleEndian.Uint16(data[offset : offset+2])),
 		Kind:      bitmapKindFromCode(data[offset+2]),
+		BSIWidth:  data[offset+28], // former geo codec slot byte 0
 		Flags:     binary.LittleEndian.Uint32(data[offset+4 : offset+8]),
 		Quant: Quantizer{
 			Code:    binary.LittleEndian.Uint16(data[offset+8 : offset+10]),
@@ -131,7 +137,7 @@ func decodeNamespace(data []byte, offset int) (NamespaceSpec, int, error) {
 			Scale:   int64(binary.LittleEndian.Uint64(data[offset+12 : offset+20])),
 			Offset:  int64(binary.LittleEndian.Uint64(data[offset+20 : offset+28])),
 		},
-		// Bytes offset+28..31 are the former geo codec slot; reserved now.
+		// Bytes offset+29..31 are the former geo codec slot; reserved now.
 	}
 	normalizer, next, err := decodeCodec(data, offset+32)
 	if err != nil {

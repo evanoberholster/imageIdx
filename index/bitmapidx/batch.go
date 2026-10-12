@@ -36,6 +36,7 @@ type Batch struct {
 	remove       []Entry
 	moves        []Move
 	replacements []TextReplacement
+	bsi          []bsiOp
 	inFlight     atomic.Bool
 	sealed       atomic.Bool
 }
@@ -48,7 +49,8 @@ func (i *Index) NewBatch() *Batch {
 }
 
 // Add stages membership additions. Already-present memberships are
-// no-ops at commit. Text namespaces reject Add; use ReplaceText.
+// no-ops at commit. Text namespaces reject Add; use ReplaceText. For a BSI
+// namespace, Add is an unconditional set (upsert) of the BSI value.
 func (b *Batch) Add(entries ...Entry) error {
 	if b.sealed.Load() {
 		return ErrBatchClosed
@@ -56,6 +58,26 @@ func (b *Batch) Add(entries ...Entry) error {
 	namespace := b.index.spec()
 	if namespace.Kind == common.KindBitmapString {
 		return ErrUnsupportedOperation
+	}
+	if namespace.Kind == common.KindBitmapBSI {
+		for _, entry := range entries {
+			if entry.ImageID == 0 {
+				return ErrInvalidImageID
+			}
+			if entry.Value.Kind != common.KindBitmapBSI {
+				return ErrValueKind
+			}
+			if entry.Value.Int < 0 {
+				return ErrBSIValueRange
+			}
+			if err := checkBSIValue(namespace.BSIWidth, uint64(entry.Value.Int)); err != nil {
+				return err
+			}
+			if err := b.stageBSI(bsiOp{id: entry.ImageID, to: uint32(entry.Value.Int), flags: bsiFlagUpsert}); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	for _, entry := range entries {
 		if entry.ImageID == 0 {
@@ -71,7 +93,8 @@ func (b *Batch) Add(entries ...Entry) error {
 
 // Remove stages membership removals. Unknown removals are no-ops at
 // commit and never create dictionary entries. Text namespaces reject Remove;
-// use ReplaceText.
+// use ReplaceText. For a BSI namespace, Remove deletes the ValueID's value
+// regardless of the stored number; the Value's Int is ignored.
 func (b *Batch) Remove(entries ...Entry) error {
 	if b.sealed.Load() {
 		return ErrBatchClosed
@@ -79,6 +102,20 @@ func (b *Batch) Remove(entries ...Entry) error {
 	namespace := b.index.spec()
 	if namespace.Kind == common.KindBitmapString {
 		return ErrUnsupportedOperation
+	}
+	if namespace.Kind == common.KindBitmapBSI {
+		for _, entry := range entries {
+			if entry.ImageID == 0 {
+				return ErrInvalidImageID
+			}
+			if entry.Value.Kind != common.KindBitmapBSI {
+				return ErrValueKind
+			}
+			if err := b.stageBSI(bsiOp{id: entry.ImageID, flags: bsiFlagRemove}); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	for _, entry := range entries {
 		if entry.ImageID == 0 {
@@ -89,6 +126,61 @@ func (b *Batch) Remove(entries ...Entry) error {
 		}
 		b.remove = append(b.remove, entry)
 	}
+	return nil
+}
+
+// BSIMove stages logical BSI value transitions. Presence flags are literal
+// preconditions (see BSIMove): HasFrom requires the current value to match,
+// HasTo sets the next value, and an insert (HasTo only) requires the ValueID to
+// be absent. Stale preconditions fail at commit. Duplicate ValueIDs within one
+// batch are rejected, and no-op moves are dropped.
+func (b *Batch) BSIMove(moves ...BSIMove) error {
+	if b.sealed.Load() {
+		return ErrBatchClosed
+	}
+	namespace := b.index.spec()
+	if namespace.Kind != common.KindBitmapBSI {
+		return ErrBSINotBSI
+	}
+	for _, move := range moves {
+		if move.ID == 0 {
+			return ErrInvalidImageID
+		}
+		var op bsiOp
+		op.id = move.ID
+		if move.HasFrom {
+			if err := checkBSIValue(namespace.BSIWidth, uint64(move.From)); err != nil {
+				return err
+			}
+			op.flags |= bsiFlagHasFrom
+			op.from = move.From
+		}
+		if move.HasTo {
+			if err := checkBSIValue(namespace.BSIWidth, uint64(move.To)); err != nil {
+				return err
+			}
+			op.flags |= bsiFlagHasTo
+			op.to = move.To
+		}
+		if op.flags == 0 {
+			continue
+		}
+		if err := b.stageBSI(op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stageBSI appends one prepared BSI op, rejecting a ValueID already staged in
+// this batch. Batches are small (~64), so a linear scan needs no map.
+func (b *Batch) stageBSI(op bsiOp) error {
+	for n := range b.bsi {
+		if b.bsi[n].id == op.id {
+			return ErrBSIDuplicate
+		}
+	}
+	b.bsi = append(b.bsi, op)
 	return nil
 }
 
@@ -150,7 +242,7 @@ func (b *Batch) Len() int {
 	if b == nil {
 		return 0
 	}
-	return len(b.add) + len(b.remove) + len(b.moves) + len(b.replacements)
+	return len(b.add) + len(b.remove) + len(b.moves) + len(b.replacements) + len(b.bsi)
 }
 
 // Empty reports whether the batch stages nothing.
@@ -172,6 +264,7 @@ func (b *Batch) Reset() error {
 	b.remove = b.remove[:0]
 	b.moves = b.moves[:0]
 	b.replacements = b.replacements[:0]
+	b.bsi = b.bsi[:0]
 	return nil
 }
 
@@ -184,6 +277,7 @@ func (b *Batch) Close() error {
 	b.remove = nil
 	b.moves = nil
 	b.replacements = nil
+	b.bsi = nil
 	return nil
 }
 
@@ -207,6 +301,18 @@ func (b *Batch) Apply() error {
 	i := b.index
 	if i.closed.Load() {
 		return ErrClosed
+	}
+	if i.spec().Kind == common.KindBitmapBSI {
+		if len(b.bsi) == 0 {
+			return nil
+		}
+		// Detach from batch-owned memory: the commit runs after Apply returns
+		// and the caller may Reset or reuse the batch immediately.
+		ops := append([]bsiOp(nil), b.bsi...)
+		if !i.commits.Submit(commitReq{bsi: ops}) {
+			return ErrClosed
+		}
+		return nil
 	}
 	if i.owner != nil && len(b.replacements) != 0 {
 		remaining := MaxNamespaceBatchBytes

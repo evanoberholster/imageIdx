@@ -201,6 +201,44 @@ func (v *namespaceView) effective(key NamespaceKey) (*posting, bool) {
 	return &corrected, true
 }
 
+// deltaTouches reports whether any delta layer carries a correction for key.
+func (v *namespaceView) deltaTouches(key NamespaceKey) bool {
+	if _, ok := v.frozen.delta(key); ok {
+		return true
+	}
+	_, ok := v.active.delta(key)
+	return ok
+}
+
+// effectiveInto writes the fully corrected posting for key into m and returns
+// it, aliasing m. It mirrors effective but recycles m's buffer, so a range query
+// can fold many corrected keys without allocating a fresh bitmap per key. When
+// key has no correction it returns the shared base posting without touching m.
+func (v *namespaceView) effectiveInto(key NamespaceKey, m *roar.MutableBitmap) (roar.Bitmap, bool) {
+	base, hasBase := v.base.get(key)
+	frozen, hasFrozen := v.frozen.delta(key)
+	active, hasActive := v.active.delta(key)
+	if !hasFrozen && !hasActive {
+		if !hasBase {
+			return roar.Bitmap{}, false
+		}
+		return base.bitmap(), true
+	}
+	m.Reset()
+	if hasBase {
+		m.Or(base.bitmap())
+	}
+	if hasFrozen {
+		m.Or(frozen.additions)
+		m.AndNot(frozen.removals)
+	}
+	if hasActive {
+		m.Or(active.additions)
+		m.AndNot(active.removals)
+	}
+	return m.Freeze(), true
+}
+
 // effectiveTable folds the supplied deltas in order into a replacement
 // posting table. Each layer merges its sorted keys with the table in one pass.
 // Used by compaction, checkpointing, and hard-limit folds.

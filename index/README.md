@@ -82,6 +82,36 @@ Single operations and batches share one internal pipeline.
   then removes ID-authoritative records where the engine supports it (timestamp,
   vector). simhash and radixhash rely on the liveness filter.
 
+## Bit-sliced numeric indexes (BSI)
+
+A `KindBitmapBSI` namespace stores one unsigned integer per `ValueID` in
+`bitmapidx`, addressed through reserved existence and value-bit postings. Two
+widths are supported: `BSIWidth16` (`uint16`) and `BSIWidth32` (`uint32`); the
+width is persisted in the namespace registry and validated on reopen. Values are
+never truncated — a value wider than the namespace is rejected. Zero is a real
+value, distinguished from absent by the existence bitmap.
+
+```go
+def, _ := index.BitmapDef(bitmapidx.NamespaceSpec{
+    Namespace: 30, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+}, "quality", common.EntityImage)
+bsi, _ := db.Bitmap(30)
+bsi.Set(100, 85); bsi.Delete(200)
+value, ok, _ := bsi.Get(100)
+equal, _ := bsi.Equal(85)             // roar.Bitmap of common.ValueID
+inRange, _ := bsi.BSIRange(50, 90)
+candidates, _ := bsi.BSIFilterRange(nil, ids, bitmapidx.ValuesBetween(50, 90))
+```
+
+Both single writes and `Batch.BSIMove` (with explicit `HasFrom`/`HasTo`
+preconditions) are supported; stale preconditions and duplicate `ValueID`s fail
+the whole batch atomically. Queries use bit-sliced comparisons (MSB first, with
+early termination), `BSIFilterRange` reconstructs small candidate sets and
+materializes a range bitmap otherwise, and results are ordinary `roar.Bitmap`s
+of `common.ValueID` that compose with the rest of the unified search surface.
+WAL records are logical value transitions, not per-bit changes, and reuse the
+shared checkpoint, compaction, mmap-reopen, and durability machinery.
+
 ## Consistency and recovery
 
 A `Store` is **not** an atomic multi-engine transaction. A batch is prevalidated
@@ -199,6 +229,10 @@ paths. Benchmarks live in `benchmark_test.go`, `matcher_benchmark_test.go`, and
 - **geoidx legacy detection.** With a missing geoidx data file, geoidx reports
   `ErrLegacyFormat` when the directory contains any `manifest` file; the
   namespace is unavailable either way.
+- **BSI range evaluation is not fused.** Each bit-sliced comparison allocates
+  intermediate bitmaps (MSB first, with early termination). It is already much
+  faster than the continuous index for wide ranges, but a fused kernel could
+  cut allocations further; this is deferred until profiling justifies it.
 
 ## Validation
 

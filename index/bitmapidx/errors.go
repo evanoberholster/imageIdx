@@ -2,11 +2,13 @@
 // database-wide image identifiers (common.ImageID).
 //
 // An Index owns all postings for one typed namespace. Values are
-// canonicalized according to the persisted namespace definition and may be enum,
-// bool, text, continuous, or geographic values. The dictionary maps hashed
-// values to collision slots; postings map each value to the images holding
-// it. A namespaceView is one atomically published snapshot of base postings,
-// frozen/active deltas, and the dictionary.
+// canonicalized according to the persisted namespace definition and may be
+// enum, bool, text, continuous, or bit-sliced (BSI). The dictionary maps hashed
+// values to collision slots; postings map each value to the records holding
+// it. A BSI namespace instead maps each ValueID to one unsigned value through
+// reserved existence and value-bit postings (see bsi.go). A namespaceView is
+// one atomically published snapshot of base postings, frozen/active deltas, and
+// the dictionary.
 //
 // Concurrency: readers load one published view and take no locks; writers
 // serialize through one mutex per index (plus one WAL mutex per store).
