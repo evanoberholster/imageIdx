@@ -114,6 +114,14 @@ shared checkpoint, compaction, mmap-reopen, and durability machinery.
 
 ## Consistency and recovery
 
+For authoritative Pebble records coordinated with this derived store, see
+[`database/README.md`](../database/README.md). The database layer owns an
+ordered journal and only acknowledges a batch after the unified store's
+recoverable source generation confirms it. An interrupted batch without a
+complete durable watermark is reported as recovery-required in manual mode.
+Automatic database startup recovery may reconstruct a full replacement before
+publishing any index pointer; it does not hot-swap live namespaces.
+
 A `Store` is **not** an atomic multi-engine transaction. A batch is prevalidated
 (routing, family, entity, ValueID, vector dimensions, simhash id model) before
 any engine is mutated, so a malformed batch cannot partially apply. If an engine
@@ -130,6 +138,11 @@ outrun recoverable engine data. A timeidx batch commits its mutations and its
 watermark in one engine transaction. `SourceGeneration()` is the minimum across
 declared namespaces; timeidx also persists and validates its own watermark on
 reopen (`ErrIndexStale`, never corrupt).
+
+`ApplyWithGenerationAll` is the database-coordinator variant: after securing
+touched writes, it advances healthy **untouched** namespaces to the same
+source generation in that manifest publication. It does not rewrite unchanged
+values. A failed/unavailable namespace still holds the global minimum back.
 
 ### Interrupted mutations
 

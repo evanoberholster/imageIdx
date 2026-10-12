@@ -11,6 +11,7 @@ import (
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
+	"github.com/evanoberholster/imageIdx/index/simhash"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -66,11 +67,65 @@ func TestRecoveryMarkerPersistsPartialFailure(t *testing.T) {
 	if h, _ := reopened.HealthOf(1); !h.NeedsRebuild {
 		t.Fatalf("health = %+v, want NeedsRebuild", h)
 	}
+	// Durability and compaction cannot reconstruct an interrupted logical
+	// batch. The marker must survive either maintenance operation and reopen.
+	if err := reopened.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if rec := reopened.RecoveryNamespaces(); !slices.Contains(rec, common.Namespace(1)) || !slices.Contains(rec, common.Namespace(4)) {
+		t.Fatalf("maintenance cleared recovery marker: %v", rec)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); err != nil {
+		t.Fatalf("marker lost on disk: %v", err)
+	}
 	if err := reopened.ClearRecovery(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); !os.IsNotExist(err) {
 		t.Fatalf("recovery marker not cleared: %v", err)
+	}
+}
+
+// A completeness claim must never outrun a newly appended simhash record:
+// unlike updates, appends require a manifest checkpoint to survive reopen.
+func TestSimHashGenerationBarrierPersistsNewAppend(t *testing.T) {
+	dir := t.TempDir()
+	schema := common.NewSchema()
+	if err := schema.Register(common.NamespaceDef{Namespace: 3, Name: "sim", Kind: common.KindHashPerceptual, Entity: common.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := index.Create(dir, index.Spec{Schema: schema})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := db.NewBatch(1)
+	if err := b.Add(index.Entry{ValueID: 1, Sims: []index.SimValue{{Namespace: 3, Record: simhash.Record{PHash: 17}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyWithGenerationAll(b, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.SourceGeneration() != 1 {
+		t.Fatalf("source generation = %d", db.SourceGeneration())
+	}
+	sim, ok := db.Sim(3)
+	if !ok {
+		t.Fatal("simhash unavailable after reopen")
+	}
+	record, ok := sim.Get(1)
+	if !ok || record.PHash != 17 {
+		t.Fatalf("simhash append lost: %+v, %t", record, ok)
 	}
 }
 

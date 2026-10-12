@@ -12,6 +12,7 @@ key-value collection, **not** a namespace routed by `index.Store`.
 |---|---|---|
 | `common` | `Schema`, namespace/entity kinds, ID aliases, durability | — |
 | `index` | unified persistent store, typed routing, mutations, liveness, recovery, import matcher | owns the six families below |
+| `database` | authoritative Pebble records, atomic mutation journal, durable indexing coordinator and generation waits | owns a separate canonical `store.Store` and `index.Store` |
 | `index/bitmapidx` | enum, bool, analyzed text, signed continuous grid, unsigned 16/32-bit bit-sliced index (BSI) | `KindBitmapEnum`, `KindBitmapBool`, `KindBitmapString`, `KindBitmapContinuous`, `KindBitmapBSI` |
 | `index/timeidx` | timestamp range index | `KindTimestamp` |
 | `index/geoidx` | level-19 S2 geographic index | `KindGeo` |
@@ -32,6 +33,15 @@ is reserved. Numeric IDs can overlap across entity kinds without mixing their
 liveness. `common.UserID` and `common.GroupID` are separate defined types.
 
 ## Quick start: unified store and search
+
+When metadata must survive and drive eventual index updates, use the
+[`database` integration layer](database/README.md) instead of directly
+mutating `index.Store`. It commits authoritative Pebble records and a mutation
+journal atomically, then indexes them asynchronously. `WaitIndexed` establishes
+the requested search-completeness generation. `database.Options{Recovery:
+database.RecoveryAutomatic}` enables synchronous startup-only rebuilding of a
+missing or incomplete index from canonical records; manual recovery remains
+the default. See the documented rebuild and mmap-reader limitations.
 
 The snippets below use these imports:
 
