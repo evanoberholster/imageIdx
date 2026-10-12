@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	common "github.com/evanoberholster/imageIdx/common"
+	"github.com/evanoberholster/imageIdx/roar"
 )
 
 const (
@@ -347,6 +348,186 @@ func TestBSIRangeRandomizedInclusiveExclusive(t *testing.T) {
 				t.Fatalf("width %d range %+v: count %d (%v) want %d", width, r, count, err, len(want))
 			}
 		}
+	}
+}
+
+// TestBSIRangeBoundaries is a table-driven boundary check for both widths:
+// stored zero vs absent, the width extremes, inclusive/exclusive single points,
+// open-ended and full-domain ranges, and empty/inverted ranges. It cross-checks
+// BSIRangeQuery, BSICountRange, and BSIFilterRange against a map reference.
+func TestBSIRangeBoundaries(t *testing.T) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		max := bsiMaxValue(width)
+		index := mustBSI(t, bsiNamespace(testBSI16Namespace, width))
+		ref := newRefBSI()
+		for id, value := range map[common.ValueID]uint64{
+			1: 0, 2: max, 3: max - 1, 4: 1, 5: max / 2, 6: 2, 7: max / 2,
+		} {
+			if err := index.Set(id, value); err != nil {
+				t.Fatal(err)
+			}
+			ref.set(id, value)
+		}
+		// Candidates include present and absent IDs and deliberate duplicates.
+		candidates := []common.ValueID{1, 2, 3, 8, 5, 99, 4, 5, 9, 6, 7}
+		cases := []struct {
+			name string
+			r    ValueRange
+		}{
+			{"eq[0,0]", ValueRange{Lo: 0, Hi: 0, HasLo: true, HasHi: true, LoInclusive: true, HiInclusive: true}},
+			{"(0,1)", ValueRange{Lo: 0, Hi: 1, HasLo: true, HasHi: true}},
+			{"[0,max]", ValueRange{Lo: 0, Hi: max, HasLo: true, HasHi: true, LoInclusive: true, HiInclusive: true}},
+			{"[max,max]", ValueRange{Lo: max, Hi: max, HasLo: true, HasHi: true, LoInclusive: true, HiInclusive: true}},
+			{"[0,max)", ValueRange{Lo: 0, Hi: max, HasLo: true, HasHi: true, LoInclusive: true}},
+			{"(0,max]", ValueRange{Lo: 0, Hi: max, HasLo: true, HasHi: true, HiInclusive: true}},
+			{"[0,0)", ValueRange{Lo: 0, Hi: 0, HasLo: true, HasHi: true, LoInclusive: true}},
+			{"(max,max]", ValueRange{Lo: max, Hi: max, HasLo: true, HasHi: true, HiInclusive: true}},
+			{"atleast0", ValuesAtLeast(0)},
+			{"atleast1", ValuesAtLeast(1)},
+			{"atmostMax", ValuesAtMost(max)},
+			{"atmostMaxMinus1", ValuesAtMost(max - 1)},
+			{"[max/2,max/2]", ValuesBetween(max/2, max/2)},
+			{"inverted", ValueRange{Lo: max, Hi: 0, HasLo: true, HasHi: true, LoInclusive: true, HiInclusive: true}},
+			{"emptyEqual", ValueRange{Lo: 5, Hi: 5, HasLo: true, HasHi: true}},
+			{"unbounded", ValueRange{}},
+		}
+		for _, tc := range cases {
+			bit, err := index.BSIRangeQuery(tc.r)
+			if err != nil {
+				t.Fatalf("width %d %s: BSIRangeQuery: %v", width, tc.name, err)
+			}
+			got := bit.AppendTo(nil)
+			var want []common.ValueID
+			for id, value := range ref.values {
+				if tc.r.contains(value) {
+					want = append(want, id)
+				}
+			}
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("width %d %s: range got %v want %v", width, tc.name, got, want)
+			}
+			count, err := index.BSICountRange(tc.r)
+			if err != nil || count != uint64(len(want)) {
+				t.Fatalf("width %d %s: count %d (%v) want %d", width, tc.name, count, err, len(want))
+			}
+			filtered, err := index.BSIFilterRange(nil, candidates, tc.r)
+			if err != nil {
+				t.Fatalf("width %d %s: BSIFilterRange: %v", width, tc.name, err)
+			}
+			var wantFiltered []common.ValueID
+			for _, id := range candidates {
+				if value, ok := ref.get(id); ok && tc.r.contains(value) {
+					wantFiltered = append(wantFiltered, id)
+				}
+			}
+			if !slices.Equal(filtered, wantFiltered) {
+				t.Fatalf("width %d %s: filter got %v want %v", width, tc.name, filtered, wantFiltered)
+			}
+		}
+	}
+}
+
+// TestBSIConcurrentQueriesWithMaintenance races readers (which retain results)
+// against a writer plus checkpoint and compaction, verifying pooled scratch and
+// returned bitmaps stay valid. Intended for -race.
+func TestBSIConcurrentQueriesWithMaintenance(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, common.DurabilityOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, ok := store.Lookup(testBSI16Namespace)
+	if !ok {
+		t.Fatal("namespace missing")
+	}
+	seed := index.NewBatch()
+	for i := 1; i <= 2000; i++ {
+		if err := seed.BSIMove(BSIMove{ID: common.ValueID(i), To: uint32(i % 256), HasTo: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := seed.Apply(); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Barrier(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Readers run until stop; the writer and maintenance finish first so the
+	// checkpoints/compactions overlap the write stream without running forever.
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	var readers, work sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			var held []roar.Bitmap
+			for {
+				select {
+				case <-stop:
+					// Retained results must survive scratch reuse, checkpoint,
+					// compaction, and mmap remapping.
+					for _, b := range held {
+						_ = b.AppendTo(nil)
+					}
+					return
+				default:
+				}
+				if b, err := index.BSIRange(10, 200); err == nil && len(held) < 8 {
+					held = append(held, b)
+				}
+				if _, err := index.Equal(50); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := index.BSICountRange(ValuesBetween(0, 128)); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := index.BSIFilterRange(nil, []common.ValueID{1, 2, 3, 2000, 7}, ValuesBetween(0, 255)); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	work.Add(1)
+	go func() {
+		defer work.Done()
+		for i := 0; i < 3000; i++ {
+			if err := index.Set(common.ValueID(i%2000+1), uint64(i%256)); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+		close(writerDone)
+	}()
+	work.Add(1)
+	go func() {
+		defer work.Done()
+		for cycle := 0; cycle < 8; cycle++ {
+			select {
+			case <-writerDone:
+				return
+			default:
+			}
+			if err := store.Checkpoint(); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := index.Compact(); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	work.Wait()
+	close(stop)
+	readers.Wait()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

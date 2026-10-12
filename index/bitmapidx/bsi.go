@@ -676,6 +676,31 @@ func (i *Index) bsiRangeSpec(r ValueRange) (NamespaceSpec, error) {
 	return spec, nil
 }
 
+// bsiRangeUnrestricted reports whether r accepts every stored value, so a query
+// reduces to the existence set and needs no bit slices resolved. A lower bound
+// of 0 and an upper bound past the width are unconditional.
+func bsiRangeUnrestricted(width uint8, r ValueRange) bool {
+	if r.HasLo {
+		lo := r.Lo
+		if !r.LoInclusive {
+			lo++
+		}
+		if lo != 0 {
+			return false
+		}
+	}
+	if r.HasHi {
+		hi := r.Hi
+		if r.HiInclusive {
+			hi++
+		}
+		if hi <= bsiMaxValue(width) {
+			return false
+		}
+	}
+	return true
+}
+
 // BSIRangeQuery returns the ValueIDs whose BSI value lies inside r, honoring
 // inclusive/exclusive ends.
 func (i *Index) BSIRangeQuery(r ValueRange) (roar.Bitmap, error) {
@@ -686,6 +711,15 @@ func (i *Index) BSIRangeQuery(r ValueRange) (roar.Bitmap, error) {
 	view, token, ok := i.bsiRead()
 	if !ok {
 		return roar.Bitmap{}, nil
+	}
+	// An unrestricted range is the existence set: skip slice resolution.
+	if bsiRangeUnrestricted(spec.BSIWidth, r) {
+		exists, has := view.bsiExists(spec.Namespace)
+		i.readers.Release(token)
+		if !has {
+			return roar.Bitmap{}, nil
+		}
+		return ownBSI(exists), nil
 	}
 	sc := i.bsiAcquire(spec, view)
 	result := ownBSI(bsiRangeInto(&sc.slices, r, sc))
@@ -705,6 +739,15 @@ func (i *Index) BSICountRange(r ValueRange) (uint64, error) {
 	if !ok {
 		return 0, nil
 	}
+	// An unrestricted range is the existence cardinality: no bit slices needed.
+	if bsiRangeUnrestricted(spec.BSIWidth, r) {
+		exists, has := view.bsiExists(spec.Namespace)
+		i.readers.Release(token)
+		if !has {
+			return 0, nil
+		}
+		return exists.Cardinality(), nil
+	}
 	sc := i.bsiAcquire(spec, view)
 	count := bsiRangeInto(&sc.slices, r, sc).Cardinality()
 	releaseBSIScratch(sc)
@@ -713,24 +756,24 @@ func (i *Index) BSICountRange(r ValueRange) (uint64, error) {
 }
 
 // bsiCandidateFactor selects between reconstructing candidate values and
-// materializing the range bitmap in FilterRange. Reconstructing one candidate
+// materializing the range bitmap in BSIFilterRange. Reconstructing one candidate
 // costs about `width` contains probes; building the bitmap costs about one
 // pass over the existence bitmap. Below this factor of (existence cardinality
 // / width) the candidate strategy wins. Tuned with BenchmarkBSIFilterRange.
 const bsiCandidateFactor = 2
 
-// FilterRange appends the candidates whose BSI value lies in r to dst,
-// preserving candidate order and duplicates. dst=candidates[:0] is safe.
-// Small candidate sets reconstruct each value; larger sets materialize the
-// range bitmap once and probe it.
-// bsiLazyCandidateThreshold bounds the candidate count for which FilterRange
-// probes the view directly instead of resolving the slice directory. At or
-// below it, per-bit view probes (with early termination) cost less than
-// resolving 17 or 33 slices; above it the resolved directory pays off. Tuned
-// with BenchmarkBSIFilterRangeSmall: lazy wins at 1-4 candidates, resolving
-// wins from 8 up.
+// bsiLazyCandidateThreshold bounds the candidate count for which
+// BSIFilterRange probes the view directly instead of resolving the slice
+// directory. At or below it, per-bit view probes (with early termination) cost
+// less than resolving 17 or 33 slices; above it the resolved directory pays
+// off. Tuned with BenchmarkBSIFilterRangeSmall: lazy wins at 1-4 candidates,
+// resolving wins from 8 up.
 const bsiLazyCandidateThreshold = 4
 
+// BSIFilterRange appends the candidates whose BSI value lies in r to dst,
+// preserving candidate order and duplicates. dst=candidates[:0] is safe. Small
+// candidate sets probe the view directly; larger sets resolve the slice
+// directory and either probe it or materialize the range bitmap once.
 func (i *Index) BSIFilterRange(dst, candidates []common.ValueID, r ValueRange) ([]common.ValueID, error) {
 	spec, err := i.bsiRangeSpec(r)
 	if err != nil || r.empty() || len(candidates) == 0 {
@@ -750,6 +793,14 @@ func (i *Index) BSIFilterRange(dst, candidates []common.ValueID, r ValueRange) (
 			}
 		}
 		return dst, nil
+	}
+	// An unrestricted range is existence membership: skip slice resolution.
+	if bsiRangeUnrestricted(spec.BSIWidth, r) {
+		exists, has := view.bsiExists(spec.Namespace)
+		if !has {
+			return dst, nil
+		}
+		return filterBitmap(dst, candidates, exists), nil
 	}
 	sc := i.bsiAcquire(spec, view)
 	defer releaseBSIScratch(sc)
