@@ -242,6 +242,65 @@ func BenchmarkBSIFilterRange(b *testing.B) {
 	}
 }
 
+// BenchmarkBSIFilterRangeSmall targets the small-candidate regime with one
+// selective and one nonselective predicate, where slice resolution overhead
+// dominates.
+func BenchmarkBSIFilterRangeSmall(b *testing.B) {
+	index, ids := buildBSIBench(b, BSIWidth16, bsiDistUniform, 100_000)
+	max := bsiMaxValue(BSIWidth16)
+	ranges := []struct {
+		name string
+		r    ValueRange
+	}{
+		{"selective", ValuesBetween(max/2, max/2+max/1000)},
+		{"wide", ValuesBetween(max/8, max*7/8)},
+		{"empty", ValuesBetween(max/2, max/2)},
+	}
+	for _, rg := range ranges {
+		for _, count := range []int{1, 2, 4, 8, 16, 32, 64} {
+			b.Run(rg.name+"-c"+itoa(count), func(b *testing.B) {
+				candidates := ids[:count]
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := index.BSIFilterRange(nil, candidates, rg.r); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkBSILowCardinality measures equality and range queries on tiny
+// namespaces, where per-query setup dominates.
+func BenchmarkBSILowCardinality(b *testing.B) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, n := range []int{1, 2, 4, 8, 16, 32, 64, 256} {
+			index, _ := buildBSIBench(b, width, bsiDistUniform, n)
+			max := bsiMaxValue(width)
+			b.Run(sizeName(width, n)+"-equal", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := index.Equal(max / 3); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run(sizeName(width, n)+"-range", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := index.BSIRange(max/4, max*3/4); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkBSISet(b *testing.B) {
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
 		b.Run(sizeName(width, 0), func(b *testing.B) {
@@ -357,8 +416,11 @@ func benchBSIBatch(b *testing.B, index *Index, size int, op string) {
 				b.Fatal(err)
 			}
 		case "delete":
+			// Re-insert the deleted IDs; mask to the namespace width so the
+			// maintenance value never overflows (BSI16).
+			maxValue := uint32(bsiMaxValue(index.spec().BSIWidth))
 			for j := 0; j < size; j++ {
-				if err := batch.Add(Entry{ImageID: common.ValueID((seed+j)%bsiBatchDomain + 1), Value: Uint32Value(uint32(seed + j))}); err != nil {
+				if err := batch.Add(Entry{ImageID: common.ValueID((seed+j)%bsiBatchDomain + 1), Value: Uint32Value(uint32(seed+j) & maxValue)}); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -482,6 +544,59 @@ func BenchmarkBSIBatchMixed(b *testing.B) {
 		for _, size := range bsiBatchSizes {
 			b.Run(sizeName(width, size), func(b *testing.B) {
 				benchBSIBatch(b, bsiBenchIndex(b, width), size, "mixed")
+			})
+		}
+	}
+}
+
+// BenchmarkBSIBatchBitDelta measures replacement commits that change one bit
+// versus all bits, at a fixed 64-op batch.
+func BenchmarkBSIBatchBitDelta(b *testing.B) {
+	const n = 4096
+	const size = 64
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		for _, mode := range []string{"onebit", "allbits"} {
+			b.Run(sizeName(width, 0)+"-"+mode, func(b *testing.B) {
+				index := bsiBenchIndex(b, width)
+				seed := index.NewBatch()
+				for j := 0; j < n; j++ {
+					if err := seed.Add(Entry{ImageID: common.ValueID(j + 1), Value: Uint32Value(0)}); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := seed.Apply(); err != nil {
+					b.Fatal(err)
+				}
+				if err := index.Barrier(); err != nil {
+					b.Fatal(err)
+				}
+				max := uint32(bsiMaxValue(width))
+				batch := index.NewBatch()
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := batch.Reset(); err != nil {
+						b.Fatal(err)
+					}
+					high := uint32(i & 1)
+					for j := 0; j < size; j++ {
+						id := common.ValueID((i*size+j)%n + 1)
+						v := high // one bit differs
+						if mode == "allbits" {
+							v = high * max
+						}
+						if err := batch.Add(Entry{ImageID: id, Value: Uint32Value(v)}); err != nil {
+							b.Fatal(err)
+						}
+					}
+					if err := batch.Apply(); err != nil {
+						b.Fatal(err)
+					}
+					if err := index.Barrier(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				_ = batch.Close()
 			})
 		}
 	}

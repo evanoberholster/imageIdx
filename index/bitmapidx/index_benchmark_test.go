@@ -249,6 +249,38 @@ func BenchmarkNamespaceRangeShapes(b *testing.B) {
 	}
 }
 
+// BenchmarkNamespaceRangeUnion isolates the multiway union across the number of
+// in-range postings, for sparse, dense, and mixed value shapes.
+func BenchmarkNamespaceRangeUnion(b *testing.B) {
+	datasets := []struct {
+		name          string
+		distinct, per int
+	}{
+		{"sparse-1", 200_000, 1},
+		{"dense-100", 1_000, 100},
+		{"mixed-10", 20_000, 10},
+	}
+	spans := []int{2, 4, 8, 16, 32, 64, 256, 1024}
+	for _, ds := range datasets {
+		index := benchmarkContinuousRangeIndex(b, ds.distinct, ds.per)
+		for _, span := range spans {
+			if span > ds.distinct {
+				continue
+			}
+			b.Run(ds.name+"-postings"+itoa(span), func(b *testing.B) {
+				bounds := Between(0, int64(span))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := index.Range(bounds); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // BenchmarkNamespaceCountRange measures the count-only continuous path.
 func BenchmarkNamespaceCountRange(b *testing.B) {
 	index := benchmarkContinuousRangeIndex(b, 10_000, 10)
