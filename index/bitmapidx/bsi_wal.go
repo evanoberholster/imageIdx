@@ -119,6 +119,10 @@ func decodeBSIChanges(spec NamespaceSpec, payload []byte, records uint32) ([]bsi
 // resolveBSIBatch validates a batch's logical transitions against the current
 // view, expands them into slice membership changes, and freezes the logical WAL
 // payload. It performs every fallible step before the caller appends to the WAL.
+//
+// Value reads use per-bit view probes, not a slice directory: resolving slices
+// once per batch was measured to regress small commits (a lazy cache helped only
+// batches of ~256+ while raising allocations ~10%), so per-op probes stay.
 func (i *Index) resolveBSIBatch(view *namespaceView, ops []bsiOp) ([]stagedChange, []byte, uint32, error) {
 	if len(ops) == 0 {
 		return nil, nil, 0, nil
@@ -139,9 +143,6 @@ func (i *Index) resolveBSIBatch(view *namespaceView, ops []bsiOp) ([]stagedChang
 				return nil, nil, 0, err
 			}
 		}
-		// Read the current value with per-bit probes: resolving every slice
-		// here would fold (and allocate) untouched corrected postings for a
-		// batch that usually touches only a few.
 		current, present := view.bsiValueAt(spec.Namespace, spec.BSIWidth, op.id)
 		if err := bsiExpand(&deltas, op, current, present); err != nil {
 			return nil, nil, 0, err

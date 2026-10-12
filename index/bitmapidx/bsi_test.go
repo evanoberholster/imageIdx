@@ -299,6 +299,57 @@ func TestBSIRangeInclusiveExclusiveAndEmpty(t *testing.T) {
 	}
 }
 
+func TestBSIRangeRandomizedInclusiveExclusive(t *testing.T) {
+	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
+		index := mustBSI(t, bsiNamespace(testBSI16Namespace, width))
+		ref := newRefBSI()
+		rng := rand.New(rand.NewSource(int64(width) + 7))
+		max := bsiMaxValue(width)
+		for i := 0; i < 1500; i++ {
+			id := common.ValueID(rng.Intn(300) + 1)
+			if rng.Intn(4) == 0 {
+				if err := index.Delete(id); err != nil {
+					t.Fatal(err)
+				}
+				ref.del(id)
+			} else {
+				value := uint64(rng.Int63n(int64(max) + 1))
+				if err := index.Set(id, value); err != nil {
+					t.Fatal(err)
+				}
+				ref.set(id, value)
+			}
+		}
+		for trial := 0; trial < 400; trial++ {
+			lo := uint64(rng.Int63n(int64(max) + 1))
+			hi := uint64(rng.Int63n(int64(max) + 1))
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			r := ValueRange{Lo: lo, Hi: hi, HasLo: true, HasHi: true, LoInclusive: rng.Intn(2) == 0, HiInclusive: rng.Intn(2) == 0}
+			bit, err := index.BSIRangeQuery(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := bit.AppendTo(nil)
+			var want []common.ValueID
+			for id, value := range ref.values {
+				if r.contains(value) {
+					want = append(want, id)
+				}
+			}
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("width %d range %+v: got %v want %v", width, r, got, want)
+			}
+			count, err := index.BSICountRange(r)
+			if err != nil || count != uint64(len(want)) {
+				t.Fatalf("width %d range %+v: count %d (%v) want %d", width, r, count, err, len(want))
+			}
+		}
+	}
+}
+
 func TestBSIFilterRangePreservesOrderAndDuplicates(t *testing.T) {
 	index := mustBSI(t, bsiNamespace(testBSI16Namespace, BSIWidth16))
 	for i := 1; i <= 20; i++ {
@@ -645,6 +696,73 @@ func TestBSIStorageSize(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Logf("width %d: %d ValueIDs -> %d segment bytes", width, len(values), info.Size())
+	}
+}
+
+func TestBSIScratchOwnershipAcrossQueries(t *testing.T) {
+	index := mustBSI(t, bsiNamespace(testBSI16Namespace, BSIWidth16))
+	for i := 1; i <= 2000; i++ {
+		if err := index.Set(common.ValueID(i), uint64(i%100)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := index.Equal(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := first.AppendTo(nil)
+	rng := rand.New(rand.NewSource(3))
+	for i := 0; i < 200; i++ {
+		lo := uint64(rng.Intn(100))
+		if _, err := index.BSIRange(lo, lo+uint64(rng.Intn(20))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.Less(uint64(rng.Intn(100))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.Equal(uint64(rng.Intn(100))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The earlier result must not alias live scratch: later queries recycle it.
+	if got := first.AppendTo(nil); !slices.Equal(got, want) {
+		t.Fatalf("earlier result mutated by later queries: got %v want %v", got, want)
+	}
+}
+
+func TestBSIResultSurvivesCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, common.DurabilitySync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, ok := store.Lookup(testBSI16Namespace)
+	if !ok {
+		t.Fatal("namespace missing")
+	}
+	for i := 1; i <= 500; i++ {
+		if err := index.Set(common.ValueID(i), uint64(i%64)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := index.Equal(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := result.AppendTo(nil)
+	if len(want) == 0 {
+		t.Fatal("no matches for the reference query")
+	}
+	if err := store.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	// Checkpoint may unmap the previous snapshot; a detached result must remain
+	// valid because it owns its bytes.
+	if got := result.AppendTo(nil); !slices.Equal(got, want) {
+		t.Fatalf("result changed after checkpoint: got %v want %v", got, want)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

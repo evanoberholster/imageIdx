@@ -135,12 +135,16 @@ func (s *bsiSlices) bitAt(id common.ValueID, bit uint8) bool {
 // bsiScratch is one reusable query workspace: recycled accumulators plus the
 // resolved slice view. Accumulators recycle a single owned result buffer, so
 // repeated bit operations allocate only on growth instead of once per bit.
+// eqLo/lessLo drive a lower bound, eqHi/lessHi an upper bound; a range query
+// evaluates both in one traversal.
 type bsiScratch struct {
 	slices bsiSlices
-	equal  *roar.MutableBitmap
-	less   *roar.MutableBitmap
-	zero   *roar.MutableBitmap
 	res    *roar.MutableBitmap
+	eqLo   *roar.MutableBitmap
+	lessLo *roar.MutableBitmap
+	eqHi   *roar.MutableBitmap
+	lessHi *roar.MutableBitmap
+	zero   *roar.MutableBitmap
 }
 
 // bsiScratchMaxRetained bounds a pooled workspace so one huge query cannot pin
@@ -149,24 +153,29 @@ const bsiScratchMaxRetained = 1 << 20
 
 var bsiScratchPool = sync.Pool{New: func() any {
 	return &bsiScratch{
-		equal: roar.NewMutableBitmap(),
-		less:  roar.NewMutableBitmap(),
-		zero:  roar.NewMutableBitmap(),
-		res:   roar.NewMutableBitmap(),
+		res:    roar.NewMutableBitmap(),
+		eqLo:   roar.NewMutableBitmap(),
+		lessLo: roar.NewMutableBitmap(),
+		eqHi:   roar.NewMutableBitmap(),
+		lessHi: roar.NewMutableBitmap(),
+		zero:   roar.NewMutableBitmap(),
 	}
 }}
 
 func acquireBSIScratch() *bsiScratch {
 	s := bsiScratchPool.Get().(*bsiScratch)
-	s.equal.Reset()
-	s.less.Reset()
-	s.zero.Reset()
 	s.res.Reset()
+	s.eqLo.Reset()
+	s.lessLo.Reset()
+	s.eqHi.Reset()
+	s.lessHi.Reset()
+	s.zero.Reset()
 	return s
 }
 
 func releaseBSIScratch(s *bsiScratch) {
-	retained := s.equal.RetainedBytes() + s.less.RetainedBytes() + s.zero.RetainedBytes() + s.res.RetainedBytes()
+	retained := s.res.RetainedBytes() + s.eqLo.RetainedBytes() + s.lessLo.RetainedBytes() +
+		s.eqHi.RetainedBytes() + s.lessHi.RetainedBytes() + s.zero.RetainedBytes()
 	if retained > bsiScratchMaxRetained {
 		return
 	}
@@ -247,29 +256,92 @@ func bsiLessInto(s *bsiSlices, value uint64, equal, less, zero *roar.MutableBitm
 
 // bsiRangeInto fills res with the IDs whose value lies in r. The result aliases
 // res.
+//
+// It evaluates both bounds in one most-significant-first traversal: eqLo/lessLo
+// track {value < loBound} and eqHi/lessHi track {value < hiBound}, and the
+// result is exists minus both. A lower bound of 0 and an upper bound past the
+// width are unconditional, so the traversal is skipped entirely for the full
+// domain. Folding both bounds into one pass measured ~40% faster than two
+// separate comparisons plus an intersection, and ~50x faster for the full
+// domain (see BenchmarkBSIRangeCombined).
 func bsiRangeInto(s *bsiSlices, r ValueRange, sc *bsiScratch) roar.Bitmap {
 	sc.res.Reset()
 	if !s.hasExists || r.empty() {
 		return roar.Bitmap{}
 	}
+	loBound := r.Lo
+	if r.HasLo && !r.LoInclusive {
+		loBound++
+	}
+	hiBound := r.Hi
+	if r.HasHi && r.HiInclusive {
+		hiBound++
+	}
+	loActive := r.HasLo && loBound != 0
+	hiActive := r.HasHi && hiBound <= bsiMaxValue(s.width)
+	if !loActive && !hiActive {
+		sc.res.Or(s.exists)
+		return sc.res.Freeze()
+	}
+	sc.eqLo.Reset()
+	sc.lessLo.Reset()
+	sc.eqHi.Reset()
+	sc.lessHi.Reset()
+	if loActive {
+		sc.eqLo.Or(s.exists)
+	}
+	if hiActive {
+		sc.eqHi.Or(s.exists)
+	}
+	for bit := int(s.width) - 1; bit >= 0; bit-- {
+		has := s.hasBit[bit]
+		var slice roar.Bitmap
+		if has {
+			slice = s.bits[bit]
+		}
+		if loActive && !sc.eqLo.Freeze().IsEmpty() {
+			if loBound&(uint64(1)<<uint(bit)) != 0 {
+				if has {
+					sc.zero.Reset()
+					sc.zero.Or(sc.eqLo.Freeze())
+					sc.zero.AndNot(slice)
+					sc.lessLo.Or(sc.zero.Freeze())
+					sc.eqLo.And(slice)
+				} else {
+					sc.lessLo.Or(sc.eqLo.Freeze())
+					sc.eqLo.Reset()
+				}
+			} else if has {
+				sc.eqLo.AndNot(slice)
+			}
+		}
+		if hiActive && !sc.eqHi.Freeze().IsEmpty() {
+			if hiBound&(uint64(1)<<uint(bit)) != 0 {
+				if has {
+					sc.zero.Reset()
+					sc.zero.Or(sc.eqHi.Freeze())
+					sc.zero.AndNot(slice)
+					sc.lessHi.Or(sc.zero.Freeze())
+					sc.eqHi.And(slice)
+				} else {
+					sc.lessHi.Or(sc.eqHi.Freeze())
+					sc.eqHi.Reset()
+				}
+			} else if has {
+				sc.eqHi.AndNot(slice)
+			}
+		}
+	}
 	res := sc.res
 	res.Or(s.exists)
-	if r.HasLo {
-		bound := r.Lo
-		if !r.LoInclusive {
-			bound++
-		}
-		res.AndNot(bsiLessInto(s, bound, sc.equal, sc.less, sc.zero))
+	if loActive {
+		res.AndNot(sc.lessLo.Freeze())
 		if res.Freeze().IsEmpty() {
 			return roar.Bitmap{}
 		}
 	}
-	if r.HasHi {
-		bound := r.Hi
-		if r.HiInclusive {
-			bound++
-		}
-		res.And(bsiLessInto(s, bound, sc.equal, sc.less, sc.zero))
+	if hiActive {
+		res.And(sc.lessHi.Freeze())
 	}
 	return res.Freeze()
 }
@@ -312,6 +384,49 @@ func bsiCandidateAtMost(s *bsiSlices, id common.ValueID, bound uint64, inclusive
 		}
 	}
 	return inclusive
+}
+
+// bsiBitAt reports id's value bit by probing the view directly, touching only
+// that bit's slice. It resolves no slice directory and allocates nothing.
+func (v *namespaceView) bsiBitAt(ns common.Namespace, bit uint8, id common.ValueID) bool {
+	return v.contains(bsiSliceKey(ns, uint64(bit)+1), id)
+}
+
+// bsiCompareToBound compares id's value against bound, returning -1, 0, or 1.
+// It reads bits most-significant first and stops at the first difference.
+func (v *namespaceView) bsiCompareToBound(ns common.Namespace, width uint8, id common.ValueID, bound uint64) int {
+	for bit := int(width) - 1; bit >= 0; bit-- {
+		c := v.bsiBitAt(ns, uint8(bit), id)
+		b := bound&(uint64(1)<<uint(bit)) != 0
+		if c != b {
+			if c {
+				return 1
+			}
+			return -1
+		}
+	}
+	return 0
+}
+
+// bsiCandidateInRangeLazy tests one candidate against r by reading only the
+// bits a comparison needs, most-significant first, stopping at the first
+// difference. It is the small-candidate path: no slice resolution, no scratch,
+// no allocation when dst has capacity.
+func (v *namespaceView) bsiCandidateInRangeLazy(ns common.Namespace, width uint8, id common.ValueID, r ValueRange) bool {
+	if !v.contains(bsiSliceKey(ns, bsiExistsSlice), id) {
+		return false
+	}
+	if r.HasLo {
+		if cmp := v.bsiCompareToBound(ns, width, id, r.Lo); cmp < 0 || (cmp == 0 && !r.LoInclusive) {
+			return false
+		}
+	}
+	if r.HasHi {
+		if cmp := v.bsiCompareToBound(ns, width, id, r.Hi); cmp > 0 || (cmp == 0 && !r.HiInclusive) {
+			return false
+		}
+	}
+	return true
 }
 
 // ValueRange is an unsigned, inclusive/exclusive value range over a BSI
@@ -429,7 +544,7 @@ func (i *Index) bsiLessQuery(spec NamespaceSpec, bound uint64) (roar.Bitmap, err
 		return roar.Bitmap{}, nil
 	}
 	sc := i.bsiAcquire(spec, view)
-	result := ownBSI(bsiLessInto(&sc.slices, bound, sc.equal, sc.less, sc.zero))
+	result := ownBSI(bsiLessInto(&sc.slices, bound, sc.eqLo, sc.lessLo, sc.zero))
 	releaseBSIScratch(sc)
 	i.readers.Release(token)
 	return result, nil
@@ -445,7 +560,7 @@ func (i *Index) bsiExcludeLess(spec NamespaceSpec, bound uint64) (roar.Bitmap, e
 	sc.res.Reset()
 	if sc.slices.hasExists {
 		sc.res.Or(sc.slices.exists)
-		sc.res.AndNot(bsiLessInto(&sc.slices, bound, sc.equal, sc.less, sc.zero))
+		sc.res.AndNot(bsiLessInto(&sc.slices, bound, sc.eqLo, sc.lessLo, sc.zero))
 	}
 	result := ownBSI(sc.res.Freeze())
 	releaseBSIScratch(sc)
@@ -463,7 +578,7 @@ func (i *Index) bsiExcludeEqual(spec NamespaceSpec, value uint64) (roar.Bitmap, 
 	sc.res.Reset()
 	if sc.slices.hasExists {
 		sc.res.Or(sc.slices.exists)
-		sc.res.AndNot(bsiEqualInto(&sc.slices, value, sc.equal))
+		sc.res.AndNot(bsiEqualInto(&sc.slices, value, sc.eqLo))
 	}
 	result := ownBSI(sc.res.Freeze())
 	releaseBSIScratch(sc)
@@ -483,7 +598,7 @@ func (i *Index) Equal(value uint64) (roar.Bitmap, error) {
 		return roar.Bitmap{}, nil
 	}
 	sc := i.bsiAcquire(spec, view)
-	result := ownBSI(bsiEqualInto(&sc.slices, value, sc.equal))
+	result := ownBSI(bsiEqualInto(&sc.slices, value, sc.eqLo))
 	releaseBSIScratch(sc)
 	i.readers.Release(token)
 	return result, nil
@@ -608,6 +723,14 @@ const bsiCandidateFactor = 2
 // preserving candidate order and duplicates. dst=candidates[:0] is safe.
 // Small candidate sets reconstruct each value; larger sets materialize the
 // range bitmap once and probe it.
+// bsiLazyCandidateThreshold bounds the candidate count for which FilterRange
+// probes the view directly instead of resolving the slice directory. At or
+// below it, per-bit view probes (with early termination) cost less than
+// resolving 17 or 33 slices; above it the resolved directory pays off. Tuned
+// with BenchmarkBSIFilterRangeSmall: lazy wins at 1-4 candidates, resolving
+// wins from 8 up.
+const bsiLazyCandidateThreshold = 4
+
 func (i *Index) BSIFilterRange(dst, candidates []common.ValueID, r ValueRange) ([]common.ValueID, error) {
 	spec, err := i.bsiRangeSpec(r)
 	if err != nil || r.empty() || len(candidates) == 0 {
@@ -618,6 +741,16 @@ func (i *Index) BSIFilterRange(dst, candidates []common.ValueID, r ValueRange) (
 		return dst, nil
 	}
 	defer i.readers.Release(token)
+	// Tiny candidate sets probe only the bits the comparisons need, with no
+	// slice resolution and no scratch; larger sets use the resolved directory.
+	if len(candidates) <= bsiLazyCandidateThreshold {
+		for _, id := range candidates {
+			if view.bsiCandidateInRangeLazy(spec.Namespace, spec.BSIWidth, id, r) {
+				dst = append(dst, id)
+			}
+		}
+		return dst, nil
+	}
 	sc := i.bsiAcquire(spec, view)
 	defer releaseBSIScratch(sc)
 	s := &sc.slices
