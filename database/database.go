@@ -14,7 +14,7 @@ import (
 
 	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
-	"github.com/evanoberholster/imageIdx/index/idalloc"
+	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
@@ -56,7 +56,7 @@ type Options struct {
 type DB struct {
 	mu        sync.Mutex // serializes sequence allocation with the Pebble commit
 	values    *store.Store
-	ids       *idalloc.Allocator
+	ids       *schema.Schema
 	idsClosed atomic.Bool
 	indexes   *index.Store
 	decode    Decoder
@@ -91,7 +91,7 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return openWithValues(values, indexDir, decode, options)
+	return openWithValues(values, dir, indexDir, decode, options)
 }
 
 func canonicalSpecs() []store.Spec {
@@ -108,7 +108,7 @@ func canonicalSpecs() []store.Spec {
 	return specs
 }
 
-func openWithValues(values *store.Store, indexDir string, decode Decoder, options Options) (*DB, error) {
+func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	// A prior activation must be completed before reading the active index.
 	if err := resumeActivation(indexDir, values, options.boundary); err != nil {
 		_ = values.Close()
@@ -154,7 +154,7 @@ func openWithValues(values *store.Store, indexDir string, decode Decoder, option
 	if err := db.persistSchema(); err != nil {
 		return nil, err
 	}
-	if err := db.openIDs(); err != nil {
+	if err := db.openIDs(dir); err != nil {
 		return nil, err
 	}
 	idx = db.indexes
@@ -324,7 +324,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 	// Reconcile them before publishing canonical records, including deletions,
 	// so neither reopening nor future reservations can hand them out again.
 	for _, m := range mutations {
-		if err := db.ids.SkipThrough(m.Entity, m.ValueID); err != nil {
+		if err := db.ids.EnsureMinimum(common.Namespace(m.Entity), m.ValueID); err != nil {
 			return 0, err
 		}
 	}
@@ -387,12 +387,12 @@ func (db *DB) Index() *index.Store        { return db.indexes }
 // already admitted before closing the backing Pebble database.
 func (db *DB) NextID(entity common.EntityKind) (common.ValueID, error) {
 	if !entity.Valid() {
-		return 0, idalloc.ErrKind
+		return 0, schema.ErrNamespace
 	}
 	if db.idsClosed.Load() {
-		return 0, idalloc.ErrClosed
+		return 0, schema.ErrClosed
 	}
-	return db.ids.Next(entity)
+	return db.ids.NextID(common.Namespace(entity))
 }
 
 // WaitIndexed waits without polling or per-waiter goroutines. Permanent
@@ -441,7 +441,7 @@ func (db *DB) Close() error {
 	db.notify()
 	db.signal()
 	db.mu.Unlock()
-	_ = db.ids.Close()
+	idsErr := db.ids.Close()
 	<-db.done
-	return errors.Join(db.indexes.Close(), db.values.Close())
+	return errors.Join(idsErr, db.indexes.Close(), db.values.Close())
 }

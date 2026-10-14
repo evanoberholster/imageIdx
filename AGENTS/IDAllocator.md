@@ -1,5 +1,10 @@
 # IDAllocator.md — Lock-Free Monotonic Entity ID Allocation
 
+> Historical specification for the retired Pebble-backed `index/idalloc`
+> implementation. The active namespace allocator is `schema/` (see
+> `schema/README.md`). `database.DB.NextID` now uses that package with one
+> canonical namespace per entity. Do not recreate this retired package.
+
 **Status:** Codex implementation specification · **Suggested package:** `index/idalloc` (or a small subpackage of `index` without engine dependencies).
 
 ## Objective

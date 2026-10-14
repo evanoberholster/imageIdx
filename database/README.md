@@ -179,3 +179,13 @@ One measured startup-rebuild iteration reconstructed **10,000** enum records
 in **179 ms** (~56k records/s) and **100,000** in **397 ms** (~252k records/s),
 excluding fixture ingestion. These single observations are not a base-branch
 `benchstat` comparison and do not validate other index families.
+## ID allocation
+
+`DB.NextID(entity)` uses the standalone `schema` package's single-file
+`schema.dat` allocator, keyed by the entity's canonical namespace. Other
+namespaces for that entity reference the same ID; they do not allocate it.
+On first open, the database transfers the former Pebble allocator's durable
+high-water marks (if present) and reconciles canonical records and tombstones
+before publishing a synced migration marker. Later opens use only the schema
+file and never scan canonical records to reconstruct issued IDs. A clean close
+preserves the last issued ID; an unclean close skips unused reservations.

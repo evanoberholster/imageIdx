@@ -1,11 +1,16 @@
 package database
 
 import (
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/evanoberholster/imageIdx/common"
-	"github.com/evanoberholster/imageIdx/index/idalloc"
+	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
@@ -23,15 +28,15 @@ func TestNextIDAbandonedAndReopen(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.NextID(common.EntityImage); !errors.Is(err, idalloc.ErrClosed) {
+	if _, err := db.NextID(common.EntityImage); !errors.Is(err, schema.ErrClosed) {
 		t.Fatal(err)
 	}
 	db = openTest(t, data, idx)
 	defer db.Close()
-	if id, err := db.NextID(common.EntityImage); id != 1001 || err != nil {
+	if id, err := db.NextID(common.EntityImage); id != 2 || err != nil {
 		t.Fatalf("reopen image=%d: %v", id, err)
 	}
-	if id, err := db.NextID(common.EntityPerson); id != 1001 || err != nil {
+	if id, err := db.NextID(common.EntityPerson); id != 2 || err != nil {
 		t.Fatalf("reopen person=%d: %v", id, err)
 	}
 }
@@ -71,7 +76,7 @@ func TestCommitReconcilesExternalID(t *testing.T) {
 	}
 	db = openTest(t, data, idx)
 	defer db.Close()
-	if id, err := db.NextID(common.EntityImage); id != 6201 || err != nil {
+	if id, err := db.NextID(common.EntityImage); id != 5202 || err != nil {
 		t.Fatalf("reopen issued old ID: %d, %v", id, err)
 	}
 }
@@ -101,7 +106,81 @@ func TestLegacyCanonicalSchemaExtendsForNewKinds(t *testing.T) {
 	}
 	db = openTest(t, data, idx)
 	defer db.Close()
-	if id, err := db.NextID(common.EntityUser); id != 1001 || err != nil {
+	if id, err := db.NextID(common.EntityUser); id != 2 || err != nil {
 		t.Fatalf("user reopen: %d, %v", id, err)
+	}
+}
+
+func TestMigratesLegacyDurableHighWater(t *testing.T) {
+	data, idx := paths(t)
+	values, err := store.Open(data, canonicalSpecs()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := values.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Old allocator reserved 1..6000 although no image record committed.
+	pdb, err := pebble.Open(data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := pdb.NewBatch()
+	witness := store.EncodeKey(store.Key{Namespace: 0, ID: 1})
+	var key [11]byte
+	copy(key[:], []byte{0, 0, 'i', 'd', 'a', 'l', 'l', 'o', 'c', '/'})
+	key[10] = 0
+	if err := batch.Set(key[:], []byte{2, byte(common.EntityKindCount)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Set(witness[:], []byte{2}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for n := 1; n <= common.EntityKindCount; n++ {
+		key[10] = byte(n)
+		var raw [14]byte
+		raw[0], raw[1] = 2, byte(n)
+		if n == int(common.EntityImage) {
+			binary.BigEndian.PutUint64(raw[2:10], 6000)
+		}
+		binary.BigEndian.PutUint32(raw[10:], crc32.ChecksumIEEE(raw[:10]))
+		if err := batch.Set(key[:], raw[:], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := openTest(t, data, idx)
+	if id, err := db.NextID(common.EntityImage); id != 6001 || err != nil {
+		t.Fatalf("legacy reservation reused: %d %v", id, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openTest(t, data, idx)
+	defer db.Close()
+	if id, err := db.NextID(common.EntityImage); id != 6002 || err != nil {
+		t.Fatalf("reopen: %d %v", id, err)
+	}
+	// Losing the authoritative single-file state must never reset from the
+	// (now removed) legacy metadata or surviving canonical records.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(data, "schema.dat")); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(data, idx, decodeTest, Options{}); !errors.Is(err, schema.ErrCorrupt) {
+		if reopened != nil {
+			reopened.Close()
+		}
+		t.Fatalf("missing schema reset: %v", err)
 	}
 }

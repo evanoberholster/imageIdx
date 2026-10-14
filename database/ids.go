@@ -3,22 +3,13 @@ package database
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/evanoberholster/imageIdx/common"
-	"github.com/evanoberholster/imageIdx/index/idalloc"
+	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
-
-// migrateIDs is the one-time legacy migration. Scan *all* canonical keys,
-// including tombstones, not only live entries. Once initialized, startup
-// reads only durable watermarks; missing/corrupt metadata then fails closed.
-func (db *DB) migrateIDs() error {
-	maxima, err := db.canonicalMaxima()
-	if err != nil {
-		return err
-	}
-	return db.values.InitializeReservations(maxima)
-}
 
 func (db *DB) canonicalMaxima() ([common.EntityKindCount + 1]uint64, error) {
 	var maxima [common.EntityKindCount + 1]uint64
@@ -39,26 +30,54 @@ func (db *DB) canonicalMaxima() ([common.EntityKindCount + 1]uint64, error) {
 	return maxima, nil
 }
 
-func (db *DB) openIDs() error {
-	reservations, err := db.values.OpenReservations()
-	if errors.Is(err, store.ErrUninitializedReservations) {
-		if err = db.migrateIDs(); err != nil {
-			return err
-		}
-		reservations, err = db.values.OpenReservations()
-	} else if errors.Is(err, store.ErrLegacyReservations) {
-		maxima, scanErr := db.canonicalMaxima()
-		if scanErr != nil {
-			return scanErr
-		}
-		if err = db.values.UpgradeReservations(maxima); err != nil {
-			return err
-		}
-		reservations, err = db.values.OpenReservations()
-	}
+func (db *DB) openIDs(dir string) error {
+	path := filepath.Join(dir, "schema.dat")
+	complete, err := db.values.SchemaMigrationComplete()
 	if err != nil {
 		return err
 	}
-	db.ids, err = idalloc.Open(reservations)
-	return err
+	if complete {
+		if _, err := os.Stat(path); err != nil {
+			return errors.Join(schema.ErrCorrupt, fmt.Errorf("database: missing allocation file after migration: %w", err))
+		}
+	}
+	defs := make([]schema.NamespaceConfig, 0, common.EntityKindCount)
+	for n := 1; n <= common.EntityKindCount; n++ {
+		kind := common.EntityKind(n)
+		// The existing database has exactly one canonical namespace per
+		// entity. Its other index namespaces continue to share that ID.
+		defs = append(defs, schema.NamespaceConfig{ID: common.Namespace(kind), Name: "entity-" + kind.String(), ReserveSize: 1000})
+	}
+	ids, err := schema.Open(path, schema.Options{Namespaces: defs})
+	if err != nil {
+		return err
+	}
+	db.ids = ids
+	if complete {
+		return nil
+	}
+	// The legacy Pebble high-water marks are authoritative even if the
+	// corresponding record never committed or was later deleted. A canonical
+	// scan only reconciles records beyond those marks on this one-time path.
+	legacy, _, err := db.values.LegacyReservations()
+	if err != nil {
+		return err
+	}
+	maxima, err := db.canonicalMaxima()
+	if err != nil {
+		return err
+	}
+	for n := 1; n <= common.EntityKindCount; n++ {
+		floor := legacy[n]
+		if maxima[n] > floor {
+			floor = maxima[n]
+		}
+		if err := ids.EnsureMinimum(common.Namespace(n), floor); err != nil {
+			return err
+		}
+	}
+	// Atomic deletion of the legacy keys and publication of this marker is
+	// LAST. A crash beforehand repeats the idempotent floor advancement; a
+	// crash afterward recovers solely from the new single-file schema.
+	return db.values.CompleteSchemaMigration()
 }
