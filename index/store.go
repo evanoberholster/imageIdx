@@ -199,6 +199,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	}
 	s.reconcileGenerations(gens, safe)
 	if rec, rerr := readRecovery(dir); rerr != nil {
+		_ = s.Close()
 		return nil, rerr
 	} else if len(rec) != 0 {
 		// A prior interrupted multi-engine mutation may have left these
@@ -835,6 +836,8 @@ func (s *Store) NamespaceDef(ns common.Namespace) (common.NamespaceDef, bool) {
 
 // Health returns per-namespace open state for every declared namespace.
 func (s *Store) Health() []NamespaceHealth {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.healthOK {
 		return nil
 	}
@@ -847,10 +850,24 @@ func (s *Store) Health() []NamespaceHealth {
 
 // HealthOf returns the open state of one namespace.
 func (s *Store) HealthOf(ns common.Namespace) (NamespaceHealth, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.healthOK || int(ns) >= len(s.health) {
 		return NamespaceHealth{}, false
 	}
 	return s.health[ns], true
+}
+
+// NamespaceSourceGeneration returns the durable canonical completeness
+// watermark for one declared namespace. It does not imply availability;
+// callers must also inspect HealthOf before using a damaged index.
+func (s *Store) NamespaceSourceGeneration(ns common.Namespace) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.schema.Lookup(ns); !ok {
+		return 0, false
+	}
+	return s.nsSource[ns], true
 }
 
 // isDegraded reports whether a namespace is known to be potentially incomplete
@@ -988,7 +1005,9 @@ func (s *Store) Sync() error {
 	for _, v := range s.reg.vectors {
 		err = errors.Join(err, v.Sync())
 	}
-	return errors.Join(err, s.clearRecoveryAfterDurability())
+	// An interrupted batch can contain missing logical mutations even when
+	// every surviving engine file is durable. Sync cannot resolve that marker.
+	return err
 }
 
 // Checkpoint flushes every engine's durable checkpoint. It serializes with
@@ -1016,17 +1035,8 @@ func (s *Store) Checkpoint() error {
 	for _, v := range s.reg.vectors {
 		err = errors.Join(err, v.Checkpoint())
 	}
-	return errors.Join(err, s.clearRecoveryAfterDurability())
-}
-
-// clearRecoveryAfterDurability drops the recovery marker once every engine has
-// been made durable. The caller holds mu.
-func (s *Store) clearRecoveryAfterDurability() error {
-	if len(s.pendingSet) == 0 {
-		return nil
-	}
-	s.pendingSet = s.pendingSet[:0]
-	return s.persistRecovery()
+	// Checkpointing a partial state does not reconstruct omitted associations.
+	return err
 }
 
 // Compact compacts every engine that supports it. It serializes with mutations

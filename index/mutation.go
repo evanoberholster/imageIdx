@@ -136,16 +136,26 @@ func (s *Store) Delete(entity common.EntityKind, id common.ValueID) error {
 // writers. It does not roll back engine mutations that a later failure cannot
 // undo; see the package consistency contract.
 func (s *Store) Apply(b *Batch) error {
-	return s.applyBatch(b, 0, false)
+	return s.applyBatch(b, 0, false, false)
 }
 
 // ApplyWithGeneration commits a batch and records a canonical-database
 // completeness watermark. See the package consistency contract.
 func (s *Store) ApplyWithGeneration(b *Batch, sourceGeneration uint64) error {
-	return s.applyBatch(b, sourceGeneration, true)
+	return s.applyBatch(b, sourceGeneration, true, false)
 }
 
-func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) error {
+// ApplyWithGenerationAll commits a batch and confirms that every healthy
+// declared namespace (including unchanged namespaces) is complete through
+// sourceGeneration. This is for a coordinator that owns the full canonical
+// mutation stream. It avoids a second empty generation-only batch and does
+// not rewrite unchanged index values. Unavailable namespaces still hold the
+// store-wide safe generation back.
+func (s *Store) ApplyWithGenerationAll(b *Batch, sourceGeneration uint64) error {
+	return s.applyBatch(b, sourceGeneration, true, true)
+}
+
+func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit, all bool) error {
 	if b == nil {
 		return ErrEmptyBatch
 	}
@@ -170,7 +180,7 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 		// watermark, which is a supported way to mark a bulk import complete.
 		// It claims completeness through sourceGeneration for every healthy
 		// namespace.
-		if !explicit || sourceGeneration == s.source {
+		if !explicit || (sourceGeneration == s.source && s.recomputeSafe() >= sourceGeneration) {
 			return ErrEmptyBatch
 		}
 		if err := s.advanceAllCompleteness(sourceGeneration); err != nil {
@@ -208,6 +218,14 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit bool) err
 		if err != nil {
 			s.degradeIntended(err)
 			return err
+		}
+		if all {
+			untouched, err := s.advanceUntouchedCompleteness(sourceGeneration)
+			if err != nil {
+				s.degradeIntended(err)
+				return err
+			}
+			advanced = advanced || untouched
 		}
 		if risky {
 			if err := s.pendingRemoveSet(); err != nil {
@@ -354,6 +372,31 @@ func (s *Store) advanceTouchedCompleteness(gen uint64) (bool, error) {
 	return advanced, nil
 }
 
+// advanceUntouchedCompleteness promotes only healthy namespaces not written by
+// this batch. Prior index writes are already durable at their last confirmed
+// generation; there is no new engine payload to checkpoint here.
+func (s *Store) advanceUntouchedCompleteness(gen uint64) (bool, error) {
+	advanced := false
+	for _, def := range s.defs {
+		ns := def.Namespace
+		if !s.health[ns].Available || s.isDegraded(ns) || (s.pvSet[ns>>6]&(uint64(1)<<(uint(ns)&63))) != 0 {
+			continue
+		}
+		if def.Kind == common.KindTimestamp {
+			if idx, ok := s.reg.timeIndex(ns); ok {
+				if err := applyTimeGeneration(idx, gen); err != nil {
+					return advanced, err
+				}
+			}
+		}
+		if gen > s.nsSource[ns] {
+			s.nsSource[ns] = gen
+			advanced = true
+		}
+	}
+	return advanced, nil
+}
+
 // advanceAllCompleteness establishes a durability barrier for every healthy
 // namespace, then records that all are complete through gen. It is used by an
 // empty generation-only batch.
@@ -380,7 +423,7 @@ func (s *Store) advanceAllCompleteness(gen uint64) error {
 }
 
 // syncNamespace makes one healthy namespace durable. Only the
-// checkpoint-dependent engines (radixhash, geoidx) need work; the others'
+// checkpoint-dependent engines (radixhash, geoidx, simhash) need work; the others'
 // Apply already left crash-recoverable state, so re-checkpointing them would be
 // redundant write amplification.
 func (s *Store) syncNamespace(ns common.Namespace) error {
@@ -395,6 +438,10 @@ func (s *Store) syncNamespace(ns common.Namespace) error {
 		}
 	case familyRadix:
 		if idx, ok := s.reg.radixIndex(ns); ok {
+			return idx.Checkpoint()
+		}
+	case familySim:
+		if idx, ok := s.reg.simStore(ns); ok {
 			return idx.Checkpoint()
 		}
 	}
