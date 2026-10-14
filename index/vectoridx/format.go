@@ -8,7 +8,7 @@ import (
 	"sort"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -23,7 +23,7 @@ var _ = atomic.LoadInt32
 //
 // Region kinds: 1=NodeMeta, 2=Vectors, 3=Graph, 4=Tombstones.
 //
-// The 16-bit identity field at header offset 24 is a plain common.Namespace.
+// The 16-bit identity field at header offset 24 is a plain schema.Namespace.
 // The format is byte-identical to the era when it held a packed SpaceID: the
 // field was always one validated uint16, so no version bump is needed and old
 // files reopen with their old packed value read as a namespace.
@@ -57,7 +57,7 @@ var vectorMagic = [8]byte{
 
 type fileHeader struct {
 	generation     uint64
-	namespace      common.Namespace
+	namespace      schema.Namespace
 	elem           ElementType
 	metric         uint8
 	dims           uint16
@@ -132,7 +132,7 @@ func decodeHeader(data []byte) (fileHeader, error) {
 		return h, ErrCorruptStorage
 	}
 	h.generation = binary.LittleEndian.Uint64(data[16:24])
-	h.namespace = common.Namespace(binary.LittleEndian.Uint16(data[24:26]))
+	h.namespace = schema.Namespace(binary.LittleEndian.Uint16(data[24:26]))
 	h.elem = ElementType(data[26])
 	h.metric = data[27]
 	h.dims = binary.LittleEndian.Uint16(data[28:30])

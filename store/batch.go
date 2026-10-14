@@ -5,7 +5,7 @@ import (
 	"errors"
 
 	"github.com/cockroachdb/pebble/v2"
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Batch is an exclusively owned atomic write group. A successful Commit syncs
@@ -35,7 +35,7 @@ func (b *Batch) Delete(key Key) error {
 
 // DeleteRange removes [start, end), including all flags for IDs in the range.
 // end must be greater than start; the operation cannot cross namespaces.
-func (b *Batch) DeleteRange(ns common.Namespace, start, end uint64) error {
+func (b *Batch) DeleteRange(ns schema.Namespace, start, end uint64) error {
 	if err := b.store.check(Key{Namespace: ns}); err != nil {
 		return err
 	}
@@ -52,13 +52,13 @@ func (b *Batch) Close() error  { return b.batch.Close() }
 
 // ScanFrom visits keys starting at start, stopping when visit returns false.
 // Values are borrowed until the next iterator step; do not retain them.
-func (s *Store) ScanFrom(ns common.Namespace, start uint64, visit func(Key, []byte) (bool, error)) error {
+func (s *Store) ScanFrom(ns schema.Namespace, start uint64, visit func(Key, []byte) (bool, error)) error {
 	if err := s.check(Key{Namespace: ns}); err != nil {
 		return err
 	}
 	lower := EncodeKey(Key{Namespace: ns, ID: start})
 	options := &pebble.IterOptions{LowerBound: lower[:]}
-	if ns < common.Namespace(^uint16(0)) {
+	if ns < schema.Namespace(^uint16(0)) {
 		var upper [2]byte
 		binary.BigEndian.PutUint16(upper[:], uint16(ns)+1)
 		options.UpperBound = upper[:]

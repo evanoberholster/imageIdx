@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
@@ -72,7 +72,7 @@ func (db *DB) run() {
 	}
 }
 
-func (db *DB) decodeEntry(raw []byte, entity common.EntityKind, id common.ValueID) (index.Entry, error) {
+func (db *DB) decodeEntry(raw []byte, entity schema.EntityKind, id schema.ValueID) (index.Entry, error) {
 	entry, err := db.decode(raw)
 	if err != nil {
 		return index.Entry{}, fmt.Errorf("%w: %v", ErrCorruptJournal, err)
@@ -113,7 +113,7 @@ func (db *DB) decodeEntry(raw []byte, entity common.EntityKind, id common.ValueI
 	return entry, nil
 }
 
-func (db *DB) owns(ns common.Namespace, entity common.EntityKind) bool {
+func (db *DB) owns(ns schema.Namespace, entity schema.EntityKind) bool {
 	owner, ok := db.indexes.EntityOf(ns)
 	return ok && owner == entity
 }

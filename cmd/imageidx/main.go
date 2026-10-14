@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
@@ -33,7 +33,7 @@ type searchRequest struct {
 }
 
 type searchResponse struct {
-	ImageIDs []common.ImageID `json:"image_ids"`
+	ImageIDs []schematypes.ImageID `json:"image_ids"`
 }
 
 type demoService struct {
@@ -41,7 +41,7 @@ type demoService struct {
 	engine    *search.Engine
 	executor  *search.Executor
 	dir       string
-	canonical map[common.ImageID]uint64
+	canonical map[schematypes.ImageID]uint64
 	demoCell  uint64
 }
 
@@ -122,16 +122,16 @@ func runServer(ctx context.Context, address string) error {
 }
 
 func newDemoService() (*demoService, error) {
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
-	}, "tags", common.EntityImage)
+		Namespace: schematypes.NamespaceTag, Kind: schematypes.KindBitmapEnum,
+	}, "tags", schematypes.EntityImage)
 	if err != nil {
 		return nil, err
 	}
 	if err := schema.RegisterAll(tags,
-		common.NamespaceDef{Namespace: common.NamespaceLocation, Name: "location", Kind: common.KindGeo, Entity: common.EntityImage},
-		common.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: common.KindTimestamp, Entity: common.EntityImage},
+		schematypes.NamespaceDef{Namespace: schematypes.NamespaceLocation, Name: "location", Kind: schematypes.KindGeo, Entity: schematypes.EntityImage},
+		schematypes.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
 	); err != nil {
 		return nil, err
 	}
@@ -157,12 +157,12 @@ func newDemoService() (*demoService, error) {
 	if err != nil {
 		return fail(err)
 	}
-	service.canonical = map[common.ImageID]uint64{
+	service.canonical = map[schematypes.ImageID]uint64{
 		100: demoQuantum, 200: 2 * demoQuantum,
 		300: 3 * demoQuantum, 400: 4 * demoQuantum,
 	}
 	for _, row := range []struct {
-		id  common.ImageID
+		id  schematypes.ImageID
 		lat float64
 		lng float64
 	}{
@@ -175,10 +175,10 @@ func newDemoService() (*demoService, error) {
 		}
 		entry := index.Entry{ValueID: row.id,
 			Times: []index.TimeValue{{Namespace: 100, Timestamp: service.canonical[row.id]}},
-			Geos:  []index.GeoValue{{Namespace: common.NamespaceLocation, Key: key}},
+			Geos:  []index.GeoValue{{Namespace: schematypes.NamespaceLocation, Key: key}},
 		}
 		if row.id != 400 {
-			entry.Bitmaps = []index.BitmapValue{{Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}}
+			entry.Bitmaps = []index.BitmapValue{{Namespace: schematypes.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}}
 		}
 		if err := db.Add(entry); err != nil {
 			return fail(err)
@@ -195,24 +195,24 @@ func (service *demoService) Close() error {
 	return errors.Join(service.store.Close(), os.RemoveAll(service.dir))
 }
 
-func (service *demoService) searchOnce(ctx context.Context, request searchRequest) ([]common.ImageID, error) {
-	favorites, err := service.engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+func (service *demoService) searchOnce(ctx context.Context, request searchRequest) ([]schematypes.ImageID, error) {
+	favorites, err := service.engine.Values(schematypes.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
 	if err != nil {
 		return nil, err
 	}
 	during, err := service.engine.During(100, request.Start, request.End,
-		search.ExactTimestamp(func(id common.ImageID) (uint64, bool) {
+		search.ExactTimestamp(func(id schematypes.ImageID) (uint64, bool) {
 			value, ok := service.canonical[id]
 			return value, ok
 		}))
 	if err != nil {
 		return nil, err
 	}
-	cells, err := service.engine.InCells(common.NamespaceLocation, request.CellIDs...)
+	cells, err := service.engine.InCells(schematypes.NamespaceLocation, request.CellIDs...)
 	if err != nil {
 		return nil, err
 	}
-	plan, err := service.engine.Compile(common.EntityImage, favorites, during, cells)
+	plan, err := service.engine.Compile(schematypes.EntityImage, favorites, during, cells)
 	if err != nil {
 		return nil, err
 	}

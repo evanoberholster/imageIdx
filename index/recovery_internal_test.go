@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -16,26 +16,26 @@ import (
 )
 
 // boundarySchema has one namespace per engine family, all EntityImage.
-func boundarySchema(t *testing.T) *common.Schema {
+func boundarySchema(t *testing.T) *schematypes.Definitions {
 	t.Helper()
-	schema := common.NewSchema()
-	defs := []common.NamespaceDef{
-		{Namespace: 1, Name: "time", Kind: common.KindTimestamp, Entity: common.EntityImage},
-		{Namespace: 2, Name: "geo", Kind: common.KindGeo, Entity: common.EntityImage},
-		{Namespace: 3, Name: "sim", Kind: common.KindHashPerceptual, Entity: common.EntityImage},
-		{Namespace: 4, Name: "sha", Kind: common.KindHashExact, Entity: common.EntityImage},
+	schema := schematypes.NewDefinitions()
+	defs := []schematypes.NamespaceDef{
+		{Namespace: 1, Name: "time", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+		{Namespace: 2, Name: "geo", Kind: schematypes.KindGeo, Entity: schematypes.EntityImage},
+		{Namespace: 3, Name: "sim", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage},
+		{Namespace: 4, Name: "sha", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage},
 	}
 	if err := schema.RegisterAll(defs...); err != nil {
 		t.Fatal(err)
 	}
-	tags, err := BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: common.KindBitmapEnum}, "tags", common.EntityImage)
+	tags, err := BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: schematypes.KindBitmapEnum}, "tags", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := schema.Register(tags); err != nil {
 		t.Fatal(err)
 	}
-	vec, err := VectorDef(vectoridx.Config{Namespace: 5, Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementFloat32}, "vec", common.EntityImage)
+	vec, err := VectorDef(vectoridx.Config{Namespace: 5, Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementFloat32}, "vec", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestUnifiedProcessCrashRecovery(t *testing.T) {
 					if got := ti.Search(nil, 0, 100); !slices.Equal(got, []uint64{1}) {
 						t.Fatalf("time search = %v, want [1]", got)
 					}
-					live, val, ok := reopened.Liveness(common.EntityImage)
+					live, val, ok := reopened.Liveness(schematypes.EntityImage)
 					if !ok {
 						t.Fatal("liveness unavailable")
 					}
@@ -177,7 +177,7 @@ func TestUnifiedProcessCrashRecovery(t *testing.T) {
 					}
 					rec := reopened.RecoveryNamespaces()
 					slices.Sort(rec)
-					if !slices.Contains(rec, common.Namespace(1)) || !slices.Contains(rec, common.Namespace(4)) {
+					if !slices.Contains(rec, schematypes.Namespace(1)) || !slices.Contains(rec, schematypes.Namespace(4)) {
 						t.Fatalf("recovery namespaces = %v, want [1 4]", rec)
 					}
 					if _, ok := reopened.Time(1); ok {
@@ -240,7 +240,7 @@ func TestSingleNamespaceLivenessFailureIsBenign(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	live, val, ok := reopened.Liveness(common.EntityImage)
+	live, val, ok := reopened.Liveness(schematypes.EntityImage)
 	if !ok {
 		t.Fatal("liveness namespace unavailable after reopen")
 	}

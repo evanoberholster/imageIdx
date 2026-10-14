@@ -36,13 +36,13 @@ Prefer immutable reader-visible structures, lock-free readers, serialized
 writes/publication, reusable scratch memory, zero-copy mmap reads, and SIMD
 behind internal kernels. Avoid speculative architectural redesigns.
 
-Keep package dependencies one-way: index packages may use shared `common`,
+Keep package dependencies one-way: index packages may use shared `schema`,
 `roar`, and `internal/storage` mechanisms; `search` may combine indexes, but
 index packages must not import `search`. Namespaces are schema-defined: a
-`common.Schema` holds unique namespace numbers and names, and every new
-collection must register a `common.NamespaceDef` (built from its
-package-specific spec) before it is shared. `common` owns the shared
-identifier aliases (`ImageID`, `UserID`, `GroupID`) and durability.
+`schema.Definitions` holds unique namespace numbers and names, and every new
+collection must register a `schema.NamespaceDef` (built from its
+package-specific spec) before it is shared. `schema` owns entity identity,
+identifier aliases (`ImageID`, `UserID`, `GroupID`), durability, and allocation.
 
 ## Implementation workflow
 

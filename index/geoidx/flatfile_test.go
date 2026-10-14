@@ -5,14 +5,14 @@ import (
 	"path/filepath"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // flatEntries returns n deterministic entries whose ImageIDs start at base.
 func flatEntries(n int, base uint64) []Entry {
 	entries := shardedMemoryEntries(n)
 	for i := range entries {
-		entries[i].ImageID += common.ImageID(base)
+		entries[i].ImageID += schema.ImageID(base)
 	}
 	return entries
 }

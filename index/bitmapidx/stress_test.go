@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // stressInt reads an environment override for a stress parameter, falling
@@ -25,7 +25,7 @@ func stressInt(name string, def int) int {
 }
 
 // idsSortedUnique reports whether ids is ascending with no duplicates.
-func idsSortedUnique(ids []common.ImageID) bool {
+func idsSortedUnique(ids []schema.ImageID) bool {
 	for i := 1; i < len(ids); i++ {
 		if ids[i] <= ids[i-1] {
 			return false
@@ -48,16 +48,16 @@ func TestStressMixedWorkload(t *testing.T) {
 	rounds := stressInt("BITMAPIDX_STRESS_ROUNDS", 24)
 	const idsPerWriter = 192
 	const (
-		enumType       = common.Namespace(100)
-		textType       = common.Namespace(101)
-		continuousType = common.Namespace(102)
+		enumType       = schema.Namespace(100)
+		textType       = schema.Namespace(101)
+		continuousType = schema.Namespace(102)
 	)
 
 	dir := t.TempDir()
 	config := NamespaceConfig{ActiveTarget: 64, HardDeltaLimit: 256, MaxDeltaValues: 32}
 	store, err := NewStore(dir, []NamespaceSpec{
 		enumNamespace(enumType), textNamespace(textType), continuousNamespace(continuousType),
-	}, config, common.DurabilityOS)
+	}, config, schema.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewMemory: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestStressMixedWorkload(t *testing.T) {
 				textChanges := make([]TextReplacement, 0, idsPerWriter)
 				contMoves := make([]Move, 0, idsPerWriter)
 				for i := 0; i < idsPerWriter; i++ {
-					id := common.ImageID(w*idsPerWriter + i + 1)
+					id := schema.ImageID(w*idsPerWriter + i + 1)
 					enumValue := fmt.Sprintf("tag-%d-%d", w, id)
 					enumAdds = append(enumAdds, Entry{ImageID: id, Value: EnumStringValue(enumValue)})
 
@@ -262,7 +262,7 @@ func TestStressMixedWorkload(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := OpenStore(dir, config, common.DurabilityOS)
+	reopened, err := OpenStore(dir, config, schema.DurabilityOS)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestStressMixedWorkload(t *testing.T) {
 	total := writers * idsPerWriter
 	for w := 0; w < writers; w++ {
 		for i := 0; i < idsPerWriter; i++ {
-			id := common.ImageID(w*idsPerWriter + i + 1)
+			id := schema.ImageID(w*idsPerWriter + i + 1)
 			exp := reference[w][i]
 			if ok, err := rtag.Contains(id, EnumStringValue(exp.enumValue)); err != nil || !ok {
 				t.Fatalf("enum id=%d value=%q ok=%v err=%v", id, exp.enumValue, ok, err)

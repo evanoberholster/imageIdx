@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // BSI benchmark distributions. The same shapes are exercised for both widths
@@ -64,7 +64,7 @@ func bsiBenchValues(dist bsiBenchDist, width uint8, n int) []uint32 {
 
 // buildBSIBench fills an in-memory BSI namespace with n values and returns it
 // with the ids, ready for read benchmarks.
-func buildBSIBench(b *testing.B, width uint8, dist bsiBenchDist, n int) (*Index, []common.ValueID) {
+func buildBSIBench(b *testing.B, width uint8, dist bsiBenchDist, n int) (*Index, []schema.ValueID) {
 	b.Helper()
 	index, err := NewMemory(bsiNamespace(testBSI16Namespace, width), NamespaceConfig{})
 	if err != nil {
@@ -72,10 +72,10 @@ func buildBSIBench(b *testing.B, width uint8, dist bsiBenchDist, n int) (*Index,
 	}
 	b.Cleanup(func() { _ = index.Close() })
 	values := bsiBenchValues(dist, width, n)
-	ids := make([]common.ValueID, n)
+	ids := make([]schema.ValueID, n)
 	batch := index.NewBatch()
 	for i, value := range values {
-		id := common.ValueID(i + 1)
+		id := schema.ValueID(i + 1)
 		ids[i] = id
 		if err := batch.BSIMove(BSIMove{ID: id, To: value, HasTo: true}); err != nil {
 			b.Fatal(err)
@@ -109,7 +109,7 @@ func fillBSIBench(b *testing.B, index *Index, values []uint32) {
 	b.Helper()
 	batch := index.NewBatch()
 	for i, value := range values {
-		if err := batch.BSIMove(BSIMove{ID: common.ValueID(i + 1), To: value, HasTo: true}); err != nil {
+		if err := batch.BSIMove(BSIMove{ID: schema.ValueID(i + 1), To: value, HasTo: true}); err != nil {
 			b.Fatal(err)
 		}
 		if batch.Len() >= 4096 {
@@ -308,14 +308,14 @@ func BenchmarkBSISet(b *testing.B) {
 			max := bsiMaxValue(width)
 			// Pre-insert ids so the timed loop measures replacement.
 			for i := 1; i <= 4096; i++ {
-				if err := index.Set(common.ValueID(i), uint64(i)&max); err != nil {
+				if err := index.Set(schema.ValueID(i), uint64(i)&max); err != nil {
 					b.Fatal(err)
 				}
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := index.Set(common.ValueID(i%4096+1), uint64(i+1)&max); err != nil {
+				if err := index.Set(schema.ValueID(i%4096+1), uint64(i+1)&max); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -347,7 +347,7 @@ func bsiBenchIndex(b *testing.B, width uint8) *Index {
 // stageUpserts stages size Set-semantics upserts over the bounded domain.
 func stageUpserts(batch *Batch, seed, size int) error {
 	for j := 0; j < size; j++ {
-		id := common.ValueID((seed+j)%bsiBatchDomain + 1)
+		id := schema.ValueID((seed+j)%bsiBatchDomain + 1)
 		if err := batch.Add(Entry{ImageID: id, Value: Uint32Value(uint32((seed + j) & 0xFFFF))}); err != nil {
 			return err
 		}
@@ -370,11 +370,11 @@ func benchBSIBatch(b *testing.B, index *Index, size int, op string) {
 			b.Fatal(err)
 		}
 		for j := 0; j < size; j++ {
-			id := common.ValueID((seed+j)%bsiBatchDomain + 1)
+			id := schema.ValueID((seed+j)%bsiBatchDomain + 1)
 			var err error
 			switch op {
 			case "insert":
-				err = batch.BSIMove(BSIMove{ID: common.ValueID((seed+j)%bsiChurnDomain + 1), To: uint32((seed + j) & 0xFFFF), HasTo: true})
+				err = batch.BSIMove(BSIMove{ID: schema.ValueID((seed+j)%bsiChurnDomain + 1), To: uint32((seed + j) & 0xFFFF), HasTo: true})
 			case "delete":
 				err = batch.Remove(Entry{ImageID: id, Value: Uint32Value(0)})
 			case "mixed":
@@ -405,7 +405,7 @@ func benchBSIBatch(b *testing.B, index *Index, size int, op string) {
 		switch op {
 		case "insert":
 			for j := 0; j < size; j++ {
-				if err := batch.Remove(Entry{ImageID: common.ValueID((seed+j)%bsiChurnDomain + 1), Value: Uint32Value(0)}); err != nil {
+				if err := batch.Remove(Entry{ImageID: schema.ValueID((seed+j)%bsiChurnDomain + 1), Value: Uint32Value(0)}); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -420,7 +420,7 @@ func benchBSIBatch(b *testing.B, index *Index, size int, op string) {
 			// maintenance value never overflows (BSI16).
 			maxValue := uint32(bsiMaxValue(index.spec().BSIWidth))
 			for j := 0; j < size; j++ {
-				if err := batch.Add(Entry{ImageID: common.ValueID((seed+j)%bsiBatchDomain + 1), Value: Uint32Value(uint32(seed+j) & maxValue)}); err != nil {
+				if err := batch.Add(Entry{ImageID: schema.ValueID((seed+j)%bsiBatchDomain + 1), Value: Uint32Value(uint32(seed+j) & maxValue)}); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -480,7 +480,7 @@ func BenchmarkBSIBatchCommitPersistent(b *testing.B) {
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
 		for _, size := range bsiBatchSizes {
 			b.Run(sizeName(width, size), func(b *testing.B) {
-				store, err := NewStore(b.TempDir(), []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, common.DurabilityOS)
+				store, err := NewStore(b.TempDir(), []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, schema.DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -498,7 +498,7 @@ func BenchmarkBSIBatchCommitDurable(b *testing.B) {
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
 		for _, size := range bsiBatchSizes {
 			b.Run(sizeName(width, size), func(b *testing.B) {
-				store, err := NewStore(b.TempDir(), []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, common.DurabilitySync)
+				store, err := NewStore(b.TempDir(), []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, schema.DurabilitySync)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -560,7 +560,7 @@ func BenchmarkBSIBatchBitDelta(b *testing.B) {
 				index := bsiBenchIndex(b, width)
 				seed := index.NewBatch()
 				for j := 0; j < n; j++ {
-					if err := seed.Add(Entry{ImageID: common.ValueID(j + 1), Value: Uint32Value(0)}); err != nil {
+					if err := seed.Add(Entry{ImageID: schema.ValueID(j + 1), Value: Uint32Value(0)}); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -580,7 +580,7 @@ func BenchmarkBSIBatchBitDelta(b *testing.B) {
 					}
 					high := uint32(i & 1)
 					for j := 0; j < size; j++ {
-						id := common.ValueID((i*size+j)%n + 1)
+						id := schema.ValueID((i*size+j)%n + 1)
 						v := high // one bit differs
 						if mode == "allbits" {
 							v = high * max
@@ -618,7 +618,7 @@ func BenchmarkBSIPersistent(b *testing.B) {
 		for _, size := range []int{10_000, 100_000} {
 			b.Run(sizeName(width, size), func(b *testing.B) {
 				dir := b.TempDir()
-				store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, common.DurabilityOS)
+				store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, schema.DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -636,7 +636,7 @@ func BenchmarkBSIPersistent(b *testing.B) {
 				}
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					reopened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+					reopened, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -696,7 +696,7 @@ func BenchmarkBSICheckpoint(b *testing.B) {
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
 		b.Run(sizeName(width, n), func(b *testing.B) {
 			dir := b.TempDir()
-			store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, common.DurabilityOS)
+			store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, width)}, NamespaceConfig{}, schema.DurabilityOS)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -744,7 +744,7 @@ func BenchmarkBSIVsContinuousRange(b *testing.B) {
 		b.Cleanup(func() { _ = index.Close() })
 		batch := index.NewBatch()
 		for i, value := range values {
-			if err := batch.Add(Entry{ImageID: common.ImageID(i + 1), Value: IntValue(int64(value))}); err != nil {
+			if err := batch.Add(Entry{ImageID: schema.ImageID(i + 1), Value: IntValue(int64(value))}); err != nil {
 				b.Fatal(err)
 			}
 			if batch.Len() >= 4096 {

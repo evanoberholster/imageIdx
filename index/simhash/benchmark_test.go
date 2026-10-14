@@ -2,7 +2,7 @@ package simhash
 
 import (
 	"fmt"
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -349,7 +349,7 @@ func BenchmarkGet(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, ok := st.Get(common.ImageID(1 + i%100_000)); !ok {
+		if _, ok := st.Get(schema.ImageID(1 + i%100_000)); !ok {
 			b.Fatal("missing")
 		}
 	}
@@ -429,8 +429,8 @@ func BenchmarkGroupingExperiment(b *testing.B) {
 	local := make([]Update, 64)
 	random := make([]Update, 64)
 	for i := range local {
-		local[i] = Update{ImageID: common.ImageID(50_000 + i), Record: records[i]}
-		random[i] = Update{ImageID: common.ImageID(1 + rng.Intn(1_000_000)), Record: records[i]}
+		local[i] = Update{ImageID: schema.ImageID(50_000 + i), Record: records[i]}
+		random[i] = Update{ImageID: schema.ImageID(1 + rng.Intn(1_000_000)), Record: records[i]}
 	}
 	b.Run("consecutive/local", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
@@ -505,7 +505,7 @@ func reportNsPerUpdate(b *testing.B, updates int, elapsed time.Duration) {
 	b.ReportMetric(float64(elapsed.Nanoseconds())/float64(int64(b.N)*int64(updates)), "ns/update")
 }
 
-func makeUpdates(records []Record, ids []common.ImageID) []Update {
+func makeUpdates(records []Record, ids []schema.ImageID) []Update {
 	updates := make([]Update, len(ids))
 	for i := range ids {
 		updates[i] = Update{ImageID: ids[i], Record: records[i%len(records)]}
@@ -517,11 +517,11 @@ func makeUpdates(records []Record, ids []common.ImageID) []Update {
 func BenchmarkUpsertBatch(b *testing.B) {
 	st, records := benchSetup(b, 1_000_000, defaultSeqBlockRecords)
 	defer st.Close()
-	base := common.ImageID(200_000)
+	base := schema.ImageID(200_000)
 	for _, size := range []int{1, 4, 16, 32, 64, 128, 256} {
-		ids := make([]common.ImageID, size)
+		ids := make([]schema.ImageID, size)
 		for i := range ids {
-			ids[i] = base + common.ImageID(i*997)
+			ids[i] = base + schema.ImageID(i*997)
 		}
 		updates := makeUpdates(records, ids)
 		b.Run(fmt.Sprintf("batch=%d", size), func(b *testing.B) {
@@ -544,9 +544,9 @@ func BenchmarkUpsertBatch(b *testing.B) {
 func BenchmarkUpsert64VsBatch64(b *testing.B) {
 	st, records := benchSetup(b, 1_000_000, defaultSeqBlockRecords)
 	defer st.Close()
-	ids := make([]common.ImageID, 64)
+	ids := make([]schema.ImageID, 64)
 	for i := range ids {
-		ids[i] = 200_000 + common.ImageID(i*997)
+		ids[i] = 200_000 + schema.ImageID(i*997)
 	}
 	updates := makeUpdates(records, ids)
 	b.Run("individual64", func(b *testing.B) {
@@ -588,16 +588,16 @@ func BenchmarkUpsertBatchLocality(b *testing.B) {
 	base := uint64(200_000)
 	patterns := []struct {
 		name string
-		pick func(i int) common.ImageID
+		pick func(i int) schema.ImageID
 	}{
-		{"sequential", func(i int) common.ImageID { return common.ImageID(1 + (base+uint64(i))%n) }},
-		{"sameBlock", func(i int) common.ImageID { return common.ImageID(1 + base + uint64(i%1000)) }},
-		{"samePage", func(i int) common.ImageID { return common.ImageID(1 + (base/65536)*65536 + uint64((i*997)%65536)) }},
-		{"spreadPages", func(i int) common.ImageID { return common.ImageID(1 + (base+uint64(i)*65536)%n) }},
-		{"random", func(i int) common.ImageID { return common.ImageID(1 + rng.Intn(n)) }},
+		{"sequential", func(i int) schema.ImageID { return schema.ImageID(1 + (base+uint64(i))%n) }},
+		{"sameBlock", func(i int) schema.ImageID { return schema.ImageID(1 + base + uint64(i%1000)) }},
+		{"samePage", func(i int) schema.ImageID { return schema.ImageID(1 + (base/65536)*65536 + uint64((i*997)%65536)) }},
+		{"spreadPages", func(i int) schema.ImageID { return schema.ImageID(1 + (base+uint64(i)*65536)%n) }},
+		{"random", func(i int) schema.ImageID { return schema.ImageID(1 + rng.Intn(n)) }},
 	}
 	for _, p := range patterns {
-		ids := make([]common.ImageID, 64)
+		ids := make([]schema.ImageID, 64)
 		for i := range ids {
 			ids[i] = p.pick(i)
 		}
@@ -643,8 +643,8 @@ func BenchmarkSeqGrouping(b *testing.B) {
 		local := make([]Update, size)
 		random := make([]Update, size)
 		for i := range local {
-			local[i] = Update{ImageID: common.ImageID(200_000 + i), Record: records[i]}
-			random[i] = Update{ImageID: common.ImageID(1 + rng.Intn(1_000_000)), Record: records[i]}
+			local[i] = Update{ImageID: schema.ImageID(200_000 + i), Record: records[i]}
+			random[i] = Update{ImageID: schema.ImageID(1 + rng.Intn(1_000_000)), Record: records[i]}
 		}
 		b.Run(fmt.Sprintf("grouped/sameBlock/%d", size), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
@@ -683,9 +683,9 @@ func BenchmarkWALBatch(b *testing.B) {
 	defer st.Close()
 	records := randRecords(200, 64)
 	for _, size := range []int{1, 16, 32, 64, 128, 256} {
-		updates := makeUpdates(records, make([]common.ImageID, size))
+		updates := makeUpdates(records, make([]schema.ImageID, size))
 		for i := range updates {
-			updates[i].ImageID = common.ImageID(i + 1)
+			updates[i].ImageID = schema.ImageID(i + 1)
 		}
 		b.Run(fmt.Sprintf("batch=%d", size), func(b *testing.B) {
 			before, _ := st.journal.wal.Offset()
@@ -702,7 +702,7 @@ func BenchmarkWALBatch(b *testing.B) {
 		})
 	}
 	// 64 individual frames versus one 64-update frame.
-	single := makeUpdates(records[:1], []common.ImageID{1})
+	single := makeUpdates(records[:1], []schema.ImageID{1})
 	b.Run("individual64", func(b *testing.B) {
 		before, _ := st.journal.wal.Offset()
 		b.ReportAllocs()
@@ -724,8 +724,8 @@ func BenchmarkWALBatch(b *testing.B) {
 func BenchmarkDurabilityModes(b *testing.B) {
 	for _, mode := range []struct {
 		name string
-		dur  common.Durability
-	}{{"relaxed", common.DurabilityOS}, {"sync", common.DurabilitySync}} {
+		dur  schema.Durability
+	}{{"relaxed", schema.DurabilityOS}, {"sync", schema.DurabilitySync}} {
 		cfg := testConfig()
 		cfg.Durability = mode.dur
 		st, records := func() (*Store, []Record) {
@@ -740,9 +740,9 @@ func BenchmarkDurabilityModes(b *testing.B) {
 			return s, records
 		}()
 		for _, size := range []int{1, 16, 64} {
-			ids := make([]common.ImageID, size)
+			ids := make([]schema.ImageID, size)
 			for i := range ids {
-				ids[i] = 1000 + common.ImageID(i*997)
+				ids[i] = 1000 + schema.ImageID(i*997)
 			}
 			updates := makeUpdates(records, ids)
 			b.Run(fmt.Sprintf("%s/batch=%d", mode.name, size), func(b *testing.B) {
@@ -781,7 +781,7 @@ func BenchmarkCheckpointAfterUpdates(b *testing.B) {
 				b.Fatal(err)
 			}
 			for i := 0; i < updates; i++ {
-				id := common.ImageID(1 + (i*7919)%20_000)
+				id := schema.ImageID(1 + (i*7919)%20_000)
 				if err := st.Upsert(id, records[i%len(records)]); err != nil {
 					b.Fatal(err)
 				}
@@ -822,7 +822,7 @@ func BenchmarkRecovery(b *testing.B) {
 			batch := make([]Update, 64)
 			for i := 0; i < updates; i += 64 {
 				for j := range batch {
-					id := common.ImageID(1 + ((i+j)*7919)%20_000)
+					id := schema.ImageID(1 + ((i+j)*7919)%20_000)
 					batch[j] = Update{ImageID: id, Record: records[(i+j)%len(records)]}
 				}
 				if err := st.UpsertBatch(batch); err != nil {
@@ -853,9 +853,9 @@ func BenchmarkConcurrentSearchUpdate(b *testing.B) {
 	defer st.Close()
 	queries := benchQueries(records, 8, 12)
 	for _, size := range []int{1, 16, 64} {
-		ids := make([]common.ImageID, size)
+		ids := make([]schema.ImageID, size)
 		for i := range ids {
-			ids[i] = 1000 + common.ImageID(i*997)
+			ids[i] = 1000 + schema.ImageID(i*997)
 		}
 		updates := makeUpdates(records, ids)
 		b.Run(fmt.Sprintf("batch=%d", size), func(b *testing.B) {
@@ -896,7 +896,7 @@ func BenchmarkUpsertBatchDuplicates(b *testing.B) {
 	defer st.Close()
 	updates := make([]Update, 64)
 	for i := range updates {
-		updates[i] = Update{ImageID: common.ImageID(1 + i%2), Record: records[i]}
+		updates[i] = Update{ImageID: schema.ImageID(1 + i%2), Record: records[i]}
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -919,8 +919,8 @@ func BenchmarkSeqBlockSizeUpdates(b *testing.B) {
 		local := make([]Update, 64)
 		random := make([]Update, 64)
 		for i := range local {
-			local[i] = Update{ImageID: common.ImageID(50_000 + i), Record: records[i]}
-			random[i] = Update{ImageID: common.ImageID(1 + rng.Intn(200_000)), Record: records[i]}
+			local[i] = Update{ImageID: schema.ImageID(50_000 + i), Record: records[i]}
+			random[i] = Update{ImageID: schema.ImageID(1 + rng.Intn(200_000)), Record: records[i]}
 		}
 		b.Run(fmt.Sprintf("local/seq=%d", seq), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {

@@ -9,7 +9,7 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestRunOnce(t *testing.T) {
@@ -55,7 +55,7 @@ func TestSearchHandlerExcludesDeletedImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
-	if err := service.store.Delete(common.EntityImage, 100); err != nil {
+	if err := service.store.Delete(schema.EntityImage, 100); err != nil {
 		t.Fatal(err)
 	}
 	path := fmt.Sprintf("/search?start=%d&end=%d&cell=%d", demoQuantum, 3*demoQuantum, service.demoCell)
@@ -68,7 +68,7 @@ func TestSearchHandlerExcludesDeletedImages(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(body.ImageIDs, []common.ImageID{200}) {
+	if !slices.Equal(body.ImageIDs, []schema.ImageID{200}) {
 		t.Fatalf("image IDs after deletion = %v", body.ImageIDs)
 	}
 }

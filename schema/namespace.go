@@ -1,4 +1,4 @@
-package common
+package schema
 
 // Namespace identifies one indexed collection: a bitmap namespace, a
 // timestamp index, a hash index, a vector space, or a key-value collection.

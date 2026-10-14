@@ -2,7 +2,7 @@ package geoidx
 
 import (
 	"cmp"
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s2"
 	"math"
@@ -18,14 +18,14 @@ import (
 // distance is exact at S2Level cell resolution (about 20 m). uint32 holds the
 // full 0..20,015 km range.
 type Result struct {
-	ImageID  common.ImageID
+	ImageID  schema.ImageID
 	Distance uint32
 }
 
 // viewTouched reports the effective state of id in the active, layered, then
 // frozen mutation state (active is newest). touched is false when no layer
 // names id.
-func viewTouched(v *view, id common.ImageID) (present, touched bool) {
+func viewTouched(v *view, id schema.ImageID) (present, touched bool) {
 	if index, ok := mutationIndex(v.active, id); ok {
 		return v.active[index].add, true
 	}
@@ -44,7 +44,7 @@ func viewTouched(v *view, id common.ImageID) (present, touched bool) {
 // (S2Key, ImageID) whose key falls in ranges, in native ascending-key order,
 // with pending additions last. It imposes no ImageID ordering. ranges must be
 // normalized. fn returning false stops the scan.
-func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bool {
+func scanRanges(v *view, ranges []Range, fn func(S2Key, schema.ImageID) bool) bool {
 	useDelta := viewDelta(v) != nil
 	if !scanShards(v.shards, ranges, useDelta, v, fn) {
 		return false
@@ -71,7 +71,7 @@ func scanRanges(v *view, ranges []Range, fn func(S2Key, common.ImageID) bool) bo
 // are shadowed. The range cursor advances monotonically across shards, so a
 // range that spans shards is continued rather than restarted. A repeated S2Key
 // spanning shards is visited in every shard that holds part of its run.
-func scanShards(shards []*shard, ranges []Range, useDelta bool, v *view, fn func(S2Key, common.ImageID) bool) bool {
+func scanShards(shards []*shard, ranges []Range, useDelta bool, v *view, fn func(S2Key, schema.ImageID) bool) bool {
 	if len(ranges) == 0 {
 		return true
 	}
@@ -124,7 +124,7 @@ func normalizeResult(stack *[DefaultMaxCells]Range, ranges []Range) []Range {
 // appendBaseRanges appends the base ImageIDs covered by normalized ranges using
 // a bulk copy per shard-range overlap. Callers use it only when no mutation
 // layers exist.
-func appendBaseRanges(dst []common.ImageID, v *view, ranges []Range) []common.ImageID {
+func appendBaseRanges(dst []schema.ImageID, v *view, ranges []Range) []schema.ImageID {
 	if len(ranges) == 0 {
 		return dst
 	}
@@ -157,7 +157,7 @@ func appendBaseRanges(dst []common.ImageID, v *view, ranges []Range) []common.Im
 // sortSuffix sorts dst[mark:] ascending by ImageID and removes duplicates,
 // returning the (possibly shortened) dst. It skips the sort and any allocation
 // when the native scan already produced ordered output.
-func sortSuffix(dst []common.ImageID, mark int, maxID common.ImageID) []common.ImageID {
+func sortSuffix(dst []schema.ImageID, mark int, maxID schema.ImageID) []schema.ImageID {
 	tail := dst[mark:]
 	if len(tail) == 0 {
 		return dst
@@ -174,7 +174,7 @@ func sortSuffix(dst []common.ImageID, mark int, maxID common.ImageID) []common.I
 // ImageID order. ranges need not be sorted; they are normalized first. This is
 // the initial-query path: ordering is required by the search merge/intersection
 // paths, so a sort of the appended suffix is acceptable.
-func (i *Index) SearchRanges(dst []common.ImageID, ranges []Range) []common.ImageID {
+func (i *Index) SearchRanges(dst []schema.ImageID, ranges []Range) []schema.ImageID {
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
@@ -185,7 +185,7 @@ func (i *Index) SearchRanges(dst []common.ImageID, ranges []Range) []common.Imag
 		if viewDelta(v) == nil {
 			dst = appendBaseRanges(dst, v, normalized)
 		} else {
-			scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
+			scanRanges(v, normalized, func(_ S2Key, id schema.ImageID) bool {
 				dst = append(dst, id)
 				return true
 			})
@@ -196,7 +196,7 @@ func (i *Index) SearchRanges(dst []common.ImageID, ranges []Range) []common.Imag
 }
 
 // SearchCell appends the ImageIDs stored in cellID's cell, ascending.
-func (i *Index) SearchCell(dst []common.ImageID, cellID uint64) ([]common.ImageID, error) {
+func (i *Index) SearchCell(dst []schema.ImageID, cellID uint64) ([]schema.ImageID, error) {
 	key, err := KeyFromCellID(cellID)
 	if err != nil {
 		return dst, err
@@ -206,19 +206,19 @@ func (i *Index) SearchCell(dst []common.ImageID, cellID uint64) ([]common.ImageI
 
 // SearchCover appends the ImageIDs covered by region (a cell-superset: cover
 // cells that merely intersect the region are included).
-func (i *Index) SearchCover(dst []common.ImageID, region s2.Region, options ...CoverOptions) []common.ImageID {
+func (i *Index) SearchCover(dst []schema.ImageID, region s2.Region, options ...CoverOptions) []schema.ImageID {
 	var stack [DefaultMaxCells]Range
 	ranges := CoverRegion(stack[:0], region, options...)
 	return i.SearchRanges(dst, ranges)
 }
 
 // SearchRect appends the ImageIDs covered by a latitude/longitude rectangle.
-func (i *Index) SearchRect(dst []common.ImageID, rect s2.Rect, options ...CoverOptions) []common.ImageID {
+func (i *Index) SearchRect(dst []schema.ImageID, rect s2.Rect, options ...CoverOptions) []schema.ImageID {
 	return i.SearchCover(dst, rect, options...)
 }
 
 // SearchPolygon appends the ImageIDs covered by polygon.
-func (i *Index) SearchPolygon(dst []common.ImageID, polygon *s2.Polygon, options ...CoverOptions) []common.ImageID {
+func (i *Index) SearchPolygon(dst []schema.ImageID, polygon *s2.Polygon, options ...CoverOptions) []schema.ImageID {
 	return i.SearchCover(dst, polygon, options...)
 }
 
@@ -226,7 +226,7 @@ func (i *Index) SearchPolygon(dst []common.ImageID, polygon *s2.Polygon, options
 // a coordinate, in ascending ImageID order. Distance is measured from the query
 // to the authoritative S2Level cell center, so the result is exact at cell
 // resolution rather than a raw cover superset.
-func (i *Index) SearchRadius(dst []common.ImageID, latitude, longitude, radiusMeters float64, options ...CoverOptions) ([]common.ImageID, error) {
+func (i *Index) SearchRadius(dst []schema.ImageID, latitude, longitude, radiusMeters float64, options ...CoverOptions) ([]schema.ImageID, error) {
 	center, err := validLatLng(latitude, longitude)
 	if err != nil {
 		return dst, err
@@ -238,7 +238,7 @@ func (i *Index) SearchRadius(dst []common.ImageID, latitude, longitude, radiusMe
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
 		mark := len(dst)
-		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
+		scanRanges(v, ranges, func(key S2Key, id schema.ImageID) bool {
 			if keyDistanceMeters(key, center) <= radiusMeters {
 				dst = append(dst, id)
 			}
@@ -265,7 +265,7 @@ func (i *Index) SearchRadiusResults(dst []Result, latitude, longitude, radiusMet
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
 		mark := len(dst)
-		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
+		scanRanges(v, ranges, func(key S2Key, id schema.ImageID) bool {
 			if d := keyDistanceMeters(key, center); d <= radiusMeters {
 				dst = append(dst, Result{ImageID: id, Distance: metersToUint32(d)})
 			}
@@ -278,7 +278,7 @@ func (i *Index) SearchRadiusResults(dst []Result, latitude, longitude, radiusMet
 
 // nearestHit is one candidate in the bounded nearest-N heap.
 type nearestHit struct {
-	id     common.ImageID
+	id     schema.ImageID
 	meters float64
 }
 
@@ -366,7 +366,7 @@ func (i *Index) Nearest(dst []Result, latitude, longitude float64, k int) ([]Res
 			heap = heap[:0]
 			var cover [DefaultMaxCells]Range
 			ranges := CoverCap(cover[:0], CapFromMeters(center, radius), CoverOptions{MaxCells: i.config.MaxCells})
-			scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
+			scanRanges(v, ranges, func(key S2Key, id schema.ImageID) bool {
 				heap = nearestPush(heap, k, nearestHit{id: id, meters: keyDistanceMeters(key, center)})
 				return true
 			})
@@ -384,7 +384,7 @@ func (i *Index) Nearest(dst []Result, latitude, longitude float64, k int) ([]Res
 			// remaining small-index and safety cases.
 			heap = heap[:0]
 			full := []Range{{Start: 0, End: S2Key(^uint64(0))}}
-			scanRanges(v, full, func(key S2Key, id common.ImageID) bool {
+			scanRanges(v, full, func(key S2Key, id schema.ImageID) bool {
 				heap = nearestPush(heap, k, nearestHit{id: id, meters: keyDistanceMeters(key, center)})
 				return true
 			})
@@ -409,11 +409,11 @@ const collectChunk = 256
 // the result cardinality and the sink folds the staged IDs.
 type collector struct {
 	dst   *roar.MutableBitmap
-	buf   []common.ImageID
-	stack [collectChunk]common.ImageID
+	buf   []schema.ImageID
+	stack [collectChunk]schema.ImageID
 }
 
-func (c *collector) add(id common.ImageID) {
+func (c *collector) add(id schema.ImageID) {
 	if len(c.buf) == cap(c.buf) {
 		c.flush()
 	}
@@ -459,7 +459,7 @@ func (i *Index) CollectRanges(dst *roar.MutableBitmap, ranges []Range) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
 		c := acquireCollector(dst)
-		scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
+		scanRanges(v, normalized, func(_ S2Key, id schema.ImageID) bool {
 			c.add(id)
 			return true
 		})
@@ -502,7 +502,7 @@ func (i *Index) CollectRadius(dst *roar.MutableBitmap, latitude, longitude, radi
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
 		c := acquireCollector(dst)
-		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
+		scanRanges(v, ranges, func(key S2Key, id schema.ImageID) bool {
 			if keyDistanceMeters(key, center) <= radiusMeters {
 				c.add(id)
 			}
@@ -535,7 +535,7 @@ func (i *Index) FilterRanges(dst *roar.MutableBitmap, candidates roar.Bitmap, ra
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
 		c := acquireCollector(dst)
-		scanRanges(v, normalized, func(_ S2Key, id common.ImageID) bool {
+		scanRanges(v, normalized, func(_ S2Key, id schema.ImageID) bool {
 			if candidates.Contains(id) {
 				c.add(id)
 			}
@@ -580,7 +580,7 @@ func (i *Index) FilterRadius(dst *roar.MutableBitmap, candidates roar.Bitmap, la
 		var stack [DefaultMaxCells]Range
 		ranges := CoverCap(stack[:0], CapFromMeters(center, radiusMeters), options...)
 		c := acquireCollector(dst)
-		scanRanges(v, ranges, func(key S2Key, id common.ImageID) bool {
+		scanRanges(v, ranges, func(key S2Key, id schema.ImageID) bool {
 			if candidates.Contains(id) && keyDistanceMeters(key, center) <= radiusMeters {
 				c.add(id)
 			}
@@ -625,7 +625,7 @@ func (i *Index) CountRanges(ranges []Range) uint64 {
 	i.withView(func(v *view) {
 		var stack [DefaultMaxCells]Range
 		normalized := normalizeResult(&stack, ranges)
-		scanRanges(v, normalized, func(_ S2Key, _ common.ImageID) bool {
+		scanRanges(v, normalized, func(_ S2Key, _ schema.ImageID) bool {
 			count++
 			return true
 		})
@@ -672,7 +672,7 @@ func (i *Index) EstimateRanges(ranges []Range) uint64 {
 }
 
 // Contains reports whether id is stored at key in the effective view.
-func (i *Index) Contains(key S2Key, id common.ImageID) bool {
+func (i *Index) Contains(key S2Key, id schema.ImageID) bool {
 	found := false
 	i.withView(func(v *view) {
 		if present, touched := viewTouched(v, id); touched {
@@ -697,7 +697,7 @@ func (i *Index) Contains(key S2Key, id common.ImageID) bool {
 }
 
 // layerKey returns the key asserted by the newest mutation layer naming id.
-func layerKey(v *view, id common.ImageID) S2Key {
+func layerKey(v *view, id schema.ImageID) S2Key {
 	if index, ok := mutationIndex(v.active, id); ok {
 		return v.active[index].key
 	}
@@ -733,7 +733,7 @@ const bitsetMaxID = 1 << 30
 // bitset when the ImageID domain is compact, otherwise an LSD radix sort. The
 // sorted initial-query contract forces this work, so the goal is to keep it far
 // below a general comparison sort. The input may alias the destination suffix.
-func sortIDs(ids []common.ImageID, maxID common.ImageID) []common.ImageID {
+func sortIDs(ids []schema.ImageID, maxID schema.ImageID) []schema.ImageID {
 	switch len(ids) {
 	case 0, 1:
 		return ids
@@ -753,7 +753,7 @@ func sortIDs(ids []common.ImageID, maxID common.ImageID) []common.ImageID {
 // It returns the shortened slice and true when the bitset was worthwhile (small
 // enough, non-sparse domain), otherwise false. The actual maximum of ids is used
 // so a stale maxID hint can never overrun the bitset.
-func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) ([]common.ImageID, bool) {
+func sortIDsBitset(ids []schema.ImageID, maxID schema.ImageID) ([]schema.ImageID, bool) {
 	if maxID == 0 {
 		return ids, false
 	}
@@ -781,7 +781,7 @@ func sortIDsBitset(ids []common.ImageID, maxID common.ImageID) ([]common.ImageID
 	for w, word := range set {
 		for word != 0 {
 			b := bits.TrailingZeros64(word)
-			ids[out] = common.ImageID(uint64(w)<<6 | uint64(b))
+			ids[out] = schema.ImageID(uint64(w)<<6 | uint64(b))
 			out++
 			word &= word - 1
 		}
@@ -821,11 +821,11 @@ func releaseBitset(set []uint64) {
 // radixSortIDs sorts a uint64 slice with an 8-pass, base-256 LSD radix sort. One
 // temp buffer the size of the result is allocated; eight passes guarantee the
 // sorted data lands back in ids. Duplicates are preserved; the caller compacts.
-func radixSortIDs(ids []common.ImageID) {
+func radixSortIDs(ids []schema.ImageID) {
 	const shiftBits = 8
 	const bucketCount = 1 << shiftBits
 	const mask = bucketCount - 1
-	buf := make([]common.ImageID, len(ids))
+	buf := make([]schema.ImageID, len(ids))
 	src, dst := ids, buf
 	var counts [bucketCount]int
 	for shift := uint(0); shift < 64; shift += shiftBits {

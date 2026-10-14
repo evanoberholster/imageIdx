@@ -1,7 +1,7 @@
 package index
 
 import (
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -17,8 +17,8 @@ const noSlot uint16 = ^uint16(0)
 // is resolved once during Create/Open; search and mutation never do string or
 // map lookups.
 type route struct {
-	kind      common.NamespaceKind
-	entity    common.EntityKind
+	kind      schema.NamespaceKind
+	entity    schema.EntityKind
 	slot      uint16
 	available bool
 }
@@ -26,7 +26,7 @@ type route struct {
 // registry is the immutable published namespace → engine table. It is replaced
 // wholesale during Create/Open and never mutated afterwards.
 type registry struct {
-	routes  []route // indexed directly by common.Namespace
+	routes  []route // indexed directly by schema.Namespace
 	times   []*timeidx.Index
 	geos    []*geoidx.Index
 	sims    []*simhash.Store
@@ -35,10 +35,10 @@ type registry struct {
 	bitmaps []*bitmapidx.Index
 
 	live    *bitmapidx.Index
-	liveVal [common.EntityKindCount + 1]bitmapidx.Value
+	liveVal [schema.EntityKindCount + 1]bitmapidx.Value
 }
 
-func (r *registry) lookup(ns common.Namespace) (route, bool) {
+func (r *registry) lookup(ns schema.Namespace) (route, bool) {
 	if int(ns) >= len(r.routes) {
 		return route{}, false
 	}
@@ -49,7 +49,7 @@ func (r *registry) lookup(ns common.Namespace) (route, bool) {
 	return rt, true
 }
 
-func (r *registry) timeIndex(ns common.Namespace) (*timeidx.Index, bool) {
+func (r *registry) timeIndex(ns schema.Namespace) (*timeidx.Index, bool) {
 	rt, ok := r.lookup(ns)
 	if !ok || !rt.available || int(rt.slot) >= len(r.times) {
 		return nil, false
@@ -57,7 +57,7 @@ func (r *registry) timeIndex(ns common.Namespace) (*timeidx.Index, bool) {
 	return r.times[rt.slot], true
 }
 
-func (r *registry) geoIndex(ns common.Namespace) (*geoidx.Index, bool) {
+func (r *registry) geoIndex(ns schema.Namespace) (*geoidx.Index, bool) {
 	rt, ok := r.lookup(ns)
 	if !ok || !rt.available || int(rt.slot) >= len(r.geos) {
 		return nil, false
@@ -65,7 +65,7 @@ func (r *registry) geoIndex(ns common.Namespace) (*geoidx.Index, bool) {
 	return r.geos[rt.slot], true
 }
 
-func (r *registry) simStore(ns common.Namespace) (*simhash.Store, bool) {
+func (r *registry) simStore(ns schema.Namespace) (*simhash.Store, bool) {
 	rt, ok := r.lookup(ns)
 	if !ok || !rt.available || int(rt.slot) >= len(r.sims) {
 		return nil, false
@@ -73,7 +73,7 @@ func (r *registry) simStore(ns common.Namespace) (*simhash.Store, bool) {
 	return r.sims[rt.slot], true
 }
 
-func (r *registry) radixIndex(ns common.Namespace) (*radixhash.Index, bool) {
+func (r *registry) radixIndex(ns schema.Namespace) (*radixhash.Index, bool) {
 	rt, ok := r.lookup(ns)
 	if !ok || !rt.available || int(rt.slot) >= len(r.radixs) {
 		return nil, false
@@ -81,7 +81,7 @@ func (r *registry) radixIndex(ns common.Namespace) (*radixhash.Index, bool) {
 	return r.radixs[rt.slot], true
 }
 
-func (r *registry) vectorIndex(ns common.Namespace) (*vectoridx.VectorIdx, bool) {
+func (r *registry) vectorIndex(ns schema.Namespace) (*vectoridx.VectorIdx, bool) {
 	rt, ok := r.lookup(ns)
 	if !ok || !rt.available || int(rt.slot) >= len(r.vectors) {
 		return nil, false
@@ -89,7 +89,7 @@ func (r *registry) vectorIndex(ns common.Namespace) (*vectoridx.VectorIdx, bool)
 	return r.vectors[rt.slot], true
 }
 
-func (r *registry) bitmapIndex(ns common.Namespace) (*bitmapidx.Index, bool) {
+func (r *registry) bitmapIndex(ns schema.Namespace) (*bitmapidx.Index, bool) {
 	rt, ok := r.lookup(ns)
 	if !ok || !rt.available || int(rt.slot) >= len(r.bitmaps) {
 		return nil, false
@@ -99,7 +99,7 @@ func (r *registry) bitmapIndex(ns common.Namespace) (*bitmapidx.Index, bool) {
 
 // liveness returns the shared liveness bitmap index and the enum value that
 // marks an entity of the given kind as live.
-func (r *registry) liveness(entity common.EntityKind) (*bitmapidx.Index, bitmapidx.Value, bool) {
+func (r *registry) liveness(entity schema.EntityKind) (*bitmapidx.Index, bitmapidx.Value, bool) {
 	if !entity.Valid() || r.live == nil {
 		return nil, bitmapidx.Value{}, false
 	}

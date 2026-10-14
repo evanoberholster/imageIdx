@@ -5,12 +5,12 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
 func TestExecutorCountAndAppendIDs(t *testing.T) {
-	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
+	tags := enumNamespaceForSearch(t, schema.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)

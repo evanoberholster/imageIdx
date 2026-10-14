@@ -9,17 +9,17 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
 const (
-	testBSI16Namespace common.Namespace = 200
-	testBSI32Namespace common.Namespace = 201
+	testBSI16Namespace schema.Namespace = 200
+	testBSI32Namespace schema.Namespace = 201
 )
 
-func bsiNamespace(t common.Namespace, width uint8) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapBSI, BSIWidth: width}
+func bsiNamespace(t schema.Namespace, width uint8) NamespaceSpec {
+	return NamespaceSpec{Namespace: t, Kind: schema.KindBitmapBSI, BSIWidth: width}
 }
 
 func mustBSI(t *testing.T, namespace NamespaceSpec) *Index {
@@ -35,20 +35,20 @@ func mustBSI(t *testing.T, namespace NamespaceSpec) *Index {
 // refBSI is the simple map-based reference implementation the bit-sliced index
 // is checked against.
 type refBSI struct {
-	values map[common.ValueID]uint64
+	values map[schema.ValueID]uint64
 }
 
-func newRefBSI() *refBSI { return &refBSI{values: make(map[common.ValueID]uint64)} }
+func newRefBSI() *refBSI { return &refBSI{values: make(map[schema.ValueID]uint64)} }
 
-func (r *refBSI) set(id common.ValueID, value uint64) { r.values[id] = value }
-func (r *refBSI) del(id common.ValueID)               { delete(r.values, id) }
-func (r *refBSI) get(id common.ValueID) (uint64, bool) {
+func (r *refBSI) set(id schema.ValueID, value uint64) { r.values[id] = value }
+func (r *refBSI) del(id schema.ValueID)               { delete(r.values, id) }
+func (r *refBSI) get(id schema.ValueID) (uint64, bool) {
 	v, ok := r.values[id]
 	return v, ok
 }
 
-func (r *refBSI) equal(value uint64) []common.ValueID {
-	var out []common.ValueID
+func (r *refBSI) equal(value uint64) []schema.ValueID {
+	var out []schema.ValueID
 	for id, v := range r.values {
 		if v == value {
 			out = append(out, id)
@@ -58,8 +58,8 @@ func (r *refBSI) equal(value uint64) []common.ValueID {
 	return out
 }
 
-func (r *refBSI) less(value uint64) []common.ValueID {
-	var out []common.ValueID
+func (r *refBSI) less(value uint64) []schema.ValueID {
+	var out []schema.ValueID
 	for id, v := range r.values {
 		if v < value {
 			out = append(out, id)
@@ -69,8 +69,8 @@ func (r *refBSI) less(value uint64) []common.ValueID {
 	return out
 }
 
-func (r *refBSI) inRange(lo, hi uint64) []common.ValueID {
-	var out []common.ValueID
+func (r *refBSI) inRange(lo, hi uint64) []schema.ValueID {
+	var out []schema.ValueID
 	for id, v := range r.values {
 		if v >= lo && v <= hi {
 			out = append(out, id)
@@ -80,12 +80,12 @@ func (r *refBSI) inRange(lo, hi uint64) []common.ValueID {
 	return out
 }
 
-func bitmapIDs(t *testing.T, bit interface{ AppendTo([]uint64) []uint64 }) []common.ValueID {
+func bitmapIDs(t *testing.T, bit interface{ AppendTo([]uint64) []uint64 }) []schema.ValueID {
 	t.Helper()
 	return bit.AppendTo(nil)
 }
 
-func assertIDs(t *testing.T, got, want []common.ValueID) {
+func assertIDs(t *testing.T, got, want []schema.ValueID) {
 	t.Helper()
 	if !slices.Equal(got, want) {
 		t.Fatalf("ids = %v, want %v", got, want)
@@ -93,13 +93,13 @@ func assertIDs(t *testing.T, got, want []common.ValueID) {
 }
 
 func TestBSINamespaceValidation(t *testing.T) {
-	if _, err := NewMemory(NamespaceSpec{Namespace: 1, Kind: common.KindBitmapBSI, BSIWidth: 8}, NamespaceConfig{}); !errors.Is(err, ErrInvalidBSIWidth) {
+	if _, err := NewMemory(NamespaceSpec{Namespace: 1, Kind: schema.KindBitmapBSI, BSIWidth: 8}, NamespaceConfig{}); !errors.Is(err, ErrInvalidBSIWidth) {
 		t.Fatalf("width 8 err = %v, want ErrInvalidBSIWidth", err)
 	}
-	if _, err := NewMemory(NamespaceSpec{Namespace: 1, Kind: common.KindBitmapBSI, BSIWidth: 0}, NamespaceConfig{}); !errors.Is(err, ErrInvalidBSIWidth) {
+	if _, err := NewMemory(NamespaceSpec{Namespace: 1, Kind: schema.KindBitmapBSI, BSIWidth: 0}, NamespaceConfig{}); !errors.Is(err, ErrInvalidBSIWidth) {
 		t.Fatalf("width 0 err = %v, want ErrInvalidBSIWidth", err)
 	}
-	if _, err := NewMemory(NamespaceSpec{Namespace: 1, Kind: common.KindBitmapEnum, Normalizer: CodecSpec{Code: NormalizerIdentity, Version: 1}, BSIWidth: 16}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
+	if _, err := NewMemory(NamespaceSpec{Namespace: 1, Kind: schema.KindBitmapEnum, Normalizer: CodecSpec{Code: NormalizerIdentity, Version: 1}, BSIWidth: 16}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
 		t.Fatalf("enum with width err = %v, want ErrInvalidNamespace", err)
 	}
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
@@ -120,7 +120,7 @@ func TestBSIPersistWidthRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.BSIWidth != width || got.Kind != common.KindBitmapBSI || got.Namespace != 7 {
+		if got.BSIWidth != width || got.Kind != schema.KindBitmapBSI || got.Namespace != 7 {
 			t.Fatalf("round trip = %+v, want width %d", got, width)
 		}
 	}
@@ -128,7 +128,7 @@ func TestBSIPersistWidthRoundTrip(t *testing.T) {
 
 func TestBSISetGetEqualRange16(t *testing.T) {
 	index := mustBSI(t, bsiNamespace(testBSI16Namespace, BSIWidth16))
-	sets := map[common.ValueID]uint64{
+	sets := map[schema.ValueID]uint64{
 		1: 0, 2: 1, 3: 255, 4: 256, 5: 65535, 6: 32768, 7: 100, 8: 12345,
 	}
 	ref := newRefBSI()
@@ -217,7 +217,7 @@ func TestBSIUpdateOnlyTouchesChangedBits(t *testing.T) {
 		t.Fatalf("value = %d,%v", v, ok)
 	}
 	bit, _ := index.Equal(0b0010)
-	assertIDs(t, bitmapIDs(t, bit), []common.ValueID{1})
+	assertIDs(t, bitmapIDs(t, bit), []schema.ValueID{1})
 	notSet, _ := index.Equal(0b1010)
 	if !notSet.IsEmpty() {
 		t.Fatalf("old value still matches: %v", bitmapIDs(t, notSet))
@@ -229,7 +229,7 @@ func TestBSIComparisons(t *testing.T) {
 	ref := newRefBSI()
 	values := []uint64{0, 1, 2, 7, 8, 100, 255, 256, 65535}
 	for i, v := range values {
-		id := common.ValueID(i + 1)
+		id := schema.ValueID(i + 1)
 		if err := index.Set(id, v); err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +256,7 @@ func TestBSIComparisons(t *testing.T) {
 		assertIDs(t, bitmapIDs(t, got), ref.inRange(probe, 65535))
 
 		got, _ = index.NotEqual(probe)
-		var wantNE []common.ValueID
+		var wantNE []schema.ValueID
 		for id, v := range ref.values {
 			if v != probe {
 				wantNE = append(wantNE, id)
@@ -271,7 +271,7 @@ func TestBSIRangeInclusiveExclusiveAndEmpty(t *testing.T) {
 	index := mustBSI(t, bsiNamespace(testBSI16Namespace, BSIWidth16))
 	ref := newRefBSI()
 	for i := 0; i < 32; i++ {
-		id := common.ValueID(i + 1)
+		id := schema.ValueID(i + 1)
 		value := uint64(i * 100)
 		_ = index.Set(id, value)
 		ref.set(id, value)
@@ -307,7 +307,7 @@ func TestBSIRangeRandomizedInclusiveExclusive(t *testing.T) {
 		rng := rand.New(rand.NewSource(int64(width) + 7))
 		max := bsiMaxValue(width)
 		for i := 0; i < 1500; i++ {
-			id := common.ValueID(rng.Intn(300) + 1)
+			id := schema.ValueID(rng.Intn(300) + 1)
 			if rng.Intn(4) == 0 {
 				if err := index.Delete(id); err != nil {
 					t.Fatal(err)
@@ -333,7 +333,7 @@ func TestBSIRangeRandomizedInclusiveExclusive(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := bit.AppendTo(nil)
-			var want []common.ValueID
+			var want []schema.ValueID
 			for id, value := range ref.values {
 				if r.contains(value) {
 					want = append(want, id)
@@ -360,7 +360,7 @@ func TestBSIRangeBoundaries(t *testing.T) {
 		max := bsiMaxValue(width)
 		index := mustBSI(t, bsiNamespace(testBSI16Namespace, width))
 		ref := newRefBSI()
-		for id, value := range map[common.ValueID]uint64{
+		for id, value := range map[schema.ValueID]uint64{
 			1: 0, 2: max, 3: max - 1, 4: 1, 5: max / 2, 6: 2, 7: max / 2,
 		} {
 			if err := index.Set(id, value); err != nil {
@@ -369,7 +369,7 @@ func TestBSIRangeBoundaries(t *testing.T) {
 			ref.set(id, value)
 		}
 		// Candidates include present and absent IDs and deliberate duplicates.
-		candidates := []common.ValueID{1, 2, 3, 8, 5, 99, 4, 5, 9, 6, 7}
+		candidates := []schema.ValueID{1, 2, 3, 8, 5, 99, 4, 5, 9, 6, 7}
 		cases := []struct {
 			name string
 			r    ValueRange
@@ -397,7 +397,7 @@ func TestBSIRangeBoundaries(t *testing.T) {
 				t.Fatalf("width %d %s: BSIRangeQuery: %v", width, tc.name, err)
 			}
 			got := bit.AppendTo(nil)
-			var want []common.ValueID
+			var want []schema.ValueID
 			for id, value := range ref.values {
 				if tc.r.contains(value) {
 					want = append(want, id)
@@ -415,7 +415,7 @@ func TestBSIRangeBoundaries(t *testing.T) {
 			if err != nil {
 				t.Fatalf("width %d %s: BSIFilterRange: %v", width, tc.name, err)
 			}
-			var wantFiltered []common.ValueID
+			var wantFiltered []schema.ValueID
 			for _, id := range candidates {
 				if value, ok := ref.get(id); ok && tc.r.contains(value) {
 					wantFiltered = append(wantFiltered, id)
@@ -433,7 +433,7 @@ func TestBSIRangeBoundaries(t *testing.T) {
 // returned bitmaps stay valid. Intended for -race.
 func TestBSIConcurrentQueriesWithMaintenance(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, common.DurabilityOS)
+	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +443,7 @@ func TestBSIConcurrentQueriesWithMaintenance(t *testing.T) {
 	}
 	seed := index.NewBatch()
 	for i := 1; i <= 2000; i++ {
-		if err := seed.BSIMove(BSIMove{ID: common.ValueID(i), To: uint32(i % 256), HasTo: true}); err != nil {
+		if err := seed.BSIMove(BSIMove{ID: schema.ValueID(i), To: uint32(i % 256), HasTo: true}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -486,7 +486,7 @@ func TestBSIConcurrentQueriesWithMaintenance(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if _, err := index.BSIFilterRange(nil, []common.ValueID{1, 2, 3, 2000, 7}, ValuesBetween(0, 255)); err != nil {
+				if _, err := index.BSIFilterRange(nil, []schema.ValueID{1, 2, 3, 2000, 7}, ValuesBetween(0, 255)); err != nil {
 					t.Error(err)
 					return
 				}
@@ -497,7 +497,7 @@ func TestBSIConcurrentQueriesWithMaintenance(t *testing.T) {
 	go func() {
 		defer work.Done()
 		for i := 0; i < 3000; i++ {
-			if err := index.Set(common.ValueID(i%2000+1), uint64(i%256)); err != nil {
+			if err := index.Set(schema.ValueID(i%2000+1), uint64(i%256)); err != nil {
 				t.Error(err)
 				return
 			}
@@ -534,14 +534,14 @@ func TestBSIConcurrentQueriesWithMaintenance(t *testing.T) {
 func TestBSIFilterRangePreservesOrderAndDuplicates(t *testing.T) {
 	index := mustBSI(t, bsiNamespace(testBSI16Namespace, BSIWidth16))
 	for i := 1; i <= 20; i++ {
-		_ = index.Set(common.ValueID(i), uint64(i*10))
+		_ = index.Set(schema.ValueID(i), uint64(i*10))
 	}
-	candidates := []common.ValueID{5, 3, 3, 17, 100, 1, 12}
+	candidates := []schema.ValueID{5, 3, 3, 17, 100, 1, 12}
 	got, err := index.BSIFilterRange(nil, candidates, ValuesBetween(30, 120))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []common.ValueID{5, 3, 3, 12}
+	want := []schema.ValueID{5, 3, 3, 12}
 	assertIDs(t, got, want)
 
 	// In-place destination reuse is safe.
@@ -603,7 +603,7 @@ func TestBSIBatchAtomicMultiBit(t *testing.T) {
 	index := mustBSI(t, bsiNamespace(testBSI32Namespace, BSIWidth32))
 	batch := index.NewBatch()
 	for i := 1; i <= 64; i++ {
-		if err := batch.BSIMove(BSIMove{ID: common.ValueID(i), To: uint32(i * 1000), HasTo: true}); err != nil {
+		if err := batch.BSIMove(BSIMove{ID: schema.ValueID(i), To: uint32(i * 1000), HasTo: true}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -643,7 +643,7 @@ func TestBSIRandomizedAgainstReference(t *testing.T) {
 		rng := rand.New(rand.NewSource(int64(width)))
 		max := bsiMaxValue(width)
 		for op := 0; op < 2000; op++ {
-			id := common.ValueID(rng.Intn(512) + 1)
+			id := schema.ValueID(rng.Intn(512) + 1)
 			switch rng.Intn(3) {
 			case 0, 1:
 				value := uint64(rng.Int63n(int64(max))) + 1
@@ -685,7 +685,7 @@ func TestBSIRandomizedAgainstReference(t *testing.T) {
 func TestBSIConcurrentReadersWriters(t *testing.T) {
 	index := mustBSI(t, bsiNamespace(testBSI32Namespace, BSIWidth32))
 	for i := 1; i <= 256; i++ {
-		_ = index.Set(common.ValueID(i), uint64(i))
+		_ = index.Set(schema.ValueID(i), uint64(i))
 	}
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -706,7 +706,7 @@ func TestBSIConcurrentReadersWriters(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 2000; i++ {
-		id := common.ValueID(i%256 + 1)
+		id := schema.ValueID(i%256 + 1)
 		if i%5 == 0 {
 			_ = index.Delete(id)
 		} else {
@@ -722,7 +722,7 @@ func TestBSICompaction(t *testing.T) {
 	ref := newRefBSI()
 	rng := rand.New(rand.NewSource(9))
 	for op := 0; op < 1000; op++ {
-		id := common.ValueID(rng.Intn(200) + 1)
+		id := schema.ValueID(rng.Intn(200) + 1)
 		if rng.Intn(4) == 0 {
 			_ = index.Delete(id)
 			ref.del(id)
@@ -745,7 +745,7 @@ func TestBSICompaction(t *testing.T) {
 func TestBSIPersistentCheckpointReopen(t *testing.T) {
 	dir := t.TempDir()
 	spec := bsiNamespace(testBSI32Namespace, BSIWidth32)
-	store, err := NewStore(dir, []NamespaceSpec{spec}, NamespaceConfig{}, common.DurabilitySync)
+	store, err := NewStore(dir, []NamespaceSpec{spec}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,14 +756,14 @@ func TestBSIPersistentCheckpointReopen(t *testing.T) {
 	ref := newRefBSI()
 	for i := 1; i <= 300; i++ {
 		value := uint64(i * 7)
-		if err := index.Set(common.ValueID(i), value); err != nil {
+		if err := index.Set(schema.ValueID(i), value); err != nil {
 			t.Fatal(err)
 		}
-		ref.set(common.ValueID(i), value)
+		ref.set(schema.ValueID(i), value)
 	}
 	for i := 1; i <= 300; i += 3 {
-		_ = index.Delete(common.ValueID(i))
-		ref.del(common.ValueID(i))
+		_ = index.Delete(schema.ValueID(i))
+		ref.del(schema.ValueID(i))
 	}
 	if err := store.Checkpoint(); err != nil {
 		t.Fatal(err)
@@ -771,7 +771,7 @@ func TestBSIPersistentCheckpointReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilitySync)
+	reopened, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +831,7 @@ func TestBSIRepeatedWritesAndMissingValues(t *testing.T) {
 func TestBSIStorageSize(t *testing.T) {
 	for _, width := range []uint8{BSIWidth16, BSIWidth32} {
 		dir := t.TempDir()
-		store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI32Namespace, width)}, NamespaceConfig{}, common.DurabilitySync)
+		store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI32Namespace, width)}, NamespaceConfig{}, schema.DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -839,7 +839,7 @@ func TestBSIStorageSize(t *testing.T) {
 		values := bsiBenchValues(bsiDistUniform, width, 64_000)
 		batch := index.NewBatch()
 		for i, value := range values {
-			if err := batch.BSIMove(BSIMove{ID: common.ValueID(i + 1), To: value, HasTo: true}); err != nil {
+			if err := batch.BSIMove(BSIMove{ID: schema.ValueID(i + 1), To: value, HasTo: true}); err != nil {
 				t.Fatal(err)
 			}
 			if batch.Len() >= 4096 {
@@ -883,7 +883,7 @@ func TestBSIStorageSize(t *testing.T) {
 func TestBSIScratchOwnershipAcrossQueries(t *testing.T) {
 	index := mustBSI(t, bsiNamespace(testBSI16Namespace, BSIWidth16))
 	for i := 1; i <= 2000; i++ {
-		if err := index.Set(common.ValueID(i), uint64(i%100)); err != nil {
+		if err := index.Set(schema.ValueID(i), uint64(i%100)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -913,7 +913,7 @@ func TestBSIScratchOwnershipAcrossQueries(t *testing.T) {
 
 func TestBSIResultSurvivesCheckpoint(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, common.DurabilitySync)
+	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -922,7 +922,7 @@ func TestBSIResultSurvivesCheckpoint(t *testing.T) {
 		t.Fatal("namespace missing")
 	}
 	for i := 1; i <= 500; i++ {
-		if err := index.Set(common.ValueID(i), uint64(i%64)); err != nil {
+		if err := index.Set(schema.ValueID(i), uint64(i%64)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -949,13 +949,13 @@ func TestBSIResultSurvivesCheckpoint(t *testing.T) {
 
 func TestBSICorruptSegmentRejected(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, common.DurabilitySync)
+	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
 	index, _ := store.Lookup(testBSI16Namespace)
 	for i := 1; i <= 32; i++ {
-		_ = index.Set(common.ValueID(i), uint64(i*3))
+		_ = index.Set(schema.ValueID(i), uint64(i*3))
 	}
 	if err := store.Vacuum(); err != nil {
 		t.Fatal(err)
@@ -975,20 +975,20 @@ func TestBSICorruptSegmentRejected(t *testing.T) {
 	if err := os.WriteFile(files[0], data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenStore(dir, NamespaceConfig{}, common.DurabilitySync); !errors.Is(err, ErrCorruptSegment) {
+	if _, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilitySync); !errors.Is(err, ErrCorruptSegment) {
 		t.Fatalf("open err = %v, want ErrCorruptSegment", err)
 	}
 }
 
 func TestBSICorruptWALRejected(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, common.DurabilitySync)
+	store, err := NewStore(dir, []NamespaceSpec{bsiNamespace(testBSI16Namespace, BSIWidth16)}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
 	index, _ := store.Lookup(testBSI16Namespace)
 	for i := 1; i <= 4; i++ {
-		if err := index.Set(common.ValueID(i), uint64(i*11)); err != nil {
+		if err := index.Set(schema.ValueID(i), uint64(i*11)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1011,7 +1011,7 @@ func TestBSICorruptWALRejected(t *testing.T) {
 	if err := os.WriteFile(files[0], data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenStore(dir, NamespaceConfig{}, common.DurabilitySync); !errors.Is(err, ErrCorruptWAL) {
+	if _, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilitySync); !errors.Is(err, ErrCorruptWAL) {
 		t.Fatalf("open err = %v, want ErrCorruptWAL", err)
 	}
 }
@@ -1019,15 +1019,15 @@ func TestBSICorruptWALRejected(t *testing.T) {
 func TestBSIMixedNamespaceStore(t *testing.T) {
 	dir := t.TempDir()
 	specs := []NamespaceSpec{
-		enumNamespace(common.NamespaceTag),
+		enumNamespace(schema.NamespaceTag),
 		bsiNamespace(testBSI16Namespace, BSIWidth16),
 		continuousNamespace(testFocalLength),
 	}
-	store, err := NewStore(dir, specs, NamespaceConfig{}, common.DurabilitySync)
+	store, err := NewStore(dir, specs, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tags, _ := store.Lookup(common.NamespaceTag)
+	tags, _ := store.Lookup(schema.NamespaceTag)
 	bsi, _ := store.Lookup(testBSI16Namespace)
 	focal, _ := store.Lookup(testFocalLength)
 
@@ -1065,29 +1065,29 @@ func TestBSIMixedNamespaceStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilitySync)
+	reopened, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	rtags, _ := reopened.Lookup(common.NamespaceTag)
+	rtags, _ := reopened.Lookup(schema.NamespaceTag)
 	got, err := rtags.MatchValues(tagValue)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertIDs(t, got.AppendTo(nil), []common.ValueID{1, 2})
+	assertIDs(t, got.AppendTo(nil), []schema.ValueID{1, 2})
 	rbsi, _ := reopened.Lookup(testBSI16Namespace)
 	if v, ok, _ := rbsi.Get(1); !ok || v != 42 {
 		t.Fatalf("bsi Get(1) after reopen = %d,%v", v, ok)
 	}
 	eq, _ := rbsi.Equal(7)
-	assertIDs(t, eq.AppendTo(nil), []common.ValueID{2})
+	assertIDs(t, eq.AppendTo(nil), []schema.ValueID{2})
 }
 
 func TestBSIWALReplayWithoutCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	spec := bsiNamespace(testBSI16Namespace, BSIWidth16)
-	store, err := NewStore(dir, []NamespaceSpec{spec}, NamespaceConfig{}, common.DurabilitySync)
+	store, err := NewStore(dir, []NamespaceSpec{spec}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1097,21 +1097,21 @@ func TestBSIWALReplayWithoutCheckpoint(t *testing.T) {
 	// recovery must come entirely from WAL replay.
 	for i := 1; i <= 200; i++ {
 		value := uint64((i * 13) % 65536)
-		_ = index.Set(common.ValueID(i), value)
-		ref.set(common.ValueID(i), value)
+		_ = index.Set(schema.ValueID(i), value)
+		ref.set(schema.ValueID(i), value)
 	}
 	for i := 1; i <= 200; i += 2 {
-		_ = index.Set(common.ValueID(i), uint64(i))
-		ref.set(common.ValueID(i), uint64(i))
+		_ = index.Set(schema.ValueID(i), uint64(i))
+		ref.set(schema.ValueID(i), uint64(i))
 	}
 	for i := 1; i <= 200; i += 7 {
-		_ = index.Delete(common.ValueID(i))
-		ref.del(common.ValueID(i))
+		_ = index.Delete(schema.ValueID(i))
+		ref.del(schema.ValueID(i))
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilitySync)
+	reopened, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,7 +7,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -74,11 +74,11 @@ var (
 
 type Entry struct {
 	Timestamp uint64
-	ImageID   common.ValueID
+	ImageID   schema.ValueID
 }
 
 type Spec struct {
-	Namespace common.Namespace
+	Namespace schema.Namespace
 	Name      string
 	Flags     uint32
 	// Offset is retained as metadata for source compatibility, not used in encoding.
@@ -86,12 +86,12 @@ type Spec struct {
 	Entries []Entry
 }
 
-func (s Spec) NamespaceDef() common.NamespaceDef {
-	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindTimestamp}
+func (s Spec) NamespaceDef() schema.NamespaceDef {
+	return schema.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: schema.KindTimestamp}
 }
 
 type Metadata struct {
-	Namespace  common.Namespace
+	Namespace  schema.Namespace
 	Flags      uint32
 	Generation uint64
 	Offset     uint64
@@ -137,9 +137,9 @@ func (c Config) withDefaults() (Config, error) {
 	return c, nil
 }
 
-type Durability = common.Durability
+type Durability = schema.Durability
 
 const (
-	DurabilityOS   = common.DurabilityOS
-	DurabilitySync = common.DurabilitySync
+	DurabilityOS   = schema.DurabilityOS
+	DurabilitySync = schema.DurabilitySync
 )

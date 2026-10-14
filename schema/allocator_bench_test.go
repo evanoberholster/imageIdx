@@ -6,16 +6,14 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-
-	"github.com/evanoberholster/imageIdx/common"
 )
 
 func benchOptions(backend Backend, namespaces int, block uint64) Options {
-	defs := make([]NamespaceConfig, namespaces)
-	for i := range defs {
-		defs[i] = NamespaceConfig{ID: common.Namespace(i + 1), Name: fmt.Sprintf("ns-%d", i+1), ReserveSize: block}
+	d := NewDefinitions()
+	for i := 0; i < namespaces; i++ {
+		_ = d.Register(NamespaceDef{Namespace: Namespace(i + 1), Name: fmt.Sprintf("ns-%d", i+1), Kind: KindKV, Entity: EntityImage})
 	}
-	return Options{Backend: backend, Namespaces: defs}
+	return Options{Backend: backend, Definitions: d, Entities: []EntityConfig{{Entity: EntityImage, ReserveSize: block}}}
 }
 
 func backendName(b Backend) string {
@@ -137,14 +135,14 @@ func BenchmarkNamespaceCount(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer func() { b.StopTimer(); _ = s.Close() }()
-			if _, err := s.NextID(common.Namespace(n)); err != nil {
-				b.Fatal(err)
+			if _, ok := s.Lookup(Namespace(n)); !ok {
+				b.Fatal("namespace missing")
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := s.NextID(common.Namespace(n)); err != nil {
-					b.Fatal(err)
+				if _, ok := s.Lookup(Namespace(n)); !ok {
+					b.Fatal("namespace missing")
 				}
 			}
 		})

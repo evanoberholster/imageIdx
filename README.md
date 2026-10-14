@@ -10,7 +10,7 @@ key-value collection, **not** a namespace routed by `index.Store`.
 
 | Import suffix | Role | Unified namespace kind |
 |---|---|---|
-| `common` | `Schema`, namespace/entity kinds, ID aliases, durability | — |
+| `schema` | entity IDs, namespace definitions, persistent schema and ID allocation, durability | — |
 | `index` | unified persistent store, typed routing, mutations, liveness, recovery, import matcher | owns the six families below |
 | `database` | authoritative Pebble records, atomic mutation journal, durable indexing coordinator and generation waits | owns a separate canonical `store.Store` and `index.Store` |
 | `index/bitmapidx` | enum, bool, analyzed text, signed continuous grid, unsigned 16/32-bit bit-sliced index (BSI) | `KindBitmapEnum`, `KindBitmapBool`, `KindBitmapString`, `KindBitmapContinuous`, `KindBitmapBSI` |
@@ -21,16 +21,16 @@ key-value collection, **not** a namespace routed by `index.Store`.
 | `index/vectoridx` | HNSW vector search and exact reference search | `KindVector` |
 | `search`, `search/ranking` | AND query planning/execution, ranking and fusion | — |
 | `roar` | immutable, serialized bitmap sets | — |
-| `store` | independent Pebble key-value collections | `KindKV` in its **own** schema, not in the unified store |
+| `store` | persisted canonical values and independent Pebble collections | `KindKV`; database validates these against the central schema |
 
 All imports start with `github.com/evanoberholster/imageIdx/`. A
-`common.Namespace` is a nonzero `uint16`; its number and name must be unique
-within a `common.Schema`. Unified namespaces additionally have exactly one
-`common.EntityKind` (`EntityImage`, `EntityFace`, `EntityPerson`, `EntityObject`,
+`schema.Namespace` is a nonzero `uint16`; its number and name must be unique
+within a `schema.Definitions`. Unified namespaces additionally have exactly one
+`schema.EntityKind` (`EntityImage`, `EntityFace`, `EntityPerson`, `EntityObject`,
 `EntityAlbum`, `EntityEvent`, `EntityPlace`, `EntityAsset`, `EntityCollection`,
-or `EntityStack`). `common.ValueID` and `common.ImageID` alias `uint64`; zero
+or `EntityStack`). `schema.ValueID` and `schema.ImageID` alias `uint64`; zero
 is reserved. Numeric IDs can overlap across entity kinds without mixing their
-liveness. `common.UserID` and `common.GroupID` are separate defined types.
+liveness. `schema.UserID` and `schema.GroupID` are separate defined types.
 
 ## Quick start: unified store and search
 
@@ -49,7 +49,7 @@ The snippets below use these imports:
 import (
     "context"
 
-    common "github.com/evanoberholster/imageIdx/common"
+    "github.com/evanoberholster/imageIdx/schema"
     "github.com/evanoberholster/imageIdx/index"
     "github.com/evanoberholster/imageIdx/index/bitmapidx"
     "github.com/evanoberholster/imageIdx/index/geoidx"
@@ -67,24 +67,24 @@ persisted definition; the time, geo and hash families use `NamespaceDef`
 directly. Check every returned error in application code.
 
 ```go
-schema := common.NewSchema()
+defs := schema.NewDefinitions()
 tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-    Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
-}, "tags", common.EntityImage)
+    Namespace: schema.NamespaceTag, Kind: schema.KindBitmapEnum,
+}, "tags", schema.EntityImage)
 if err != nil { return err }
 quality, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-    Namespace: 40, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
-}, "quality", common.EntityImage)
+    Namespace: 40, Kind: schema.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+}, "quality", schema.EntityImage)
 if err != nil { return err }
-err = schema.RegisterAll(tags, quality,
-    common.NamespaceDef{Namespace: 90, Name: "taken-at", Kind: common.KindTimestamp, Entity: common.EntityImage},
-    common.NamespaceDef{Namespace: 91, Name: "location", Kind: common.KindGeo, Entity: common.EntityImage},
-    common.NamespaceDef{Namespace: 92, Name: "sha256", Kind: common.KindHashExact, Entity: common.EntityImage},
+err = defs.RegisterAll(tags, quality,
+    schema.NamespaceDef{Namespace: 90, Name: "taken-at", Kind: schema.KindTimestamp, Entity: schema.EntityImage},
+    schema.NamespaceDef{Namespace: 91, Name: "location", Kind: schema.KindGeo, Entity: schema.EntityImage},
+    schema.NamespaceDef{Namespace: 92, Name: "sha256", Kind: schema.KindHashExact, Entity: schema.EntityImage},
 )
 if err != nil { return err }
 
-db, err := index.Create("./data/index", index.Spec{Schema: schema},
-    index.WithDurability(common.DurabilityOS))
+db, err := index.Create("./data/index", index.Spec{Schema: defs},
+    index.WithDurability(schema.DurabilityOS))
 if err != nil { return err }
 defer db.Close()
 
@@ -95,7 +95,7 @@ err = db.Add(index.Entry{ValueID: 100,
     Times:   []index.TimeValue{{Namespace: 90, Timestamp: takenAt}},
     Geos:    []index.GeoValue{{Namespace: 91, Key: key}},
     Bitmaps: []index.BitmapValue{
-        {Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")},
+        {Namespace: schema.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")},
         {Namespace: 40, Value: bitmapidx.Uint16Value(85)},
     },
 })
@@ -103,11 +103,11 @@ if err != nil { return err }
 
 engine, err := search.New(db)
 if err != nil { return err }
-favorite, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+favorite, err := engine.Values(schema.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
 if err != nil { return err }
 score, err := engine.BSIRange(40, bitmapidx.ValuesBetween(50, 90)) // inclusive
 if err != nil { return err }
-plan, err := engine.Compile(common.EntityImage, favorite, score)
+plan, err := engine.Compile(schema.EntityImage, favorite, score)
 if err != nil { return err }
 ws := search.NewWorkspace(256) // caller-owned; not shared concurrently
 ids, err := plan.AppendIDs(context.Background(), nil, ws) // [100]
@@ -124,12 +124,12 @@ HTTP server, `examples/service` demonstrates `search.Executor`, and
 
 | API | Purpose / options |
 |---|---|
-| `common.NewSchema`, `Register`, `RegisterAll`, `Lookup`, `LookupName`, `Defs`, `Len` | Define unique namespace numbers/names before `index.Create`. `NamespaceDef` contains `Namespace`, `Name`, `Kind`, `Entity`, and optional persisted `Config`. |
+| `schema.NewDefinitions`, `Register`, `RegisterAll`, `Lookup`, `LookupName`, `Defs`, `Len` | Define unique namespace numbers/names before `index.Create`. `NamespaceDef` contains `Namespace`, `Name`, `Kind`, `Entity`, and optional persisted `Config`. |
 | `index.BitmapDef(spec, name, entity)` | Bitmap enum/bool/text/continuous/BSI; `NamespaceSpec` selects `Kind`, optional `Normalizer` (enum), `Analyzer` (text), `Quant` (continuous), or `BSIWidth` (BSI, 16 or 32). Geography uses `KindGeo`, **not** the retired `KindBitmapGeo`. |
 | `index.VectorDef(cfg, name, entity)` | Persists `Namespace`, `Dimensions`, `ElementType`, `Metric` from `vectoridx.Config`. `Dimensions` and `ElementType` must be valid. |
-| `index.Create(dir, index.Spec{Schema: schema}, opts...)` | Creates one directory and all declared indexes; schema cannot be extended at runtime. |
+| `index.Create(dir, index.Spec{Schema: defs}, opts...)` | Creates one directory and all declared indexes; schema cannot be extended at runtime. |
 | `index.Open(dir, opts...)` | Opens an existing store and its persisted schema. Inspect `Health()`; an unavailable namespace need not prevent other namespaces from opening. Keep the store open for any plans or matcher bound to it. |
-| `index.WithDurability(d)` | `common.DurabilityOS` (default) or `common.DurabilitySync`; timeidx commits synchronously independently of this setting. |
+| `index.WithDurability(d)` | `schema.DurabilityOS` (default) or `schema.DurabilitySync`; timeidx commits synchronously independently of this setting. |
 | `index.WithRadixArenaBytes(n)` | Runtime capacity for each exact-hash namespace; default 64 MiB. |
 | `index.Option` / `index.Options.Vector` | An `Option` can configure vector runtime policy, e.g. `func(o *index.Options) { o.Vector.EfSearch = 128 }`. The persisted dimensions/type/metric come from `VectorDef`, not runtime overrides. |
 
@@ -166,7 +166,7 @@ the matcher to exclude deleted IDs.
 batch := db.NewBatch(64) // private, reusable; not safe for concurrent staging
 if err := batch.Add(entry); err != nil { return err }
 if err := batch.Update(index.Change{Before: old, After: next}); err != nil { return err }
-if err := batch.Delete(common.EntityImage, 7); err != nil { return err }
+if err := batch.Delete(schema.EntityImage, 7); err != nil { return err }
 if err := db.Apply(batch); err != nil { return err }
 if err := batch.Reset(); err != nil { return err }
 ```
@@ -264,7 +264,7 @@ and [`search/PERFORMANCE.md`](search/PERFORMANCE.md) for benchmarks.
 
 ### ACL grants and principals
 
-`search.NewUserACL(common.UserID(id))` and `NewGroupACL(common.GroupID(id))`
+`search.NewUserACL(schema.UserID(id))` and `NewGroupACL(schema.GroupID(id))`
 validate nonzero IDs and encode them as enum values for the dedicated bitmap
 namespaces. `WithACL` uses the user's posting plus postings for the supplied
 authenticated groups; it does not establish group membership. For grants,

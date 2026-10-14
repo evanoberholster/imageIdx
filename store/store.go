@@ -11,7 +11,7 @@ import (
 	"io"
 
 	"github.com/cockroachdb/pebble/v2"
-	"github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
 var (
@@ -25,21 +25,21 @@ var (
 // Spec defines a KV collection. Its namespace number and name must be stable
 // across reopenings of the same directory.
 type Spec struct {
-	Namespace common.Namespace
+	Namespace schematypes.Namespace
 	Name      string
-	Entity    common.EntityKind
+	Entity    schematypes.EntityKind
 }
 
 // NamespaceDef registers the collection in the shared namespace vocabulary.
-func (s Spec) NamespaceDef() common.NamespaceDef {
-	return common.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: common.KindKV, Entity: s.Entity}
+func (s Spec) NamespaceDef() schematypes.NamespaceDef {
+	return schematypes.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: schematypes.KindKV, Entity: s.Entity}
 }
 
 // Store owns one Pebble database. Pebble permits concurrent reads and writes.
 // Close must run after all callers have finished using the store.
 type Store struct {
 	db         *pebble.DB
-	namespaces map[common.Namespace]struct{}
+	namespaces map[schematypes.Namespace]struct{}
 }
 
 var schemaKey = EncodeKey(Key{}) // namespace zero is reserved for metadata
@@ -66,8 +66,8 @@ func open(dir string, extend bool, specs ...Spec) (*Store, error) {
 	if len(specs) == 0 {
 		return nil, ErrEmptySpecs
 	}
-	schema := common.NewSchema()
-	namespaces := make(map[common.Namespace]struct{}, len(specs))
+	schema := schematypes.NewDefinitions()
+	namespaces := make(map[schematypes.Namespace]struct{}, len(specs))
 	for _, spec := range specs {
 		if err := schema.Register(spec.NamespaceDef()); err != nil {
 			return nil, fmt.Errorf("store: invalid spec: %w", err)
@@ -96,15 +96,15 @@ func verifySchema(db *pebble.DB, expected []byte, extend bool) error {
 		matches := bytes.Equal(value, expected)
 		canExtend := false
 		if !matches && extend {
-			var oldSchema, newSchema common.Schema
+			var oldSchema, newSchema schematypes.Definitions
 			if oldSchema.UnmarshalBinary(value) == nil && newSchema.UnmarshalBinary(expected) == nil {
 				before, after := oldSchema.Defs(), newSchema.Defs()
 				canExtend = len(before) <= len(after)
 				changed := len(before) < len(after)
 				for i := 0; canExtend && i < len(before); i++ {
 					a, b := before[i], after[i]
-					ownerUpgrade := a.Entity == common.EntityInvalid && b.Entity.Valid() &&
-						b.Entity == common.EntityKind(b.Namespace) && b.Name == "entity-"+b.Entity.String()
+					ownerUpgrade := a.Entity == schematypes.EntityInvalid && b.Entity.Valid() &&
+						b.Entity == schematypes.EntityKind(b.Namespace) && b.Name == "entity-"+b.Entity.String()
 					if ownerUpgrade {
 						changed = true
 					}
@@ -190,14 +190,14 @@ func (s *Store) Delete(key Key) error {
 
 // Scan visits a namespace in ascending ID and flags order. The value passed
 // to visit remains valid only until visit returns; copy it to retain it.
-func (s *Store) Scan(namespace common.Namespace, visit func(Key, []byte) error) error {
+func (s *Store) Scan(namespace schematypes.Namespace, visit func(Key, []byte) error) error {
 	if err := s.check(Key{Namespace: namespace}); err != nil {
 		return err
 	}
 	var lower [2]byte
 	binary.BigEndian.PutUint16(lower[:], uint16(namespace))
 	options := &pebble.IterOptions{LowerBound: lower[:]}
-	if namespace < common.Namespace(^uint16(0)) {
+	if namespace < schematypes.Namespace(^uint16(0)) {
 		var upper [2]byte
 		binary.BigEndian.PutUint16(upper[:], uint16(namespace)+1)
 		options.UpperBound = upper[:]

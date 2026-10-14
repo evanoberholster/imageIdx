@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -38,7 +38,7 @@ func shardedMemoryEntries(n int) []Entry {
 		if err != nil {
 			panic(err)
 		}
-		entries[i] = Entry{Key: key, ImageID: common.ImageID(i + 1)}
+		entries[i] = Entry{Key: key, ImageID: schema.ImageID(i + 1)}
 	}
 	return entries
 }
@@ -73,8 +73,8 @@ func shardedMemoryIndex(t testing.TB, n int, cfg Config) (*Index, []Entry) {
 }
 
 // referenceIDs returns the ascending ImageIDs whose entry key is in ranges.
-func referenceIDs(entries []Entry, ranges []Range) []common.ImageID {
-	out := make([]common.ImageID, 0)
+func referenceIDs(entries []Entry, ranges []Range) []schema.ImageID {
+	out := make([]schema.ImageID, 0)
 	for _, e := range entries {
 		if keyInRanges(ranges, e.Key) {
 			out = append(out, e.ImageID)
@@ -95,14 +95,14 @@ func TestShardDirectoryHelpers(t *testing.T) {
 	}
 	slices.Sort(keys)
 	k0, k1, k2, k3 := keys[0], keys[1], keys[2], keys[3]
-	s0 := &shard{keys: []S2Key{k0, k0, k1}, ids: []common.ImageID{1, 2, 3}}
-	s1 := &shard{keys: []S2Key{k1, k2}, ids: []common.ImageID{4, 5}}
-	s2 := &shard{keys: []S2Key{k3}, ids: []common.ImageID{6}}
+	s0 := &shard{keys: []S2Key{k0, k0, k1}, ids: []schema.ImageID{1, 2, 3}}
+	s1 := &shard{keys: []S2Key{k1, k2}, ids: []schema.ImageID{4, 5}}
+	s2 := &shard{keys: []S2Key{k3}, ids: []schema.ImageID{6}}
 	shards := []*shard{s0, s1, s2}
 
 	for _, tc := range []struct {
 		key  S2Key
-		id   common.ImageID
+		id   schema.ImageID
 		want int
 	}{
 		{k0 - 1, 1, 0}, {k0, 1, 0}, {k1, 3, 0}, {k1, 4, 1}, {k1 + 1, 1, 1}, {k3, 6, 2}, {k3 + 1, 1, 2},
@@ -158,7 +158,7 @@ func TestRepeatedKeySpansShards(t *testing.T) {
 	const n = 1000
 	entries := make([]Entry, n)
 	for i := range entries {
-		entries[i] = Entry{Key: key, ImageID: common.ImageID(i + 1)}
+		entries[i] = Entry{Key: key, ImageID: schema.ImageID(i + 1)}
 	}
 	index, err := NewMemory(tinyShardConfig())
 	if err != nil {
@@ -179,7 +179,7 @@ func TestRepeatedKeySpansShards(t *testing.T) {
 		t.Fatalf("SearchRanges exact key = %d ids, want %d", len(got), n)
 	}
 	// Boundary ImageIDs across shards must all resolve.
-	for _, id := range []common.ImageID{1, 128, 129, 256, 257, 999, 1000} {
+	for _, id := range []schema.ImageID{1, 128, 129, 256, 257, 999, 1000} {
 		if !index.Contains(key, id) {
 			t.Fatalf("image %d missing after split", id)
 		}
@@ -361,7 +361,7 @@ func TestMultiShardMove(t *testing.T) {
 		t.Fatal("moved image missing at its new key")
 	}
 	// No duplicate live ImageID across shards.
-	seen := map[common.ImageID]int{}
+	seen := map[schema.ImageID]int{}
 	for _, s := range index.view.Load().shards {
 		for _, id := range s.ids {
 			seen[id]++
@@ -512,7 +512,7 @@ func monotonicEntries(n int) []Entry {
 	slices.Sort(keys)
 	entries := make([]Entry, n)
 	for i, k := range keys {
-		entries[i] = Entry{Key: k, ImageID: common.ImageID(i + 1)}
+		entries[i] = Entry{Key: k, ImageID: schema.ImageID(i + 1)}
 	}
 	return entries
 }
@@ -584,7 +584,7 @@ func TestConcurrentPersistentReadersDuringCompaction(t *testing.T) {
 	}
 	more := shardedMemoryEntries(800)
 	for i := range more {
-		more[i].ImageID = common.ImageID(100000 + i)
+		more[i].ImageID = schema.ImageID(100000 + i)
 	}
 	insertChunked(t, index, more)
 	close(stop)
@@ -628,7 +628,7 @@ func TestConcurrentReadersAcrossShardReplacement(t *testing.T) {
 	}
 	more := shardedMemoryEntries(500)
 	for i := range more {
-		more[i].ImageID = common.ImageID(100000 + i)
+		more[i].ImageID = schema.ImageID(100000 + i)
 	}
 	insertChunked(t, index, more)
 	close(stop)
@@ -642,7 +642,7 @@ func TestConcurrentReadersAcrossShardReplacement(t *testing.T) {
 // against a map reference, compacting frequently so shards split and merge.
 func TestShardedMixedMutationDifferential(t *testing.T) {
 	index, entries := shardedMemoryIndex(t, 3000, tinyShardConfig())
-	live := map[common.ImageID]Entry{}
+	live := map[schema.ImageID]Entry{}
 	for _, e := range entries {
 		live[e.ImageID] = e
 	}
@@ -657,7 +657,7 @@ func TestShardedMixedMutationDifferential(t *testing.T) {
 		return k
 	}
 
-	nextID := common.ImageID(len(entries) + 1)
+	nextID := schema.ImageID(len(entries) + 1)
 	for step := 0; step < 400; step++ {
 		switch rng.Intn(3) {
 		case 0: // insert
@@ -700,7 +700,7 @@ func TestShardedMixedMutationDifferential(t *testing.T) {
 	if got := index.Len(); got != uint64(len(live)) {
 		t.Fatalf("Len = %d, want %d", got, len(live))
 	}
-	wantIDs := make([]common.ImageID, 0, len(live))
+	wantIDs := make([]schema.ImageID, 0, len(live))
 	for id := range live {
 		wantIDs = append(wantIDs, id)
 	}

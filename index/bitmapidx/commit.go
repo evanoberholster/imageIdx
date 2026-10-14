@@ -4,7 +4,7 @@ import (
 	"errors"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // commitQueueCapacity bounds queued commit requests. Apply blocks when the
@@ -127,7 +127,7 @@ func (i *Index) commitGroup(group []commitReq) {
 			updates  uint32
 			err      error
 		)
-		isBSI := i.spec().Kind == common.KindBitmapBSI
+		isBSI := i.spec().Kind == schema.KindBitmapBSI
 		var groups uint32
 		if isBSI {
 			resolved, payload, updates, err = i.resolveBSIBatch(current, req.bsi)
@@ -169,7 +169,7 @@ func (i *Index) commitGroup(group []commitReq) {
 				return
 			}
 		}
-		if i.owner.durability == common.DurabilitySync {
+		if i.owner.durability == schema.DurabilitySync {
 			if err := i.owner.wal.Sync(); err != nil {
 				i.owner.failed = errors.Join(ErrRecoveryRequired, err)
 				i.dict = groupStart

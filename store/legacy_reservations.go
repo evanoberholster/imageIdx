@@ -1,7 +1,7 @@
 package store
 
 // This file exists only to migrate databases written by the former Pebble
-// entity allocator. New ID allocation is exclusively owned by schema.Schema.
+// entity allocator. New ID allocation is exclusively owned by schema.Definitions.
 
 import (
 	"bytes"
@@ -11,14 +11,14 @@ import (
 	"hash/crc32"
 
 	"github.com/cockroachdb/pebble/v2"
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 var legacyPrefix = [...]byte{0, 0, 'i', 'd', 'a', 'l', 'l', 'o', 'c', '/'}
 var legacyWitness = EncodeKey(Key{Namespace: 0, ID: 1})
 var schemaMigrationKey = EncodeKey(Key{Namespace: 0, ID: 2})
 
-func legacyKey(kind common.EntityKind) [11]byte {
+func legacyKey(kind schema.EntityKind) [11]byte {
 	var key [11]byte
 	copy(key[:], legacyPrefix[:])
 	key[10] = byte(kind)
@@ -46,18 +46,18 @@ func (s *Store) SchemaMigrationComplete() (bool, error) {
 // LegacyReservations reads *durable reservation high-water marks*, never
 // surviving record maxima alone. Any partially present legacy metadata is an
 // error; resetting a watermark would risk reissuing an uncommitted ID.
-func (s *Store) LegacyReservations() (high [common.EntityKindCount + 1]uint64, present bool, err error) {
+func (s *Store) LegacyReservations() (high [schema.EntityKindCount + 1]uint64, present bool, err error) {
 	witness, closer, err := s.db.Get(legacyWitness[:])
 	if errors.Is(err, pebble.ErrNotFound) {
-		marker := legacyKey(common.EntityInvalid)
+		marker := legacyKey(schema.EntityInvalid)
 		if _, c, e := s.db.Get(marker[:]); e == nil {
 			_ = c.Close()
 			return high, false, errors.New("store: legacy marker without witness")
 		} else if !errors.Is(e, pebble.ErrNotFound) {
 			return high, false, e
 		}
-		for n := 1; n <= common.EntityKindCount; n++ {
-			key := legacyKey(common.EntityKind(n))
+		for n := 1; n <= schema.EntityKindCount; n++ {
+			key := legacyKey(schema.EntityKind(n))
 			if _, c, e := s.db.Get(key[:]); e == nil {
 				_ = c.Close()
 				return high, false, errors.New("store: legacy watermark without witness")
@@ -78,12 +78,12 @@ func (s *Store) LegacyReservations() (high [common.EntityKindCount + 1]uint64, p
 	if err := closer.Close(); err != nil {
 		return high, true, err
 	}
-	marker := legacyKey(common.EntityInvalid)
+	marker := legacyKey(schema.EntityInvalid)
 	v, c, err := s.db.Get(marker[:])
 	if err != nil {
 		return high, true, fmt.Errorf("store: missing legacy allocator marker: %w", err)
 	}
-	count := common.EntityKindCount
+	count := schema.EntityKindCount
 	if version == 1 {
 		count = 10
 	}
@@ -95,7 +95,7 @@ func (s *Store) LegacyReservations() (high [common.EntityKindCount + 1]uint64, p
 		return high, true, errors.New("store: corrupt legacy allocator marker")
 	}
 	for n := 1; n <= count; n++ {
-		key := legacyKey(common.EntityKind(n))
+		key := legacyKey(schema.EntityKind(n))
 		v, c, err := s.db.Get(key[:])
 		if err != nil {
 			return high, true, fmt.Errorf("store: missing legacy watermark for %d: %w", n, err)
@@ -113,8 +113,8 @@ func (s *Store) LegacyReservations() (high [common.EntityKindCount + 1]uint64, p
 		}
 	}
 	if version == 1 {
-		for n := count + 1; n <= common.EntityKindCount; n++ {
-			key := legacyKey(common.EntityKind(n))
+		for n := count + 1; n <= schema.EntityKindCount; n++ {
+			key := legacyKey(schema.EntityKind(n))
 			if _, c, e := s.db.Get(key[:]); e == nil {
 				_ = c.Close()
 				return high, true, errors.New("store: unexpected new-kind watermark in legacy format")
@@ -128,22 +128,22 @@ func (s *Store) LegacyReservations() (high [common.EntityKindCount + 1]uint64, p
 
 // CompleteSchemaMigration publishes the authoritative migration marker and
 // removes obsolete legacy metadata in one synced Pebble batch. Call only after
-// every high-water/floor has been durably transferred to schema.Schema.
+// every high-water/floor has been durably transferred to schema.Definitions.
 func (s *Store) CompleteSchemaMigration() error {
 	b := s.db.NewBatch()
 	defer b.Close()
 	if err := b.Set(schemaMigrationKey[:], []byte("schema-v1"), nil); err != nil {
 		return err
 	}
-	key := legacyKey(common.EntityInvalid)
+	key := legacyKey(schema.EntityInvalid)
 	if err := b.Delete(key[:], nil); err != nil {
 		return err
 	}
 	if err := b.Delete(legacyWitness[:], nil); err != nil {
 		return err
 	}
-	for n := 1; n <= common.EntityKindCount; n++ {
-		key := legacyKey(common.EntityKind(n))
+	for n := 1; n <= schema.EntityKindCount; n++ {
+		key := legacyKey(schema.EntityKind(n))
 		if err := b.Delete(key[:], nil); err != nil {
 			return err
 		}

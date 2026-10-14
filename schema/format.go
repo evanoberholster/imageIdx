@@ -7,20 +7,21 @@ import (
 	"math"
 	"unicode/utf8"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-// Format version 1: two 512-byte superblocks, followed by append-only
+// Format version 2: two 512-byte superblocks, followed by append-only
 // checksummed directories and 64-byte metadata slots. Integers are LE.
 // A directory entry is id:u16, nameLen:u16, block:u64, slotsOffset:u64,
 // name:nameLen. A directory starts with count:u16 and ends in CRC32C:u32.
 // Superblock payload: directory offset:u64, length:u64, CRC32C:u32,
-// namespace count:u16, reserved:u16, end of committed file:u64.
+// entity count:u16, reserved:u16, end of committed file:u64,
+// definitions offset:u64, length:u64, CRC32C:u32, reserved:12 bytes.
+// Directory keys are persisted EntityKind ordinals, not namespace IDs.
 // Metadata slot: generation:u64, reserved:u64, lastIssued:u64, clean:u8,
 // 35 zero bytes, CRC32C:u32 over the first 60 bytes.
 const (
-	SchemaVersion     uint16 = 1
+	SchemaVersion     uint16 = 2
 	superMagic        uint32 = 0x49445343 // IDSC
 	superBytes               = storage.SuperblockSlotBytes
 	metadataBytes            = 64
@@ -32,7 +33,7 @@ const (
 )
 
 type directoryEntry struct {
-	id      common.Namespace
+	id      Namespace
 	name    string
 	reserve uint64
 	offset  uint64
@@ -125,7 +126,7 @@ func parseDirectory(data []byte, end uint64) ([]directoryEntry, error) {
 		if pos+20 > len(data)-4 {
 			return nil, ErrCorrupt
 		}
-		e := directoryEntry{common.Namespace(binary.LittleEndian.Uint16(data[pos : pos+2])), "", binary.LittleEndian.Uint64(data[pos+4 : pos+12]), binary.LittleEndian.Uint64(data[pos+12 : pos+20])}
+		e := directoryEntry{Namespace(binary.LittleEndian.Uint16(data[pos : pos+2])), "", binary.LittleEndian.Uint64(data[pos+4 : pos+12]), binary.LittleEndian.Uint64(data[pos+12 : pos+20])}
 		n := int(binary.LittleEndian.Uint16(data[pos+2 : pos+4]))
 		pos += 20
 		if n == 0 || n > maxName || pos+n > len(data)-4 || !e.id.Valid() || e.reserve == 0 ||
@@ -151,13 +152,16 @@ func parseDirectory(data []byte, end uint64) ([]directoryEntry, error) {
 	return entries, nil
 }
 
-func superPayload(dirOffset uint64, data []byte, end uint64) [32]byte {
-	var p [32]byte
+func superPayload(dirOffset uint64, data, definitions []byte, end uint64) [64]byte {
+	var p [64]byte
 	binary.LittleEndian.PutUint64(p[0:8], dirOffset)
 	binary.LittleEndian.PutUint64(p[8:16], uint64(len(data)))
 	binary.LittleEndian.PutUint32(p[16:20], storage.Checksum(data))
 	binary.LittleEndian.PutUint16(p[20:22], binary.LittleEndian.Uint16(data[:2]))
 	binary.LittleEndian.PutUint64(p[24:32], end)
+	binary.LittleEndian.PutUint64(p[32:40], dirOffset+uint64(len(data)))
+	binary.LittleEndian.PutUint64(p[40:48], uint64(len(definitions)))
+	binary.LittleEndian.PutUint32(p[48:52], storage.Checksum(definitions))
 	return p
 }
 
@@ -169,24 +173,33 @@ func parseSuper(src []byte, size uint64) (uint64, uint64, uint64, uint64, error)
 		return 0, 0, 0, 0, ErrVersion
 	}
 	h, p, ok := storage.DecodeSuperblock(src, superMagic, SchemaVersion)
-	if !ok || h.Generation == 0 || len(p) != 32 || p[22] != 0 || p[23] != 0 {
+	if !ok || h.Generation == 0 || len(p) != 64 || p[22] != 0 || p[23] != 0 {
 		return 0, 0, 0, 0, ErrCorrupt
 	}
 	off, length, end := binary.LittleEndian.Uint64(p[:8]), binary.LittleEndian.Uint64(p[8:16]), binary.LittleEndian.Uint64(p[24:32])
 	if off < metaStart || length < 26 || length > maxDirectory || end > size || off > end || length > end-off || binary.LittleEndian.Uint16(p[20:22]) == 0 {
 		return 0, 0, 0, 0, ErrCorrupt
 	}
+	defsOff, defsLen := binary.LittleEndian.Uint64(p[32:40]), binary.LittleEndian.Uint64(p[40:48])
+	if defsOff != off+length || defsLen < 14 || defsLen > maxDirectory || defsOff > end || defsLen != end-defsOff {
+		return 0, 0, 0, 0, ErrCorrupt
+	}
+	for _, b := range p[52:] {
+		if b != 0 {
+			return 0, 0, 0, 0, ErrCorrupt
+		}
+	}
 	return h.Generation, off, length, end, nil
 }
 
-func checkSuperDirectory(p []byte, data []byte) error {
-	if len(p) != 32 || binary.LittleEndian.Uint32(p[16:20]) != storage.Checksum(data) || binary.LittleEndian.Uint16(p[20:22]) != binary.LittleEndian.Uint16(data[:2]) {
+func checkSuperDirectory(p, data, definitions []byte) error {
+	if len(p) != 64 || binary.LittleEndian.Uint32(p[16:20]) != storage.Checksum(data) || binary.LittleEndian.Uint16(p[20:22]) != binary.LittleEndian.Uint16(data[:2]) || binary.LittleEndian.Uint32(p[48:52]) != storage.Checksum(definitions) {
 		return ErrCorrupt
 	}
 	return nil
 }
 
-func formatErr(ns common.Namespace, err error) error {
+func formatErr(ns Namespace, err error) error {
 	return fmt.Errorf("schema: namespace %d: %w", ns, err)
 }
 

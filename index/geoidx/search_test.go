@@ -2,7 +2,7 @@ package geoidx
 
 import (
 	"cmp"
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s2"
 	"math/rand"
@@ -252,7 +252,7 @@ func buildEdgeIndex(t testing.TB) (*Index, []Entry) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		entries[i] = Entry{Key: key, ImageID: common.ImageID(i + 1)}
+		entries[i] = Entry{Key: key, ImageID: schema.ImageID(i + 1)}
 	}
 	index, err := NewMemory(Config{})
 	if err != nil {

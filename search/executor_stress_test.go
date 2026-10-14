@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 
@@ -57,7 +57,7 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 	}
 
 	bitmap, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
-		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
+		Namespace: schema.NamespaceTag, Kind: schema.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func buildStressFixture(tb testing.TB) *stressFixture {
 	}
 	tb.Cleanup(func() { _ = timeIndex.Close() })
 
-	geo := newTestGeoNamespace(tb, common.Namespace(3), geoEntries)
+	geo := newTestGeoNamespace(tb, schema.Namespace(3), geoEntries)
 
 	cell, err := geoidx.KeyFromLatLng(37, -122)
 	if err != nil {

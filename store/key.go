@@ -4,13 +4,13 @@ import (
 	"encoding/binary"
 	"errors"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Key is the complete identity of one value. The on-disk encoding is always
 // 12 bytes: big-endian namespace, ID, then flags.
 type Key struct {
-	Namespace common.Namespace
+	Namespace schema.Namespace
 	ID        uint64
 	Flags     uint16
 }
@@ -34,7 +34,7 @@ func DecodeKey(encoded []byte) (Key, error) {
 		return Key{}, ErrInvalidKey
 	}
 	return Key{
-		Namespace: common.Namespace(binary.BigEndian.Uint16(encoded[0:2])),
+		Namespace: schema.Namespace(binary.BigEndian.Uint16(encoded[0:2])),
 		ID:        binary.BigEndian.Uint64(encoded[2:10]),
 		Flags:     binary.BigEndian.Uint16(encoded[10:12]),
 	}, nil

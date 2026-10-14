@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestNamespaceManagementAndIsolation(t *testing.T) {
@@ -119,7 +119,7 @@ func TestConcurrentNamespaceCreationAndWrites(t *testing.T) {
 	if wins != 1 {
 		t.Fatal(wins)
 	}
-	for ns := common.Namespace(2); ns < 5; ns++ {
+	for ns := schema.Namespace(2); ns < 5; ns++ {
 		if _, err := s.CreateNamespace(ns); err != nil {
 			t.Fatal(err)
 		}
@@ -127,9 +127,9 @@ func TestConcurrentNamespaceCreationAndWrites(t *testing.T) {
 	if err := s.SealStartup(); err != nil {
 		t.Fatal(err)
 	}
-	for ns := common.Namespace(1); ns < 5; ns++ {
+	for ns := schema.Namespace(1); ns < 5; ns++ {
 		wg.Add(1)
-		go func(ns common.Namespace) {
+		go func(ns schema.Namespace) {
 			defer wg.Done()
 			i, err := s.OpenNamespace(ns)
 			if err != nil {
@@ -146,7 +146,7 @@ func TestConcurrentNamespaceCreationAndWrites(t *testing.T) {
 		}(ns)
 	}
 	wg.Wait()
-	for ns := common.Namespace(1); ns < 5; ns++ {
+	for ns := schema.Namespace(1); ns < 5; ns++ {
 		i, _ := s.OpenNamespace(ns)
 		if i.Len() != 10 {
 			t.Fatal(ns, i.Len())

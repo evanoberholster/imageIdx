@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // This file deliberately uses only the pre-modernization public API so the
@@ -31,7 +31,7 @@ func BenchmarkModernization(b *testing.B) {
 			}
 			defer i.Close()
 			start := base + 50000*spacing
-			dst := make([]common.ValueID, 0, n)
+			dst := make([]schema.ValueID, 0, n)
 			expected := len(i.Search(dst[:0], start, start+tc.width))
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -63,7 +63,7 @@ func BenchmarkModernization(b *testing.B) {
 			if duplicates {
 				start = base
 			}
-			dst := make([]common.ValueID, 0, n)
+			dst := make([]schema.ValueID, 0, n)
 			expected := len(i.Search(dst[:0], start, start+1))
 			b.ReportAllocs()
 			b.ResetTimer()

@@ -6,7 +6,7 @@ import (
 	"hash/crc32"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -62,7 +62,7 @@ func encodeNamespaceChanges(changes []stagedChange) ([]byte, uint32, error) {
 		binary.LittleEndian.PutUint32(group[16:20], uint32(len(removes)))
 		copy(group[24:], change.canonical)
 		pos := 24 + len(change.canonical)
-		for _, ids := range [][]common.ImageID{adds, removes} {
+		for _, ids := range [][]schema.ImageID{adds, removes} {
 			for _, id := range ids {
 				binary.LittleEndian.PutUint64(group[pos:pos+8], id)
 				pos += 8
@@ -127,14 +127,14 @@ func (s *Store) replay(path string) (int64, error) {
 		if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(header[40:44]) {
 			return ErrCorruptWAL
 		}
-		t := common.Namespace(binary.LittleEndian.Uint16(header[6:8]))
+		t := schema.Namespace(binary.LittleEndian.Uint16(header[6:8]))
 		index, ok := s.namespaces[t]
 		if !ok {
 			return ErrCorruptWAL
 		}
 		groups := binary.LittleEndian.Uint32(header[16:20])
 		updates := binary.LittleEndian.Uint32(header[20:24])
-		if index.spec().Kind == common.KindBitmapBSI {
+		if index.spec().Kind == schema.KindBitmapBSI {
 			ops, decoded, err := decodeBSIChanges(index.spec(), payload, groups)
 			if err != nil || decoded != updates {
 				return ErrCorruptWAL
@@ -181,7 +181,7 @@ func decodeNamespaceChanges(namespace NamespaceSpec, payload []byte, groups uint
 			return nil, 0, ErrCorruptWAL
 		}
 		change := stagedChange{base: NamespaceKey{Namespace: namespace.Namespace, Hash: hash}, next: -1}
-		if namespace.Kind == common.KindBitmapContinuous {
+		if namespace.Kind == schema.KindBitmapContinuous {
 			if n != 0 {
 				return nil, 0, ErrCorruptWAL
 			}
@@ -193,7 +193,7 @@ func decodeNamespaceChanges(namespace NamespaceSpec, payload []byte, groups uint
 		}
 		pos := 24 + n
 		for side, count := range []uint64{a, r} {
-			ids := make([]common.ImageID, count)
+			ids := make([]schema.ImageID, count)
 			for j := range ids {
 				ids[j] = binary.LittleEndian.Uint64(payload[pos : pos+8])
 				pos += 8

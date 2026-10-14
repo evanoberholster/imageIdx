@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
@@ -15,15 +15,15 @@ import (
 
 // matchSchema binds exact (SHA-256, BLAKE3) and perceptual namespaces, plus a
 // foreign-entity exact namespace for validation tests.
-func matchSchema(t testing.TB) *common.Schema {
+func matchSchema(t testing.TB) *schematypes.Definitions {
 	t.Helper()
-	schema := common.NewSchema()
-	defs := []common.NamespaceDef{
-		{Namespace: 1, Name: "time", Kind: common.KindTimestamp, Entity: common.EntityImage},
-		{Namespace: 3, Name: "sim", Kind: common.KindHashPerceptual, Entity: common.EntityImage},
-		{Namespace: 4, Name: "sha256", Kind: common.KindHashExact, Entity: common.EntityImage},
-		{Namespace: 5, Name: "blake3", Kind: common.KindHashExact, Entity: common.EntityImage},
-		{Namespace: 6, Name: "face-sha", Kind: common.KindHashExact, Entity: common.EntityFace},
+	schema := schematypes.NewDefinitions()
+	defs := []schematypes.NamespaceDef{
+		{Namespace: 1, Name: "time", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+		{Namespace: 3, Name: "sim", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage},
+		{Namespace: 4, Name: "sha256", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage},
+		{Namespace: 5, Name: "blake3", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage},
+		{Namespace: 6, Name: "face-sha", Kind: schematypes.KindHashExact, Entity: schematypes.EntityFace},
 	}
 	if err := schema.RegisterAll(defs...); err != nil {
 		t.Fatal(err)
@@ -45,8 +45,8 @@ func newMatcher(t *testing.T) (*index.Store, *index.Matcher) {
 	return db, m
 }
 
-func matchIDs(matches []index.Match) []common.ValueID {
-	ids := make([]common.ValueID, 0, len(matches))
+func matchIDs(matches []index.Match) []schematypes.ValueID {
+	ids := make([]schematypes.ValueID, 0, len(matches))
 	for _, m := range matches {
 		if !m.Intra {
 			ids = append(ids, m.ImageID)
@@ -69,16 +69,16 @@ func TestMatcherExactSHA256(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{100, 200}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{100, 200}) {
 		t.Fatalf("dup-hash matches = %v, want [100 200]", ids)
 	}
 
 	// A deleted image must not be returned.
-	if err := db.Delete(common.EntityImage, 100); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 100); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = m.MatchOne(got[:0], index.MatchItem{SHA256: &h}, index.MatchParams{})
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{200}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{200}) {
 		t.Fatalf("after delete = %v, want [200]", ids)
 	}
 }
@@ -100,7 +100,7 @@ func TestMatcherStaleHashAssociation(t *testing.T) {
 		t.Fatalf("stale hash A returned %v", got)
 	}
 	got, _ := m.MatchOne(nil, index.MatchItem{SHA256: &hB}, index.MatchParams{})
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{7}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{7}) {
 		t.Fatalf("hash B = %v, want [7]", ids)
 	}
 }
@@ -112,7 +112,7 @@ func TestMatcherExactBLAKE3(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := m.MatchOne(nil, index.MatchItem{BLAKE3: &g}, index.MatchParams{})
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{300}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{300}) {
 		t.Fatalf("blake3 = %v, want [300]", ids)
 	}
 }
@@ -138,7 +138,7 @@ func TestMatcherPerceptualAndLiveness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{1, 2}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{1, 2}) {
 		t.Fatalf("pHash<=1 = %v, want [1 2]", ids)
 	}
 	// Native distances preserved and ascending.
@@ -151,17 +151,17 @@ func TestMatcherPerceptualAndLiveness(t *testing.T) {
 	}
 
 	// Deleted image 2 is excluded.
-	if err := db.Delete(common.EntityImage, 2); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 2); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = m.MatchOne(got[:0], index.MatchItem{PHash: &q}, index.MatchParams{PHashDistance: 1})
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{1}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{1}) {
 		t.Fatalf("after delete = %v, want [1]", ids)
 	}
 
 	// PDQ search returns the stored hash.
 	got, _ = m.MatchOne(got[:0], index.MatchItem{PDQ: &pdq}, index.MatchParams{PDQDistance: 0})
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{1}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{1}) {
 		t.Fatalf("pdq = %v, want [1]", ids)
 	}
 }
@@ -223,7 +223,7 @@ func TestMatcherDeletedExcludedAfterReopen(t *testing.T) {
 	if err := db.Add(index.Entry{ValueID: 200, Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Delete(common.EntityImage, 100); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 100); err != nil {
 		t.Fatal(err)
 	}
 	// radixhash/simhash Close does not checkpoint; Checkpoint makes the
@@ -248,7 +248,7 @@ func TestMatcherDeletedExcludedAfterReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{200}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{200}) {
 		t.Fatalf("reopened matches = %v, want [200]", ids)
 	}
 }
@@ -259,7 +259,7 @@ func TestMatcherBatchOf64(t *testing.T) {
 	hashes := make([]radixhash.Hash, 64)
 	for i := range items {
 		hashes[i] = radixhash.Hash{byte(i + 1)}
-		if err := db.Add(index.Entry{ValueID: common.ValueID(1000 + i), Hashes: []index.HashValue{{Namespace: 4, Hash: hashes[i]}}}); err != nil {
+		if err := db.Add(index.Entry{ValueID: schematypes.ValueID(1000 + i), Hashes: []index.HashValue{{Namespace: 4, Hash: hashes[i]}}}); err != nil {
 			t.Fatal(err)
 		}
 		h := hashes[i]
@@ -273,7 +273,7 @@ func TestMatcherBatchOf64(t *testing.T) {
 		t.Fatalf("batch matches = %d, want 64", len(got))
 	}
 	for _, mt := range got {
-		if mt.ImageID != common.ValueID(1000+mt.Item) {
+		if mt.ImageID != schematypes.ValueID(1000+mt.Item) {
 			t.Fatalf("item %d matched %d", mt.Item, mt.ImageID)
 		}
 	}
@@ -302,19 +302,19 @@ func TestMatcherDeleteVisibleImmediately(t *testing.T) {
 	}
 	h := radixhash.Hash{0x33}
 	for i := 1; i <= 16; i++ {
-		if err := db.Add(index.Entry{ValueID: common.ValueID(i), Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
+		if err := db.Add(index.Entry{ValueID: schematypes.ValueID(i), Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := 1; i <= 16; i++ {
-		if err := db.Delete(common.EntityImage, common.ValueID(i)); err != nil {
+		if err := db.Delete(schematypes.EntityImage, schematypes.ValueID(i)); err != nil {
 			t.Fatal(err)
 		}
 		got, err := m.MatchOne(nil, index.MatchItem{SHA256: &h}, index.MatchParams{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if slices.Contains(matchIDs(got), common.ValueID(i)) {
+		if slices.Contains(matchIDs(got), schematypes.ValueID(i)) {
 			t.Fatalf("deleted id %d still matched after Delete returned: %v", i, got)
 		}
 	}
@@ -352,7 +352,7 @@ func TestMatcherFastPathSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ids := matchIDs(got); !slices.Equal(ids, []common.ValueID{100}) {
+	if ids := matchIDs(got); !slices.Equal(ids, []schematypes.ValueID{100}) {
 		t.Fatalf("reopened fast-path matches = %v, want [100]", ids)
 	}
 }
@@ -384,12 +384,12 @@ func TestMatcherConcurrentMutation(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 200; i++ {
-		id := common.ValueID(i%32 + 1)
+		id := schematypes.ValueID(i%32 + 1)
 		if err := db.Add(index.Entry{ValueID: id, Hashes: []index.HashValue{{Namespace: 4, Hash: h}}}); err != nil {
 			t.Fatal(err)
 		}
 		if i%3 == 0 {
-			if err := db.Delete(common.EntityImage, id); err != nil {
+			if err := db.Delete(schematypes.EntityImage, id); err != nil {
 				t.Fatal(err)
 			}
 		}

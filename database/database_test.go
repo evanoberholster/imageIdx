@@ -10,13 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
-const tagNS common.Namespace = 101
+const tagNS schematypes.Namespace = 101
 
 func projection(id uint64, value byte) []byte {
 	var b [9]byte
@@ -36,15 +36,15 @@ func paths(t testing.TB) (string, string) {
 	t.Helper()
 	root := t.TempDir()
 	data, idxPath := filepath.Join(root, "data"), filepath.Join(root, "index")
-	schema := common.NewSchema()
-	def, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: tagNS, Kind: common.KindBitmapEnum}, "tags", common.EntityImage)
+	schema := schematypes.NewDefinitions()
+	def, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: tagNS, Kind: schematypes.KindBitmapEnum}, "tags", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := schema.Register(def); err != nil {
 		t.Fatal(err)
 	}
-	other, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 102, Kind: common.KindBitmapEnum}, "untouched", common.EntityImage)
+	other, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 102, Kind: schematypes.KindBitmapEnum}, "untouched", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,38 +105,38 @@ func contains(t *testing.T, db *DB, id uint64, value byte, want bool) {
 func TestCommitReplayAndReopen(t *testing.T) {
 	data, idxPath := paths(t)
 	db := openTest(t, data, idxPath)
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Record: []byte("image"), Projection: projection(1, 'a')})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Record: []byte("image"), Projection: projection(1, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.Get(common.EntityImage, 1)
+	got, err := db.Get(schematypes.EntityImage, 1)
 	if err != nil || string(got) != "image" {
 		t.Fatalf("canonical record %q: %v", got, err)
 	}
 	wait(t, db, g)
 	contains(t, db, 1, 'a', true)
-	g, err = db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Record: []byte("metadata only"), Projection: projection(1, 'a')})
+	g, err = db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Record: []byte("metadata only"), Projection: projection(1, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}
 	wait(t, db, g)
 	contains(t, db, 1, 'a', true)
-	g, err = db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Record: []byte("updated"), Projection: projection(1, 'b')})
+	g, err = db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Record: []byte("updated"), Projection: projection(1, 'b')})
 	if err != nil {
 		t.Fatal(err)
 	}
 	wait(t, db, g)
 	contains(t, db, 1, 'a', false)
 	contains(t, db, 1, 'b', true)
-	g, err = db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Delete: true})
+	g, err = db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Delete: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	wait(t, db, g)
-	if _, err := db.Get(common.EntityImage, 1); !errors.Is(err, store.ErrNotFound) {
+	if _, err := db.Get(schematypes.EntityImage, 1); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("deleted: %v", err)
 	}
-	g, err = db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: projection(1, 'c')})
+	g, err = db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection(1, 'c')})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,17 +158,17 @@ func TestFailedCommitDoesNotAdvance(t *testing.T) {
 	data, idxPath := paths(t)
 	db := openTest(t, data, idxPath)
 	defer db.Close()
-	_, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 4, Projection: projection(4, 'a')}, Mutation{Entity: common.EntityImage, ValueID: 4, Projection: projection(4, 'b')})
+	_, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 4, Projection: projection(4, 'a')}, Mutation{Entity: schematypes.EntityImage, ValueID: 4, Projection: projection(4, 'b')})
 	if !errors.Is(err, ErrInvalidMutation) {
 		t.Fatalf("duplicate key: %v", err)
 	}
 	if db.DatabaseGeneration() != 0 {
 		t.Fatal("failed batch advanced generation")
 	}
-	if _, err := db.Get(common.EntityImage, 4); !errors.Is(err, store.ErrNotFound) {
+	if _, err := db.Get(schematypes.EntityImage, 4); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("failed batch visible: %v", err)
 	}
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 4, Projection: projection(4, 'a')})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 4, Projection: projection(4, 'a')})
 	if err != nil || g != 1 {
 		t.Fatalf("sequence = %d: %v", g, err)
 	}
@@ -187,7 +187,7 @@ func TestConcurrentSequences(t *testing.T) {
 		wg.Add(1)
 		go func(id uint64) {
 			defer wg.Done()
-			g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: id, Projection: projection(id, byte(id))})
+			g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: id, Projection: projection(id, byte(id))})
 			if err != nil {
 				errorsCh <- err
 				return
@@ -222,7 +222,7 @@ func TestConcurrentSequences(t *testing.T) {
 func TestAcknowledgmentCannotExceedRecoverableIndex(t *testing.T) {
 	data, idxPath := paths(t)
 	db := openTest(t, data, idxPath)
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 5, Projection: projection(5, 'a')})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 5, Projection: projection(5, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,9 @@ func TestCorruptPendingJournalStopsReplay(t *testing.T) {
 		t.Fatal("corrupt record acknowledged")
 	}
 	for _, status := range db.RecoveryStatus() {
-		if status.State != RecoveryFailed || !errors.Is(status.Err, ErrCorruptJournal) { t.Fatalf("corrupt journal status: %+v", status) }
+		if status.State != RecoveryFailed || !errors.Is(status.Err, ErrCorruptJournal) {
+			t.Fatalf("corrupt journal status: %+v", status)
+		}
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -300,7 +302,7 @@ func TestWaitIndexedCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 9, Projection: projection(9, 'a')})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 9, Projection: projection(9, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}

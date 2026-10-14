@@ -1,4 +1,4 @@
-package common
+package schema
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 )
 
 func TestSchemaRegistrationAndUniqueness(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	defs := []NamespaceDef{
 		{Namespace: NamespaceLocation, Name: "location", Kind: KindBitmapGeo, Config: []byte{1, 2, 3}},
 		{Namespace: NamespaceTag, Name: "tag", Kind: KindBitmapEnum},
@@ -57,7 +57,7 @@ func TestSchemaRegistrationAndUniqueness(t *testing.T) {
 }
 
 func TestSchemaRoundTrip(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	if err := schema.RegisterAll(
 		NamespaceDef{Namespace: NamespaceAlbum, Name: "album", Kind: KindBitmapEnum, Config: []byte("codec")},
 		NamespaceDef{Namespace: 700, Name: "sha256", Kind: KindHashExact, Config: []byte{9}},
@@ -69,7 +69,7 @@ func TestSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var restored Schema
+	var restored Definitions
 	if err := restored.UnmarshalBinary(data); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestSchemaRoundTrip(t *testing.T) {
 }
 
 func TestSchemaRejectsCorruption(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	if err := schema.Register(NamespaceDef{Namespace: 1, Name: "a", Kind: KindBitmapEnum}); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestSchemaRejectsCorruption(t *testing.T) {
 	cases["crc"][6] ^= 0xFF
 	cases["magic"][0] ^= 0xFF
 	cases["version"][4] = 9
-	var target Schema
+	var target Definitions
 	for name, corrupted := range cases {
 		if err := target.UnmarshalBinary(corrupted); !errors.Is(err, ErrCorruptSchema) {
 			t.Fatalf("%s: err = %v, want ErrCorruptSchema", name, err)
@@ -128,7 +128,7 @@ func TestSchemaRejectsCorruption(t *testing.T) {
 }
 
 func TestSchemaDefensiveCopies(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	config := []byte{1, 2, 3}
 	if err := schema.Register(NamespaceDef{Namespace: 5, Name: "copy", Kind: KindVector, Config: config}); err != nil {
 		t.Fatal(err)

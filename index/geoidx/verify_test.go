@@ -6,7 +6,7 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s2"
@@ -14,8 +14,8 @@ import (
 
 // refRangeIDs is the reference result for a range query: ascending, unique
 // ImageIDs whose key is in ranges.
-func refRangeIDs(entries []Entry, ranges []Range) []common.ImageID {
-	out := make([]common.ImageID, 0)
+func refRangeIDs(entries []Entry, ranges []Range) []schema.ImageID {
+	out := make([]schema.ImageID, 0)
 	for _, e := range entries {
 		if keyInRanges(ranges, e.Key) {
 			out = append(out, e.ImageID)
@@ -27,7 +27,7 @@ func refRangeIDs(entries []Entry, ranges []Range) []common.ImageID {
 
 // assertAscendingUniqueNoDuplicates checks an initial-search result and the
 // live shard records for ordering and uniqueness.
-func assertAscendingUniqueNoDuplicates(t *testing.T, index *Index, got []common.ImageID) {
+func assertAscendingUniqueNoDuplicates(t *testing.T, index *Index, got []schema.ImageID) {
 	t.Helper()
 	if !slices.IsSorted(got) {
 		t.Fatal("results not ascending")
@@ -37,7 +37,7 @@ func assertAscendingUniqueNoDuplicates(t *testing.T, index *Index, got []common.
 			t.Fatalf("duplicate result %d", got[i])
 		}
 	}
-	seen := map[common.ImageID]struct{}{}
+	seen := map[schema.ImageID]struct{}{}
 	for _, s := range index.view.Load().shards {
 		for _, id := range s.ids {
 			if _, dup := seen[id]; dup {
@@ -293,7 +293,7 @@ func TestSearchDifferentialAcrossShards(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wantRadius := make([]common.ImageID, 0)
+		wantRadius := make([]schema.ImageID, 0)
 		for _, e := range entries {
 			if keyDistanceMeters(e.Key, center) <= radius {
 				wantRadius = append(wantRadius, e.ImageID)

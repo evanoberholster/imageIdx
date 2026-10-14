@@ -18,10 +18,10 @@ created.
 
 ## Entity model
 
-`common.EntityKind` names ten entity kinds (image, face, person, object, album,
+`schema.EntityKind` names ten entity kinds (image, face, person, object, album,
 event, place, asset, collection, stack). A namespace declares exactly one entity
-kind in `common.NamespaceDef.Entity`; the entity is never stored per record, and
-the same numeric `common.ValueID` is independent across entity kinds.
+kind in `schema.NamespaceDef.Entity`; the entity is never stored per record, and
+the same numeric `schema.ValueID` is independent across entity kinds.
 
 Liveness is a single reserved `bitmapidx` enum namespace (`0xFFF0`) whose values
 are the entity-kind names. Marking an entity live adds `(id, kindName)`; deleting
@@ -30,22 +30,22 @@ entity, and deleting `ImageID 100` never affects `FaceID 100`.
 
 ## Schema
 
-Namespaces are registered in a `common.Schema` before `Create`/`Open` and never
+Namespaces are registered in a `schema.Definitions` before `Create`/`Open` and never
 at runtime. The schema is persisted (`schema.bin`) and validated on reopen.
-`common.Schema` uses version 2, which stores the entity kind; version-1 blobs
+`schema.Definitions` uses version 2, which stores the entity kind; version-1 blobs
 load as `EntityInvalid` and are rejected.
 
 Helpers encode engine configuration into `NamespaceDef.Config`:
 
 ```go
-tags, _ := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: common.KindBitmapEnum}, "tags", common.EntityImage)
-vec, _  := index.VectorDef(vectoridx.Config{Namespace: 5, Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementFloat32}, "embedding", common.EntityImage)
+tags, _ := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: schema.KindBitmapEnum}, "tags", schema.EntityImage)
+vec, _  := index.VectorDef(vectoridx.Config{Namespace: 5, Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementFloat32}, "embedding", schema.EntityImage)
 ```
 
 ## Lifecycle
 
 ```go
-db, err := index.Create(dir, index.Spec{Schema: schema}, index.WithDurability(common.DurabilityOS))
+db, err := index.Create(dir, index.Spec{Schema: schema}, index.WithDurability(schema.DurabilityOS))
 db, err := index.Open(dir)
 defer db.Close()
 db.Sync(); db.Checkpoint(); db.Compact(); db.Verify()
@@ -61,10 +61,10 @@ blocking healthy ones. Accessors (`Time`, `Geo`, `Sim`, `Hash`, `Vector`,
 ```go
 db.Add(index.Entry{ValueID: 100, Times: ..., Bitmaps: ...})
 db.Update(index.Change{Before: ..., After: ...})
-db.Delete(common.EntityImage, 100)
+db.Delete(schema.EntityImage, 100)
 
 batch := db.NewBatch(64)
-batch.Add(entry); batch.Update(change); batch.Delete(common.EntityImage, 7)
+batch.Add(entry); batch.Update(change); batch.Delete(schema.EntityImage, 7)
 db.Apply(batch)
 batch.Reset()
 ```
@@ -93,12 +93,12 @@ value, distinguished from absent by the existence bitmap.
 
 ```go
 def, _ := index.BitmapDef(bitmapidx.NamespaceSpec{
-    Namespace: 30, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
-}, "quality", common.EntityImage)
+    Namespace: 30, Kind: schema.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+}, "quality", schema.EntityImage)
 bsi, _ := db.Bitmap(30)
 bsi.Set(100, 85); bsi.Delete(200)
 value, ok, _ := bsi.Get(100)
-equal, _ := bsi.Equal(85)             // roar.Bitmap of common.ValueID
+equal, _ := bsi.Equal(85)             // roar.Bitmap of schema.ValueID
 inRange, _ := bsi.BSIRange(50, 90)
 candidates, _ := bsi.BSIFilterRange(nil, ids, bitmapidx.ValuesBetween(50, 90))
 ```
@@ -108,7 +108,7 @@ preconditions) are supported; stale preconditions and duplicate `ValueID`s fail
 the whole batch atomically. Queries use bit-sliced comparisons (MSB first, with
 early termination), `BSIFilterRange` reconstructs small candidate sets and
 materializes a range bitmap otherwise, and results are ordinary `roar.Bitmap`s
-of `common.ValueID` that compose with the rest of the unified search surface.
+of `schema.ValueID` that compose with the rest of the unified search surface.
 WAL records are logical value transitions, not per-bit changes, and reuse the
 shared checkpoint, compaction, mmap-reopen, and durability machinery.
 
@@ -171,7 +171,7 @@ reachable through the typed accessor):
 ```go
 eng, err := search.New(db)
 during, _ := eng.During(1, start, end)
-plan, err := eng.Compile(common.EntityImage, during)
+plan, err := eng.Compile(schema.EntityImage, during)
 ids, err := plan.AppendIDs(ctx, nil, ws)
 ```
 
@@ -217,7 +217,7 @@ hits, err := m.Match(dst, items, index.MatchParams{PHashDistance: 4, PDQDistance
 
 ## Performance
 
-Namespace routing is a dense `[]route` indexed by `common.Namespace` and
+Namespace routing is a dense `[]route` indexed by `schema.Namespace` and
 allocates nothing; no maps or reflection appear on the mutation or query hot
 paths. Benchmarks live in `benchmark_test.go`, `matcher_benchmark_test.go`, and
 `geo_test.go`.

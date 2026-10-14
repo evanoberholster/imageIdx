@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func tempPath(t *testing.T) string {
@@ -532,7 +532,7 @@ func TestWALSegmentRotationAndReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(results) != 1 || results[0].ValueID != common.ValueID(id) {
+		if len(results) != 1 || results[0].ValueID != schema.ValueID(id) {
 			t.Fatalf("node %d self-search after segmented replay = %+v", id, results)
 		}
 	}

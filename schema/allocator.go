@@ -2,24 +2,22 @@ package schema
 
 import (
 	"math"
-
-	"github.com/evanoberholster/imageIdx/common"
 )
 
 // NextID issues one ID. Uniqueness is ordered by the successful CAS, not the
 // completion order of concurrent goroutines.
-func (s *Schema) NextID(ns common.Namespace) (common.ValueID, error) {
-	return s.NextIDs(ns, 1)
+func (s *Schema) NextID(entity EntityKind) (ValueID, error) {
+	return s.NextIDs(entity, 1)
 }
 
 // NextIDs atomically issues the contiguous interval [start, start+count).
 // On any error it publishes no part of that interval. A failed reservation
 // may nevertheless leave an unused durable block (which is safe to skip).
-func (s *Schema) NextIDs(ns common.Namespace, count uint64) (common.ValueID, error) {
+func (s *Schema) NextIDs(entity EntityKind, count uint64) (ValueID, error) {
 	if count == 0 {
 		return 0, ErrCount
 	}
-	a := s.entry(ns)
+	a := s.entry(entity)
 	if a == nil {
 		return 0, ErrNamespace
 	}
@@ -75,8 +73,8 @@ func reservationEnd(old, required, block uint64) uint64 {
 // raises issued: a concurrent allocation linearized before that CAS may
 // return <= minimum (even if it finishes afterward); later allocations may
 // not. This deliberately creates gaps for restoration/migration.
-func (s *Schema) EnsureMinimum(ns common.Namespace, minimum common.ValueID) error {
-	a := s.entry(ns)
+func (s *Schema) EnsureMinimum(entity EntityKind, minimum ValueID) error {
+	a := s.entry(entity)
 	if a == nil {
 		return ErrNamespace
 	}

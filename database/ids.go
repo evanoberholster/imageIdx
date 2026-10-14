@@ -6,16 +6,15 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
-func (db *DB) canonicalMaxima() ([common.EntityKindCount + 1]uint64, error) {
-	var maxima [common.EntityKindCount + 1]uint64
-	for n := 1; n <= common.EntityKindCount; n++ {
-		kind := common.EntityKind(n)
-		if err := db.values.Scan(common.Namespace(kind), func(key store.Key, _ []byte) error {
+func (db *DB) canonicalMaxima() ([schema.EntityKindCount + 1]uint64, error) {
+	var maxima [schema.EntityKindCount + 1]uint64
+	for n := 1; n <= schema.EntityKindCount; n++ {
+		kind := schema.EntityKind(n)
+		if err := db.values.Scan(schema.Namespace(kind), func(key store.Key, _ []byte) error {
 			if key.Flags != 0 || key.ID == 0 {
 				return fmt.Errorf("database: invalid canonical ID key for %s", kind)
 			}
@@ -41,14 +40,25 @@ func (db *DB) openIDs(dir string) error {
 			return errors.Join(schema.ErrCorrupt, fmt.Errorf("database: missing allocation file after migration: %w", err))
 		}
 	}
-	defs := make([]schema.NamespaceConfig, 0, common.EntityKindCount)
-	for n := 1; n <= common.EntityKindCount; n++ {
-		kind := common.EntityKind(n)
-		// The existing database has exactly one canonical namespace per
-		// entity. Its other index namespaces continue to share that ID.
-		defs = append(defs, schema.NamespaceConfig{ID: common.Namespace(kind), Name: "entity-" + kind.String(), ReserveSize: 1000})
+	defs := schema.NewDefinitions()
+	for _, spec := range canonicalSpecs() {
+		if spec.Entity.Valid() {
+			if err := defs.Register(spec.NamespaceDef()); err != nil {
+				return err
+			}
+		}
 	}
-	ids, err := schema.Open(path, schema.Options{Namespaces: defs})
+	for _, def := range db.indexes.Schema().Defs() {
+		if err := defs.Register(def); err != nil {
+			return fmt.Errorf("database: global namespace ownership: %w", err)
+		}
+	}
+	entities := make([]schema.EntityConfig, 0, schema.EntityKindCount)
+	for n := 1; n <= schema.EntityKindCount; n++ {
+		kind := schema.EntityKind(n)
+		entities = append(entities, schema.EntityConfig{Entity: kind, ReserveSize: 1000})
+	}
+	ids, err := schema.Open(path, schema.Options{Definitions: defs, Entities: entities})
 	if err != nil {
 		return err
 	}
@@ -67,12 +77,12 @@ func (db *DB) openIDs(dir string) error {
 	if err != nil {
 		return err
 	}
-	for n := 1; n <= common.EntityKindCount; n++ {
+	for n := 1; n <= schema.EntityKindCount; n++ {
 		floor := legacy[n]
 		if maxima[n] > floor {
 			floor = maxima[n]
 		}
-		if err := ids.EnsureMinimum(common.Namespace(n), floor); err != nil {
+		if err := ids.EnsureMinimum(schema.EntityKind(n), floor); err != nil {
 			return err
 		}
 	}

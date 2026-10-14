@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/golang/geo/s2"
 )
 
@@ -45,7 +45,7 @@ func TestScale20And30Million(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				entries[i] = Entry{Key: k, ImageID: common.ImageID(i + 1)}
+				entries[i] = Entry{Key: k, ImageID: schema.ImageID(i + 1)}
 			}
 
 			// Memory.

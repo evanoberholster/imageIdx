@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func basePosting(t *testing.T, index *Index, key NamespaceKey) *posting {
@@ -26,8 +26,8 @@ func TestIntersectPostingsEmpty(t *testing.T) {
 }
 
 func TestTinyPostingTier(t *testing.T) {
-	rare := hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("rare"))
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	rare := hashCanonical(schema.NamespaceTag, schema.KindBitmapEnum, []byte("rare"))
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
 			Entry{ImageID: 1, Value: EnumStringValue("rare")},
@@ -44,7 +44,7 @@ func TestTinyPostingTier(t *testing.T) {
 	if p := basePosting(t, index, rare); !p.contains(2) || p.contains(9) {
 		t.Fatal("tiny contains mismatch")
 	}
-	if ids := appendIDs(t, index, EnumStringValue("rare")); !slices.Equal(ids, []common.ImageID{1, 2, 3}) {
+	if ids := appendIDs(t, index, EnumStringValue("rare")); !slices.Equal(ids, []schema.ImageID{1, 2, 3}) {
 		t.Fatalf("ValueIDs = %v", ids)
 	}
 
@@ -75,7 +75,7 @@ func TestTinyPostingTier(t *testing.T) {
 	if p := basePosting(t, index, rare); !p.isTiny() || p.cardinality() != 3 {
 		t.Fatalf("demoted posting = tiny:%v card:%d, want tiny 3", p.isTiny(), p.cardinality())
 	}
-	if ids := appendIDs(t, index, EnumStringValue("rare")); !slices.Equal(ids, []common.ImageID{3, 4, 5}) {
+	if ids := appendIDs(t, index, EnumStringValue("rare")); !slices.Equal(ids, []schema.ImageID{3, 4, 5}) {
 		t.Fatalf("ValueIDs after demotion = %v", ids)
 	}
 
@@ -93,7 +93,7 @@ func TestTinyPostingTier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchValues: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{3, 4}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []schema.ImageID{3, 4}) {
 		t.Fatalf("tiny intersection = %v, want [3 4]", got)
 	}
 	count, err := index.CountValues(EnumStringValue("rare"), EnumStringValue("overlap"))
@@ -115,24 +115,24 @@ func TestTinyPostingTierKinds(t *testing.T) {
 		t.Fatalf("Compact: %v", err)
 	}
 	match, err := focals.Range(Between(0, 100))
-	if err != nil || !slices.Equal(match.AppendTo(nil), []common.ImageID{1, 2}) {
+	if err != nil || !slices.Equal(match.AppendTo(nil), []schema.ImageID{1, 2}) {
 		t.Fatalf("Range = %v, %v", match.AppendTo(nil), err)
 	}
 
 	// Text: a token with a single member stays inline and matches.
-	titles := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	titles := mustNamespace(t, textNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, titles, func(b *Batch) error {
 		return b.ReplaceText(TextReplacement{ImageID: 7, After: []string{"golden"}})
 	})
 	if err := titles.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	token := hashCanonical(common.NamespaceTag, common.KindBitmapString, []byte("golden"))
+	token := hashCanonical(schema.NamespaceTag, schema.KindBitmapString, []byte("golden"))
 	if p := basePosting(t, titles, token); !p.isTiny() {
 		t.Fatal("text posting not tiny")
 	}
 	match, err = titles.MatchText("golden")
-	if err != nil || !slices.Equal(match.AppendTo(nil), []common.ImageID{7}) {
+	if err != nil || !slices.Equal(match.AppendTo(nil), []schema.ImageID{7}) {
 		t.Fatalf("MatchText = %v, %v", match.AppendTo(nil), err)
 	}
 }

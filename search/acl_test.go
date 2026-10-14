@@ -6,18 +6,18 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
 func aclStore(t *testing.T, includeGroups bool) *bitmapidx.Store {
 	t.Helper()
-	specs := []bitmapidx.NamespaceSpec{{Namespace: common.NamespaceUserACL, Kind: common.KindBitmapEnum}}
+	specs := []bitmapidx.NamespaceSpec{{Namespace: schema.NamespaceUserACL, Kind: schema.KindBitmapEnum}}
 	if includeGroups {
-		specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceGroupACL, Kind: common.KindBitmapEnum})
+		specs = append(specs, bitmapidx.NamespaceSpec{Namespace: schema.NamespaceGroupACL, Kind: schema.KindBitmapEnum})
 	}
-	specs = append(specs, bitmapidx.NamespaceSpec{Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum})
-	store, err := bitmapidx.NewStore(t.TempDir(), specs, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
+	specs = append(specs, bitmapidx.NamespaceSpec{Namespace: schema.NamespaceTag, Kind: schema.KindBitmapEnum})
+	store, err := bitmapidx.NewStore(t.TempDir(), specs, bitmapidx.NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,9 +27,9 @@ func aclStore(t *testing.T, includeGroups bool) *bitmapidx.Store {
 
 func TestWithACLUnionAndSearchOperations(t *testing.T) {
 	store := aclStore(t, true)
-	users, _ := store.Lookup(common.NamespaceUserACL)
-	groups, _ := store.Lookup(common.NamespaceGroupACL)
-	tags, _ := store.Lookup(common.NamespaceTag)
+	users, _ := store.Lookup(schema.NamespaceUserACL)
+	groups, _ := store.Lookup(schema.NamespaceGroupACL)
+	tags, _ := store.Lookup(schema.NamespaceTag)
 	user, _ := NewUserACL(42)
 	otherUser, _ := NewUserACL(43)
 	group7, _ := NewGroupACL(7)
@@ -149,7 +149,7 @@ func TestWithACLUnionAndSearchOperations(t *testing.T) {
 
 func TestWithACLValidationAndUserOnly(t *testing.T) {
 	store := aclStore(t, false)
-	users, _ := store.Lookup(common.NamespaceUserACL)
+	users, _ := store.Lookup(schema.NamespaceUserACL)
 	user, _ := NewUserACL(42)
 	commitBitmap(t, users, func(b *bitmapidx.Batch) error {
 		return b.Add(bitmapidx.Entry{ImageID: 9, Value: user.Value()})

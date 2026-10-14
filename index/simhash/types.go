@@ -4,7 +4,7 @@ import (
 	"errors"
 	"unsafe"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	hashkernel "github.com/evanoberholster/imageIdx/index/simhash/internal/hashkernel"
 )
 
@@ -43,7 +43,7 @@ type Record struct {
 // Update is one point update of an existing record. Batch updates are the
 // expected workload.
 type Update struct {
-	ImageID common.ImageID
+	ImageID schema.ImageID
 	Record  Record
 }
 
@@ -52,7 +52,7 @@ type Update struct {
 // search. The caller knows which search produced the result, so no hash
 // discriminator is stored.
 type Result struct {
-	ImageID  common.ImageID
+	ImageID  schema.ImageID
 	Distance uint8
 }
 
@@ -77,7 +77,7 @@ type Config struct {
 	// It must be a power of two dividing 65,536. Zero selects 1024.
 	SeqBlockRecords int
 	// Durability controls whether a commit flushes the shard and manifest.
-	Durability common.Durability
+	Durability schema.Durability
 }
 
 func (c Config) withDefaults() (Config, error) {

@@ -2,7 +2,7 @@ package simhash
 
 import (
 	"errors"
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"os"
 	"path/filepath"
@@ -448,7 +448,7 @@ func TestPersistenceFailureInjection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			cfg := testConfig()
-			cfg.Durability = common.DurabilitySync
+			cfg.Durability = schema.DurabilitySync
 			st, err := Open(dir, cfg)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
@@ -505,7 +505,7 @@ func TestPersistenceFailureInjection(t *testing.T) {
 func TestStaleWALAfterManifestCommit(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig()
-	cfg.Durability = common.DurabilitySync
+	cfg.Durability = schema.DurabilitySync
 	st, err := Open(dir, cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -790,7 +790,7 @@ func TestZeroAllocationOperations(t *testing.T) {
 	single := records[0]
 	updates := make([]Update, 64)
 	for i := range updates {
-		updates[i] = Update{ImageID: common.ImageID(1 + i), Record: records[i]}
+		updates[i] = Update{ImageID: schema.ImageID(1 + i), Record: records[i]}
 	}
 
 	check := func(name string, f func()) {

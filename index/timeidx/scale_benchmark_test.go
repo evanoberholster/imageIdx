@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Opt-in: setup includes 10M rows and real mmap writes. This file uses APIs and
@@ -139,7 +139,7 @@ func BenchmarkScaleShards(b *testing.B) {
 						}
 						defer func() { i.Close() }()
 						start := entries[count/2].Timestamp
-						dst := make([]common.ValueID, 0, count)
+						dst := make([]schema.ValueID, 0, count)
 						for _, width := range []uint64{1, (entries[count-1].Timestamp + 1000000000) / 4} {
 							b.Run(fmt.Sprintf("Search/Width=%d", width), func(b *testing.B) {
 								b.ReportAllocs()

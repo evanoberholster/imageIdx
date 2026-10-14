@@ -1,6 +1,8 @@
 package schema
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"math"
 
@@ -14,11 +16,11 @@ func align64(v uint64) (uint64, error) {
 	return (v + 63) &^ uint64(63), nil
 }
 
-func (s *Schema) create(defs []NamespaceConfig) error {
-	entries := make([]directoryEntry, len(defs))
+func (s *Schema) create(defs []directoryEntry) error {
+	entries := append([]directoryEntry(nil), defs...)
 	end := uint64(metaStart)
-	for i, d := range defs {
-		entries[i] = directoryEntry{d.ID, d.Name, d.ReserveSize, end}
+	for i := range entries {
+		entries[i].offset = end
 		end += metadataPairBytes
 	}
 	dir, err := directoryBytes(entries)
@@ -26,7 +28,7 @@ func (s *Schema) create(defs []NamespaceConfig) error {
 		return err
 	}
 	dirOff := end
-	end += uint64(len(dir))
+	end += uint64(len(dir) + len(s.definitionsData))
 	if err := s.f.Truncate(int64(end)); err != nil {
 		return err
 	}
@@ -40,16 +42,20 @@ func (s *Schema) create(defs []NamespaceConfig) error {
 		if err := s.write(buf[:], e.offset+metadataBytes); err != nil {
 			return err
 		}
-		a := &namespaceAllocator{id: e.id, name: e.name, block: e.reserve, offset: e.offset, record: m}
+		a := &entityAllocator{id: e.id, name: e.name, block: e.reserve, offset: e.offset, record: m}
 		s.entries = append(s.entries, a)
+		s.owners[EntityKind(e.id)] = a
 	}
 	if err := s.write(dir, dirOff); err != nil {
+		return err
+	}
+	if err := s.write(s.definitionsData, dirOff+uint64(len(dir))); err != nil {
 		return err
 	}
 	if err := s.sync(); err != nil {
 		return err
 	}
-	p := superPayload(dirOff, dir, end)
+	p := superPayload(dirOff, dir, s.definitionsData, end)
 	var sb [superBytes]byte
 	if err := storage.EncodeSuperblock(sb[:], storage.SuperblockHeader{Magic: superMagic, Version: SchemaVersion, Generation: 1}, p[:]); err != nil {
 		return err
@@ -62,13 +68,13 @@ func (s *Schema) create(defs []NamespaceConfig) error {
 	return s.sync()
 }
 
-func (s *Schema) commitDirectory(slot int, generation, off uint64, dir []byte, end uint64) error {
+func (s *Schema) commitDirectory(slot int, generation, off uint64, dir, definitions []byte, end uint64) error {
 	if s.fault != nil {
 		if err := s.fault("before superblock"); err != nil {
 			return err
 		}
 	}
-	p := superPayload(off, dir, end)
+	p := superPayload(off, dir, definitions, end)
 	var sb [superBytes]byte
 	if err := storage.EncodeSuperblock(sb[:], storage.SuperblockHeader{Magic: superMagic, Version: SchemaVersion, Generation: generation}, p[:]); err != nil {
 		return err
@@ -118,7 +124,7 @@ func (s *Schema) loadRecord(e directoryEntry) (allocationRecord, error) {
 	}
 }
 
-func (s *Schema) recover(defs []NamespaceConfig) error {
+func (s *Schema) recover(defs []directoryEntry) error {
 	info, err := s.f.Stat()
 	if err != nil {
 		return err
@@ -176,28 +182,54 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 		return errors.Join(ErrCorrupt, err)
 	}
 	_, payload, valid := storage.DecodeSuperblock(slots[best][:], superMagic, SchemaVersion)
-	if !valid || checkSuperDirectory(payload, dir) != nil {
+	if !valid {
 		return ErrCorrupt
+	}
+	definitionsOffset := binary.LittleEndian.Uint64(payload[32:40])
+	definitionsLength := binary.LittleEndian.Uint64(payload[40:48])
+	storedDefinitions := make([]byte, definitionsLength)
+	if err := s.read(storedDefinitions, definitionsOffset); err != nil {
+		return errors.Join(ErrCorrupt, err)
+	}
+	if checkSuperDirectory(payload, dir, storedDefinitions) != nil {
+		return ErrCorrupt
+	}
+	stored := NewDefinitions()
+	if err := stored.UnmarshalBinary(storedDefinitions); err != nil {
+		return errors.Join(ErrCorrupt, err)
+	}
+	prior, desired := stored.Defs(), s.definitions.Defs()
+	if len(prior) > len(desired) {
+		return ErrNamespace
+	}
+	for i, p := range prior {
+		d := desired[i]
+		if p.Namespace != d.Namespace || p.Name != d.Name || p.Kind != d.Kind || p.Entity != d.Entity || !bytes.Equal(p.Config, d.Config) {
+			return ErrNamespace
+		}
 	}
 	entries, err := parseDirectory(dir, c.end)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		if e.offset < c.off+uint64(len(dir)) && c.off < e.offset+metadataPairBytes {
+		if e.offset < c.end && c.off < e.offset+metadataPairBytes {
 			return formatErr(e.id, ErrCorrupt)
 		}
 	}
 	if len(defs) < len(entries) {
 		return ErrNamespace
 	}
-	byName := make(map[string]struct{}, len(entries))
+	var byEntity [EntityKindCount + 1]bool
 	for _, e := range entries {
-		byName[e.name] = struct{}{}
+		if !EntityKind(e.id).Valid() || e.name != EntityKind(e.id).String() {
+			return ErrCorrupt
+		}
+		byEntity[e.id] = true
 		found := false
 		for _, d := range defs {
-			if d.ID == e.id {
-				if d.Name != e.name {
+			if d.id == e.id {
+				if d.name != e.name {
 					return formatErr(e.id, ErrNamespace)
 				}
 				found = true
@@ -211,7 +243,7 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 		if err != nil {
 			return err
 		}
-		a := &namespaceAllocator{id: e.id, name: e.name, block: e.reserve, offset: e.offset, record: m}
+		a := &entityAllocator{id: e.id, name: e.name, block: e.reserve, offset: e.offset, record: m}
 		if m.clean {
 			// Invalidate reuse *durably* before returning any ID to callers.
 			if err := s.persist(a, allocationRecord{m.generation + 1, m.reserved, 0, false}); err != nil {
@@ -223,18 +255,19 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 		}
 		a.limit.Store(m.reserved)
 		s.entries = append(s.entries, a)
+		s.owners[EntityKind(e.id)] = a
 	}
-	changed := false
+	changed := !bytes.Equal(storedDefinitions, s.definitionsData)
 	for _, d := range defs {
-		if _, exists := byName[d.Name]; exists {
-			a := s.entry(d.ID)
-			if a.block != d.ReserveSize {
-				a.block = d.ReserveSize
+		if byEntity[d.id] {
+			a := s.entry(EntityKind(d.id))
+			if a.block != d.reserve {
+				a.block = d.reserve
 				changed = true
 			}
 		} else {
-			if s.entry(d.ID) != nil {
-				return formatErr(d.ID, ErrNamespace)
+			if s.entry(EntityKind(d.id)) != nil {
+				return formatErr(d.id, ErrNamespace)
 			}
 			changed = true
 		}
@@ -253,8 +286,8 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 	}
 	newEntries := make([]directoryEntry, 0, len(defs))
 	for _, d := range defs {
-		if a := s.entry(d.ID); a != nil {
-			newEntries = append(newEntries, directoryEntry{d.ID, d.Name, d.ReserveSize, a.offset})
+		if a := s.entry(EntityKind(d.id)); a != nil {
+			newEntries = append(newEntries, directoryEntry{d.id, d.name, d.reserve, a.offset})
 			continue
 		}
 		if end > math.MaxInt64-metadataPairBytes {
@@ -262,7 +295,7 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 		}
 		off := end
 		end += metadataPairBytes
-		newEntries = append(newEntries, directoryEntry{d.ID, d.Name, d.ReserveSize, off})
+		newEntries = append(newEntries, directoryEntry{d.id, d.name, d.reserve, off})
 	}
 	// Reserve records first, then directory, then publish the inactive SB.
 	// Entries are sorted by ID even when additions were supplied out of order.
@@ -278,7 +311,7 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 		return err
 	}
 	dirOff := end
-	end += uint64(len(newDir))
+	end += uint64(len(newDir) + len(s.definitionsData))
 	if end > math.MaxInt64 {
 		return ErrExhausted
 	}
@@ -286,7 +319,7 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 		return err
 	}
 	for _, e := range newEntries {
-		if s.entry(e.id) != nil {
+		if s.entry(EntityKind(e.id)) != nil {
 			continue
 		}
 		var buf [metadataBytes]byte
@@ -301,6 +334,9 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 	if err := s.write(newDir, dirOff); err != nil {
 		return err
 	}
+	if err := s.write(s.definitionsData, dirOff+uint64(len(newDir))); err != nil {
+		return err
+	}
 	if err := s.sync(); err != nil {
 		return err
 	}
@@ -309,13 +345,13 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 			return err
 		}
 	}
-	if err := s.commitDirectory(1-best, c.gen+1, dirOff, newDir, end); err != nil {
+	if err := s.commitDirectory(1-best, c.gen+1, dirOff, newDir, s.definitionsData, end); err != nil {
 		return err
 	}
 	oldEntries := s.entries
 	s.entries = nil
 	for _, e := range newEntries {
-		var old *namespaceAllocator
+		var old *entityAllocator
 		for _, a := range oldEntries {
 			if a.id == e.id {
 				old = a
@@ -325,13 +361,15 @@ func (s *Schema) recover(defs []NamespaceConfig) error {
 		if old != nil {
 			s.entries = append(s.entries, old)
 		} else {
-			s.entries = append(s.entries, &namespaceAllocator{id: e.id, name: e.name, block: e.reserve, offset: e.offset, record: allocationRecord{generation: 1}})
+			a := &entityAllocator{id: e.id, name: e.name, block: e.reserve, offset: e.offset, record: allocationRecord{generation: 1}}
+			s.entries = append(s.entries, a)
+			s.owners[EntityKind(e.id)] = a
 		}
 	}
 	return nil
 }
 
-func (s *Schema) persist(a *namespaceAllocator, next allocationRecord) error {
+func (s *Schema) persist(a *entityAllocator, next allocationRecord) error {
 	if a.record.generation == math.MaxUint64 || next.generation != a.record.generation+1 || next.reserved < a.record.reserved || next.issued > next.reserved {
 		s.poisoned.Store(true)
 		return formatErr(a.id, ErrCorrupt)

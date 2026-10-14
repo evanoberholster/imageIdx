@@ -5,12 +5,12 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
-const hashNS common.Namespace = 103
+const hashNS schematypes.Namespace = 103
 
 func hashProjection(id uint64, marker byte) []byte {
 	b := make([]byte, 40)
@@ -31,8 +31,8 @@ func decodeHash(b []byte) (index.Entry, error) {
 func TestHashReplacementAndTombstoneReuse(t *testing.T) {
 	root := t.TempDir()
 	data, idxPath := filepath.Join(root, "data"), filepath.Join(root, "idx")
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: hashNS, Name: "digest", Kind: common.KindHashExact, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: hashNS, Name: "digest", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	idx, err := index.Create(idxPath, index.Spec{Schema: schema})
@@ -57,7 +57,7 @@ func TestHashReplacementAndTombstoneReuse(t *testing.T) {
 		return engine.Lookup(nil, h)
 	}
 	for _, marker := range []byte{'a', 'b'} {
-		g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: hashProjection(1, marker)})
+		g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: hashProjection(1, marker)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,12 +66,12 @@ func TestHashReplacementAndTombstoneReuse(t *testing.T) {
 	if len(lookup('a')) != 0 || len(lookup('b')) != 1 {
 		t.Fatal("old hash survived replacement")
 	}
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Delete: true})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Delete: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	wait(t, db, g)
-	g, err = db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: hashProjection(1, 'c')})
+	g, err = db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: hashProjection(1, 'c')})
 	if err != nil {
 		t.Fatal(err)
 	}

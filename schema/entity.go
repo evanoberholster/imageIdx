@@ -1,4 +1,4 @@
-package common
+package schema
 
 // EntityKind identifies the kind of entity an indexed value describes. It is a
 // property of the namespace schema, never of an individual ValueID: two entity

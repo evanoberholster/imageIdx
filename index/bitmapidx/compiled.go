@@ -1,7 +1,7 @@
 package bitmapidx
 
 import (
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -59,7 +59,7 @@ func (i *Index) Compile(values ...Value) (Query, error) {
 // tokens. A query producing no tokens compiles to a Query that matches
 // nothing.
 func (i *Index) CompileText(query string) (Query, error) {
-	if i.spec().Kind != common.KindBitmapString {
+	if i.spec().Kind != schema.KindBitmapString {
 		return Query{}, ErrNamespaceMismatch
 	}
 	tokens, err := i.analyzer.TokenSet(query, nil)
@@ -71,7 +71,7 @@ func (i *Index) CompileText(query string) (Query, error) {
 	}
 	values := make([]Value, 0, len(tokens))
 	for _, text := range tokens {
-		values = append(values, Value{Kind: common.KindBitmapString, Bytes: []byte(text)})
+		values = append(values, Value{Kind: schema.KindBitmapString, Bytes: []byte(text)})
 	}
 	return i.Compile(values...)
 }
@@ -187,7 +187,7 @@ func (q Query) Count() (uint64, error) {
 // Filter appends candidates holding every compiled value, preserving order
 // and duplicates. It pins one view and probes postings directly, without
 // materializing or copying the matching population. dst=candidates[:0] is safe.
-func (q Query) Filter(dst, candidates []common.ImageID) ([]common.ImageID, error) {
+func (q Query) Filter(dst, candidates []schema.ImageID) ([]schema.ImageID, error) {
 	if q.index == nil || len(candidates) == 0 {
 		return dst, nil
 	}
@@ -210,7 +210,7 @@ func (q Query) Filter(dst, candidates []common.ImageID) ([]common.ImageID, error
 
 // filterResolved probes one published view with resolved keys. It preserves
 // candidate order and duplicates, including when dst aliases candidates.
-func (view *namespaceView) filterResolved(dst, candidates []common.ImageID, keys []NamespaceKey) []common.ImageID {
+func (view *namespaceView) filterResolved(dst, candidates []schema.ImageID, keys []NamespaceKey) []schema.ImageID {
 	start := len(dst)
 	for n, key := range keys {
 		if n != 0 {

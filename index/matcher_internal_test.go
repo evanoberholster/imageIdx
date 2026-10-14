@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
 )
@@ -12,11 +12,11 @@ import (
 // P1-1: a namespace degraded after the matcher is constructed must be rejected
 // for the operations that need it, while healthy namespaces keep working.
 func TestMatcherRejectsDegradedNamespace(t *testing.T) {
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: 1, Name: "sha", Kind: common.KindHashExact, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 1, Name: "sha", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
-	if err := schema.Register(common.NamespaceDef{Namespace: 2, Name: "sim", Kind: common.KindHashPerceptual, Entity: common.EntityImage}); err != nil {
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 2, Name: "sim", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := Create(t.TempDir(), Spec{Schema: schema})
@@ -47,11 +47,11 @@ func TestMatcherRejectsDegradedNamespace(t *testing.T) {
 // P0-3: when one required namespace is degraded, a mixed batch must fail
 // before appending any results, leaving the destination unchanged.
 func TestMatcherNoPartialResultsOnDegraded(t *testing.T) {
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: 1, Name: "sha", Kind: common.KindHashExact, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 1, Name: "sha", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
-	if err := schema.Register(common.NamespaceDef{Namespace: 2, Name: "sim", Kind: common.KindHashPerceptual, Entity: common.EntityImage}); err != nil {
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 2, Name: "sim", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := Create(t.TempDir(), Spec{Schema: schema})

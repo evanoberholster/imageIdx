@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -355,11 +355,11 @@ func TestPartialSuperblockWrite(t *testing.T) {
 // uniqueness, and (S2Key, ImageID) directory ordering after every commit.
 func TestShardDifferentialBatches(t *testing.T) {
 	index, entries := shardedMemoryIndex(t, 3000, tinyShardConfig())
-	live := map[common.ImageID]Entry{}
+	live := map[schema.ImageID]Entry{}
 	for _, e := range entries {
 		live[e.ImageID] = e
 	}
-	nextID := common.ImageID(len(entries) + 1)
+	nextID := schema.ImageID(len(entries) + 1)
 	keyFor := func(i int) S2Key {
 		lat := testLat + (float64(i)*0.0007 - 0.35)
 		lng := testLng + (float64(i%97)*0.0007 - 0.03)
@@ -377,7 +377,7 @@ func TestShardDifferentialBatches(t *testing.T) {
 		if !validateDirectory(index.view.Load().shards) {
 			t.Fatalf("step %d directory not ordered", step)
 		}
-		seen := map[common.ImageID]struct{}{}
+		seen := map[schema.ImageID]struct{}{}
 		for _, s := range index.view.Load().shards {
 			for n := range s.ids {
 				if _, dup := seen[s.ids[n]]; dup {
@@ -386,7 +386,7 @@ func TestShardDifferentialBatches(t *testing.T) {
 				seen[s.ids[n]] = struct{}{}
 			}
 		}
-		want := make([]common.ImageID, 0, len(live))
+		want := make([]schema.ImageID, 0, len(live))
 		for id := range live {
 			want = append(want, id)
 		}
@@ -444,7 +444,7 @@ func TestShardDifferentialBatches(t *testing.T) {
 			break
 		}
 	}
-	var dupID common.ImageID
+	var dupID schema.ImageID
 	for id := range live {
 		dupID = id
 		break

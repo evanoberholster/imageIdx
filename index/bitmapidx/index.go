@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	commitqueue "github.com/evanoberholster/imageIdx/internal/commit"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/internal/textanalyzer"
@@ -131,7 +131,7 @@ func NewMemory(namespace NamespaceSpec, config NamespaceConfig) (*Index, error) 
 		readers: &storage.ReaderTracker{},
 	}
 	index.commits = commitqueue.New(commitQueueCapacity, index.commitGroup)
-	if namespace.Kind == common.KindBitmapString {
+	if namespace.Kind == schema.KindBitmapString {
 		index.analyzer, err = textanalyzer.New(namespace.Analyzer.Code, namespace.Analyzer.Version, namespace.Analyzer.Params)
 		if err != nil {
 			return nil, err
@@ -153,7 +153,7 @@ func (i *Index) spec() NamespaceSpec { return i.view.Load().namespace }
 func (i *Index) Metadata() NamespaceMetadata {
 	view := i.view.Load()
 	base := uint64(len(view.base.keys))
-	if view.namespace.Kind == common.KindBitmapBSI {
+	if view.namespace.Kind == schema.KindBitmapBSI {
 		base = 0
 		if exists, ok := view.bsiExists(view.namespace.Namespace); ok {
 			base = exists.Cardinality()
@@ -175,7 +175,7 @@ func (i *Index) WaitIdle(ctx context.Context) error {
 // Contains reports whether id holds value in this namespace. Unknown values
 // report false with no error; kind mismatches and oversized values report
 // errors. Closed indexes report false.
-func (i *Index) Contains(id common.ImageID, value Value) (bool, error) {
+func (i *Index) Contains(id schema.ImageID, value Value) (bool, error) {
 	base, canonical, err := i.keyForValue(i.spec(), value)
 	if err != nil {
 		return false, err
@@ -203,7 +203,7 @@ func (i *Index) Contains(id common.ImageID, value Value) (bool, error) {
 // ContainsKey reports whether id holds the posting named by key,
 // including its collision slot. It skips canonicalization for callers
 // that already resolved keys.
-func (i *Index) ContainsKey(id common.ImageID, key NamespaceKey) bool {
+func (i *Index) ContainsKey(id schema.ImageID, key NamespaceKey) bool {
 	token := i.readers.Acquire()
 	view := i.view.Load()
 	present := !i.closed.Load() && view.contains(key, id)

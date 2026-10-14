@@ -7,13 +7,13 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 type Index struct {
-	namespace   common.Namespace
+	namespace   schema.Namespace
 	flags       uint32
 	offset      uint64 // compatibility metadata only
 	config      Config
@@ -86,7 +86,7 @@ func (i *Index) CheckSourceGeneration(required uint64) error {
 	}
 	return nil
 }
-func (i *Index) Namespace() common.Namespace        { return i.namespace }
+func (i *Index) Namespace() schema.Namespace        { return i.namespace }
 func (i *Index) Generation() uint64                 { return i.view.Load().generation }
 func (i *Index) Len() uint64                        { return i.view.Load().count }
 func (i *Index) PendingCompactions() int64          { return 0 }

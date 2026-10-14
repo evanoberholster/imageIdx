@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
@@ -23,7 +23,7 @@ const (
 )
 
 // NamespaceFilename uses four hexadecimal digits for the uint16 namespace.
-func NamespaceFilename(ns common.Namespace) string {
+func NamespaceFilename(ns schema.Namespace) string {
 	const hex = "0123456789abcdef"
 	return string([]byte{hex[uint16(ns)>>12], hex[uint16(ns)>>8&15], hex[uint16(ns)>>4&15], hex[uint16(ns)&15]}) + ".timeidx"
 }
@@ -145,7 +145,7 @@ func OpenStore(dir string, config Config, durability Durability) (*Index, error)
 	return openNamespace(dir, ns, config, durability)
 }
 
-func singleNamespace(dir string) (common.Namespace, error) {
+func singleNamespace(dir string) (schema.Namespace, error) {
 	if legacyManifestPresent(dir) {
 		return 0, ErrUnsupported
 	}
@@ -157,7 +157,7 @@ func singleNamespace(dir string) (common.Namespace, error) {
 		return 0, err
 	}
 	var found bool
-	var ns common.Namespace
+	var ns schema.Namespace
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".timeidx" {
 			continue
@@ -181,7 +181,7 @@ func singleNamespace(dir string) (common.Namespace, error) {
 			return 0, ErrAmbiguousNamespace
 		}
 		found = true
-		ns = common.Namespace(n)
+		ns = schema.Namespace(n)
 	}
 	if !found {
 		return 0, ErrNamespaceNotFound
@@ -189,14 +189,14 @@ func singleNamespace(dir string) (common.Namespace, error) {
 	return ns, nil
 }
 
-func OpenNamespace(dir string, ns common.Namespace, config Config, durability Durability) (*Index, error) {
+func OpenNamespace(dir string, ns schema.Namespace, config Config, durability Durability) (*Index, error) {
 	if !ns.Valid() {
 		return nil, ErrInvalidNamespace
 	}
 	return openNamespace(dir, ns, config, durability)
 }
 
-func openNamespace(dir string, ns common.Namespace, config Config, durability Durability) (*Index, error) {
+func openNamespace(dir string, ns schema.Namespace, config Config, durability Durability) (*Index, error) {
 	if !durability.Valid() {
 		return nil, ErrInvalidConfig
 	}
@@ -268,7 +268,7 @@ func shardLive(shards []*shard, root storage.Extent) []storage.Extent {
 	return live
 }
 
-func decodeGeneration(data, payload []byte, ns common.Namespace, gen uint64) (generation, error) {
+func decodeGeneration(data, payload []byte, ns schema.Namespace, gen uint64) (generation, error) {
 	if len(payload) != payloadBytes || gen == 0 {
 		return generation{}, ErrCorrupt
 	}
@@ -352,7 +352,7 @@ func decodeDirectoryShards(data, dir []byte, count uint32, entries, maxShard uin
 		if err != nil {
 			return nil, 0, err
 		}
-		ids, err := storage.View[common.ValueID](data, off+uint64(num)*8, uint64(num), ErrCorrupt, ErrUnsupportedEndian)
+		ids, err := storage.View[schema.ValueID](data, off+uint64(num)*8, uint64(num), ErrCorrupt, ErrUnsupportedEndian)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -406,7 +406,7 @@ func decodeDirectoryShards(data, dir []byte, count uint32, entries, maxShard uin
 	return shards, total, nil
 }
 
-func recoverGenerations(data []byte, ns common.Namespace) ([]generation, error) {
+func recoverGenerations(data []byte, ns schema.Namespace) ([]generation, error) {
 	if len(data) < 1024 || len(data)%512 != 0 || uint64(len(data)) > 1<<41 {
 		return nil, ErrCorrupt
 	}
@@ -546,7 +546,7 @@ func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 				s := *p
 				s.times, err = storage.View[uint64](i.file.Bytes(), p.offset, uint64(len(p.times)), ErrCorrupt, ErrUnsupportedEndian)
 				if err == nil {
-					s.ids, err = storage.View[common.ValueID](i.file.Bytes(), p.offset+uint64(len(p.times))*8, uint64(len(p.ids)), ErrCorrupt, ErrUnsupportedEndian)
+					s.ids, err = storage.View[schema.ValueID](i.file.Bytes(), p.offset+uint64(len(p.times))*8, uint64(len(p.ids)), ErrCorrupt, ErrUnsupportedEndian)
 				}
 				if err != nil {
 					break
@@ -567,7 +567,7 @@ func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 				err = verr
 				break
 			}
-			ids, verr := storage.View[common.ValueID](i.file.Bytes(), off+uint64(len(p.times))*8, uint64(len(p.ids)), ErrCorrupt, ErrUnsupportedEndian)
+			ids, verr := storage.View[schema.ValueID](i.file.Bytes(), off+uint64(len(p.times))*8, uint64(len(p.ids)), ErrCorrupt, ErrUnsupportedEndian)
 			if verr != nil {
 				err = verr
 				break
@@ -746,7 +746,7 @@ func Verify(dir string) error {
 	return VerifyNamespace(dir, ns)
 }
 
-func VerifyNamespace(dir string, ns common.Namespace) error {
+func VerifyNamespace(dir string, ns schema.Namespace) error {
 	data, err := storage.MapFile(filepath.Join(dir, NamespaceFilename(ns)), nil)
 	if err != nil {
 		return err

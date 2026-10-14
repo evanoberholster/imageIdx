@@ -1,7 +1,7 @@
 package simhash
 
 import (
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"runtime"
 	"sync"
 	"testing"
@@ -181,7 +181,7 @@ func TestClosedStore(t *testing.T) {
 	if err := st.Upsert(1, Record{}); err != ErrClosed {
 		t.Fatalf("Upsert after Close = %v, want ErrClosed", err)
 	}
-	_ = common.ImageID(0)
+	_ = schema.ImageID(0)
 }
 
 func TestClosedStoreReads(t *testing.T) {

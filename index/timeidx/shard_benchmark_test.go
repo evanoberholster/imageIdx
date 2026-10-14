@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func BenchmarkTimeShardSize(b *testing.B) {
@@ -60,7 +60,7 @@ func BenchmarkNamespaceParallel(b *testing.B) {
 	defer s.Close()
 	indexes := make([]*Index, 8)
 	for n := range indexes {
-		indexes[n], err = s.CreateNamespace(common.Namespace(n + 1))
+		indexes[n], err = s.CreateNamespace(schema.Namespace(n + 1))
 		if err != nil {
 			b.Fatal(err)
 		}

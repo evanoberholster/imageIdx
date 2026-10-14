@@ -15,7 +15,7 @@ func TestConcurrentMixedAllocationAndMinimum(t *testing.T) {
 		for _, workers := range []int{1, 2, 4, 8, 16, 32, 64} {
 			t.Run(string(rune('A'+workers)), func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "schema.dat")
-				s, err := Open(path, Options{Backend: b, Namespaces: []NamespaceConfig{{ID: 123, Name: "mixed", ReserveSize: 19}}})
+				s, err := Open(path, singleOptions(b, 123, "mixed", 19))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -36,14 +36,14 @@ func TestConcurrentMixedAllocationAndMinimum(t *testing.T) {
 							if rng.Intn(15) == 0 {
 								// Multiple concurrent floor raises; no allocation CAS may
 								// duplicate a range, regardless of their completion order.
-								if err := s.EnsureMinimum(123, uint64(w*rounds+i+10000)); err != nil {
+								if err := s.EnsureMinimum(EntityImage, uint64(w*rounds+i+10000)); err != nil {
 									t.Error(err)
 									return
 								}
 								continue
 							}
 							count := uint64(rng.Intn(11) + 1)
-							start, err := s.NextIDs(123, count)
+							start, err := s.NextIDs(EntityImage, count)
 							if err != nil {
 								t.Error(err)
 								return
@@ -69,7 +69,7 @@ func TestConcurrentMixedAllocationAndMinimum(t *testing.T) {
 func TestCloseAndPersistenceFailure(t *testing.T) {
 	forBackends(t, func(t *testing.T, b Backend) {
 		path := filepath.Join(t.TempDir(), "schema.dat")
-		opts := Options{Backend: b, Namespaces: []NamespaceConfig{{ID: 33, Name: "x", ReserveSize: 4}}}
+		opts := singleOptions(b, 33, "x", 4)
 		s, err := Open(path, opts)
 		if err != nil {
 			t.Fatal(err)
@@ -85,7 +85,7 @@ func TestCloseAndPersistenceFailure(t *testing.T) {
 			return nil
 		}
 		result := make(chan error, 1)
-		go func() { _, err := s.NextID(33); result <- err }()
+		go func() { _, err := s.NextID(EntityImage); result <- err }()
 		<-entered
 		closed := make(chan error, 1)
 		go func() { closed <- s.Close() }()
@@ -101,7 +101,7 @@ func TestCloseAndPersistenceFailure(t *testing.T) {
 		if err := <-closed; !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("failed close: %v", err)
 		}
-		if _, err := s.NextID(33); !errors.Is(err, ErrClosed) {
+		if _, err := s.NextID(EntityImage); !errors.Is(err, ErrClosed) {
 			t.Fatal(err)
 		}
 		// The inactive slot may be valid even though sync was not attempted.
@@ -109,7 +109,7 @@ func TestCloseAndPersistenceFailure(t *testing.T) {
 		// an ID from the failed block before durable evidence would not be.
 		s, err = Open(path, opts)
 		if err == nil {
-			if id, err := s.NextID(33); err != nil || (id != 1 && id <= 4) {
+			if id, err := s.NextID(EntityImage); err != nil || (id != 1 && id <= 4) {
 				t.Fatalf("recovery: %d %v", id, err)
 			}
 			_ = s.Close()
@@ -119,23 +119,23 @@ func TestCloseAndPersistenceFailure(t *testing.T) {
 
 func TestZeroAllocationFastPath(t *testing.T) {
 	forBackends(t, func(t *testing.T, b Backend) {
-		s, err := Open(filepath.Join(t.TempDir(), "schema.dat"), Options{Backend: b, Namespaces: []NamespaceConfig{{ID: 12, Name: "fast", ReserveSize: 100000}}})
+		s, err := Open(filepath.Join(t.TempDir(), "schema.dat"), singleOptions(b, 12, "fast", 100000))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer s.Close()
-		if _, err := s.NextID(12); err != nil {
+		if _, err := s.NextID(EntityImage); err != nil {
 			t.Fatal(err)
 		}
 		if n := testing.AllocsPerRun(1000, func() {
-			if _, err := s.NextID(12); err != nil {
+			if _, err := s.NextID(EntityImage); err != nil {
 				panic(err)
 			}
 		}); n != 0 {
 			t.Fatalf("NextID allocations: %g", n)
 		}
 		if n := testing.AllocsPerRun(1000, func() {
-			if _, err := s.NextIDs(12, 8); err != nil {
+			if _, err := s.NextIDs(EntityImage, 8); err != nil {
 				panic(err)
 			}
 		}); n != 0 {
@@ -146,7 +146,7 @@ func TestZeroAllocationFastPath(t *testing.T) {
 
 func TestEnsureMinimumAndCloseRaces(t *testing.T) {
 	forBackends(t, func(t *testing.T, b Backend) {
-		s, err := Open(filepath.Join(t.TempDir(), "schema.dat"), Options{Backend: b, Namespaces: []NamespaceConfig{{ID: 88, Name: "races", ReserveSize: 13}}})
+		s, err := Open(filepath.Join(t.TempDir(), "schema.dat"), singleOptions(b, 88, "races", 13))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -159,11 +159,11 @@ func TestEnsureMinimumAndCloseRaces(t *testing.T) {
 					var err error
 					switch w % 3 {
 					case 0:
-						_, err = s.NextID(88)
+						_, err = s.NextID(EntityImage)
 					case 1:
-						_, err = s.NextIDs(88, 23)
+						_, err = s.NextIDs(EntityImage, 23)
 					default:
-						err = s.EnsureMinimum(88, uint64(10000+w*150+i))
+						err = s.EnsureMinimum(EntityImage, uint64(10000+w*150+i))
 					}
 					if err != nil && !errors.Is(err, ErrClosed) {
 						t.Error(err)
@@ -172,20 +172,20 @@ func TestEnsureMinimumAndCloseRaces(t *testing.T) {
 				}
 			}(w)
 		}
-		if err := s.EnsureMinimum(88, 100000); err != nil {
+		if err := s.EnsureMinimum(EntityImage, 100000); err != nil {
 			t.Fatal(err)
 		}
-		if id, err := s.NextID(88); id <= 100000 || err != nil {
+		if id, err := s.NextID(EntityImage); id <= 100000 || err != nil {
 			t.Fatalf("floor: %d, %v", id, err)
 		}
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
 		wg.Wait()
-		if _, err := s.NextIDs(88, 8); !errors.Is(err, ErrClosed) {
+		if _, err := s.NextIDs(EntityImage, 8); !errors.Is(err, ErrClosed) {
 			t.Fatal(err)
 		}
-		if err := s.EnsureMinimum(88, 200000); !errors.Is(err, ErrClosed) {
+		if err := s.EnsureMinimum(EntityImage, 200000); !errors.Is(err, ErrClosed) {
 			t.Fatal(err)
 		}
 	})

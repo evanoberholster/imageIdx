@@ -9,8 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
@@ -27,7 +27,7 @@ const (
 )
 
 type RecoveryStatus struct {
-	Namespace  common.Namespace
+	Namespace  schematypes.Namespace
 	State      RecoveryState
 	Generation uint64
 	Err        error
@@ -83,12 +83,12 @@ func (db *DB) needsRecovery() bool {
 
 const schemaKeyID uint64 = 4
 
-func (db *DB) persistedSchema() (*common.Schema, error) {
+func (db *DB) persistedSchema() (*schematypes.Definitions, error) {
 	data, err := db.values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
 	if err != nil {
 		return nil, err
 	}
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	if err := schema.UnmarshalBinary(data); err != nil {
 		return nil, fmt.Errorf("%w: canonical schema: %v", ErrRecoveryRequired, err)
 	}
@@ -167,7 +167,7 @@ func (db *DB) rebuildOnOpen(dir string) error {
 		return err
 	}
 	batch := stage.NewBatch(db.options.BatchSize)
-	for entity := common.EntityImage; entity.Valid(); entity++ {
+	for entity := schematypes.EntityImage; entity.Valid(); entity++ {
 		if err = db.scanRebuild(stage, schema, batch, entity); err != nil {
 			break
 		}
@@ -221,7 +221,7 @@ func (db *DB) rebuildOnOpen(dir string) error {
 	return nil
 }
 
-func (db *DB) scanRebuild(stage *index.Store, schema *common.Schema, batch *index.Batch, entity common.EntityKind) error {
+func (db *DB) scanRebuild(stage *index.Store, schema *schematypes.Definitions, batch *index.Batch, entity schematypes.EntityKind) error {
 	// Decoders may return slices borrowing their input. Pebble iterator values
 	// are valid only until the next step, so keep one reusable projection
 	// buffer per staged record until Apply has finished consuming the batch.
@@ -246,7 +246,7 @@ func (db *DB) scanRebuild(stage *index.Store, schema *common.Schema, batch *inde
 		used = 0
 		return nil
 	}
-	err := db.values.ScanFrom(common.Namespace(entity), 0, func(key store.Key, raw []byte) (bool, error) {
+	err := db.values.ScanFrom(schematypes.Namespace(entity), 0, func(key store.Key, raw []byte) (bool, error) {
 		if db.options.boundary != nil {
 			db.options.boundary("during rebuild scan")
 		}
@@ -285,8 +285,8 @@ func (db *DB) scanRebuild(stage *index.Store, schema *common.Schema, batch *inde
 	return flush()
 }
 
-func validateProjection(schema *common.Schema, entity common.EntityKind, entry index.Entry) error {
-	check := func(ns common.Namespace) error {
+func validateProjection(schema *schematypes.Definitions, entity schematypes.EntityKind, entry index.Entry) error {
+	check := func(ns schematypes.Namespace) error {
 		def, ok := schema.Lookup(ns)
 		if !ok || def.Entity != entity {
 			return fmt.Errorf("%w: namespace %d does not belong to entity %d", ErrCorruptJournal, ns, entity)

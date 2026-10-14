@@ -4,18 +4,18 @@ import (
 	"errors"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
 func grantHandles(t *testing.T) (users UserGrants, groups GroupGrants, userNamespace *bitmapidx.Index) {
 	t.Helper()
 	store := aclStore(t, true)
-	userNamespace, ok := store.Lookup(common.NamespaceUserACL)
+	userNamespace, ok := store.Lookup(schema.NamespaceUserACL)
 	if !ok {
 		t.Fatal("missing user ACL namespace")
 	}
-	groupNamespace, ok := store.Lookup(common.NamespaceGroupACL)
+	groupNamespace, ok := store.Lookup(schema.NamespaceGroupACL)
 	if !ok {
 		t.Fatal("missing group ACL namespace")
 	}
@@ -37,7 +37,7 @@ func TestGrantNamespaceValidation(t *testing.T) {
 		t.Fatalf("NewGroupGrants(nil) err = %v, want ErrInvalidACLField", err)
 	}
 	store := aclStore(t, true)
-	tags, _ := store.Lookup(common.NamespaceTag)
+	tags, _ := store.Lookup(schema.NamespaceTag)
 	if _, err := NewUserGrants(tags); !errors.Is(err, ErrInvalidACLField) {
 		t.Fatalf("NewUserGrants(tag namespace) err = %v, want ErrInvalidACLField", err)
 	}
@@ -45,8 +45,8 @@ func TestGrantNamespaceValidation(t *testing.T) {
 
 func TestGrantNamespaceCrossWiring(t *testing.T) {
 	store := aclStore(t, true)
-	userNamespace, _ := store.Lookup(common.NamespaceUserACL)
-	groupNamespace, _ := store.Lookup(common.NamespaceGroupACL)
+	userNamespace, _ := store.Lookup(schema.NamespaceUserACL)
+	groupNamespace, _ := store.Lookup(schema.NamespaceGroupACL)
 	if _, err := NewUserGrants(groupNamespace); !errors.Is(err, ErrInvalidACLField) {
 		t.Fatalf("NewUserGrants(group namespace) err = %v, want ErrInvalidACLField", err)
 	}

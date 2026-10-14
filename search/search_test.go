@@ -7,17 +7,17 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/golang/geo/s2"
 )
 
-func enumNamespaceForSearch(t *testing.T, typ common.Namespace, value string, ids []uint64) *bitmapidx.Index {
+func enumNamespaceForSearch(t *testing.T, typ schema.Namespace, value string, ids []uint64) *bitmapidx.Index {
 	t.Helper()
 	index, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
-		Namespace: typ, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
+		Namespace: typ, Kind: schema.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,8 +45,8 @@ func enumNamespaceForSearch(t *testing.T, typ common.Namespace, value string, id
 
 func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
-	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
-	albums := enumNamespaceForSearch(t, common.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
+	tags := enumNamespaceForSearch(t, schema.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
+	albums := enumNamespaceForSearch(t, schema.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
 
 	timeIndex, err := timeidx.NewMemory(timeidx.Spec{Entries: []timeidx.Entry{
 		{Timestamp: quantum, ImageID: 1}, {Timestamp: 2 * quantum, ImageID: 2},
@@ -58,7 +58,7 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 	}
 	defer timeIndex.Close()
 
-	geo := newTestGeoNamespace(t, common.Namespace(20), []geoEntry{
+	geo := newTestGeoNamespace(t, schema.Namespace(20), []geoEntry{
 		{id: 1, lat: 37, lng: -122}, {id: 2, lat: 37, lng: -122},
 		{id: 3, lat: 37, lng: -122}, {id: 4, lat: 37, lng: -122},
 	})
@@ -90,7 +90,7 @@ func TestCompileAndSearchCombinedQuery(t *testing.T) {
 }
 
 func TestInCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
-	geo := newTestGeoNamespace(t, common.Namespace(21), []geoEntry{
+	geo := newTestGeoNamespace(t, schema.Namespace(21), []geoEntry{
 		{id: 1, lat: 37.7749, lng: -122.4194},
 		{id: 2, lat: 34.0522, lng: -118.2437},
 	})
@@ -115,7 +115,7 @@ func TestInCellsAcceptsCellIDsAndCoarseCells(t *testing.T) {
 
 func TestSearchUsesExactTimestampLookup(t *testing.T) {
 	quantum := uint64(1) << timeidx.TimestampShift
-	times := map[common.ValueID]uint64{1: quantum + 10, 2: quantum + 20}
+	times := map[schema.ValueID]uint64{1: quantum + 10, 2: quantum + 20}
 	index, err := timeidx.NewMemory(timeidx.Spec{Entries: []timeidx.Entry{
 		{Timestamp: times[1], ImageID: 1}, {Timestamp: times[2], ImageID: 2},
 	}}, timeidx.Config{})
@@ -123,7 +123,7 @@ func TestSearchUsesExactTimestampLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer index.Close()
-	got, err := SearchOnce(context.Background(), nil, During(index, quantum+15, quantum+25, ExactTimestamp(func(id common.ValueID) (uint64, bool) {
+	got, err := SearchOnce(context.Background(), nil, During(index, quantum+15, quantum+25, ExactTimestamp(func(id schema.ValueID) (uint64, bool) {
 		value, ok := times[id]
 		return value, ok
 	})))
@@ -145,8 +145,8 @@ func TestSearchRejectsEmptyAndNilNamespaceQueries(t *testing.T) {
 }
 
 func TestNamespaceOnlyCountMatchesSearch(t *testing.T) {
-	first := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
-	second := enumNamespaceForSearch(t, common.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
+	first := enumNamespaceForSearch(t, schema.NamespaceTag, "favorite", []uint64{1, 2, 3, 5})
+	second := enumNamespaceForSearch(t, schema.NamespaceAlbum, "holiday", []uint64{2, 3, 4})
 	plan, err := Compile(
 		AllValues(first, bitmapidx.EnumStringValue("favorite")),
 		AllValues(second, bitmapidx.EnumStringValue("holiday")),
@@ -169,7 +169,7 @@ func TestNamespaceOnlyCountMatchesSearch(t *testing.T) {
 
 func TestNamespaceTextAndRangeClauses(t *testing.T) {
 	text, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
-		Namespace: common.Namespace(24), Kind: common.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
+		Namespace: schema.Namespace(24), Kind: schema.KindBitmapString, Analyzer: bitmapidx.CodecSpec{Code: bitmapidx.AnalyzerLatin, Version: bitmapidx.AnalyzerVersion},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 	})
 
 	continuous, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
-		Namespace: common.Namespace(25), Kind: common.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
+		Namespace: schema.Namespace(25), Kind: schema.KindBitmapContinuous, Quant: bitmapidx.Quantizer{Code: bitmapidx.QuantIdentity, Version: 1, Scale: 1},
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ func TestNamespaceTextAndRangeClauses(t *testing.T) {
 }
 
 func TestGeoStageCollectsCandidates(t *testing.T) {
-	newGeo := func(t *testing.T, typ common.Namespace, ids []uint64) (*geoidx.Index, uint64) {
+	newGeo := func(t *testing.T, typ schema.Namespace, ids []uint64) (*geoidx.Index, uint64) {
 		t.Helper()
 		entries := make([]geoEntry, len(ids))
 		for i, id := range ids {
@@ -222,8 +222,8 @@ func TestGeoStageCollectsCandidates(t *testing.T) {
 		return index, cellID
 	}
 
-	geo, cellID := newGeo(t, common.Namespace(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
-	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
+	geo, cellID := newGeo(t, schema.Namespace(22), []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	tags := enumNamespaceForSearch(t, schema.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")), InCells(geo, cellID))
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +247,7 @@ func TestGeoStageCollectsCandidates(t *testing.T) {
 			geoEntries = append(geoEntries, geoEntry{id: id, lat: 37 + float64(cell)/100, lng: -122})
 		}
 	}
-	bigGeo := newTestGeoNamespace(t, common.Namespace(23), geoEntries)
+	bigGeo := newTestGeoNamespace(t, schema.Namespace(23), geoEntries)
 	if len(cellIDs) < 5 {
 		t.Fatalf("need distinct cells, got %d", len(cellIDs))
 	}
@@ -257,7 +257,7 @@ func TestGeoStageCollectsCandidates(t *testing.T) {
 			bitmapIDs = append(bitmapIDs, id)
 		}
 	}
-	largeTags := enumNamespaceForSearch(t, common.NamespaceObject, "favorite", bitmapIDs)
+	largeTags := enumNamespaceForSearch(t, schema.NamespaceObject, "favorite", bitmapIDs)
 	fallback, err := Compile(AllValues(largeTags, bitmapidx.EnumStringValue("favorite")), InCells(bigGeo, cellIDs...))
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestGeoStageCollectsCandidates(t *testing.T) {
 }
 
 func TestAppendPage(t *testing.T) {
-	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
+	tags := enumNamespaceForSearch(t, schema.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +285,7 @@ func TestAppendPage(t *testing.T) {
 }
 
 func TestVisit(t *testing.T) {
-	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{1, 2, 3})
+	tags := enumNamespaceForSearch(t, schema.NamespaceTag, "favorite", []uint64{1, 2, 3})
 	plan, err := Compile(AllValues(tags, bitmapidx.EnumStringValue("favorite")))
 	if err != nil {
 		t.Fatal(err)

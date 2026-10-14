@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestAtomicBatchScanAndRangeCleanup(t *testing.T) {
@@ -44,7 +44,7 @@ func TestAtomicBatchScanAndRangeCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	var ids []uint64
-	if err := db.ScanFrom(common.Namespace(44), 2, func(k Key, v []byte) (bool, error) {
+	if err := db.ScanFrom(schema.Namespace(44), 2, func(k Key, v []byte) (bool, error) {
 		ids = append(ids, k.ID)
 		if len(v) != 1 || v[0] != byte(k.ID) {
 			t.Fatalf("bad value at %d", k.ID)

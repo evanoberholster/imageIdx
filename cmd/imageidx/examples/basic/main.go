@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
@@ -19,16 +19,16 @@ import (
 const quantum = uint64(1) << timeidx.TimestampShift
 
 func main() {
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
-	}, "tags", common.EntityImage)
+		Namespace: schematypes.NamespaceTag, Kind: schematypes.KindBitmapEnum,
+	}, "tags", schematypes.EntityImage)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err := schema.RegisterAll(tags,
-		common.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: common.KindTimestamp, Entity: common.EntityImage},
-		common.NamespaceDef{Namespace: common.NamespaceLocation, Name: "location", Kind: common.KindGeo, Entity: common.EntityImage},
+		schematypes.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+		schematypes.NamespaceDef{Namespace: schematypes.NamespaceLocation, Name: "location", Kind: schematypes.KindGeo, Entity: schematypes.EntityImage},
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -43,9 +43,9 @@ func main() {
 	}
 	defer db.Close()
 
-	canonical := map[common.ImageID]uint64{100: quantum, 200: 2 * quantum, 300: 3 * quantum, 400: 4 * quantum}
+	canonical := map[schematypes.ImageID]uint64{100: quantum, 200: 2 * quantum, 300: 3 * quantum, 400: 4 * quantum}
 	for _, row := range []struct {
-		id       common.ImageID
+		id       schematypes.ImageID
 		lat, lng float64
 	}{{100, 37.7749, -122.4194}, {200, 37.7749, -122.4194},
 		{300, 34.0522, -118.2437}, {400, 40.7128, -74.0060}} {
@@ -55,10 +55,10 @@ func main() {
 		}
 		entry := index.Entry{ValueID: row.id,
 			Times: []index.TimeValue{{Namespace: 100, Timestamp: canonical[row.id]}},
-			Geos:  []index.GeoValue{{Namespace: common.NamespaceLocation, Key: key}},
+			Geos:  []index.GeoValue{{Namespace: schematypes.NamespaceLocation, Key: key}},
 		}
 		if row.id != 400 {
-			entry.Bitmaps = []index.BitmapValue{{Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}}
+			entry.Bitmaps = []index.BitmapValue{{Namespace: schematypes.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}}
 		}
 		if err := db.Add(entry); err != nil {
 			log.Fatal(err)
@@ -72,23 +72,23 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	favorites, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+	favorites, err := engine.Values(schematypes.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	during, err := engine.During(100, quantum, 3*quantum,
-		search.ExactTimestamp(func(id common.ImageID) (uint64, bool) {
+		search.ExactTimestamp(func(id schematypes.ImageID) (uint64, bool) {
 			stamp, ok := canonical[id]
 			return stamp, ok
 		}))
 	if err != nil {
 		log.Fatal(err)
 	}
-	cells, err := engine.InCells(common.NamespaceLocation, cellID)
+	cells, err := engine.InCells(schematypes.NamespaceLocation, cellID)
 	if err != nil {
 		log.Fatal(err)
 	}
-	plan, err := engine.Compile(common.EntityImage, favorites, during, cells)
+	plan, err := engine.Compile(schematypes.EntityImage, favorites, during, cells)
 	if err != nil {
 		log.Fatal(err)
 	}

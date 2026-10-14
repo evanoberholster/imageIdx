@@ -3,7 +3,7 @@
 `index/simhash` is a persistent, mmap-oriented **exact similarity store for the
 canonical image tuple `pHash64 + PDQ256 + PDQQuality`**. It is deliberately not a
 generic column store: the only supported shape is this tuple, indexed directly by
-`common.ImageID`.
+`schema.ImageID`.
 
 The full design is in [`AGENTS/SimHash.md`](../../AGENTS/SimHash.md). This README
 covers usage and measured results.
@@ -23,14 +23,14 @@ covers usage and measured results.
 
 ```go
 import (
-    "github.com/evanoberholster/imageIdx/common"
+    "github.com/evanoberholster/imageIdx/schema"
     "github.com/evanoberholster/imageIdx/index/simhash"
 )
 
 store, err := simhash.Open("./data/simhash", simhash.Config{
     MaxShardBytes:   4 << 30,
     SeqBlockRecords: 1024,
-    Durability:      common.DurabilityOS,
+    Durability:      schema.DurabilityOS,
 })
 if err != nil {
     return err

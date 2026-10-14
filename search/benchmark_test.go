@@ -5,16 +5,16 @@ import (
 	"math/rand"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/golang/geo/s2"
 )
 
-func benchmarkEnumNamespace(tb testing.TB, typ common.Namespace, value string, ids []uint64) *bitmapidx.Index {
+func benchmarkEnumNamespace(tb testing.TB, typ schema.Namespace, value string, ids []uint64) *bitmapidx.Index {
 	tb.Helper()
-	index, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{Namespace: typ, Kind: common.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
+	index, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{Namespace: typ, Kind: schema.KindBitmapEnum}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -60,16 +60,16 @@ func BenchmarkCombinedSearch(b *testing.B) {
 		if id%2 == 0 {
 			namespaceIDs = append(namespaceIDs, id)
 		}
-		records[index] = timeidx.Entry{Timestamp: id * quantum, ImageID: common.ImageID(id)}
+		records[index] = timeidx.Entry{Timestamp: id * quantum, ImageID: schema.ImageID(id)}
 		geoEntries[index] = geoEntry{id: id, lat: 37, lng: -122}
 	}
-	namespaceIndex := benchmarkEnumNamespace(b, common.NamespaceTag, "favorite", namespaceIDs)
+	namespaceIndex := benchmarkEnumNamespace(b, schema.NamespaceTag, "favorite", namespaceIDs)
 	timeIndex, err := timeidx.NewMemory(timeidx.Spec{Entries: records}, timeidx.Config{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = timeIndex.Close() })
-	geo := newTestGeoNamespace(b, common.Namespace(30), geoEntries)
+	geo := newTestGeoNamespace(b, schema.Namespace(30), geoEntries)
 	plan, err := Compile(
 		AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")),
 		During(timeIndex, 4_000*quantum, 6_000*quantum),
@@ -103,8 +103,8 @@ func BenchmarkGeoCollectSearch(b *testing.B) {
 			id: id, lat: 30 + float64(id%200)*0.05, lng: -120 + float64(id/200)*0.05,
 		})
 	}
-	namespaceIndex := benchmarkEnumNamespace(b, common.NamespaceTag, "favorite", namespaceIDs)
-	geo := newTestGeoNamespace(b, common.Namespace(31), geoEntries)
+	namespaceIndex := benchmarkEnumNamespace(b, schema.NamespaceTag, "favorite", namespaceIDs)
+	geo := newTestGeoNamespace(b, schema.Namespace(31), geoEntries)
 	cover := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(30, -120)).Parent(0))
 	plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")), InCells(geo, cover))
 	if err != nil {
@@ -144,8 +144,8 @@ func BenchmarkGeoCityPlan(b *testing.B) {
 			namespaceIDs = append(namespaceIDs, id)
 		}
 	}
-	namespaceIndex := benchmarkEnumNamespace(b, common.NamespaceTag, "favorite", namespaceIDs)
-	geo := newTestGeoNamespace(b, common.Namespace(32), geoEntries)
+	namespaceIndex := benchmarkEnumNamespace(b, schema.NamespaceTag, "favorite", namespaceIDs)
+	geo := newTestGeoNamespace(b, schema.Namespace(32), geoEntries)
 	for _, city := range cities {
 		cityCell := uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(city.lat, city.lng)).Parent(8))
 		plan, err := Compile(AllValues(namespaceIndex, bitmapidx.EnumStringValue("favorite")), InCells(geo, cityCell))

@@ -4,12 +4,12 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Append appends one record and returns its assigned ImageID. It shares the
 // append path without constructing a one-element heap slice.
-func (st *Store) Append(rec Record) (common.ImageID, error) {
+func (st *Store) Append(rec Record) (schema.ImageID, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.closed.Load() {
@@ -23,7 +23,7 @@ func (st *Store) Append(rec Record) (common.ImageID, error) {
 // The assigned IDs are first..first+len(records)-1. New slots are not yet
 // visible, so appends do not use the update WAL. The batch is preflighted before
 // any canonical write, so a failure leaves logical state unchanged.
-func (st *Store) AppendBatch(recs []Record) (common.ImageID, error) {
+func (st *Store) AppendBatch(recs []Record) (schema.ImageID, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.closed.Load() {
@@ -32,9 +32,9 @@ func (st *Store) AppendBatch(recs []Record) (common.ImageID, error) {
 	return st.appendBatchLocked(recs)
 }
 
-func (st *Store) appendBatchLocked(recs []Record) (common.ImageID, error) {
+func (st *Store) appendBatchLocked(recs []Record) (schema.ImageID, error) {
 	if len(recs) == 0 {
-		return common.ImageID(st.committed + 1), nil
+		return schema.ImageID(st.committed + 1), nil
 	}
 	if st.committed > ^uint64(0)-uint64(len(recs)) || st.generation == ^uint64(0) {
 		return 0, ErrOverflow
@@ -67,7 +67,7 @@ func (st *Store) appendBatchLocked(recs []Record) (common.ImageID, error) {
 	// it rolls back writer state (readers never observed the new IDs); a
 	// failure after it (WAL reset) leaves the commit in place and returns the
 	// error so the stale WAL is repaired or skipped on the next Open.
-	if st.config.Durability == common.DurabilitySync {
+	if st.config.Durability == schema.DurabilitySync {
 		if err := st.preCommitLocked(); err != nil {
 			st.committed = oldCommitted
 			st.generation = oldGeneration
@@ -80,12 +80,12 @@ func (st *Store) appendBatchLocked(recs []Record) (common.ImageID, error) {
 	}
 	st.committedAtomic.Store(last)
 	st.gen.Store(st.generation)
-	if st.config.Durability == common.DurabilitySync {
+	if st.config.Durability == schema.DurabilitySync {
 		if err := st.postCommitLocked(); err != nil {
-			return common.ImageID(first), err
+			return schema.ImageID(first), err
 		}
 	}
-	return common.ImageID(first), nil
+	return schema.ImageID(first), nil
 }
 
 // ensureShardsLocked creates every shard up to lastShard and publishes the new
@@ -158,7 +158,7 @@ func shardCommitted(sh *shard, lastID uint64) uint64 {
 
 // Upsert updates one existing record. It shares the batch implementation and
 // allocates nothing.
-func (st *Store) Upsert(id common.ImageID, rec Record) error {
+func (st *Store) Upsert(id schema.ImageID, rec Record) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.singleWire[0] = Update{ImageID: id, Record: rec}
@@ -197,7 +197,7 @@ func (st *Store) upsertLocked(updates []Update) error {
 	base := st.generation
 	next := base + 1
 	if st.journal != nil {
-		if err := st.journal.appendBatch(base, next, updates, st.config.Durability == common.DurabilitySync); err != nil {
+		if err := st.journal.appendBatch(base, next, updates, st.config.Durability == schema.DurabilitySync); err != nil {
 			return err
 		}
 	}

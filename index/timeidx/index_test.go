@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 const testQuantum = uint64(1) << TimestampShift // benchmark fixture spacing, NOT encoding
-const testNamespace common.Namespace = 9
+const testNamespace schema.Namespace = 9
 
 func TestSoAColumnCapacityIsolation(t *testing.T) {
 	times, ids := makeColumns(4)
@@ -40,7 +40,7 @@ func mustNewIndex(t *testing.T, entries []Entry, offset uint64, cfg Config) *Ind
 	})
 	return i
 }
-func equalIDSet(got, want []common.ValueID) bool {
+func equalIDSet(got, want []schema.ValueID) bool {
 	got = slices.Clone(got)
 	want = slices.Clone(want)
 	slices.Sort(got)

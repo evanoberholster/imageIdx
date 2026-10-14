@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestNamespaceCrashWriter(t *testing.T) {
@@ -22,7 +22,7 @@ func TestNamespaceCrashWriter(t *testing.T) {
 	if dir == "" {
 		return
 	}
-	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestNamespaceRecoveryAfterProcessExit(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child: %s: %v", out, err)
 	}
-	s, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+	s, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestNamespaceRecoveryAfterProcessExit(t *testing.T) {
 
 func TestNamespaceManifestFailureRequiresRecovery(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,13 +80,13 @@ func TestNamespaceManifestFailureRequiresRecovery(t *testing.T) {
 	if err := os.Remove(temporary); err != nil {
 		t.Fatal(err)
 	}
-	s, err = OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+	s, err = OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	index, _ = s.Lookup(100)
-	if got := appendIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []common.ImageID{1}) {
+	if got := appendIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []schema.ImageID{1}) {
 		t.Fatal(got)
 	}
 	// An unpublished successor exists; the next checkpoint safely replaces it.
@@ -97,12 +97,12 @@ func TestNamespaceManifestFailureRequiresRecovery(t *testing.T) {
 
 func TestNamespacePersistentCollisions(t *testing.T) {
 	previous := hashCanonical
-	hashCanonical = func(t common.Namespace, _ common.NamespaceKind, _ []byte) NamespaceKey {
+	hashCanonical = func(t schema.Namespace, _ schema.NamespaceKind, _ []byte) NamespaceKey {
 		return NamespaceKey{Namespace: t, Hash: 99}
 	}
 	defer func() { hashCanonical = previous }()
 	dir := t.TempDir()
-	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilityOS)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,16 +119,16 @@ func TestNamespacePersistentCollisions(t *testing.T) {
 	}
 	commit(t, index, func(bt *Batch) error { return bt.Add(Entry{ImageID: 3, Value: EnumStringValue("c")}) })
 	s.Close()
-	s, err = OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+	s, err = OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	index, _ = s.Lookup(100)
-	if got := appendIDs(t, index, EnumStringValue("b")); !slices.Equal(got, []common.ImageID{2}) {
+	if got := appendIDs(t, index, EnumStringValue("b")); !slices.Equal(got, []schema.ImageID{2}) {
 		t.Fatal(got)
 	}
-	if got := appendIDs(t, index, EnumStringValue("c")); !slices.Equal(got, []common.ImageID{3}) {
+	if got := appendIDs(t, index, EnumStringValue("c")); !slices.Equal(got, []schema.ImageID{3}) {
 		t.Fatal(got)
 	}
 }
@@ -138,7 +138,7 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 	for _, checkpoint := range []bool{false, true} {
 		t.Run(fmt.Sprint(checkpoint), func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := NewStore(dir, namespaces, NamespaceConfig{}, common.DurabilitySync)
+			s, err := NewStore(dir, namespaces, NamespaceConfig{}, schema.DurabilitySync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,7 +146,7 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 			flags, _ := s.Lookup(101)
 			text, _ := s.Lookup(102)
 			numbers, _ := s.Lookup(103)
-			for id := common.ImageID(1); id <= 6; id++ {
+			for id := schema.ImageID(1); id <= 6; id++ {
 				commit(t, tags, func(bt *Batch) error {
 					return bt.Add(Entry{ImageID: id, Value: EnumStringValue("tag")})
 				})
@@ -179,7 +179,7 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 			if err := s.Close(); err != nil {
 				t.Fatal(err)
 			}
-			s, err = OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+			s, err = OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -191,7 +191,7 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 			if got := appendIDs(t, tags, EnumStringValue("tag")); len(got) != 6 {
 				t.Fatal(got)
 			}
-			if got := appendIDs(t, tags, EnumBytesValue(nil)); !slices.Equal(got, []common.ImageID{10}) {
+			if got := appendIDs(t, tags, EnumBytesValue(nil)); !slices.Equal(got, []schema.ImageID{10}) {
 				t.Fatal(got)
 			}
 			if present, err := flags.Contains(1, BoolValue(false)); err != nil || !present {
@@ -203,7 +203,7 @@ func TestPersistentNamespacesAllKinds(t *testing.T) {
 			if got, err := text.MatchText("bridge"); err != nil || !got.IsEmpty() {
 				t.Fatal(got, err)
 			}
-			if got, err := numbers.Range(AtMost(0)); err != nil || !slices.Equal(got.AppendTo(nil), []common.ImageID{1}) {
+			if got, err := numbers.Range(AtMost(0)); err != nil || !slices.Equal(got.AppendTo(nil), []schema.ImageID{1}) {
 				t.Fatal(got, err)
 			}
 			query, err := tags.Compile(EnumStringValue("tag"))
@@ -234,7 +234,7 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 	for _, corrupt := range []bool{false, true} {
 		t.Run(fmt.Sprint(corrupt), func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
+			s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilitySync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -257,7 +257,7 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				t.Fatal(err)
 			}
-			s, err = OpenStore(dir, NamespaceConfig{}, common.DurabilitySync)
+			s, err = OpenStore(dir, NamespaceConfig{}, schema.DurabilitySync)
 			if corrupt {
 				if !errors.Is(err, ErrCorruptWAL) {
 					if s != nil {
@@ -273,13 +273,13 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 			index, _ = s.Lookup(100)
 			commit(t, index, func(bt *Batch) error { return bt.Add(Entry{ImageID: 2, Value: EnumStringValue("b")}) })
 			s.Close()
-			s, err = OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+			s, err = OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer s.Close()
 			index, _ = s.Lookup(100)
-			if got := appendIDs(t, index, EnumStringValue("b")); !slices.Equal(got, []common.ImageID{2}) {
+			if got := appendIDs(t, index, EnumStringValue("b")); !slices.Equal(got, []schema.ImageID{2}) {
 				t.Fatal(got)
 			}
 		})
@@ -288,7 +288,7 @@ func TestNamespaceWALTailAndValidation(t *testing.T) {
 
 func TestIndexBoundsAndFailedWrites(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilityOS)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,13 +350,13 @@ func TestIndexBoundsAndFailedWrites(t *testing.T) {
 func TestNamespaceConcurrentCheckpointAndReaders(t *testing.T) {
 	dir := t.TempDir()
 	config := NamespaceConfig{ActiveTarget: 2, HardDeltaLimit: 8, CompactDelay: time.Millisecond}
-	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, config, common.DurabilityOS)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, config, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	index, _ := s.Lookup(100)
 	var seed []Entry
-	for id := common.ImageID(1001); id <= 1040; id++ {
+	for id := schema.ImageID(1001); id <= 1040; id++ {
 		seed = append(seed, Entry{ImageID: id, Value: EnumStringValue("shared")})
 	}
 	commit(t, index, func(bt *Batch) error { return bt.Add(seed...) })
@@ -400,7 +400,7 @@ func TestNamespaceConcurrentCheckpointAndReaders(t *testing.T) {
 	close(done)
 	wg.Wait()
 	s.Close()
-	s, err = OpenStore(dir, config, common.DurabilityOS)
+	s, err = OpenStore(dir, config, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,11 +418,11 @@ func TestNamespaceConcurrentCheckpointAndReaders(t *testing.T) {
 
 func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilityOS)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS); !errors.Is(err, ErrStoreBusy) {
+	if other, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS); !errors.Is(err, ErrStoreBusy) {
 		if other != nil {
 			other.Close()
 		}
@@ -434,7 +434,7 @@ func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 	}
 	path := s.snapshotPath(s.generation)
 	s.Close()
-	if other, err := NewStore(dir, nil, NamespaceConfig{}, common.DurabilityOS); !errors.Is(err, ErrStoreExists) {
+	if other, err := NewStore(dir, nil, NamespaceConfig{}, schema.DurabilityOS); !errors.Is(err, ErrStoreExists) {
 		if other != nil {
 			other.Close()
 		}
@@ -448,7 +448,7 @@ func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if other, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS); !errors.Is(err, ErrCorruptSegment) {
+	if other, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS); !errors.Is(err, ErrCorruptSegment) {
 		if other != nil {
 			other.Close()
 		}
@@ -460,9 +460,9 @@ func TestIndexOwnershipAndSnapshotCorruption(t *testing.T) {
 }
 
 func TestIndexRejectsForeignFiles(t *testing.T) {
-	build := func(t *testing.T, dir string, id common.ImageID) (snapshot, wal string) {
+	build := func(t *testing.T, dir string, id schema.ImageID) (snapshot, wal string) {
 		t.Helper()
-		s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
+		s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -490,7 +490,7 @@ func TestIndexRejectsForeignFiles(t *testing.T) {
 		_, walA := build(t, dirA, 1)
 		_, walB := build(t, dirB, 2)
 		copyFile(t, walB, walA)
-		s, err := OpenStore(dirA, NamespaceConfig{}, common.DurabilityOS)
+		s, err := OpenStore(dirA, NamespaceConfig{}, schema.DurabilityOS)
 		if s != nil {
 			s.Close()
 		}
@@ -503,7 +503,7 @@ func TestIndexRejectsForeignFiles(t *testing.T) {
 		snapC, _ := build(t, dirC, 1)
 		snapD, _ := build(t, dirD, 2)
 		copyFile(t, snapD, snapC)
-		s, err := OpenStore(dirC, NamespaceConfig{}, common.DurabilityOS)
+		s, err := OpenStore(dirC, NamespaceConfig{}, schema.DurabilityOS)
 		if s != nil {
 			s.Close()
 		}
@@ -519,7 +519,7 @@ func TestIndexRejectsForeignFiles(t *testing.T) {
 func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 	t.Run("unpublished successor files ignored", func(t *testing.T) {
 		dir := t.TempDir()
-		s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
+		s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -540,12 +540,12 @@ func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		s, err = OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+		s, err = OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 		if err != nil {
 			t.Fatalf("open with unpublished successor: %v", err)
 		}
 		index, _ = s.Lookup(100)
-		if got := appendIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []common.ImageID{1}) {
+		if got := appendIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []schema.ImageID{1}) {
 			t.Fatalf("recovered membership = %v, want [1]", got)
 		}
 		// The next checkpoint must replace the orphan generation.
@@ -559,7 +559,7 @@ func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 
 	t.Run("segment write failure recoverable", func(t *testing.T) {
 		dir := t.TempDir()
-		s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, common.DurabilitySync)
+		s, err := NewStore(dir, []NamespaceSpec{enumNamespace(100)}, NamespaceConfig{}, schema.DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -585,13 +585,13 @@ func TestNamespaceCheckpointCrashBoundaries(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		s, err = OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+		s, err = OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer s.Close()
 		index, _ = s.Lookup(100)
-		if got := appendIDs(t, index, EnumStringValue("b")); !slices.Equal(got, []common.ImageID{2}) {
+		if got := appendIDs(t, index, EnumStringValue("b")); !slices.Equal(got, []schema.ImageID{2}) {
 			t.Fatalf("recovered membership = %v, want [2]", got)
 		}
 	})

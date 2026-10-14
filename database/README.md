@@ -4,6 +4,14 @@
 unified `index.Store` for derived associations. The index schema is created
 separately with `index.Create`; `database.Open(dataDir, indexDir, decoder,
 options)` reopens it and checks health and the durable source watermark. The
+database also opens `schema.Schema` as the authoritative entity-ID allocator
+and namespace ownership snapshot. Schema owns identity and definitions;
+`store` owns values, index packages own secondary indexes, and `database`
+coordinates their lifecycle. Canonical and index namespaces must have unique
+numbers and names; conflicting preexisting layouts fail to open rather than
+silently renumbering persisted identifiers. Allocation-file format v1 is not
+automatically converted; it returns `schema.ErrVersion` rather than risking
+reuse of IDs allocated under namespace-scoped semantics.
 database directory is exclusively owned by this package: its fixed `entity-*`
 collections contain canonical records, namespace 65533 holds ordered journal
 entries, and 65534 holds generation metadata. Do not mutate these namespaces
@@ -80,7 +88,7 @@ if err != nil { return err }
 defer db.Close()
 
 generation, err := db.Commit(database.Mutation{
-    Entity: common.EntityImage, ValueID: imageID,
+    Entity: schema.EntityImage, ValueID: imageID,
     Record: imageMetadata, Projection: encodedIndexEntry,
 })
 if err != nil { return err } // canonical commit + journal are already durable
@@ -90,7 +98,7 @@ engine, err := search.New(db.Index())
 if err != nil { return err }
 clause, err := engine.Values(101, bitmapidx.EnumBytesValue([]byte("favorite")))
 if err != nil { return err }
-plan, err := engine.Compile(common.EntityImage, clause)
+plan, err := engine.Compile(schema.EntityImage, clause)
 if err != nil { return err }
 ids, err := plan.AppendIDs(ctx, nil, search.NewWorkspace(128))
 _ = ids

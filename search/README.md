@@ -23,14 +23,14 @@ var ws search.Workspace // reusable scratch; do not share across goroutines
 
 With a unified `index.Store`, use `search.New(db)` and `Engine.Compile` to
 include entity liveness automatically. For example, after registering a
-`KindBitmapBSI` namespace with width 16 in `common.Schema`:
+`KindBitmapBSI` namespace with width 16 in `schema.Definitions`:
 
 ```go
 engine, err := search.New(db)
 if err != nil { return err }
 quality, err := engine.BSIRange(40, bitmapidx.ValuesBetween(40, 85))
 if err != nil { return err }
-plan, err := engine.Compile(common.EntityImage, quality)
+plan, err := engine.Compile(schema.EntityImage, quality)
 if err != nil { return err }
 ```
 

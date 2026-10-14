@@ -21,7 +21,7 @@ func TestCrashSubprocessSkipsReservation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if id, err := s.NextID(4); id != 4 || err != nil {
+			if id, err := s.NextID(EntityImage); id != 4 || err != nil {
 				t.Fatalf("clean resume: %d %v", id, err)
 			}
 			os.Exit(0) // no clean checkpoint
@@ -31,7 +31,7 @@ func TestCrashSubprocessSkipsReservation(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := 1; i <= 3; i++ {
-			if _, err := s.NextID(4); err != nil {
+			if _, err := s.NextID(EntityImage); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -47,7 +47,7 @@ func TestCrashSubprocessSkipsReservation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if id, err := s.NextID(4); id != 9 || err != nil {
+		if id, err := s.NextID(EntityImage); id != 9 || err != nil {
 			t.Fatalf("unclean reopen: %d %v", id, err)
 		}
 		_ = s.Close()
@@ -64,14 +64,15 @@ func TestDirectoryPublicationFaults(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := s.NextID(4); err != nil {
+				if _, err := s.NextID(EntityImage); err != nil {
 					t.Fatal(err)
 				}
 				if err := s.Close(); err != nil {
 					t.Fatal(err)
 				}
 				newOpts := testOptions(b)
-				newOpts.Namespaces = append(newOpts.Namespaces, NamespaceConfig{ID: 88, Name: "new", ReserveSize: 17})
+				_ = newOpts.Definitions.Register(NamespaceDef{Namespace: 88, Name: "new", Kind: KindKV, Entity: EntityFace})
+				newOpts.Entities = append(newOpts.Entities, EntityConfig{Entity: EntityFace, ReserveSize: 17})
 				newOpts.fault = func(stage string) error {
 					if stage == step {
 						return errors.New("injected")
@@ -88,10 +89,10 @@ func TestDirectoryPublicationFaults(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer s.Close()
-				if id, err := s.NextID(4); id < 2 || err != nil {
+				if id, err := s.NextID(EntityImage); id < 2 || err != nil {
 					t.Fatalf("old ID lost/reused: %d %v", id, err)
 				}
-				if id, err := s.NextID(88); id != 1 || err != nil {
+				if id, err := s.NextID(EntityFace); id != 1 || err != nil {
 					t.Fatalf("new namespace: %d %v", id, err)
 				}
 			})
@@ -109,7 +110,7 @@ func TestCorruptFileFailsClosed(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := s.NextID(4); err != nil {
+				if _, err := s.NextID(EntityImage); err != nil {
 					t.Fatal(err)
 				}
 				if err := s.Close(); err != nil {
@@ -182,7 +183,7 @@ func TestBackendsShareExactOnDiskFormat(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if id, err := s.NextID(4); id != uint64(i+1) || err != nil {
+		if id, err := s.NextID(EntityImage); id != uint64(i+1) || err != nil {
 			t.Fatalf("backend %d: %d %v", backend, id, err)
 		}
 		if err := s.Close(); err != nil {
@@ -199,7 +200,7 @@ func TestFailedActivationDoesNotReuseCheckpoint(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.NextID(2); err != nil {
+		if _, err := s.NextID(EntityImage); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Close(); err != nil {
@@ -221,7 +222,7 @@ func TestFailedActivationDoesNotReuseCheckpoint(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer s.Close()
-		if id, err := s.NextID(2); id != 5 || err != nil {
+		if id, err := s.NextID(EntityImage); id != 9 || err != nil {
 			t.Fatalf("uncertain activation reused ID: %d %v", id, err)
 		}
 	})
@@ -234,7 +235,7 @@ func TestFailedCloseCannotReuseIssuedID(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if id, err := s.NextID(4); id != 1 || err != nil {
+		if id, err := s.NextID(EntityImage); id != 1 || err != nil {
 			t.Fatalf("first: %d %v", id, err)
 		}
 		s.fault = func(stage string) error {
@@ -251,7 +252,7 @@ func TestFailedCloseCannotReuseIssuedID(t *testing.T) {
 			return
 		} // fail closed is safe
 		defer s.Close()
-		if id, err := s.NextID(4); id <= 1 || err != nil {
+		if id, err := s.NextID(EntityImage); id <= 1 || err != nil {
 			t.Fatalf("reused issued ID: %d %v", id, err)
 		}
 	})
@@ -268,12 +269,13 @@ func TestCorruptNewestSuperblockDoesNotRollBackDirectory(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		opts.Namespaces = append(opts.Namespaces, NamespaceConfig{ID: 99, Name: "later"})
+		_ = opts.Definitions.Register(NamespaceDef{Namespace: 99, Name: "later", Kind: KindKV, Entity: EntityFace})
+		opts.Entities = append(opts.Entities, EntityConfig{Entity: EntityFace, ReserveSize: 1024})
 		s, err = Open(path, opts)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.NextID(99); err != nil {
+		if _, err := s.NextID(EntityFace); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Close(); err != nil {

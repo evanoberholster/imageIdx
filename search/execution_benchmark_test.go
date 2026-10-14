@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
@@ -72,10 +72,10 @@ func BenchmarkExecution(b *testing.B) {
 
 func BenchmarkPersistentExecution(b *testing.B) {
 	specs := []bitmapidx.NamespaceSpec{
-		{Namespace: 100, Kind: common.KindBitmapEnum},
-		{Namespace: 101, Kind: common.KindBitmapEnum},
+		{Namespace: 100, Kind: schema.KindBitmapEnum},
+		{Namespace: 101, Kind: schema.KindBitmapEnum},
 	}
-	s, err := bitmapidx.NewStore(b.TempDir(), specs, bitmapidx.NamespaceConfig{}, common.DurabilityOS)
+	s, err := bitmapidx.NewStore(b.TempDir(), specs, bitmapidx.NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		b.Fatal(err)
 	}

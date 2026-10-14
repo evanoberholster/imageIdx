@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func BenchmarkCommitAndIndex(b *testing.B) {
@@ -60,7 +60,7 @@ func BenchmarkStartupRebuild(b *testing.B) {
 					n := min(len(entries), total-first+1)
 					for j := range entries[:n] {
 						id := uint64(first + j)
-						entries[j] = Mutation{Entity: common.EntityImage, ValueID: id, Projection: projection(id, 'a')}
+						entries[j] = Mutation{Entity: schema.EntityImage, ValueID: id, Projection: projection(id, 'a')}
 					}
 					generation, err = db.Commit(entries[:n]...)
 					if err != nil {

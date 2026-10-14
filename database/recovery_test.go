@@ -7,11 +7,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
@@ -19,7 +19,7 @@ func TestAutomaticRebuildSharedBitmapStore(t *testing.T) {
 	data, dir := paths(t)
 	db := openTest(t, data, dir)
 	for id := uint64(1); id <= 4; id++ {
-		g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: id, Record: []byte("canonical"), Projection: projection(id, byte('a'+id))})
+		g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: id, Record: []byte("canonical"), Projection: projection(id, byte('a'+id))})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -45,7 +45,7 @@ func TestAutomaticRebuildSharedBitmapStore(t *testing.T) {
 		t.Fatalf("generation %d / %d", db.IndexedGeneration(), db.Index().SourceGeneration())
 	}
 	for id := uint64(1); id <= 4; id++ {
-		got, err := db.Get(common.EntityImage, id)
+		got, err := db.Get(schematypes.EntityImage, id)
 		if err != nil || string(got) != "canonical" {
 			t.Fatalf("record %d: %q %v", id, got, err)
 		}
@@ -68,7 +68,7 @@ func TestRebuildCopiesBorrowedProjectionBytesAcrossBatch(t *testing.T) {
 	mutations := make([]Mutation, 64)
 	for i := range mutations {
 		id := uint64(i + 1)
-		mutations[i] = Mutation{Entity: common.EntityImage, ValueID: id, Projection: projection(id, byte(i+1))}
+		mutations[i] = Mutation{Entity: schematypes.EntityImage, ValueID: id, Projection: projection(id, byte(i+1))}
 	}
 	g, err := db.Commit(mutations...)
 	if err != nil {
@@ -94,7 +94,7 @@ func TestRebuildCopiesBorrowedProjectionBytesAcrossBatch(t *testing.T) {
 func TestAutomaticRebuildCorruptJournalIndependent(t *testing.T) {
 	data, dir := paths(t)
 	db := openTest(t, data, dir)
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestAutomaticRebuildCorruptJournalIndependent(t *testing.T) {
 func TestRecoveryKeepsCanonicalWhenProjectionInvalid(t *testing.T) {
 	data, dir := paths(t)
 	db := openTest(t, data, dir)
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: projection(1, 'x'), Record: []byte("untouched")})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection(1, 'x'), Record: []byte("untouched")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestRecoveryKeepsCanonicalWhenProjectionInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	got, err := db.Get(common.EntityImage, 1)
+	got, err := db.Get(schematypes.EntityImage, 1)
 	if err != nil || string(got) != "untouched" {
 		t.Fatalf("canonical record changed: %q %v", got, err)
 	}
@@ -155,7 +155,7 @@ func TestRecoveryKeepsCanonicalWhenProjectionInvalid(t *testing.T) {
 func TestRecoveryGenerationMismatch(t *testing.T) {
 	data, dir := paths(t)
 	db := openTest(t, data, dir)
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,8 +236,8 @@ func TestCanonicalSchemaMismatchStopsActivation(t *testing.T) {
 func TestSparseSimHashRebuildFailsExplicitly(t *testing.T) {
 	root := t.TempDir()
 	data, dir := filepath.Join(root, "data"), filepath.Join(root, "index")
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: 141, Name: "perceptual", Kind: common.KindHashPerceptual, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 141, Name: "perceptual", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	idx, err := index.Create(dir, index.Spec{Schema: schema})
@@ -257,7 +257,7 @@ func TestSparseSimHashRebuildFailsExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Commit(Mutation{Entity: common.EntityImage, ValueID: 2, Projection: []byte{2}})
+	_, err = db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 2, Projection: []byte{2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,12 +278,12 @@ func TestSparseSimHashRebuildFailsExplicitly(t *testing.T) {
 func TestRebuildPreservesEntityOwnershipForOverlappingIDs(t *testing.T) {
 	root := t.TempDir()
 	data, dir := filepath.Join(root, "data"), filepath.Join(root, "index")
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	for _, spec := range []struct {
-		ns     common.Namespace
-		entity common.EntityKind
-	}{{151, common.EntityImage}, {152, common.EntityFace}} {
-		def, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: spec.ns, Kind: common.KindBitmapEnum}, spec.entity.String()+"-tag", spec.entity)
+		ns     schematypes.Namespace
+		entity schematypes.EntityKind
+	}{{151, schematypes.EntityImage}, {152, schematypes.EntityFace}} {
+		def, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: spec.ns, Kind: schematypes.KindBitmapEnum}, spec.entity.String()+"-tag", spec.entity)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -302,9 +302,9 @@ func TestRebuildPreservesEntityOwnershipForOverlappingIDs(t *testing.T) {
 		if len(p) != 11 {
 			return index.Entry{}, ErrCorruptJournal
 		}
-		return index.Entry{ValueID: binary.BigEndian.Uint64(p[:8]), Bitmaps: []index.BitmapValue{{Namespace: common.Namespace(binary.BigEndian.Uint16(p[8:10])), Value: bitmapidx.EnumBytesValue(p[10:11])}}}, nil
+		return index.Entry{ValueID: binary.BigEndian.Uint64(p[:8]), Bitmaps: []index.BitmapValue{{Namespace: schematypes.Namespace(binary.BigEndian.Uint16(p[8:10])), Value: bitmapidx.EnumBytesValue(p[10:11])}}}, nil
 	}
-	project := func(ns common.Namespace, value byte) []byte {
+	project := func(ns schematypes.Namespace, value byte) []byte {
 		p := make([]byte, 11)
 		binary.BigEndian.PutUint64(p[:8], 7)
 		binary.BigEndian.PutUint16(p[8:10], uint16(ns))
@@ -316,8 +316,8 @@ func TestRebuildPreservesEntityOwnershipForOverlappingIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	g, err := db.Commit(
-		Mutation{Entity: common.EntityImage, ValueID: 7, Projection: project(151, 'i')},
-		Mutation{Entity: common.EntityFace, ValueID: 7, Projection: project(152, 'f')},
+		Mutation{Entity: schematypes.EntityImage, ValueID: 7, Projection: project(151, 'i')},
+		Mutation{Entity: schematypes.EntityFace, ValueID: 7, Projection: project(152, 'f')},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -335,7 +335,7 @@ func TestRebuildPreservesEntityOwnershipForOverlappingIDs(t *testing.T) {
 	}
 	defer db.Close()
 	for _, check := range []struct {
-		ns              common.Namespace
+		ns              schematypes.Namespace
 		present, absent byte
 	}{{151, 'i', 'f'}, {152, 'f', 'i'}} {
 		idx, ok := db.Index().Bitmap(check.ns)
@@ -356,8 +356,8 @@ func TestRebuildPreservesEntityOwnershipForOverlappingIDs(t *testing.T) {
 func TestRebuildOmitsDeletedAndObsoleteHashAssociations(t *testing.T) {
 	root := t.TempDir()
 	data, dir := filepath.Join(root, "data"), filepath.Join(root, "index")
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: hashNS, Name: "hash", Kind: common.KindHashExact, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: hashNS, Name: "hash", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	idx, err := index.Create(dir, index.Spec{Schema: schema})
@@ -372,13 +372,13 @@ func TestRebuildOmitsDeletedAndObsoleteHashAssociations(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, marker := range []byte{'a', 'b'} {
-		g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: hashProjection(1, marker)})
+		g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: hashProjection(1, marker)})
 		if err != nil {
 			t.Fatal(err)
 		}
 		wait(t, db, g)
 	}
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Delete: true})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Delete: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestRebuildOmitsDeletedAndObsoleteHashAssociations(t *testing.T) {
 			t.Fatalf("obsolete hash %q survived rebuild: %v", marker, ids)
 		}
 	}
-	if _, err := db.Get(common.EntityImage, 1); !errors.Is(err, store.ErrNotFound) {
+	if _, err := db.Get(schematypes.EntityImage, 1); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("deletion lost: %v", err)
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar"
 )
@@ -585,14 +585,14 @@ func TestExactCountMatchesMerge(t *testing.T) {
 
 	type pair struct {
 		key S2Key
-		id  common.ImageID
+		id  schema.ImageID
 	}
 
 	for round := 0; round < 1000; round++ {
 		n := rng.Intn(300)
 		base := make([]pair, n)
 		for i := range base {
-			base[i] = pair{key: keys[rng.Intn(len(keys))], id: common.ImageID(i + 1)}
+			base[i] = pair{key: keys[rng.Intn(len(keys))], id: schema.ImageID(i + 1)}
 		}
 		slices.SortFunc(base, func(a, b pair) int {
 			if order := cmp.Compare(a.key, b.key); order != 0 {
@@ -601,7 +601,7 @@ func TestExactCountMatchesMerge(t *testing.T) {
 			return cmp.Compare(a.id, b.id)
 		})
 		baseKeys := make([]S2Key, n)
-		baseIDs := make([]common.ImageID, n)
+		baseIDs := make([]schema.ImageID, n)
 		for i := range base {
 			baseKeys[i] = base[i].key
 			baseIDs[i] = base[i].id
@@ -610,7 +610,7 @@ func TestExactCountMatchesMerge(t *testing.T) {
 		// An id-unique delta: each named id is an insert, a delete, or untouched,
 		// plus fresh inserts beyond the base.
 		var frozen []mutation
-		for id := common.ImageID(1); id <= common.ImageID(n); id++ {
+		for id := schema.ImageID(1); id <= schema.ImageID(n); id++ {
 			switch rng.Intn(3) {
 			case 0:
 				frozen = append(frozen, mutation{id: id, key: keys[rng.Intn(len(keys))], add: false})
@@ -619,7 +619,7 @@ func TestExactCountMatchesMerge(t *testing.T) {
 			}
 		}
 		for k := 0; k < rng.Intn(20); k++ {
-			frozen = append(frozen, mutation{id: common.ImageID(n + 1 + k), key: keys[rng.Intn(len(keys))], add: true})
+			frozen = append(frozen, mutation{id: schema.ImageID(n + 1 + k), key: keys[rng.Intn(len(keys))], add: true})
 		}
 		slices.SortFunc(frozen, compareMutationID)
 
@@ -628,7 +628,7 @@ func TestExactCountMatchesMerge(t *testing.T) {
 		count := exactCount(baseKeys, baseIDs, shadow, adds)
 
 		outKeys := make([]S2Key, len(baseKeys)+len(adds))
-		outIDs := make([]common.ImageID, len(baseKeys)+len(adds))
+		outIDs := make([]schema.ImageID, len(baseKeys)+len(adds))
 		written := mergeInto(outKeys, outIDs, baseKeys, baseIDs, shadow, adds)
 		if uint64(written) != count {
 			t.Fatalf("round %d: exactCount=%d, mergeInto=%d", round, count, written)
@@ -682,7 +682,7 @@ func TestRepeatedKeyCompaction(t *testing.T) {
 	const n = 2000
 	entries := make([]Entry, n)
 	for i := range entries {
-		entries[i] = Entry{Key: keyA, ImageID: common.ImageID(i + 1)}
+		entries[i] = Entry{Key: keyA, ImageID: schema.ImageID(i + 1)}
 	}
 	if err := index.InsertBatch(entries); err != nil {
 		t.Fatal(err)
@@ -690,12 +690,12 @@ func TestRepeatedKeyCompaction(t *testing.T) {
 
 	// Delete every fifth, move every third, insert n more at keyA.
 	var inserts, deletes []Entry
-	live := make(map[common.ImageID]S2Key, 2*n)
+	live := make(map[schema.ImageID]S2Key, 2*n)
 	for i := 0; i < n; i++ {
-		live[common.ImageID(i+1)] = keyA
+		live[schema.ImageID(i+1)] = keyA
 	}
 	for i := 0; i < n; i++ {
-		id := common.ImageID(i + 1)
+		id := schema.ImageID(i + 1)
 		if i%5 == 0 {
 			deletes = append(deletes, Entry{Key: keyA, ImageID: id})
 		}
@@ -704,7 +704,7 @@ func TestRepeatedKeyCompaction(t *testing.T) {
 		}
 	}
 	for k := 0; k < n; k++ {
-		inserts = append(inserts, Entry{Key: keyA, ImageID: common.ImageID(n + 1 + k)})
+		inserts = append(inserts, Entry{Key: keyA, ImageID: schema.ImageID(n + 1 + k)})
 	}
 	// Reference: Apply records inserts then deletes, so a later delete wins.
 	for _, e := range inserts {

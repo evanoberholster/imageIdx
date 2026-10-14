@@ -7,7 +7,7 @@ import (
 	"math"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -20,8 +20,8 @@ import (
 // (entity, id) pair is cleared immediately, so no search can return it, even
 // before physical records are reclaimed.
 type DeleteOp struct {
-	Entity common.EntityKind
-	ID     common.ValueID
+	Entity schema.EntityKind
+	ID     schema.ValueID
 }
 
 // Batch is a reusable, caller-owned group of mutations. Add/Update/Delete stage
@@ -66,7 +66,7 @@ func (b *Batch) Update(change Change) error {
 }
 
 // Delete stages a logical deletion.
-func (b *Batch) Delete(entity common.EntityKind, id common.ValueID) error {
+func (b *Batch) Delete(entity schema.EntityKind, id schema.ValueID) error {
 	if b.inFlight.Load() {
 		return ErrBatchClosed
 	}
@@ -120,7 +120,7 @@ func (s *Store) Update(change Change) error {
 }
 
 // Delete commits a single logical deletion.
-func (s *Store) Delete(entity common.EntityKind, id common.ValueID) error {
+func (s *Store) Delete(entity schema.EntityKind, id schema.ValueID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed.Load() {
@@ -260,8 +260,8 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit, all bool
 // radixhash and geoidx need an explicit Checkpoint; simhash new-record appends
 // need the manifest write, so they are checkpoint-dependent. A simhash *update*
 // is journaled and does survive (see pvSimUpdate).
-func crashDurableDuringApply(kind common.NamespaceKind) bool {
-	return kind == common.KindTimestamp || kind == common.KindVector || kind.IsBitmap()
+func crashDurableDuringApply(kind schema.NamespaceKind) bool {
+	return kind == schema.KindTimestamp || kind == schema.KindVector || kind.IsBitmap()
 }
 
 // batchMayPartiallyPersist reports whether a crash mid-batch could leave some
@@ -280,7 +280,7 @@ func (s *Store) batchMayPartiallyPersist() bool {
 				continue
 			}
 			units++
-			if def, ok := s.schema.Lookup(common.Namespace(w*64 + bit)); ok && crashDurableDuringApply(def.Kind) {
+			if def, ok := s.schema.Lookup(schema.Namespace(w*64 + bit)); ok && crashDurableDuringApply(def.Kind) {
 				anyDurable = true
 			}
 		}
@@ -355,12 +355,12 @@ func (s *Store) advanceTouchedCompleteness(gen uint64) (bool, error) {
 			if word&(1<<uint(bit)) == 0 {
 				continue
 			}
-			ns := common.Namespace(w*64 + bit)
+			ns := schema.Namespace(w*64 + bit)
 			if gen > s.nsSource[ns] {
 				s.nsSource[ns] = gen
 				advanced = true
 			}
-			if def, ok := s.schema.Lookup(ns); ok && def.Kind == common.KindTimestamp {
+			if def, ok := s.schema.Lookup(ns); ok && def.Kind == schema.KindTimestamp {
 				if idx, ok := s.reg.timeIndex(ns); ok {
 					if err := applyTimeGeneration(idx, gen); err != nil {
 						return advanced, err
@@ -382,7 +382,7 @@ func (s *Store) advanceUntouchedCompleteness(gen uint64) (bool, error) {
 		if !s.health[ns].Available || s.isDegraded(ns) || (s.pvSet[ns>>6]&(uint64(1)<<(uint(ns)&63))) != 0 {
 			continue
 		}
-		if def.Kind == common.KindTimestamp {
+		if def.Kind == schema.KindTimestamp {
 			if idx, ok := s.reg.timeIndex(ns); ok {
 				if err := applyTimeGeneration(idx, gen); err != nil {
 					return advanced, err
@@ -411,7 +411,7 @@ func (s *Store) advanceAllCompleteness(gen uint64) error {
 		if gen > s.nsSource[def.Namespace] {
 			s.nsSource[def.Namespace] = gen
 		}
-		if def.Kind == common.KindTimestamp {
+		if def.Kind == schema.KindTimestamp {
 			if idx, ok := s.reg.timeIndex(def.Namespace); ok {
 				if err := applyTimeGeneration(idx, gen); err != nil {
 					return err
@@ -426,7 +426,7 @@ func (s *Store) advanceAllCompleteness(gen uint64) error {
 // checkpoint-dependent engines (radixhash, geoidx, simhash) need work; the others'
 // Apply already left crash-recoverable state, so re-checkpointing them would be
 // redundant write amplification.
-func (s *Store) syncNamespace(ns common.Namespace) error {
+func (s *Store) syncNamespace(ns schema.Namespace) error {
 	def, ok := s.schema.Lookup(ns)
 	if !ok || !s.health[ns].Available || s.isDegraded(ns) {
 		return nil
@@ -454,7 +454,7 @@ func (s *Store) syncTouchedForCompleteness() error {
 			if word&(1<<uint(bit)) == 0 {
 				continue
 			}
-			if err := s.syncNamespace(common.Namespace(w*64 + bit)); err != nil {
+			if err := s.syncNamespace(schema.Namespace(w*64 + bit)); err != nil {
 				return err
 			}
 		}
@@ -559,7 +559,7 @@ func (s *Store) applyLocked(entries []Entry, changes []Change, deletes []DeleteO
 	return s.flushStage()
 }
 
-func (s *Store) routeEntity(ns common.Namespace) common.EntityKind {
+func (s *Store) routeEntity(ns schema.Namespace) schema.EntityKind {
 	rt, _ := s.reg.lookup(ns)
 	return rt.entity
 }
@@ -649,9 +649,9 @@ func (s *Store) stageDelete(d DeleteOp) error {
 		}
 		switch familyOf(rt.kind) {
 		case familyTime:
-			s.stageTimeDelete(common.Namespace(ns), d.ID)
+			s.stageTimeDelete(schema.Namespace(ns), d.ID)
 		case familyVector:
-			s.stageVectorDelete(common.Namespace(ns), d.ID)
+			s.stageVectorDelete(schema.Namespace(ns), d.ID)
 		}
 	}
 	return nil
@@ -690,7 +690,7 @@ func (s *Store) prevalidate(entries []Entry, changes []Change, deletes []DeleteO
 				continue
 			}
 			if familyOf(rt.kind) == familyTime || familyOf(rt.kind) == familyVector {
-				s.pvMark(common.Namespace(ns))
+				s.pvMark(schema.Namespace(ns))
 			}
 		}
 	}
@@ -722,12 +722,12 @@ func (s *Store) prevalidateEntry(e Entry) error {
 		return fmt.Errorf("%w: entity id 0", ErrEntityMismatch)
 	}
 	for _, v := range e.Times {
-		if err := s.pvKind(v.Namespace, common.KindTimestamp); err != nil {
+		if err := s.pvKind(v.Namespace, schema.KindTimestamp); err != nil {
 			return err
 		}
 	}
 	for _, v := range e.Geos {
-		if err := s.pvKind(v.Namespace, common.KindGeo); err != nil {
+		if err := s.pvKind(v.Namespace, schema.KindGeo); err != nil {
 			return err
 		}
 	}
@@ -737,7 +737,7 @@ func (s *Store) prevalidateEntry(e Entry) error {
 		}
 	}
 	for _, v := range e.Hashes {
-		if err := s.pvKind(v.Namespace, common.KindHashExact); err != nil {
+		if err := s.pvKind(v.Namespace, schema.KindHashExact); err != nil {
 			return err
 		}
 	}
@@ -755,7 +755,7 @@ func (s *Store) prevalidateEntry(e Entry) error {
 	return nil
 }
 
-func (s *Store) pvKind(ns common.Namespace, want common.NamespaceKind) error {
+func (s *Store) pvKind(ns schema.Namespace, want schema.NamespaceKind) error {
 	def, ok := s.schema.Lookup(ns)
 	if !ok || def.Kind != want {
 		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, ns)
@@ -779,9 +779,9 @@ func (s *Store) pvBitmap(v BitmapValue) error {
 	return nil
 }
 
-func (s *Store) pvSim(ns common.Namespace, id common.ValueID) error {
+func (s *Store) pvSim(ns schema.Namespace, id schema.ValueID) error {
 	def, ok := s.schema.Lookup(ns)
-	if !ok || def.Kind != common.KindHashPerceptual {
+	if !ok || def.Kind != schema.KindHashPerceptual {
 		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, ns)
 	}
 	if s.isDegraded(ns) {
@@ -822,9 +822,9 @@ func (s *Store) pvSim(ns common.Namespace, id common.ValueID) error {
 	}
 }
 
-func (s *Store) pvVector(v VectorValue, id common.ValueID) error {
+func (s *Store) pvVector(v VectorValue, id schema.ValueID) error {
 	def, ok := s.schema.Lookup(v.Namespace)
-	if !ok || def.Kind != common.KindVector {
+	if !ok || def.Kind != schema.KindVector {
 		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, v.Namespace)
 	}
 	if s.isDegraded(v.Namespace) {
@@ -862,7 +862,7 @@ func vectorLenMatches(v VectorValue, dims int) bool {
 	}
 }
 
-func (s *Store) pvMark(ns common.Namespace) {
+func (s *Store) pvMark(ns schema.Namespace) {
 	w := int(ns) >> 6
 	if w < len(s.pvSet) {
 		s.pvSet[w] |= 1 << (uint(ns) & 63)
@@ -875,13 +875,13 @@ func (s *Store) degradeIntended(err error) {
 	for w, word := range s.pvSet {
 		for bit := 0; bit < 64; bit++ {
 			if word&(1<<uint(bit)) != 0 {
-				s.markDegraded(common.Namespace(w*64+bit), err)
+				s.markDegraded(schema.Namespace(w*64+bit), err)
 			}
 		}
 	}
 }
 
-func changeID(c Change) (common.ValueID, error) {
+func changeID(c Change) (schema.ValueID, error) {
 	b, a := c.Before.ValueID, c.After.ValueID
 	if b != 0 && a != 0 && b != a {
 		return 0, fmt.Errorf("%w: before=%d after=%d", ErrEntityMismatch, b, a)
@@ -1012,11 +1012,11 @@ func (s *Store) applyDelete(d DeleteOp) error {
 		}
 		switch familyOf(rt.kind) {
 		case familyTime:
-			if err := s.deleteTime(common.Namespace(ns), d.ID); err != nil {
+			if err := s.deleteTime(schema.Namespace(ns), d.ID); err != nil {
 				return err
 			}
 		case familyVector:
-			if err := s.deleteVector(common.Namespace(ns), d.ID); err != nil {
+			if err := s.deleteVector(schema.Namespace(ns), d.ID); err != nil {
 				return err
 			}
 		}
@@ -1027,14 +1027,14 @@ func (s *Store) applyDelete(d DeleteOp) error {
 // entitySet is a bitset over entity kinds, avoiding a map for touched tracking.
 type entitySet uint32
 
-func (e *entitySet) add(k common.EntityKind) { *e |= 1 << uint(k) }
+func (e *entitySet) add(k schema.EntityKind) { *e |= 1 << uint(k) }
 
 // setLiveness marks the entity live for every touched entity kind.
-func (s *Store) setLiveness(id common.ValueID, touched entitySet) error {
+func (s *Store) setLiveness(id schema.ValueID, touched entitySet) error {
 	if id == 0 || touched == 0 {
 		return nil
 	}
-	for k := common.EntityImage; k.Valid(); k++ {
+	for k := schema.EntityImage; k.Valid(); k++ {
 		if touched&(1<<uint(k)) == 0 {
 			continue
 		}
@@ -1047,7 +1047,7 @@ func (s *Store) setLiveness(id common.ValueID, touched entitySet) error {
 
 // ---- per-family add ----
 
-func (s *Store) addTimes(id common.ValueID, values []TimeValue, touched *entitySet) error {
+func (s *Store) addTimes(id schema.ValueID, values []TimeValue, touched *entitySet) error {
 	for _, v := range values {
 		idx, rt, err := s.timeFor(v.Namespace)
 		if err != nil {
@@ -1061,7 +1061,7 @@ func (s *Store) addTimes(id common.ValueID, values []TimeValue, touched *entityS
 	return nil
 }
 
-func (s *Store) addGeos(id common.ValueID, values []GeoValue, touched *entitySet) error {
+func (s *Store) addGeos(id schema.ValueID, values []GeoValue, touched *entitySet) error {
 	for _, v := range values {
 		idx, rt, err := s.geoFor(v.Namespace)
 		if err != nil {
@@ -1075,7 +1075,7 @@ func (s *Store) addGeos(id common.ValueID, values []GeoValue, touched *entitySet
 	return nil
 }
 
-func (s *Store) addSims(id common.ValueID, values []SimValue, touched *entitySet) error {
+func (s *Store) addSims(id schema.ValueID, values []SimValue, touched *entitySet) error {
 	for _, v := range values {
 		if err := s.addSim(v, id, touched); err != nil {
 			return err
@@ -1087,7 +1087,7 @@ func (s *Store) addSims(id common.ValueID, values []SimValue, touched *entitySet
 // addSim writes one perceptual record. simhash assigns dense, 1-based record
 // IDs, so an existing id is updated and a new id must be exactly the next
 // dense ValueID; anything else is rejected rather than silently remapped.
-func (s *Store) addSim(v SimValue, id common.ValueID, touched *entitySet) error {
+func (s *Store) addSim(v SimValue, id schema.ValueID, touched *entitySet) error {
 	st, rt, err := s.simFor(v.Namespace)
 	if err != nil {
 		return err
@@ -1113,7 +1113,7 @@ func (s *Store) addSim(v SimValue, id common.ValueID, touched *entitySet) error 
 	return nil
 }
 
-func (s *Store) addHashes(id common.ValueID, values []HashValue, touched *entitySet) error {
+func (s *Store) addHashes(id schema.ValueID, values []HashValue, touched *entitySet) error {
 	for _, v := range values {
 		if err := s.addHash(v, id, touched); err != nil {
 			return err
@@ -1122,7 +1122,7 @@ func (s *Store) addHashes(id common.ValueID, values []HashValue, touched *entity
 	return nil
 }
 
-func (s *Store) addHash(v HashValue, id common.ValueID, touched *entitySet) error {
+func (s *Store) addHash(v HashValue, id schema.ValueID, touched *entitySet) error {
 	idx, rt, err := s.radixFor(v.Namespace)
 	if err != nil {
 		return err
@@ -1137,7 +1137,7 @@ func (s *Store) addHash(v HashValue, id common.ValueID, touched *entitySet) erro
 // removeHash deletes one (hash, id) association. radixhash supports targeted
 // per-association removal, so the old hash stops matching without a rebuild and
 // without relying on entity liveness.
-func (s *Store) removeHash(v HashValue, id common.ValueID, touched *entitySet) error {
+func (s *Store) removeHash(v HashValue, id schema.ValueID, touched *entitySet) error {
 	idx, rt, err := s.radixFor(v.Namespace)
 	if err != nil {
 		return err
@@ -1149,7 +1149,7 @@ func (s *Store) removeHash(v HashValue, id common.ValueID, touched *entitySet) e
 	return nil
 }
 
-func (s *Store) addVectors(id common.ValueID, values []VectorValue, touched *entitySet) error {
+func (s *Store) addVectors(id schema.ValueID, values []VectorValue, touched *entitySet) error {
 	for _, v := range values {
 		idx, rt, err := s.vectorFor(v.Namespace)
 		if err != nil {
@@ -1184,7 +1184,7 @@ func addVector(idx *vectoridx.VectorIdx, node vectoridx.NodeID, v VectorValue) e
 	}
 }
 
-func (s *Store) addBitmaps(id common.ValueID, values []BitmapValue, touched *entitySet) error {
+func (s *Store) addBitmaps(id schema.ValueID, values []BitmapValue, touched *entitySet) error {
 	for _, v := range values {
 		idx, rt, err := s.bitmapFor(v.Namespace)
 		if err != nil {
@@ -1203,7 +1203,7 @@ func (s *Store) addBitmaps(id common.ValueID, values []BitmapValue, touched *ent
 	return nil
 }
 
-func (s *Store) removeBitmap(v BitmapValue, id common.ValueID, touched *entitySet) error {
+func (s *Store) removeBitmap(v BitmapValue, id schema.ValueID, touched *entitySet) error {
 	idx, rt, err := s.bitmapFor(v.Namespace)
 	if err != nil {
 		return err
@@ -1233,7 +1233,7 @@ func applyBitmapBatch(idx *bitmapidx.Index, batch *bitmapidx.Batch) error {
 
 // ---- per-family remove ----
 
-func (s *Store) deleteTime(ns common.Namespace, id common.ValueID) error {
+func (s *Store) deleteTime(ns schema.Namespace, id schema.ValueID) error {
 	idx, _, err := s.timeFor(ns)
 	if err != nil {
 		return err
@@ -1241,7 +1241,7 @@ func (s *Store) deleteTime(ns common.Namespace, id common.ValueID) error {
 	return applyTimeMutation(idx, timeidx.Delete(id, 0))
 }
 
-func (s *Store) deleteGeo(ns common.Namespace, key geoidx.S2Key, id common.ValueID) error {
+func (s *Store) deleteGeo(ns schema.Namespace, key geoidx.S2Key, id schema.ValueID) error {
 	idx, _, err := s.geoFor(ns)
 	if err != nil {
 		return err
@@ -1249,7 +1249,7 @@ func (s *Store) deleteGeo(ns common.Namespace, key geoidx.S2Key, id common.Value
 	return idx.Delete(key, id)
 }
 
-func (s *Store) deleteVector(ns common.Namespace, id common.ValueID) error {
+func (s *Store) deleteVector(ns schema.Namespace, id schema.ValueID) error {
 	idx, _, err := s.vectorFor(ns)
 	if err != nil {
 		return err
@@ -1257,7 +1257,7 @@ func (s *Store) deleteVector(ns common.Namespace, id common.ValueID) error {
 	return deleteVectorIndex(idx, id)
 }
 
-func deleteVectorIndex(idx *vectoridx.VectorIdx, id common.ValueID) error {
+func deleteVectorIndex(idx *vectoridx.VectorIdx, id schema.ValueID) error {
 	if id > math.MaxUint32 {
 		return fmt.Errorf("%w: %d", ErrValueIDTooLarge, id)
 	}
@@ -1269,7 +1269,7 @@ func deleteVectorIndex(idx *vectoridx.VectorIdx, id common.ValueID) error {
 
 // ---- liveness ----
 
-func (s *Store) livenessAdd(entity common.EntityKind, id common.ValueID) error {
+func (s *Store) livenessAdd(entity schema.EntityKind, id schema.ValueID) error {
 	idx, value, ok := s.reg.liveness(entity)
 	if !ok {
 		return fmt.Errorf("%w: entity %d", ErrEntityMismatch, entity)
@@ -1277,7 +1277,7 @@ func (s *Store) livenessAdd(entity common.EntityKind, id common.ValueID) error {
 	return applyBitmapMutation(idx, true, id, value)
 }
 
-func (s *Store) clearLiveness(entity common.EntityKind, id common.ValueID) error {
+func (s *Store) clearLiveness(entity schema.EntityKind, id schema.ValueID) error {
 	idx, value, ok := s.reg.liveness(entity)
 	if !ok {
 		return fmt.Errorf("%w: entity %d", ErrEntityMismatch, entity)
@@ -1285,7 +1285,7 @@ func (s *Store) clearLiveness(entity common.EntityKind, id common.ValueID) error
 	return applyBitmapMutation(idx, false, id, value)
 }
 
-func applyBitmapMutation(idx *bitmapidx.Index, add bool, id common.ValueID, value bitmapidx.Value) error {
+func applyBitmapMutation(idx *bitmapidx.Index, add bool, id schema.ValueID, value bitmapidx.Value) error {
 	batch := idx.NewBatch()
 	var err error
 	if add {
@@ -1311,7 +1311,7 @@ func applyTimeMutation(idx *timeidx.Index, m timeidx.Mutation) error {
 
 // ---- routing helpers ----
 
-func (s *Store) timeFor(ns common.Namespace) (*timeidx.Index, route, error) {
+func (s *Store) timeFor(ns schema.Namespace) (*timeidx.Index, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
@@ -1326,7 +1326,7 @@ func (s *Store) timeFor(ns common.Namespace) (*timeidx.Index, route, error) {
 	return idx, rt, nil
 }
 
-func (s *Store) geoFor(ns common.Namespace) (*geoidx.Index, route, error) {
+func (s *Store) geoFor(ns schema.Namespace) (*geoidx.Index, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
@@ -1341,7 +1341,7 @@ func (s *Store) geoFor(ns common.Namespace) (*geoidx.Index, route, error) {
 	return idx, rt, nil
 }
 
-func (s *Store) simFor(ns common.Namespace) (*simhash.Store, route, error) {
+func (s *Store) simFor(ns schema.Namespace) (*simhash.Store, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
@@ -1356,7 +1356,7 @@ func (s *Store) simFor(ns common.Namespace) (*simhash.Store, route, error) {
 	return st, rt, nil
 }
 
-func (s *Store) radixFor(ns common.Namespace) (*radixhash.Index, route, error) {
+func (s *Store) radixFor(ns schema.Namespace) (*radixhash.Index, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
@@ -1371,7 +1371,7 @@ func (s *Store) radixFor(ns common.Namespace) (*radixhash.Index, route, error) {
 	return idx, rt, nil
 }
 
-func (s *Store) vectorFor(ns common.Namespace) (*vectoridx.VectorIdx, route, error) {
+func (s *Store) vectorFor(ns schema.Namespace) (*vectoridx.VectorIdx, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
@@ -1386,7 +1386,7 @@ func (s *Store) vectorFor(ns common.Namespace) (*vectoridx.VectorIdx, route, err
 	return idx, rt, nil
 }
 
-func (s *Store) bitmapFor(ns common.Namespace) (*bitmapidx.Index, route, error) {
+func (s *Store) bitmapFor(ns schema.Namespace) (*bitmapidx.Index, route, error) {
 	rt, ok := s.reg.lookup(ns)
 	if !ok {
 		return nil, route{}, fmt.Errorf("%w: %d", ErrNamespaceNotFound, ns)
@@ -1403,7 +1403,7 @@ func (s *Store) bitmapFor(ns common.Namespace) (*bitmapidx.Index, route, error) 
 
 // ---- value comparisons for set difference ----
 
-func hasTimeNS(values []TimeValue, ns common.Namespace) bool {
+func hasTimeNS(values []TimeValue, ns schema.Namespace) bool {
 	for _, v := range values {
 		if v.Namespace == ns {
 			return true
@@ -1412,7 +1412,7 @@ func hasTimeNS(values []TimeValue, ns common.Namespace) bool {
 	return false
 }
 
-func hasGeoNS(values []GeoValue, ns common.Namespace) bool {
+func hasGeoNS(values []GeoValue, ns schema.Namespace) bool {
 	for _, v := range values {
 		if v.Namespace == ns {
 			return true
@@ -1421,7 +1421,7 @@ func hasGeoNS(values []GeoValue, ns common.Namespace) bool {
 	return false
 }
 
-func hasVectorNS(values []VectorValue, ns common.Namespace) bool {
+func hasVectorNS(values []VectorValue, ns schema.Namespace) bool {
 	for _, v := range values {
 		if v.Namespace == ns {
 			return true

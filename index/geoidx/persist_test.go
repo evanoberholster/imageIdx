@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func validKeys(t *testing.T, n int) []S2Key {
@@ -30,10 +30,10 @@ func validKeys(t *testing.T, n int) []S2Key {
 
 func TestValidateBase(t *testing.T) {
 	keys := validKeys(t, 100)
-	ids := make([]common.ImageID, len(keys))
-	var max common.ImageID
+	ids := make([]schema.ImageID, len(keys))
+	var max schema.ImageID
 	for i := range ids {
-		ids[i] = common.ImageID(i + 1)
+		ids[i] = schema.ImageID(i + 1)
 		max = ids[i]
 	}
 	if err := validateBase(keys, ids, max); err != nil {
@@ -43,7 +43,7 @@ func TestValidateBase(t *testing.T) {
 		t.Fatalf("length mismatch = %v, want ErrCorrupt", err)
 	}
 
-	zeroID := append([]common.ImageID(nil), ids...)
+	zeroID := append([]schema.ImageID(nil), ids...)
 	zeroID[5] = 0
 	if err := validateBase(keys, zeroID, max); err != ErrCorrupt {
 		t.Fatalf("zero id = %v, want ErrCorrupt", err)
@@ -230,7 +230,7 @@ func TestSortIDsDifferential(t *testing.T) {
 	cases := []struct {
 		name  string
 		n     int
-		maxID common.ImageID
+		maxID schema.ImageID
 	}{
 		{"empty", 0, 1000},
 		{"single", 1, 1000},
@@ -242,14 +242,14 @@ func TestSortIDsDifferential(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ids := make([]common.ImageID, tc.n)
+			ids := make([]schema.ImageID, tc.n)
 			for i := range ids {
-				ids[i] = common.ImageID(uint64(rng.Int63n(int64(tc.maxID))) + 1)
+				ids[i] = schema.ImageID(uint64(rng.Int63n(int64(tc.maxID))) + 1)
 			}
-			want := append([]common.ImageID(nil), ids...)
+			want := append([]schema.ImageID(nil), ids...)
 			slices.Sort(want)
 			want = slices.Compact(want)
-			got := sortIDs(append([]common.ImageID(nil), ids...), tc.maxID)
+			got := sortIDs(append([]schema.ImageID(nil), ids...), tc.maxID)
 			if !slices.Equal(got, want) {
 				t.Fatalf("sortIDs: got %d ids, want %d", len(got), len(want))
 			}
@@ -260,20 +260,20 @@ func TestSortIDsDifferential(t *testing.T) {
 // TestSortSuffixPreservesPrefix verifies only the appended suffix is sorted and
 // that duplicates are removed without an extra allocation when already sorted.
 func TestSortSuffixPreservesPrefix(t *testing.T) {
-	dst := []common.ImageID{9, 9, 5, 3, 5, 1}
+	dst := []schema.ImageID{9, 9, 5, 3, 5, 1}
 	got := sortSuffix(dst, 2, 10)
-	want := []common.ImageID{9, 9, 1, 3, 5}
+	want := []schema.ImageID{9, 9, 1, 3, 5}
 	if !slices.Equal(got, want) {
 		t.Fatalf("sortSuffix = %v, want %v", got, want)
 	}
 	// Already-ordered suffix: dedup only, prefix untouched.
-	ordered := []common.ImageID{7, 7, 2, 2, 3, 3}
+	ordered := []schema.ImageID{7, 7, 2, 2, 3, 3}
 	got = sortSuffix(ordered, 2, 10)
-	if want := []common.ImageID{7, 7, 2, 3}; !slices.Equal(got, want) {
+	if want := []schema.ImageID{7, 7, 2, 3}; !slices.Equal(got, want) {
 		t.Fatalf("sorted suffix = %v, want %v", got, want)
 	}
 	// Empty suffix leaves dst unchanged.
-	empty := []common.ImageID{4, 4}
+	empty := []schema.ImageID{4, 4}
 	if got := sortSuffix(empty, 2, 10); !slices.Equal(got, empty) {
 		t.Fatalf("empty suffix = %v", got)
 	}
@@ -299,7 +299,7 @@ func TestPersistentSize(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		entries[i] = Entry{Key: key, ImageID: common.ImageID(i + 1)}
+		entries[i] = Entry{Key: key, ImageID: schema.ImageID(i + 1)}
 	}
 	if err := index.InsertBatch(entries); err != nil {
 		t.Fatal(err)

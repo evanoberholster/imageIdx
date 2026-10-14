@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestRebuildCrashChild(t *testing.T) {
@@ -39,7 +39,7 @@ func TestCrashDuringStartupRebuild(t *testing.T) {
 		t.Run(phase, func(t *testing.T) {
 			data, dir := paths(t)
 			db := openTest(t, data, dir)
-			g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Record: []byte("kept"), Projection: projection(1, 'x')})
+			g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Record: []byte("kept"), Projection: projection(1, 'x')})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -62,7 +62,7 @@ func TestCrashDuringStartupRebuild(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			if got, err := db.Get(common.EntityImage, 1); err != nil || string(got) != "kept" {
+			if got, err := db.Get(schema.EntityImage, 1); err != nil || string(got) != "kept" {
 				t.Fatalf("canonical: %q %v", got, err)
 			}
 			contains(t, db, 1, 'x', true)
@@ -76,7 +76,7 @@ func TestCrashDuringStartupRebuild(t *testing.T) {
 func TestCorruptActivationRecordDoesNotPublish(t *testing.T) {
 	data, dir := paths(t)
 	db := openTest(t, data, dir)
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
+	g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}

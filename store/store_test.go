@@ -6,7 +6,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestKeyEncoding(t *testing.T) {
@@ -36,7 +36,7 @@ func TestKeyEncoding(t *testing.T) {
 
 func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 	dir := t.TempDir()
-	specs := []Spec{{Namespace: 1, Name: "photos"}, {Namespace: common.Namespace(math.MaxUint16), Name: "last"}}
+	specs := []Spec{{Namespace: 1, Name: "photos"}, {Namespace: schema.Namespace(math.MaxUint16), Name: "last"}}
 	s, err := Open(dir, specs...)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 		{Namespace: 1, ID: 2, Flags: 1},
 		{Namespace: 1, ID: 1, Flags: 2},
 		{Namespace: 1, ID: 1, Flags: 1},
-		{Namespace: common.Namespace(math.MaxUint16), ID: 5, Flags: 0},
+		{Namespace: schema.Namespace(math.MaxUint16), ID: 5, Flags: 0},
 	}
 	for _, key := range keys {
 		if err := s.Set(key, []byte{byte(key.Flags)}); err != nil {
@@ -83,7 +83,7 @@ func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 		}
 	}
 	got = nil
-	if err := s.Scan(common.Namespace(math.MaxUint16), func(key Key, _ []byte) error {
+	if err := s.Scan(schema.Namespace(math.MaxUint16), func(key Key, _ []byte) error {
 		got = append(got, key)
 		return nil
 	}); err != nil || len(got) != 1 || got[0] != keys[3] {
@@ -112,7 +112,7 @@ func TestStoreRejectsDifferentSchema(t *testing.T) {
 	if _, err := Open(dir, Spec{Namespace: 1, Name: "videos"}); !errors.Is(err, ErrSchemaMismatch) {
 		t.Fatalf("mismatched schema: %v", err)
 	}
-	if _, err := Open(dir, Spec{Namespace: 0, Name: "invalid"}); !errors.Is(err, common.ErrNamespaceInvalid) {
+	if _, err := Open(dir, Spec{Namespace: 0, Name: "invalid"}); !errors.Is(err, schema.ErrNamespaceInvalid) {
 		t.Fatalf("invalid namespace: %v", err)
 	}
 }

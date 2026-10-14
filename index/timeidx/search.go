@@ -3,10 +3,10 @@ package timeidx
 import (
 	"sort"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
-type ExactTimestampFunc func(common.ValueID) (uint64, bool)
+type ExactTimestampFunc func(schema.ValueID) (uint64, bool)
 
 // rangeIndexes returns the half-open row span [lo, hi) whose timestamps fall in
 // [start, end). Both bounds skip their binary search when the shard cannot
@@ -35,18 +35,18 @@ func firstShardAtOrAfter(shards []*shard, start uint64) int {
 // Search appends exact [start,end) matches in (TimeKey, ValueID) order. All
 // shards come from one pinned snapshot. With sufficient dst capacity it does
 // not allocate. start>=end is empty; MaxUint64 as end excludes that key.
-func (i *Index) Search(dst []common.ValueID, start, end uint64) []common.ValueID {
+func (i *Index) Search(dst []schema.ValueID, start, end uint64) []schema.ValueID {
 	return i.search(dst, start, end, nil)
 }
 
 // SearchExact preserves the optional canonical-data filter for existing callers.
 // It is not needed to correct quantization in the new format. The caller owns
 // lookup consistency; it is not part of this index's snapshot transaction.
-func (i *Index) SearchExact(dst []common.ValueID, start, end uint64, lookup ExactTimestampFunc) []common.ValueID {
+func (i *Index) SearchExact(dst []schema.ValueID, start, end uint64, lookup ExactTimestampFunc) []schema.ValueID {
 	return i.search(dst, start, end, lookup)
 }
 
-func (i *Index) search(dst []common.ValueID, start, end uint64, lookup ExactTimestampFunc) []common.ValueID {
+func (i *Index) search(dst []schema.ValueID, start, end uint64, lookup ExactTimestampFunc) []schema.ValueID {
 	if start >= end {
 		return dst
 	}

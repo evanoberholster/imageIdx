@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 )
 
@@ -32,7 +32,7 @@ func TestConcurrentReadersWriter(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			timeIdx, _ := db.Time(1)
-			live, val, _ := db.Liveness(common.EntityImage)
+			live, val, _ := db.Liveness(schema.EntityImage)
 			for !stop.Load() {
 				_ = timeIdx.Search(nil, 0, 1000)
 				if live != nil {
@@ -47,7 +47,7 @@ func TestConcurrentReadersWriter(t *testing.T) {
 			t.Fatal(err)
 		}
 		if i%3 == 0 {
-			if err := db.Delete(common.EntityImage, id); err != nil {
+			if err := db.Delete(schema.EntityImage, id); err != nil {
 				t.Fatal(err)
 			}
 		}

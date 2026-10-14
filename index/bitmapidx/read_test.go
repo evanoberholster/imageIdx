@@ -3,18 +3,18 @@ package bitmapidx
 import (
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // TestCountValuesMatchesMaterialized checks that the single-key count fast
 // path (base + delta additions - removals) equals the materialized posting
 // cardinality across rotations, folds, and compaction.
 func TestCountValuesMatchesMaterialized(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
 	value := EnumStringValue("v")
 	other := EnumStringValue("other")
 	for step := 0; step < 600; step++ {
-		id := common.ImageID((step*7)%64 + 1)
+		id := schema.ImageID((step*7)%64 + 1)
 		switch {
 		case step%3 == 0:
 			commit(t, index, func(b *Batch) error {
@@ -42,7 +42,7 @@ func TestCountValuesMatchesMaterialized(t *testing.T) {
 		}
 	}
 	for n := 0; n < 40; n++ {
-		id := common.ImageID(n%32 + 1)
+		id := schema.ImageID(n%32 + 1)
 		if n%2 == 0 {
 			commit(t, index, func(b *Batch) error {
 				return b.Add(Entry{ImageID: id, Value: value})
@@ -69,16 +69,16 @@ func TestCountValuesMatchesMaterialized(t *testing.T) {
 // unmap here.
 func TestQueryResultsDetachedAcrossRetirement(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilityOS)
+	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(schema.NamespaceTag)}, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatalf("NewMemory: %v", err)
 	}
 	defer store.Close()
-	tag, _ := store.Lookup(common.NamespaceTag)
+	tag, _ := store.Lookup(schema.NamespaceTag)
 
 	for id := 1; id <= 128; id++ {
 		commit(t, tag, func(b *Batch) error {
-			return b.Add(Entry{ImageID: common.ImageID(id), Value: EnumStringValue("shared")})
+			return b.Add(Entry{ImageID: schema.ImageID(id), Value: EnumStringValue("shared")})
 		})
 	}
 	if err := store.Checkpoint(); err != nil {

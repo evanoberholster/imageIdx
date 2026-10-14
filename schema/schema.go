@@ -1,20 +1,15 @@
-// Package schema owns a standalone, single-file namespace directory and
-// crash-safe, per-namespace ValueID allocation. It does not store records.
+// Package schema owns namespace definitions and crash-safe per-entity ValueIDs.
 package schema
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"sync/atomic"
-	"unicode/utf8"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -25,20 +20,20 @@ const (
 	BackendMmap
 )
 
-type NamespaceConfig struct {
-	ID          common.Namespace
-	Name        string
+type EntityConfig struct {
+	Entity      EntityKind
 	ReserveSize uint64
 }
 
 type Options struct {
-	Backend    Backend
-	Namespaces []NamespaceConfig
-	fault      func(string) error // deterministic crash/failure injection in package tests
+	Backend     Backend
+	Definitions *Definitions
+	Entities    []EntityConfig
+	fault       func(string) error // deterministic crash/failure injection in package tests
 }
 
-type namespaceAllocator struct {
-	id     common.Namespace
+type entityAllocator struct {
+	id     Namespace
 	name   string
 	block  uint64
 	offset uint64
@@ -48,67 +43,78 @@ type namespaceAllocator struct {
 	record allocationRecord // guarded by mu; never read on the allocation fast path
 }
 
-// Schema holds a fixed sorted namespace directory. The backing file is locked
-// for the entire lifetime; allocate only through one Schema per file.
+// Schema owns immutable namespace definitions and entity-scoped allocation.
+// The backing file is locked for its entire lifetime.
 type Schema struct {
-	f         *os.File
-	lock      *os.File
-	mapped    *storage.MappedFile
-	backend   Backend
-	entries   []*namespaceAllocator
-	state     atomic.Uint64 // closing bit | admitted operations
-	poisoned  atomic.Bool
-	closeMu   sync.Mutex
-	closeCond *sync.Cond
-	closeOnce sync.Once
-	closeErr  error
-	fault     func(string) error
+	f               *os.File
+	lock            *os.File
+	mapped          *storage.MappedFile
+	backend         Backend
+	entries         []*entityAllocator
+	owners          [EntityKindCount + 1]*entityAllocator
+	definitions     *Definitions
+	definitionsData []byte
+	state           atomic.Uint64 // closing bit | admitted operations
+	poisoned        atomic.Bool
+	closeMu         sync.Mutex
+	closeCond       *sync.Cond
+	closeOnce       sync.Once
+	closeErr        error
+	fault           func(string) error
 }
 
 const closing uint64 = 1 << 63
 
-func configs(opts Options) ([]NamespaceConfig, error) {
+func configs(opts Options) ([]directoryEntry, *Definitions, []byte, error) {
 	if opts.Backend != BackendReadWrite && opts.Backend != BackendMmap {
-		return nil, fmt.Errorf("schema: invalid backend %d", opts.Backend)
+		return nil, nil, nil, fmt.Errorf("schema: invalid backend %d", opts.Backend)
 	}
-	if len(opts.Namespaces) == 0 || len(opts.Namespaces) > math.MaxUint16 {
-		return nil, ErrNamespace
+	if opts.Definitions == nil || opts.Definitions.Len() == 0 {
+		return nil, nil, nil, ErrNamespace
 	}
-	defs := append([]NamespaceConfig(nil), opts.Namespaces...)
-	slices.SortFunc(defs, func(a, b NamespaceConfig) int {
-		if a.ID < b.ID {
-			return -1
-		}
-		if a.ID > b.ID {
-			return 1
-		}
-		return 0
-	})
-	names := make(map[string]struct{}, len(defs)) // initialization only
-	for i := range defs {
-		d := &defs[i]
-		if !d.ID.Valid() || len(d.Name) == 0 || len(d.Name) > maxName || !utf8.ValidString(d.Name) {
-			return nil, ErrNamespace
-		}
-		if i != 0 && defs[i-1].ID == d.ID {
-			return nil, ErrNamespaceExists
-		}
-		if _, exists := names[d.Name]; exists {
-			return nil, ErrNamespaceExists
-		}
-		names[d.Name] = struct{}{}
-		if d.ReserveSize == 0 {
-			d.ReserveSize = defaultReserve
-		}
+	data, err := opts.Definitions.MarshalBinary()
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	return defs, nil
+	clone := NewDefinitions()
+	if err := clone.UnmarshalBinary(data); err != nil {
+		return nil, nil, nil, err
+	}
+	var used [EntityKindCount + 1]bool
+	var configured [EntityKindCount + 1]bool
+	var blocks [EntityKindCount + 1]uint64
+	for _, def := range clone.Defs() {
+		if !def.Entity.Valid() {
+			return nil, nil, nil, ErrNamespaceEntity
+		}
+		used[def.Entity] = true
+	}
+	for _, cfg := range opts.Entities {
+		if !cfg.Entity.Valid() || !used[cfg.Entity] || configured[cfg.Entity] {
+			return nil, nil, nil, ErrNamespaceEntity
+		}
+		configured[cfg.Entity] = true
+		blocks[cfg.Entity] = cfg.ReserveSize
+	}
+	entries := make([]directoryEntry, 0, EntityKindCount)
+	for e := EntityImage; e.Valid(); e++ {
+		if !used[e] {
+			continue
+		}
+		block := blocks[e]
+		if block == 0 {
+			block = defaultReserve
+		}
+		entries = append(entries, directoryEntry{id: Namespace(e), name: e.String(), reserve: block})
+	}
+	return entries, clone, data, nil
 }
 
 // Open opens path as the single allocation file (not a directory). Existing
-// IDs/names must match; new namespaces and reservation-size changes publish
-// a new checksummed directory while no Schema is exposed to callers.
+// definitions must match their stored prefix; new namespaces and reservation
+// sizes publish a new checksummed directory before returning to callers.
 func Open(path string, opts Options) (_ *Schema, err error) {
-	defs, err := configs(opts)
+	defs, definitions, definitionsData, err := configs(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +128,7 @@ func Open(path string, opts Options) (_ *Schema, err error) {
 		}
 		return nil, err
 	}
-	s := &Schema{lock: lock, backend: opts.Backend, fault: opts.fault}
+	s := &Schema{lock: lock, backend: opts.Backend, fault: opts.fault, definitions: definitions, definitionsData: definitionsData}
 	s.closeCond = sync.NewCond(&s.closeMu)
 	defer func() {
 		if err != nil {
@@ -165,20 +171,16 @@ func Open(path string, opts Options) (_ *Schema, err error) {
 	return s, nil
 }
 
-func (s *Schema) entry(ns common.Namespace) *namespaceAllocator {
-	lo, hi := 0, len(s.entries)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if s.entries[mid].id < ns {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
+func (s *Schema) entry(entity EntityKind) *entityAllocator {
+	if !entity.Valid() {
+		return nil
 	}
-	if lo < len(s.entries) && s.entries[lo].id == ns {
-		return s.entries[lo]
-	}
-	return nil
+	return s.owners[entity]
+}
+
+// Lookup returns a persisted namespace definition and its owning entity.
+func (s *Schema) Lookup(ns Namespace) (NamespaceDef, bool) {
+	return s.definitions.Lookup(ns)
 }
 
 func (s *Schema) admit() error {

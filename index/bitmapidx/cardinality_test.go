@@ -5,11 +5,11 @@ import (
 	"reflect"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestNamespaceCardinalityTracksLiveValues(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
 	a, b := EnumStringValue("a"), EnumStringValue("b")
 	if got := index.Cardinality(); got != 0 {
 		t.Fatal(got)
@@ -48,11 +48,11 @@ func TestNamespaceCardinalityTracksLiveValues(t *testing.T) {
 // touched by deltas. Repeated rotations exercise keys shared by Base, Frozen,
 // and Active, plus values introduced and removed before a fold.
 func TestNamespaceCardinalityAcrossRotations(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{ActiveTarget: 4, HardDeltaLimit: 32, MaxDeltaValues: 8})
 	rng := rand.New(rand.NewSource(17))
 	values := []Value{EnumStringValue("a"), EnumStringValue("b"), EnumStringValue("c"), EnumStringValue("d"), EnumStringValue("e")}
 	for step := range 300 {
-		entry := Entry{ImageID: common.ImageID(rng.Intn(12) + 1), Value: values[rng.Intn(len(values))]}
+		entry := Entry{ImageID: schema.ImageID(rng.Intn(12) + 1), Value: values[rng.Intn(len(values))]}
 		if rng.Intn(3) == 0 {
 			commit(t, index, func(bt *Batch) error { return bt.Remove(entry) })
 		} else {
@@ -79,20 +79,20 @@ func TestNamespaceCardinalityAcrossRotations(t *testing.T) {
 func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	namespaces := []NamespaceSpec{
-		enumNamespace(common.NamespaceTag),
-		boolNamespace(common.NamespaceFlag),
-		continuousNamespace(common.NamespaceRating),
-		textNamespace(common.NamespaceObject),
-		enumNamespace(common.NamespaceUserACL), // registered but empty
+		enumNamespace(schema.NamespaceTag),
+		boolNamespace(schema.NamespaceFlag),
+		continuousNamespace(schema.NamespaceRating),
+		textNamespace(schema.NamespaceObject),
+		enumNamespace(schema.NamespaceUserACL), // registered but empty
 	}
-	store, err := NewStore(dir, namespaces, NamespaceConfig{}, common.DurabilityOS)
+	store, err := NewStore(dir, namespaces, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tag, _ := store.Lookup(common.NamespaceTag)
-	flag, _ := store.Lookup(common.NamespaceFlag)
-	rating, _ := store.Lookup(common.NamespaceRating)
-	object, _ := store.Lookup(common.NamespaceObject)
+	tag, _ := store.Lookup(schema.NamespaceTag)
+	flag, _ := store.Lookup(schema.NamespaceFlag)
+	rating, _ := store.Lookup(schema.NamespaceRating)
+	object, _ := store.Lookup(schema.NamespaceObject)
 	for _, entry := range []Entry{
 		{ImageID: 1, Value: EnumStringValue("a")},
 		{ImageID: 1, Value: EnumStringValue("b")},
@@ -109,17 +109,17 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	commit(t, object, func(bt *Batch) error {
 		return bt.ReplaceText(TextReplacement{ImageID: 1, After: []string{"red blue"}}, TextReplacement{ImageID: 2, After: []string{"blue green"}})
 	})
-	want := map[common.Namespace]uint64{
-		common.NamespaceTag: 2, common.NamespaceFlag: 2, common.NamespaceRating: 2,
-		common.NamespaceObject: 3, common.NamespaceUserACL: 0,
+	want := map[schema.Namespace]uint64{
+		schema.NamespaceTag: 2, schema.NamespaceFlag: 2, schema.NamespaceRating: 2,
+		schema.NamespaceObject: 3, schema.NamespaceUserACL: 0,
 	}
 	if got := store.Cardinalities(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("before checkpoint: got %v, want %v", got, want)
 	}
-	if count, ok := store.Cardinality(common.NamespaceObject); !ok || count != 3 {
+	if count, ok := store.Cardinality(schema.NamespaceObject); !ok || count != 3 {
 		t.Fatalf("one type: %d, %v", count, ok)
 	}
-	if count, ok := store.Cardinality(common.Namespace(500)); ok || count != 0 {
+	if count, ok := store.Cardinality(schema.Namespace(500)); ok || count != 0 {
 		t.Fatalf("unregistered type: %d, %v", count, ok)
 	}
 	if err := store.Checkpoint(); err != nil {
@@ -128,7 +128,7 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+	reopened, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,11 +136,11 @@ func TestIndexCardinalitiesByTypeAndReopen(t *testing.T) {
 	if got := reopened.Cardinalities(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("after reopen: got %v, want %v", got, want)
 	}
-	object, _ = reopened.Lookup(common.NamespaceObject)
+	object, _ = reopened.Lookup(schema.NamespaceObject)
 	commit(t, object, func(bt *Batch) error {
 		return bt.ReplaceText(TextReplacement{ImageID: 2, Before: []string{"blue green"}, After: []string{"red blue"}})
 	})
-	want[common.NamespaceObject] = 2
+	want[schema.NamespaceObject] = 2
 	if got := reopened.Cardinalities(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("after replacement: got %v, want %v", got, want)
 	}

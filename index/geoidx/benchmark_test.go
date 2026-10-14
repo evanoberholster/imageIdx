@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 	"github.com/golang/geo/s2"
 )
@@ -753,7 +753,7 @@ func BenchmarkGeoCollectStrategy(b *testing.B) {
 					return true
 				})
 			})
-			buf = sortIDs(buf, common.ImageID(maxID))
+			buf = sortIDs(buf, schema.ImageID(maxID))
 			m.AddMany(buf)
 			_ = m.Cardinality()
 		}
@@ -915,9 +915,9 @@ func buildGeoBase(tb testing.TB, n int, spread float64) *Index {
 
 // flattenView concatenates a view's shards into one (keys, ids) pair. Benchmarks
 // that need a single flat SoA array use it outside their timed loop.
-func flattenView(v *view) ([]S2Key, []common.ImageID) {
+func flattenView(v *view) ([]S2Key, []schema.ImageID) {
 	keys := make([]S2Key, 0, v.entries)
-	ids := make([]common.ImageID, 0, v.entries)
+	ids := make([]schema.ImageID, 0, v.entries)
 	for _, s := range v.shards {
 		keys = append(keys, s.keys...)
 		ids = append(ids, s.ids...)
@@ -964,7 +964,7 @@ func (d pageDir) locate(keys []S2Key, key S2Key) int {
 	return base + sort.Search(end-base, func(i int) bool { return keys[base+i] >= key })
 }
 
-func pagedSearch(keys []S2Key, ids []common.ImageID, d pageDir, ranges []Range, dst []common.ImageID) []common.ImageID {
+func pagedSearch(keys []S2Key, ids []schema.ImageID, d pageDir, ranges []Range, dst []schema.ImageID) []schema.ImageID {
 	mark := len(dst)
 	for _, r := range ranges {
 		i := d.locate(keys, r.Start)
@@ -982,7 +982,7 @@ func pagedSearch(keys []S2Key, ids []common.ImageID, d pageDir, ranges []Range, 
 
 // flatSearch mirrors pagedSearch but binary-searches the whole key array, so the
 // only difference is the page directory.
-func flatSearch(keys []S2Key, ids []common.ImageID, ranges []Range, dst []common.ImageID) []common.ImageID {
+func flatSearch(keys []S2Key, ids []schema.ImageID, ranges []Range, dst []schema.ImageID) []schema.ImageID {
 	mark := len(dst)
 	for _, r := range ranges {
 		i := sort.Search(len(keys), func(k int) bool { return keys[k] >= r.Start })
@@ -1006,8 +1006,8 @@ func TestPageDirLocateMatchesFlat(t *testing.T) {
 	rng := rand.New(rand.NewSource(23))
 	const runs = 50
 	keys := make([]S2Key, 0, runs*8)
-	ids := make([]common.ImageID, 0, runs*8)
-	nextID := common.ImageID(1)
+	ids := make([]schema.ImageID, 0, runs*8)
+	nextID := schema.ImageID(1)
 	runKeys := make([]S2Key, 0, runs)
 	for r := 0; r < runs; r++ {
 		key := S2Key(1 + uint64(r)*2) // odd keys with an absent even key between runs
@@ -1058,28 +1058,28 @@ func BenchmarkPagedLookup(b *testing.B) {
 	multi := CoverCap(nil, geoNewCap(2000), CoverOptions{MaxCells: 16})
 
 	b.Run("flat/exact", func(b *testing.B) {
-		dst := make([]common.ImageID, 0, 256)
+		dst := make([]schema.ImageID, 0, 256)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			dst = index.SearchRanges(dst[:0], exact)
 		}
 	})
 	b.Run("flat/multi", func(b *testing.B) {
-		dst := make([]common.ImageID, 0, 4096)
+		dst := make([]schema.ImageID, 0, 4096)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			dst = index.SearchRanges(dst[:0], multi)
 		}
 	})
 	b.Run("flat-locate/exact", func(b *testing.B) {
-		dst := make([]common.ImageID, 0, 256)
+		dst := make([]schema.ImageID, 0, 256)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			dst = flatSearch(keys, ids, exact, dst[:0])
 		}
 	})
 	b.Run("flat-locate/multi", func(b *testing.B) {
-		dst := make([]common.ImageID, 0, 4096)
+		dst := make([]schema.ImageID, 0, 4096)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			dst = flatSearch(keys, ids, multi, dst[:0])
@@ -1088,14 +1088,14 @@ func BenchmarkPagedLookup(b *testing.B) {
 	for _, pr := range []int{256, 512, 1024, 2048} {
 		d := buildPageDir(keys, pr)
 		b.Run(fmt.Sprintf("paged/size=%d/exact", pr), func(b *testing.B) {
-			dst := make([]common.ImageID, 0, 256)
+			dst := make([]schema.ImageID, 0, 256)
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				dst = pagedSearch(keys, ids, d, exact, dst[:0])
 			}
 		})
 		b.Run(fmt.Sprintf("paged/size=%d/multi", pr), func(b *testing.B) {
-			dst := make([]common.ImageID, 0, 4096)
+			dst := make([]schema.ImageID, 0, 4096)
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				dst = pagedSearch(keys, ids, d, multi, dst[:0])
@@ -1184,14 +1184,14 @@ func BenchmarkRepeatedKeyCompaction(b *testing.B) {
 				b.Fatal(err)
 			}
 			baseKeys := make([]S2Key, n)
-			baseIDs := make([]common.ImageID, n)
+			baseIDs := make([]schema.ImageID, n)
 			for i := 0; i < n; i++ {
 				baseKeys[i] = keyA
-				baseIDs[i] = common.ImageID(i + 1)
+				baseIDs[i] = schema.ImageID(i + 1)
 			}
 			frozen := make([]mutation, 0, 2*n)
 			for i := 0; i < n; i++ {
-				id := common.ImageID(i + 1)
+				id := schema.ImageID(i + 1)
 				switch i % 3 {
 				case 0: // delete
 					frozen = append(frozen, mutation{id: id, key: keyA, add: false})
@@ -1200,7 +1200,7 @@ func BenchmarkRepeatedKeyCompaction(b *testing.B) {
 				}
 			}
 			for k := 0; k < n; k++ { // insert new images at keyA
-				frozen = append(frozen, mutation{id: common.ImageID(n + 1 + k), key: keyA, add: true})
+				frozen = append(frozen, mutation{id: schema.ImageID(n + 1 + k), key: keyA, add: true})
 			}
 			slices.SortFunc(frozen, compareMutationID)
 
@@ -1209,7 +1209,7 @@ func BenchmarkRepeatedKeyCompaction(b *testing.B) {
 				b.Fatal(err)
 			}
 			index := &Index{config: cfg}
-			one := &shard{keys: baseKeys, ids: baseIDs, maxID: common.ImageID(n)}
+			one := &shard{keys: baseKeys, ids: baseIDs, maxID: schema.ImageID(n)}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {

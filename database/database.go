@@ -12,14 +12,13 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
-const journalNS common.Namespace = 65533
-const metadataNS common.Namespace = 65534
+const journalNS schema.Namespace = 65533
+const metadataNS schema.Namespace = 65534
 
 var (
 	ErrRecoveryRequired = errors.New("database: index recovery required; journal retained")
@@ -95,15 +94,15 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 }
 
 func canonicalSpecs() []store.Spec {
-	specs := make([]store.Spec, 0, common.EntityKindCount+2)
-	for e := common.EntityImage; e <= common.EntityStack; e++ {
-		specs = append(specs, store.Spec{Namespace: common.Namespace(e), Name: "entity-" + e.String(), Entity: e})
+	specs := make([]store.Spec, 0, schema.EntityKindCount+2)
+	for e := schema.EntityImage; e <= schema.EntityStack; e++ {
+		specs = append(specs, store.Spec{Namespace: schema.Namespace(e), Name: "entity-" + e.String(), Entity: e})
 	}
 	specs = append(specs, store.Spec{Namespace: journalNS, Name: "mutation-journal"}, store.Spec{Namespace: metadataNS, Name: "database-generations"})
 	// Append new entity namespaces after the historical schema entries: the
 	// explicit additive schema upgrade checks their stable original prefix.
-	for e := common.EntityUser; e.Valid(); e++ {
-		specs = append(specs, store.Spec{Namespace: common.Namespace(e), Name: "entity-" + e.String(), Entity: e})
+	for e := schema.EntityUser; e.Valid(); e++ {
+		specs = append(specs, store.Spec{Namespace: schema.Namespace(e), Name: "entity-" + e.String(), Entity: e})
 	}
 	return specs
 }
@@ -228,8 +227,8 @@ func (db *DB) notify() { close(db.changed); db.changed = make(chan struct{}) }
 // representation of the *complete* index.Entry for this entity after a Put;
 // Delete ignores it. The caller owns Record and Projection until Commit returns.
 type Mutation struct {
-	Entity     common.EntityKind
-	ValueID    common.ValueID
+	Entity     schema.EntityKind
+	ValueID    schema.ValueID
 	Delete     bool
 	Record     []byte
 	Projection []byte
@@ -273,7 +272,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 				return 0, err
 			}
 		}
-		key := store.Key{Namespace: common.Namespace(m.Entity), ID: m.ValueID}
+		key := store.Key{Namespace: schema.Namespace(m.Entity), ID: m.ValueID}
 		prior, err := db.values.Get(key)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return 0, err
@@ -324,7 +323,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 	// Reconcile them before publishing canonical records, including deletions,
 	// so neither reopening nor future reservations can hand them out again.
 	for _, m := range mutations {
-		if err := db.ids.EnsureMinimum(common.Namespace(m.Entity), m.ValueID); err != nil {
+		if err := db.ids.EnsureMinimum(m.Entity, m.ValueID); err != nil {
 			return 0, err
 		}
 	}
@@ -352,7 +351,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 }
 
 // Get returns an owned copy of the authoritative record, without projection.
-func (db *DB) Get(entity common.EntityKind, id common.ValueID) ([]byte, error) {
+func (db *DB) Get(entity schema.EntityKind, id schema.ValueID) ([]byte, error) {
 	if !entity.Valid() || id == 0 {
 		return nil, ErrInvalidMutation
 	}
@@ -361,7 +360,7 @@ func (db *DB) Get(entity common.EntityKind, id common.ValueID) ([]byte, error) {
 	if db.closed {
 		return nil, ErrClosed
 	}
-	v, err := db.values.Get(store.Key{Namespace: common.Namespace(entity), ID: id})
+	v, err := db.values.Get(store.Key{Namespace: schema.Namespace(entity), ID: id})
 	if err != nil {
 		return nil, err
 	}
@@ -385,14 +384,14 @@ func (db *DB) Index() *index.Store        { return db.indexes }
 // NextID reserves a unique entity ID before its canonical record is committed.
 // Abandoned IDs are never recycled. Close rejects new calls and drains those
 // already admitted before closing the backing Pebble database.
-func (db *DB) NextID(entity common.EntityKind) (common.ValueID, error) {
+func (db *DB) NextID(entity schema.EntityKind) (schema.ValueID, error) {
 	if !entity.Valid() {
 		return 0, schema.ErrNamespace
 	}
 	if db.idsClosed.Load() {
 		return 0, schema.ErrClosed
 	}
-	return db.ids.NextID(common.Namespace(entity))
+	return db.ids.NextID(entity)
 }
 
 // WaitIndexed waits without polling or per-waiter goroutines. Permanent

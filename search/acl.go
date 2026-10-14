@@ -4,7 +4,7 @@ import (
 	"errors"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/roar"
 )
@@ -15,12 +15,12 @@ func compileACL(store *bitmapidx.Store, clause aclClause) (stage, error) {
 	if store == nil {
 		return stage{}, errACLStore
 	}
-	user, err := NewUserACL(common.UserID(clause.userID))
+	user, err := NewUserACL(schema.UserID(clause.userID))
 	if err != nil {
 		return stage{}, err
 	}
-	users, ok := store.Lookup(common.NamespaceUserACL)
-	if !ok || users.Spec().Kind != common.KindBitmapEnum {
+	users, ok := store.Lookup(schema.NamespaceUserACL)
+	if !ok || users.Spec().Kind != schema.KindBitmapEnum {
 		return stage{}, errACLStore
 	}
 	userQuery, err := users.Compile(user.Value())
@@ -30,13 +30,13 @@ func compileACL(store *bitmapidx.Store, clause aclClause) (stage, error) {
 	queries := make([]bitmapidx.Query, 0, 1+len(clause.groupIDs))
 	queries = append(queries, userQuery)
 	if len(clause.groupIDs) != 0 {
-		groups, ok := store.Lookup(common.NamespaceGroupACL)
-		if !ok || groups.Spec().Kind != common.KindBitmapEnum {
+		groups, ok := store.Lookup(schema.NamespaceGroupACL)
+		if !ok || groups.Spec().Kind != schema.KindBitmapEnum {
 			return stage{}, errACLStore
 		}
 		seen := make([]uint64, 0, len(clause.groupIDs))
 		for _, id := range clause.groupIDs {
-			group, err := NewGroupACL(common.GroupID(id))
+			group, err := NewGroupACL(schema.GroupID(id))
 			if err != nil {
 				return stage{}, err
 			}

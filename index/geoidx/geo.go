@@ -3,7 +3,7 @@ package geoidx
 import (
 	"cmp"
 	"errors"
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 	"math"
@@ -134,7 +134,7 @@ func DistanceBetween(lat1, lng1, lat2, lng2 float64) float64 {
 
 // CoordinateLookup returns the canonical coordinate for an ImageID. The
 // higher-level search ranker supplies it; geoidx stores no coordinates.
-type CoordinateLookup func(id common.ImageID) (latitude, longitude float64, ok bool)
+type CoordinateLookup func(id schema.ImageID) (latitude, longitude float64, ok bool)
 
 // keyDistanceMeters returns the great-circle distance from the center of key's
 // cell to target. Coordinates are not stored, so this is the finest distance the
@@ -147,7 +147,7 @@ func keyDistanceMeters(key S2Key, target s2.LatLng) float64 {
 // Entry is one stored image location.
 type Entry struct {
 	Key     S2Key
-	ImageID common.ImageID
+	ImageID schema.ImageID
 }
 
 // s1AngleFromMeters converts a surface distance in meters to a central angle.

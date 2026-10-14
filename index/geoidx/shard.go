@@ -4,7 +4,7 @@ import (
 	"sort"
 	"unsafe"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -19,12 +19,12 @@ const shardBytesPerRecord = 16
 // for a memory index they own their heap arrays.
 type shard struct {
 	keys   []S2Key
-	ids    []common.ImageID
+	ids    []schema.ImageID
 	offset uint64 // arena byte offset of the extent (persistent); 0 otherwise
 	length uint32 // extent length in bytes (persistent); 0 otherwise
 	gen    uint64
-	minID  common.ImageID
-	maxID  common.ImageID
+	minID  schema.ImageID
+	maxID  schema.ImageID
 	// keyCRC and idCRC cache the extent checksums so the directory can be
 	// re-encoded on compaction without re-hashing unchanged shards.
 	keyCRC uint32
@@ -57,10 +57,10 @@ func checksumKeys(s *shard) uint32 { return storage.Checksum(typedBytes(s.keys))
 func checksumIDs(s *shard) uint32 { return storage.Checksum(typedBytes(s.ids)) }
 
 // firstPair returns the shard's first (key, id). The shard must be non-empty.
-func (s *shard) firstPair() (S2Key, common.ImageID) { return s.keys[0], s.ids[0] }
+func (s *shard) firstPair() (S2Key, schema.ImageID) { return s.keys[0], s.ids[0] }
 
 // lastPair returns the shard's last (key, id). The shard must be non-empty.
-func (s *shard) lastPair() (S2Key, common.ImageID) {
+func (s *shard) lastPair() (S2Key, schema.ImageID) {
 	n := len(s.keys) - 1
 	return s.keys[n], s.ids[n]
 }
@@ -68,7 +68,7 @@ func (s *shard) lastPair() (S2Key, common.ImageID) {
 // keyIDLess orders two (S2Key, ImageID) pairs. Shards and inserts share this
 // composite order, so a repeated S2Key is split across shards by ImageID rather
 // than by key alone.
-func keyIDLess(aKey S2Key, aID common.ImageID, bKey S2Key, bID common.ImageID) bool {
+func keyIDLess(aKey S2Key, aID schema.ImageID, bKey S2Key, bID schema.ImageID) bool {
 	if aKey != bKey {
 		return aKey < bKey
 	}
@@ -79,7 +79,7 @@ func keyIDLess(aKey S2Key, aID common.ImageID, bKey S2Key, bID common.ImageID) b
 // shard whose first pair is <= (key, id), clamped to the edges so an insertion
 // before the first or after the last shard extends that edge shard. It returns
 // -1 for an empty directory.
-func shardFor(shards []*shard, key S2Key, id common.ImageID) int {
+func shardFor(shards []*shard, key S2Key, id schema.ImageID) int {
 	if len(shards) == 0 {
 		return -1
 	}
@@ -162,7 +162,7 @@ func splitBounds(n, targetRecords int) [][2]int {
 
 // validateShardOrder checks that a shard is internally sorted by (key, id) and
 // free of reserved zero IDs, returning false when it is malformed.
-func validateShardOrder(keys []S2Key, ids []common.ImageID) bool {
+func validateShardOrder(keys []S2Key, ids []schema.ImageID) bool {
 	if len(keys) != len(ids) {
 		return false
 	}
@@ -187,7 +187,7 @@ func validateShardOrder(keys []S2Key, ids []common.ImageID) bool {
 // non-overlapping in global (key, id) order.
 func validateDirectory(shards []*shard) bool {
 	var prevKey S2Key
-	var prevID common.ImageID
+	var prevID schema.ImageID
 	for i, s := range shards {
 		if s.count() == 0 {
 			return false

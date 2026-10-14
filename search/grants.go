@@ -3,7 +3,7 @@ package search
 import (
 	"errors"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
@@ -14,24 +14,24 @@ var ErrInvalidACLField = errors.New("search: invalid ACL namespace")
 // UserGrants manages direct image grants for the NamespaceUserACL namespace:
 // one posting per user holding the ImageIDs that user may see. Construct
 // with NewUserGrants; the zero value is unusable.
-type UserGrants = grantNamespace[common.UserID]
+type UserGrants = grantNamespace[schema.UserID]
 
 // NewUserGrants binds the store's user ACL namespace. It rejects a nil index
 // and any namespace that is not the dedicated KindBitmapEnum user namespace.
 func NewUserGrants(index *bitmapidx.Index) (UserGrants, error) {
-	return newGrantNamespace[common.UserID](index, common.NamespaceUserACL)
+	return newGrantNamespace[schema.UserID](index, schema.NamespaceUserACL)
 }
 
 // GroupGrants manages image grants for the NamespaceGroupACL namespace: one
 // posting per group holding the ImageIDs visible to its members. It also
 // serves grant audits via the underlying namespace's ValueIDs. Construct with
 // NewGroupGrants; the zero value is unusable.
-type GroupGrants = grantNamespace[common.GroupID]
+type GroupGrants = grantNamespace[schema.GroupID]
 
 // NewGroupGrants binds the store's group ACL namespace. It rejects a nil index
 // and any namespace that is not the dedicated KindBitmapEnum group namespace.
 func NewGroupGrants(index *bitmapidx.Index) (GroupGrants, error) {
-	return newGrantNamespace[common.GroupID](index, common.NamespaceGroupACL)
+	return newGrantNamespace[schema.GroupID](index, schema.NamespaceGroupACL)
 }
 
 // grantNamespace is the shared implementation behind UserGrants and
@@ -44,12 +44,12 @@ type grantNamespace[T ~uint64] struct {
 }
 
 // newGrantNamespace validates index against the dedicated ACL namespace.
-func newGrantNamespace[T ~uint64](index *bitmapidx.Index, namespace common.Namespace) (grantNamespace[T], error) {
+func newGrantNamespace[T ~uint64](index *bitmapidx.Index, namespace schema.Namespace) (grantNamespace[T], error) {
 	if index == nil {
 		return grantNamespace[T]{}, ErrInvalidACLField
 	}
 	def := index.Spec()
-	if def.Namespace != namespace || def.Kind != common.KindBitmapEnum {
+	if def.Namespace != namespace || def.Kind != schema.KindBitmapEnum {
 		return grantNamespace[T]{}, ErrInvalidACLField
 	}
 	return grantNamespace[T]{index: index}, nil
@@ -60,7 +60,7 @@ func newGrantNamespace[T ~uint64](index *bitmapidx.Index, namespace common.Names
 // helper below since staging and Apply complete synchronously in the call.
 func principalValue(id uint64, key *[8]byte) bitmapidx.Value {
 	*key = principalKey(id)
-	return bitmapidx.Value{Kind: common.KindBitmapEnum, Bytes: key[:]}
+	return bitmapidx.Value{Kind: schema.KindBitmapEnum, Bytes: key[:]}
 }
 
 // Add grants each image to id in one atomic batch. Unknown images are

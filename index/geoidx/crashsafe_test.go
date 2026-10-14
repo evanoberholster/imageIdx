@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // growthConfig returns a config whose fixed arena is too small for the data used
@@ -25,7 +25,7 @@ func growthConfig() Config {
 func withNewIDs(entries []Entry, base uint64) []Entry {
 	out := make([]Entry, len(entries))
 	for i, e := range entries {
-		out[i] = Entry{Key: e.Key, ImageID: common.ImageID(base + uint64(i))}
+		out[i] = Entry{Key: e.Key, ImageID: schema.ImageID(base + uint64(i))}
 	}
 	return out
 }

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -132,7 +132,7 @@ func TestIndependentNamespaceSourceGenerations(t *testing.T) {
 
 func TestMixedInitializationStates(t *testing.T) {
 	dir := t.TempDir()
-	for _, ns := range []common.Namespace{1, 3, 4} {
+	for _, ns := range []schema.Namespace{1, 3, 4} {
 		i, err := NewStore(dir, Spec{Namespace: ns}, Config{}, DurabilitySync)
 		if err != nil {
 			t.Fatal(err)
