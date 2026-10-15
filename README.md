@@ -457,4 +457,18 @@ go test -race ./...
 See [`index/README.md`](index/README.md) for crash/recovery details,
 [`search/README.md`](search/README.md) for planning/ranking examples, and
 [`AGENTS/README.md`](AGENTS/README.md) for current agent guidance versus
-historical design notes.
+historical design notes. The `schema.dat` persistent-format contract lives in
+[`schema/FORMAT.md`](schema/FORMAT.md).
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on Linux and macOS: `go build ./...`,
+`go vet ./...`, `go test ./...`, a full `go test -race ./...` job, a schema
+recovery/golden-fixture job, a database migration crash job, and an
+informational allocator benchmark job. The allocator fast path must stay at
+`0 B/op, 0 allocs/op`.
+
+Supported/tested platforms are Linux and macOS (both schema backends use
+`flock`-based locking). Windows is **not supported**: the crash-recovery and
+file-locking suites assume POSIX semantics, so `schema`/`database` mutating
+storage is documented as unavailable there.

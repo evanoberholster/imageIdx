@@ -143,9 +143,41 @@ func (s *Store) ValidateLegacyDefinitions(expected *schematypes.Definitions) err
 		return err
 	}
 	if !matches {
-		return ErrSchemaMismatch
+		return mismatchDetail(value, data)
 	}
 	return nil
+}
+
+// mismatchDetail names the first namespace whose persisted and requested
+// definitions disagree. It is errors.Is-compatible with ErrSchemaMismatch and
+// falls back to the bare sentinel when either blob cannot be decoded.
+func mismatchDetail(persisted, requested []byte) error {
+	var old, desired schematypes.Definitions
+	if old.UnmarshalBinary(persisted) != nil || desired.UnmarshalBinary(requested) != nil {
+		return ErrSchemaMismatch
+	}
+	before, after := old.Defs(), desired.Defs()
+	for i := 0; i < len(before) && i < len(after); i++ {
+		a, b := before[i], after[i]
+		if a.Namespace != b.Namespace {
+			return fmt.Errorf("%w: namespace %d persisted as %d", ErrSchemaMismatch, a.Namespace, b.Namespace)
+		}
+		if a.Name != b.Name {
+			return fmt.Errorf("%w: namespace %d name %q requested as %q", ErrSchemaMismatch, a.Namespace, a.Name, b.Name)
+		}
+		if a.Kind != b.Kind {
+			return fmt.Errorf("%w: namespace %d kind %s requested as %s", ErrSchemaMismatch, a.Namespace, a.Kind, b.Kind)
+		}
+		ownerUpgrade := a.Entity == schematypes.EntityInvalid && b.Entity.Valid() &&
+			b.Entity == schematypes.EntityKind(b.Namespace) && b.Name == "entity-"+b.Entity.String()
+		if a.Entity != b.Entity && !ownerUpgrade {
+			return fmt.Errorf("%w: namespace %d entity %s requested as %s", ErrSchemaMismatch, a.Namespace, a.Entity, b.Entity)
+		}
+		if !bytes.Equal(a.Config, b.Config) {
+			return fmt.Errorf("%w: namespace %d configuration differs", ErrSchemaMismatch, a.Namespace)
+		}
+	}
+	return fmt.Errorf("%w: persisted %d namespaces, requested %d", ErrSchemaMismatch, len(before), len(after))
 }
 
 // RemoveLegacyDefinitions retires the old registry only after the caller has
@@ -194,7 +226,7 @@ func verifySchema(db *pebble.DB, expected []byte, extend bool) error {
 			return err
 		}
 		if !matches && !canExtend {
-			return ErrSchemaMismatch
+			return mismatchDetail(value, expected)
 		}
 		if canExtend {
 			return db.Set(schemaKey[:], expected, pebble.Sync)

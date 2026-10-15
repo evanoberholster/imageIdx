@@ -61,23 +61,23 @@ func (s *Definitions) Register(def NamespaceDef) error {
 		return ErrNamespaceInvalid
 	}
 	if def.Name == "" || !utf8.ValidString(def.Name) || len(def.Name) > math.MaxUint16 {
-		return ErrNamespaceName
+		return fmt.Errorf("%w: namespace %d name %q", ErrNamespaceName, def.Namespace, def.Name)
 	}
 	if !def.Kind.Valid() {
-		return ErrNamespaceKind
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceKind, def.Namespace)
 	}
 	if def.Entity != EntityInvalid && !def.Entity.Valid() {
-		return ErrNamespaceEntity
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceEntity, def.Namespace)
 	}
 	if s.byID == nil {
 		s.byID = make(map[Namespace]int)
 		s.byName = make(map[string]int)
 	}
 	if _, ok := s.byID[def.Namespace]; ok {
-		return fmt.Errorf("%w: %d", ErrNamespaceDuplicate, def.Namespace)
+		return fmt.Errorf("%w: namespace %d name %q", ErrNamespaceDuplicate, def.Namespace, def.Name)
 	}
-	if _, ok := s.byName[def.Name]; ok {
-		return fmt.Errorf("%w: %q", ErrNamespaceName, def.Name)
+	if prior, ok := s.byName[def.Name]; ok {
+		return fmt.Errorf("%w: namespace %d name %q already used by namespace %d", ErrNamespaceName, def.Namespace, def.Name, s.defs[prior].Namespace)
 	}
 	def.Config = append([]byte(nil), def.Config...)
 	s.byID[def.Namespace] = len(s.defs)

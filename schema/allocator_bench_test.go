@@ -196,3 +196,48 @@ func BenchmarkOpenAndCleanClose(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkLookupIdentity(b *testing.B) {
+	for _, n := range []int{8, 64, 256} {
+		b.Run(fmt.Sprintf("namespaces=%d", n), func(b *testing.B) {
+			s, err := Open(filepath.Join(b.TempDir(), "schema.dat"), benchOptions(BackendReadWrite, n, 1<<32))
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { b.StopTimer(); _ = s.Close() }()
+			if _, ok := s.LookupIdentity(Namespace(n)); !ok {
+				b.Fatal("namespace missing")
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, ok := s.LookupIdentity(Namespace(n)); !ok {
+					b.Fatal("namespace missing")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkOpenExisting(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "schema.dat")
+	opts := benchOptions(BackendReadWrite, 16, 1024)
+	s, err := Open(path, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := Open(path, Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

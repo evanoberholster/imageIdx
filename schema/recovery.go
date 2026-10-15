@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 
 	"github.com/evanoberholster/imageIdx/internal/storage"
@@ -258,12 +259,12 @@ func (s *Schema) recover(defs []directoryEntry, prepare bool) error {
 	} else {
 		prior, desired := stored.Defs(), s.definitions.Defs()
 		if len(prior) > len(desired) {
-			return ErrNamespace
+			return fmt.Errorf("%w: requested %d namespaces, persisted %d", ErrNamespace, len(desired), len(prior))
 		}
 		for i, p := range prior {
 			d := desired[i]
 			if p.Namespace != d.Namespace || p.Name != d.Name || p.Kind != d.Kind || p.Entity != d.Entity || !bytes.Equal(p.Config, d.Config) {
-				return ErrNamespace
+				return defMismatch(p, d)
 			}
 		}
 	}

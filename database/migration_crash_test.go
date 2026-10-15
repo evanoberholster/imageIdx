@@ -187,3 +187,68 @@ func TestLegacySchemaCleanupCrashBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestAllocatorHighWaterAcrossInterruptedActivation(t *testing.T) {
+	entities := []schema.EntityKind{schema.EntityImage, schema.EntityFace, schema.EntityPerson}
+	for _, phase := range []string{"before schema index initialization", "after schema activation"} {
+		t.Run(phase, func(t *testing.T) {
+			data, indexDir := paths(t)
+			db := openTest(t, data, indexDir)
+			last := map[schema.EntityKind]schema.ValueID{}
+			for _, e := range entities {
+				for i := 0; i < int(e)+2; i++ {
+					id, err := db.NextID(e)
+					if err != nil {
+						t.Fatal(err)
+					}
+					last[e] = id
+				}
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			crashSchemaOpen(t, filepath.Dir(data), phase, true)
+			db, err := Open(data, indexDir, decodeTest, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if db.ids.PreparedDefinitions() != nil {
+				t.Fatal("interrupted activation did not complete")
+			}
+			// An unclean allocator checkpoint skips the unused tail of a
+			// reserved block, so only monotonicity and non-reuse are promised.
+			for _, e := range entities {
+				id, err := db.NextID(e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if id <= last[e] {
+					t.Fatalf("%s reused acknowledged ID: got %d, last issued %d", e, id, last[e])
+				}
+				last[e] = id
+			}
+			// A further additive restart must not rewind any entity.
+			target := db.ids.Definitions()
+			if err := target.Register(schema.NamespaceDef{Namespace: 640, Name: "recovery-kv", Kind: schema.KindKV, Entity: schema.EntityImage}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err = Open(data, indexDir, decodeTest, Options{Definitions: target})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			for _, e := range entities {
+				id, err := db.NextID(e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if id <= last[e] {
+					t.Fatalf("%s rewound across additive restart: got %d, previous %d", e, id, last[e])
+				}
+			}
+		})
+	}
+}

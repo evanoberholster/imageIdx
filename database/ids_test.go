@@ -925,3 +925,29 @@ func TestResumeInterruptedAdditionWithoutDefinitions(t *testing.T) {
 		t.Fatalf("allocator high-water regressed: %d %v", id, err)
 	}
 }
+
+func TestFailedStartupReleasesOwnership(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	active := db.ids.Definitions()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A non-additive request fails during startup.
+	short := schema.NewDefinitions()
+	defs := active.Defs()
+	if err := short.RegisterAll(defs[:len(defs)-1]...); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := Open(data, idx, decodeTest, Options{Definitions: short}); err == nil {
+		_ = opened.Close()
+		t.Fatal("accepted non-additive schema")
+	}
+	// Ownership must be released so the next opener succeeds.
+	db = openTest(t, data, idx)
+	defer db.Close()
+	if opened, err := Open(data, idx, decodeTest, Options{}); err == nil {
+		_ = opened.Close()
+		t.Fatal("second concurrent owner was allowed")
+	}
+}

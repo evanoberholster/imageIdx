@@ -697,3 +697,100 @@ func TestStandaloneAdditionPreservesExistingIdentity(t *testing.T) {
 		t.Fatalf("allocation high-water regressed: %d %v", id, err)
 	}
 }
+
+func TestFailedOpenReleasesLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.dat")
+	s, err := Open(path, testOptions(BackendReadWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A mismatched requested schema fails after acquiring the lock.
+	bad := testOptions(BackendReadWrite)
+	bad.Definitions = NewDefinitions()
+	if err := bad.Definitions.RegisterAll(
+		NamespaceDef{Namespace: NamespaceTag, Name: "renamed", Kind: KindKV, Entity: EntityImage},
+		NamespaceDef{Namespace: NamespacePerson, Name: "Person", Kind: KindKV, Entity: EntityPerson},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, bad); !errors.Is(err, ErrNamespace) {
+		t.Fatalf("expected namespace mismatch, got %v", err)
+	}
+	// The lock must be released so a correct opener still succeeds.
+	good, err := Open(path, Options{})
+	if err != nil {
+		t.Fatalf("lock leaked after failed open: %v", err)
+	}
+	if err := good.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMixedAllocatorAndPreparedCrashRecovery(t *testing.T) {
+	for _, point := range []string{"after directory sync", "after superblock sync"} {
+		t.Run(point, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "schema.dat")
+			s, err := Open(path, testOptions(BackendReadWrite))
+			if err != nil {
+				t.Fatal(err)
+			}
+			entities := []EntityKind{EntityImage, EntityPerson}
+			last := map[EntityKind]ValueID{}
+			for i, e := range entities {
+				count := uint64(i + 2)
+				start, err := s.NextIDs(e, count)
+				if err != nil {
+					t.Fatal(err)
+				}
+				last[e] = start + count - 1
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			opts := testOptions(BackendReadWrite)
+			if err := opts.Definitions.Register(NamespaceDef{Namespace: 400, Name: "extra", Kind: KindKV, Entity: EntityImage}); err != nil {
+				t.Fatal(err)
+			}
+			opts.Prepare = true
+			opts.fault = func(stage string) error {
+				if stage == point {
+					return ErrCorrupt
+				}
+				return nil
+			}
+			if opened, err := Open(path, opts); err == nil {
+				_ = opened.Close()
+				t.Fatal("injection did not fire")
+			}
+			// Recovery: activate the durable target, then confirm every entity
+			// continues above its last acknowledged ID.
+			s, err = Open(path, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if point == "after superblock sync" {
+				if s.PreparedDefinitions() == nil {
+					t.Fatal("durable prepared target lost")
+				}
+				if err := s.Activate(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, e := range entities {
+				id, err := s.NextID(e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if id <= last[e] {
+					t.Fatalf("%s reused acknowledged ID: %d <= %d", e, id, last[e])
+				}
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

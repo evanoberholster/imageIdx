@@ -1,4 +1,10 @@
-# schema: definitions and entity IDs (file format v3)
+# schema: definitions and entity IDs (schema.dat v3, V1 baseline)
+
+The persistent-format compatibility contract, the supported version matrix, the
+unsupported development formats, and the golden fixtures are documented in
+[`FORMAT.md`](FORMAT.md). `schema.dat` v3 is the proposed V1 baseline; v2 is read
+as ACTIVE and upgraded on the next directory publication; container v1 and
+allocator format v1 are rejected with `ErrVersion`.
 
 `schema.Definitions` registers namespaces, their collection kinds, and owning
 entities. `schema.Schema` owns the persistent, immutable snapshot and allocates
@@ -65,3 +71,28 @@ The canonical KV namespace is an explicit entity-to-namespace relationship;
 its number need not equal the entity ordinal. Historical assignments retain
 their original numbers. Database namespace additions use a coordinated startup
 migration; mismatched legacy copies fail closed until retired.
+
+## Exported API
+
+Normal operation:
+
+- `Open(path, Options)` opens or creates the file; `Options{Definitions, Entities, Prepare, Backend}`.
+- `NextID`, `NextIDs`, `EnsureMinimum` allocate and reconcile entity IDs.
+- `Definitions`, `Lookup`, `LookupIdentity`, `Len` read the immutable active
+  model. `LookupIdentity` omits `Config` and allocates nothing.
+- `Close` checkpoints and releases the lock; a second call is a no-op.
+
+Migration/startup only (documented as such on each method): `PreparedDefinitions`,
+`Generation`, `ReservationSize`, `Activate`, `LegacyRetired`, `MarkLegacyRetired`.
+
+There is deliberately no runtime `RegisterNamespace`. `Definitions.Register` is
+for building configuration before `Open`; once opened, the active model is
+immutable and no method mutates it. `Activate` and `MarkLegacyRetired` are the
+only post-open writers, and only during startup coordination.
+
+Definition blobs, names, kinds, and entity ownership are validated by
+`Definitions.Register` and `UnmarshalBinary`. Errors are `errors.Is`-compatible
+sentinels: `ErrNamespace`, `ErrNamespaceDuplicate`, `ErrNamespaceName`,
+`ErrNamespaceInvalid`, `ErrNamespaceKind`, `ErrNamespaceEntity`, `ErrVersion`,
+`ErrCorrupt`, `ErrCorruptSchema`, `ErrExhausted`, `ErrLocked`, `ErrClosed`, and
+`ErrCount`; messages include the offending namespace number.

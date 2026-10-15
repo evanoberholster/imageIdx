@@ -16,18 +16,26 @@ import (
 func validateAddition(active, target *schema.Definitions) error {
 	before, after := active.Defs(), target.Defs()
 	if len(after) <= len(before) {
-		return schema.ErrNamespace
+		return fmt.Errorf("%w: requested %d namespaces, active %d (additions are required)", schema.ErrNamespace, len(after), len(before))
 	}
 	for i, old := range before {
 		new := after[i]
-		if old.Namespace != new.Namespace || old.Name != new.Name || old.Entity != new.Entity ||
-			old.Kind != new.Kind || !bytes.Equal(old.Config, new.Config) {
-			return schema.ErrNamespace
+		switch {
+		case old.Namespace != new.Namespace:
+			return fmt.Errorf("%w: namespace %d requested as %d", schema.ErrNamespace, old.Namespace, new.Namespace)
+		case old.Name != new.Name:
+			return fmt.Errorf("%w: namespace %d renamed %q to %q", schema.ErrNamespace, old.Namespace, old.Name, new.Name)
+		case old.Kind != new.Kind:
+			return fmt.Errorf("%w: namespace %d kind changed %s to %s", schema.ErrNamespace, old.Namespace, old.Kind, new.Kind)
+		case old.Entity != new.Entity:
+			return fmt.Errorf("%w: namespace %d entity changed %s to %s", schema.ErrNamespace, old.Namespace, old.Entity, new.Entity)
+		case !bytes.Equal(old.Config, new.Config):
+			return fmt.Errorf("%w: namespace %d configuration changed", schema.ErrNamespace, old.Namespace)
 		}
 	}
 	for _, def := range after[len(before):] {
 		if def.Namespace == journalNS || def.Namespace == metadataNS || def.Namespace == 0xFFF0 {
-			return schema.ErrNamespace
+			return fmt.Errorf("%w: namespace %d is reserved", schema.ErrNamespace, def.Namespace)
 		}
 	}
 	return index.ValidateDefinitions(target)

@@ -210,4 +210,22 @@ func formatErr(ns Namespace, err error) error {
 	return fmt.Errorf("schema: namespace %d: %w", ns, err)
 }
 
+// defMismatch describes how a requested definition differs from the persisted
+// one. It never exposes mutable state and is errors.Is-compatible with
+// ErrNamespace.
+func defMismatch(persisted, requested NamespaceDef) error {
+	switch {
+	case persisted.Namespace != requested.Namespace:
+		return fmt.Errorf("%w: namespace %d was %d", ErrNamespace, persisted.Namespace, requested.Namespace)
+	case persisted.Name != requested.Name:
+		return fmt.Errorf("%w: namespace %d name %q was %q", ErrNamespace, persisted.Namespace, requested.Name, persisted.Name)
+	case persisted.Kind != requested.Kind:
+		return fmt.Errorf("%w: namespace %d kind %s was %s", ErrNamespace, persisted.Namespace, requested.Kind, persisted.Kind)
+	case persisted.Entity != requested.Entity:
+		return fmt.Errorf("%w: namespace %d entity %s was %s", ErrNamespace, persisted.Namespace, requested.Entity, persisted.Entity)
+	default:
+		return fmt.Errorf("%w: namespace %d configuration changed", ErrNamespace, persisted.Namespace)
+	}
+}
+
 func unsupportedVersion(err error) bool { return errors.Is(err, ErrVersion) }

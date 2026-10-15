@@ -203,12 +203,23 @@ func (s *Schema) entry(entity EntityKind) *entityAllocator {
 	return s.owners[entity]
 }
 
-// Lookup returns a persisted namespace definition and its owning entity.
+// Lookup returns a persisted namespace definition and its owning entity. The
+// returned Config is an owned copy; use LookupIdentity on hot paths.
 func (s *Schema) Lookup(ns Namespace) (NamespaceDef, bool) {
 	if s.prepared {
 		return s.activeDefinitions.Lookup(ns)
 	}
 	return s.definitions.Lookup(ns)
+}
+
+// LookupIdentity returns immutable scalar metadata for a namespace without
+// copying Config, so it allocates nothing. It reports the active definitions,
+// never a prepared target.
+func (s *Schema) LookupIdentity(ns Namespace) (NamespaceDef, bool) {
+	if s.prepared {
+		return s.activeDefinitions.LookupIdentity(ns)
+	}
+	return s.definitions.LookupIdentity(ns)
 }
 
 // Definitions returns an independent copy of the persisted namespace model.

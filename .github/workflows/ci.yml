@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -count=1 ./...
+
+  race:
+    name: race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -count=1 -race ./...
+
+  schema-recovery:
+    name: schema recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Golden persistent fixtures plus allocator/activation crash injection.
+      - name: golden and recovery fixtures
+        run: go test -count=1 ./schema -run 'TestGolden|TestPrepared|TestActivation|TestMixed|TestOpenPrevious|TestFailedOpen|TestAllocation|TestLegacyRetirement'
+      - name: crash injection
+        run: go test -count=1 ./schema -run 'TestPreparedPublicationCrashRecovery|TestActivationPublicationCrashRecovery|TestMixedAllocatorAndPreparedCrashRecovery'
+
+  migration-crash:
+    name: database migration crash
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -count=1 ./database -run 'TestSchemaAdditionCrashBoundaries|TestLegacySchemaCleanupCrashBoundaries|TestCrashDuringStartupRebuild|TestAllocatorHighWaterAcrossInterruptedActivation|TestResumeInterruptedAdditionWithoutDefinitions|TestCorruptActivationRecordDoesNotPublish'
+
+  allocator:
+    name: allocator benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Informational: NextID/NextIDs must report 0 B/op and 0 allocs/op.
+      - run: go test ./schema -run '^$' -bench 'BenchmarkNextID$|BenchmarkNextIDs$|BenchmarkLookupIdentity' -benchmem -benchtime=50ms
