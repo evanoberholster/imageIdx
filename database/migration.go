@@ -188,12 +188,19 @@ func recoverPreparedSchema(ids *schema.Schema, dir, indexDir string, decode Deco
 	if openErr != nil {
 		// Rebuild under the prepared target. Existing healthy physical files are
 		// left untouched until a verified staged replacement is activated.
+		// rebuildWithDefinitions may publish temp.indexes before a later check
+		// fails, so always release it on error to avoid leaking the index lock.
 		if err := temp.rebuildWithDefinitions(indexDir, target); err != nil {
+			if temp.indexes != nil {
+				_ = temp.indexes.Close()
+				temp.indexes = nil
+			}
 			return errors.Join(ErrRecoveryRequired, err)
 		}
 		if err := temp.indexes.Close(); err != nil {
 			return err
 		}
+		temp.indexes = nil
 	}
 	if options.boundary != nil {
 		options.boundary("after schema index initialization")

@@ -11,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/evanoberholster/imageIdx/index"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
@@ -949,5 +950,102 @@ func TestFailedStartupReleasesOwnership(t *testing.T) {
 	if opened, err := Open(data, idx, decodeTest, Options{}); err == nil {
 		_ = opened.Close()
 		t.Fatal("second concurrent owner was allowed")
+	}
+}
+
+// downgradeSchemaToV2 rewrites a version-3 schema.dat as a version-2 file
+// (clearing the PREPARED and legacy-retirement payload bytes) so the database
+// startup path can be exercised as a genuine in-place upgrade.
+func downgradeSchemaToV2(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		magic   uint32 = 0x49445343 // schema superMagic
+		slotLen        = storage.SuperblockSlotBytes
+	)
+	for slot := 0; slot < 2; slot++ {
+		off := slot * slotLen
+		version := binary.LittleEndian.Uint16(data[off+4 : off+6])
+		h, payload, ok := storage.DecodeSuperblock(data[off:off+slotLen], magic, version)
+		if !ok {
+			t.Fatalf("slot %d: invalid superblock", slot)
+		}
+		payload[52], payload[53] = 0, 0
+		h.Version = 2
+		if err := storage.EncodeSuperblock(data[off:off+slotLen], h, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func activeSchemaVersion(t *testing.T, path string) uint16 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version uint16
+	var generation uint64
+	for slot := 0; slot < 2; slot++ {
+		off := slot * storage.SuperblockSlotBytes
+		v := binary.LittleEndian.Uint16(data[off+4 : off+6])
+		h, _, ok := storage.DecodeSuperblock(data[off:off+storage.SuperblockSlotBytes], 0x49445343, v)
+		if ok && h.Generation >= generation {
+			generation, version = h.Generation, v
+		}
+	}
+	if version == 0 {
+		t.Fatal("no valid superblock")
+	}
+	return version
+}
+
+func TestDatabaseUpgradesV2SchemaInPlace(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	issued, err := db.NextID(schema.EntityImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: issued, Record: []byte("kept"), Projection: projection(issued, 'x')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, g)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(data, "schema.dat")
+	downgradeSchemaToV2(t, path)
+	if got := activeSchemaVersion(t, path); got != 2 {
+		t.Fatalf("downgrade version = %d", got)
+	}
+	db, err = Open(data, idx, decodeTest, Options{})
+	if err != nil {
+		t.Fatalf("reopen v2 database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := activeSchemaVersion(t, path); got != 3 {
+		t.Fatalf("upgraded version = %d, want 3", got)
+	}
+	db = openTest(t, data, idx)
+	defer db.Close()
+	if !db.ids.LegacyRetired() || db.ids.PreparedDefinitions() != nil {
+		t.Fatal("upgrade did not publish the retirement marker")
+	}
+	if got, err := db.Get(schema.EntityImage, issued); err != nil || string(got) != "kept" {
+		t.Fatalf("record lost across upgrade: %q %v", got, err)
+	}
+	contains(t, db, issued, 'x', true)
+	if id, err := db.NextID(schema.EntityImage); id != issued+1 || err != nil {
+		t.Fatalf("allocator high-water across upgrade: %d %v", id, err)
 	}
 }

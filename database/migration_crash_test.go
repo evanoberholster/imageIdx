@@ -252,3 +252,53 @@ func TestAllocatorHighWaterAcrossInterruptedActivation(t *testing.T) {
 		})
 	}
 }
+
+// TestRepeatedRecoveryIsIdempotent opens the database three times after an
+// interrupted addition at each publication boundary. Successive opens only
+// work if every failed or completed attempt released its locks and left a
+// single consistent active schema.
+func TestRepeatedRecoveryIsIdempotent(t *testing.T) {
+	for _, phase := range []string{
+		"after schema prepare",
+		"before schema index initialization",
+		"after schema index initialization",
+		"before schema activation",
+		"after schema activation",
+	} {
+		t.Run(phase, func(t *testing.T) {
+			data, indexDir := paths(t)
+			db := openTest(t, data, indexDir)
+			if _, err := db.NextID(schema.EntityImage); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			crashSchemaOpen(t, filepath.Dir(data), phase, true)
+			var want int
+			for i := 0; i < 3; i++ {
+				db, err := Open(data, indexDir, decodeTest, Options{})
+				if err != nil {
+					t.Fatalf("open %d: %v", i, err)
+				}
+				if db.ids.PreparedDefinitions() != nil {
+					t.Fatalf("open %d left a prepared generation", i)
+				}
+				if _, ok := db.ids.Lookup(501); !ok {
+					t.Fatalf("open %d lost the added namespace", i)
+				}
+				if n := len(db.ids.Definitions().Defs()); want == 0 {
+					want = n
+				} else if n != want {
+					t.Fatalf("open %d definition count %d, want %d", i, n, want)
+				}
+				if id, err := db.NextID(schema.EntityImage); err != nil || id <= 0 {
+					t.Fatalf("open %d allocation: %d %v", i, id, err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}

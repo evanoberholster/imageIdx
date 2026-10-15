@@ -84,13 +84,24 @@ IMAGEIDX_UPDATE_GOLDEN=1 go test ./schema -run TestUpdateGoldenFixtures
 | `v3-prepared.dat` | version 3, additive index namespace PREPARED, root ACTIVE |
 | `v3-active-after-prepare.dat` | version 3, the PREPARED target activated |
 | `v2-active.dat` | version 2, prior release, read as ACTIVE |
+| `v3-upgraded-from-v2.dat` | version 3, produced by upgrading `v2-active.dat` with the retirement marker |
 | `v3-unsupported-version.dat` | container version 99, must return `ErrVersion` |
 
 ## Upgrade behavior
 
 - A version 2 file that only has IDs allocated keeps its version until the next
-  directory publication; then the container is written as version 3.
-- Adding definitions (KV or index) writes a new version 3 directory. KV-only
+  generation publication (a definition change or the retirement marker); then
+  the container is written as version 3. Allocation alone writes only metadata
+  slots and does not bump the container version.
+- The upgrade is per superblock: after the first version-3 publication one slot
+  may briefly remain on version 2. Recovery selects by generation, and the
+  higher-generation slot's embedded version is authoritative, so the mixed
+  state is safe. The next publication writes version 3 to the other slot.
+- Adding definitions (KV or index) writes a new version 3 generation. KV-only
   additions activate immediately; index additions publish PREPARED first.
 - Legacy Pebble and `index/schema.bin` schema copies are retired once, and the
   `legacyRetired` byte prevents any later read of them.
+- A crash during the upgrade's single superblock write leaves either the old
+  version-2 generation or the new version-3 generation active; both are
+  readable and neither reuses an acknowledged ID. Verified by
+  `TestGoldenV2UpgradeCrashRecovery` and `TestDatabaseUpgradesV2SchemaInPlace`.

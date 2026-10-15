@@ -97,7 +97,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -count=1 ./database -run 'TestSchemaAdditionCrashBoundaries|TestLegacySchemaCleanupCrashBoundaries|TestCrashDuringStartupRebuild|TestAllocatorHighWaterAcrossInterruptedActivation|TestResumeInterruptedAdditionWithoutDefinitions|TestCorruptActivationRecordDoesNotPublish'
+      - run: go test -count=1 ./database -run 'TestSchemaAdditionCrashBoundaries|TestLegacySchemaCleanupCrashBoundaries|TestCrashDuringStartupRebuild|TestAllocatorHighWaterAcrossInterruptedActivation|TestResumeInterruptedAdditionWithoutDefinitions|TestCorruptActivationRecordDoesNotPublish|TestDatabaseUpgradesV2SchemaInPlace|TestRepeatedRecoveryIsIdempotent'
 
   allocator:
     name: allocator benchmarks
