@@ -98,14 +98,24 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	}
 	var existing *schema.Schema
 	path := filepath.Join(dir, "schema.dat")
-	if _, statErr := os.Stat(path); statErr == nil {
+	_, statErr := os.Stat(path)
+	if errors.Is(statErr, os.ErrNotExist) {
+		complete, err := store.InspectSchemaMigration(dir)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			return nil, errors.Join(schema.ErrCorrupt, fmt.Errorf("database: missing authoritative schema.dat"))
+		}
+	} else if statErr != nil {
+		return nil, statErr
+	}
+	if statErr == nil {
 		var openErr error
 		existing, openErr = schema.Open(path, schema.Options{})
 		if openErr != nil {
 			return nil, openErr
 		}
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return nil, statErr
 	}
 	canonical, err := canonicalNamespaces(options.CanonicalNamespaces)
 	if existing != nil {

@@ -1,6 +1,7 @@
 package database
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -218,6 +219,149 @@ func TestExplicitAuthoritativeDefinitionsOnCreation(t *testing.T) {
 	_ = wrong.Register(schema.NamespaceDef{Namespace: 100, Name: "wrong", Kind: schema.KindKV, Entity: schema.EntityImage})
 	if _, err := Open(data, idxPath, decodeTest, Options{Definitions: wrong}); !errors.Is(err, schema.ErrNamespace) {
 		t.Fatalf("accepted different authoritative definitions: %v", err)
+	}
+}
+
+func TestMissingAllocatorPreflightDoesNotExtendPebbleSchema(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pdb, err := pebble.Open(data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.EncodeKey(store.Key{})
+	value, closer, err := pdb.Get(key[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := append([]byte(nil), value...)
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	allocator, err := os.ReadFile(filepath.Join(data, "schema.dat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(data, "schema.dat")); err != nil {
+		t.Fatal(err)
+	}
+	defs := schema.NewDefinitions()
+	for _, spec := range canonicalSpecs() {
+		if spec.Entity.Valid() {
+			if err := defs.Register(spec.NamespaceDef()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := defs.Register(schema.NamespaceDef{Namespace: 500, Name: "new-index", Kind: schema.KindTimestamp, Entity: schema.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if opened, err := Open(data, idx, decodeTest, Options{Definitions: defs}); opened != nil || !errors.Is(err, schema.ErrCorrupt) {
+			if opened != nil {
+				_ = opened.Close()
+			}
+			t.Fatalf("missing authoritative state: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(data, "schema.dat")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("allocator file recreated: %v", err)
+		}
+		pdb, err = pebble.Open(data, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value, closer, err = pdb.Get(key[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(value, before) {
+			t.Fatal("preflight changed Pebble namespace metadata")
+		}
+		if err := closer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pdb.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allocator[0] ^= 0xff
+	if err := os.WriteFile(filepath.Join(data, "schema.dat"), allocator, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := Open(data, idx, decodeTest, Options{Definitions: defs}); opened != nil || !errors.Is(err, schema.ErrCorrupt) {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatalf("corrupt authoritative state: %v", err)
+	}
+	pdb, err = pebble.Open(data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, closer, err = pdb.Get(key[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(value, before) {
+		t.Fatal("corrupt file preflight changed Pebble namespace metadata")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExplicitIDCommitOverlapsAllocation(t *testing.T) {
+	data, idx := paths(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	db, err := Open(data, idx, decodeTest, Options{boundary: func(stage string) {
+		if stage == "before canonical commit" {
+			close(entered)
+			<-release
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	issued, err := db.NextID(schema.EntityImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An explicit insert can claim an already issued ID: the caller owns
+	// coordination and the record write follows last-writer-wins semantics.
+	done := make(chan error, 1)
+	go func() {
+		_, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: issued, Record: []byte("explicit"), Projection: projection(issued, 'x')})
+		done <- err
+	}()
+	<-entered // Commit has reconciled its floor but has not published the record.
+	next, err := db.NextID(schema.EntityImage)
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next <= issued {
+		t.Fatalf("allocator reused issued ID: %d <= %d", next, issued)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Get(schema.EntityImage, issued); err != nil || string(got) != "explicit" {
+		t.Fatalf("explicit ID record: %q %v", got, err)
+	}
+	after, err := db.NextID(schema.EntityImage)
+	if err != nil || after <= next {
+		t.Fatalf("allocator floor after commit: %d %v", after, err)
 	}
 }
 
