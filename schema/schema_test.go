@@ -559,3 +559,141 @@ func TestPersistedDefinitionsCorruptionFailsClosed(t *testing.T) {
 		t.Fatalf("corrupt definitions: %v", err)
 	}
 }
+
+func TestStandaloneKVAdditionActivatesImmediately(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.dat")
+	s, err := Open(path, testOptions(BackendReadWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := s.NextID(EntityImage); id != 1 || err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opts := testOptions(BackendReadWrite)
+	if err := opts.Definitions.Register(NamespaceDef{Namespace: 400, Name: "image-alt", Kind: KindKV, Entity: EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	// KV-only additions own no dependent storage, so they activate at Open.
+	s, err = Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.PreparedDefinitions() != nil {
+		t.Fatal("KV-only addition left a prepared generation")
+	}
+	if _, ok := s.Lookup(400); !ok || s.Definitions().Len() != 3 {
+		t.Fatal("KV addition missing from active schema")
+	}
+	if id, err := s.NextID(EntityImage); id != 2 || err != nil {
+		t.Fatalf("existing sequence changed: %d %v", id, err)
+	}
+}
+
+func TestStandaloneIndexAdditionRequiresActivate(t *testing.T) {
+	forBackends(t, func(t *testing.T, backend Backend) {
+		path := filepath.Join(t.TempDir(), "schema.dat")
+		s, err := Open(path, testOptions(BackendReadWrite))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		opts := testOptions(BackendReadWrite)
+		if err := opts.Definitions.Register(NamespaceDef{Namespace: 401, Name: "created", Kind: KindTimestamp, Entity: EntityImage}); err != nil {
+			t.Fatal(err)
+		}
+		// A non-KV namespace needs an index engine, so Open must not activate it.
+		s, err = Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.PreparedDefinitions() == nil {
+			_ = s.Close()
+			t.Fatal("index addition activated without external initialization")
+		}
+		if _, ok := s.Lookup(401); ok || s.Definitions().Len() != 2 {
+			_ = s.Close()
+			t.Fatal("prepared namespace became visible before activation")
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Reopening without definitions recovers the durable target.
+		s, err = Open(path, Options{Backend: backend})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.PreparedDefinitions() == nil {
+			_ = s.Close()
+			t.Fatal("lost prepared target across reopen")
+		}
+		if err := s.Activate(); err != nil {
+			t.Fatal(err)
+		}
+		if s.PreparedDefinitions() != nil {
+			t.Fatal("activation left prepared state")
+		}
+		if _, ok := s.Lookup(401); !ok || s.Definitions().Len() != 3 {
+			t.Fatal("activated namespace missing")
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s, err = Open(path, Options{Backend: backend})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if s.PreparedDefinitions() != nil || s.Definitions().Len() != 3 {
+			t.Fatal("activated generation not durable")
+		}
+	})
+}
+
+func TestStandaloneAdditionPreservesExistingIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.dat")
+	s, err := Open(path, testOptions(BackendReadWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := s.NextIDs(EntityImage, 5); id != 1 || err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		def  NamespaceDef
+	}{
+		{"renamed", NamespaceDef{Namespace: NamespaceTag, Name: "renamed", Kind: KindKV, Entity: EntityImage}},
+		{"owner", NamespaceDef{Namespace: NamespaceTag, Name: "Tag", Kind: KindKV, Entity: EntityFace}},
+		{"kind", NamespaceDef{Namespace: NamespaceTag, Name: "Tag", Kind: KindTimestamp, Entity: EntityImage}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := testOptions(BackendReadWrite)
+			opts.Definitions = NewDefinitions()
+			_ = opts.Definitions.RegisterAll(tc.def, NamespaceDef{Namespace: NamespacePerson, Name: "Person", Kind: KindKV, Entity: EntityPerson})
+			if opened, err := Open(path, opts); err == nil {
+				_ = opened.Close()
+				t.Fatal("accepted a modified existing definition")
+			}
+		})
+	}
+	s, err = Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.Definitions().Len() != 2 {
+		t.Fatal("rejected change altered active schema")
+	}
+	if id, err := s.NextID(EntityImage); id != 6 || err != nil {
+		t.Fatalf("allocation high-water regressed: %d %v", id, err)
+	}
+}

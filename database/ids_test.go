@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -724,5 +725,203 @@ func TestMigratesLegacyDurableHighWater(t *testing.T) {
 			reopened.Close()
 		}
 		t.Fatalf("missing schema reset: %v", err)
+	}
+}
+
+func TestKVOnlyAdditionSkipsIndexRebuild(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Record: []byte("kept"), Projection: projection(1, 'x')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, g)
+	target := db.ids.Definitions()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, def := range []schema.NamespaceDef{
+		{Namespace: 601, Name: "image-extra", Kind: schema.KindKV, Entity: schema.EntityImage},
+		{Namespace: 602, Name: "face-extra", Kind: schema.KindKV, Entity: schema.EntityFace},
+	} {
+		if err := target.Register(def); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rebuilds []string
+	db, err = Open(data, idx, decodeTest, Options{Definitions: target, boundary: func(at string) {
+		if strings.Contains(at, "rebuild") {
+			rebuilds = append(rebuilds, at)
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rebuilds) != 0 {
+		t.Fatalf("KV-only addition rebuilt the index: %v", rebuilds)
+	}
+	if db.ids.PreparedDefinitions() != nil {
+		t.Fatal("KV-only addition stayed prepared")
+	}
+	if _, ok := db.ids.Lookup(601); !ok {
+		t.Fatal("new KV namespace missing from active schema")
+	}
+	if got, err := db.Get(schema.EntityImage, 1); err != nil || string(got) != "kept" {
+		t.Fatalf("canonical record lost: %q %v", got, err)
+	}
+	contains(t, db, 1, 'x', true)
+	if id, err := db.NextID(schema.EntityImage); id != 2 || err != nil {
+		t.Fatalf("image sequence changed: %d %v", id, err)
+	}
+	if id, err := db.NextID(schema.EntityFace); id != 1 || err != nil {
+		t.Fatalf("new entity sequence: %d %v", id, err)
+	}
+	if err := db.values.Set(store.Key{Namespace: 601, ID: 1}, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openTest(t, data, idx)
+	defer db.Close()
+	if got, err := db.values.Get(store.Key{Namespace: 601, ID: 1}); err != nil || string(got) != "v" {
+		t.Fatalf("new KV namespace unusable after reopen: %q %v", got, err)
+	}
+}
+
+func TestStartupAddsNamespacesForDifferentEntities(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Record: []byte("kept"), Projection: projection(1, 'x')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, g)
+	if _, err := db.NextID(schema.EntityFace); err != nil {
+		t.Fatal(err)
+	}
+	target := db.ids.Definitions()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, def := range []schema.NamespaceDef{
+		{Namespace: 611, Name: "image-people", Kind: schema.KindKV, Entity: schema.EntityImage},
+		{Namespace: 612, Name: "face-time", Kind: schema.KindTimestamp, Entity: schema.EntityFace},
+		{Namespace: 613, Name: "face-geo", Kind: schema.KindGeo, Entity: schema.EntityFace},
+	} {
+		if err := target.Register(def); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err = Open(data, idx, decodeTest, Options{Definitions: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.ids.PreparedDefinitions() != nil {
+		t.Fatal("multi-entity addition not activated")
+	}
+	for _, ns := range []schema.Namespace{611, 612, 613} {
+		if _, ok := db.ids.Lookup(ns); !ok {
+			t.Fatalf("namespace %d missing", ns)
+		}
+	}
+	if got, err := db.Get(schema.EntityImage, 1); err != nil || string(got) != "kept" {
+		t.Fatalf("existing record lost: %q %v", got, err)
+	}
+	contains(t, db, 1, 'x', true)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Reopening without additional definitions must not revert or re-prepare.
+	db = openTest(t, data, idx)
+	if db.ids.PreparedDefinitions() != nil || len(db.ids.Definitions().Defs()) != len(target.Defs()) {
+		t.Fatal("plain reopen changed the active schema")
+	}
+	if id, err := db.NextID(schema.EntityFace); id != 2 || err != nil {
+		t.Fatalf("face sequence changed: %d %v", id, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRequestedDefinitionsRejectDuplicateIdentity(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	target := db.ids.Definitions()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A requested set cannot even be constructed with colliding identities.
+	dupID := schema.NewDefinitions()
+	if err := dupID.RegisterAll(target.Defs()...); err != nil {
+		t.Fatal(err)
+	}
+	existing := target.Defs()[0]
+	existing.Name = "duplicate-id"
+	if err := dupID.Register(existing); !errors.Is(err, schema.ErrNamespaceDuplicate) {
+		t.Fatalf("duplicate namespace id accepted: %v", err)
+	}
+	dupName := schema.NewDefinitions()
+	if err := dupName.RegisterAll(target.Defs()...); err != nil {
+		t.Fatal(err)
+	}
+	if err := dupName.Register(schema.NamespaceDef{Namespace: 621, Name: target.Defs()[0].Name, Kind: schema.KindKV, Entity: schema.EntityImage}); !errors.Is(err, schema.ErrNamespaceName) {
+		t.Fatalf("duplicate namespace name accepted: %v", err)
+	}
+	// A genuinely new ID and name still activates at startup.
+	if err := target.Register(schema.NamespaceDef{Namespace: 621, Name: "fresh", Kind: schema.KindKV, Entity: schema.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Open(data, idx, decodeTest, Options{Definitions: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := opened.ids.Lookup(621); !ok {
+		t.Fatal("new namespace missing")
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResumeInterruptedAdditionWithoutDefinitions(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	if _, err := db.NextID(schema.EntityImage); err != nil {
+		t.Fatal(err)
+	}
+	target := db.ids.Definitions()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.Register(schema.NamespaceDef{Namespace: 631, Name: "added-time", Kind: schema.KindTimestamp, Entity: schema.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	// Publish PREPARED and close, simulating a crash before the database
+	// coordinator initializes index resources and activates the target.
+	prepared, err := schema.Open(filepath.Join(data, "schema.dat"), schema.Options{Definitions: target, Prepare: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.PreparedDefinitions() == nil {
+		t.Fatal("target not prepared")
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(data, idx, decodeTest, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.ids.PreparedDefinitions() != nil {
+		t.Fatal("interrupted addition not completed on reopen")
+	}
+	if _, ok := db.ids.Lookup(631); !ok {
+		t.Fatal("interrupted addition missing after recovery")
+	}
+	if id, err := db.NextID(schema.EntityImage); id != 2 || err != nil {
+		t.Fatalf("allocator high-water regressed: %d %v", id, err)
 	}
 }

@@ -267,6 +267,21 @@ func (s *Schema) recover(defs []directoryEntry, prepare bool) error {
 			}
 		}
 	}
+	// A standalone additive change that introduces non-KV (index) namespaces
+	// needs external index initialization before it can be active. Publish it
+	// as PREPARED and require an explicit Activate after those resources are
+	// validated. KV-only additions own no dependent storage and may activate
+	// immediately.
+	if !prepare && !s.prepared {
+		prior := stored.Defs()
+		current := s.definitions.Defs()
+		for _, d := range current[len(prior):] {
+			if d.Kind != KindKV {
+				prepare = true
+				break
+			}
+		}
+	}
 	if prepare && !s.prepared && bytes.Equal(storedDefinitions, s.definitionsData) {
 		return ErrNamespace // a new generation requires at least one added namespace
 	}

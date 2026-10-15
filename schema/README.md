@@ -29,6 +29,16 @@ to expose only the old active definitions. `database.Open` verifies and rebuilds
 required index resources before calling `Activate`; no DB is exposed while
 PREPARED. Another version-3 payload byte records completion of the one-time
 legacy schema-copy cleanup, avoiding legacy reads on normal reopen.
+
+Additive registration is an open-time operation only. `schema.Open` with added
+`KindKV` namespaces activates them immediately, because KV collections own no
+dependent storage. Added non-KV (index) namespaces are persisted as PREPARED
+and stay invisible until the caller validates its engines and calls `Activate`,
+so a standalone opener never silently marks an index generation active.
+`Options{Prepare: true}` forces the PREPARED path for any addition, which the
+database coordinator uses. A PREPARED target is recovered on the next open
+without resupplying definitions. There is no runtime registration API; the
+active schema is immutable once opened.
 An allocator file from v1 is rejected with `ErrVersion`: reinterpreting its
 namespace counters as entity counters would permit ID reuse. No automatic v1
 allocator-file conversion is attempted. Legacy KV/index definition blobs are

@@ -25,7 +25,9 @@ projections and activated with the index recovery marker. Once every namespace
 is healthy and durable, schema.dat publishes ACTIVE. A crash can repeat staging
 or finish a verified activation; recovery loads the durable target from
 schema.dat without requiring the caller's original options. An index that
-cannot be rebuilt from canonical projections fails closed. Canonical namespaces
+cannot be rebuilt from canonical projections fails closed. A KV-only addition
+reuses the healthy index unchanged: the coordinator still publishes PREPARED
+and ACTIVE, but no index rebuild or backfill runs. Canonical namespaces
 come from persisted `entity-<kind>` definitions and need not match EntityKind
 ordinals; `Options.CanonicalNamespaces` never renumbers existing databases.
 

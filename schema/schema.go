@@ -260,7 +260,7 @@ func (s *Schema) MarkLegacyRetired() error {
 	if s.state.Load()&closing != 0 {
 		return ErrClosed
 	}
-	if s.prepared || s.f == nil || s.poisoned.Load() {
+	if s.prepared || s.poisoned.Load() {
 		return ErrNamespace
 	}
 	if s.legacyRetired {
@@ -286,7 +286,7 @@ func (s *Schema) Activate() error {
 	if s.state.Load()&closing != 0 {
 		return ErrClosed
 	}
-	if !s.prepared || s.f == nil || s.poisoned.Load() {
+	if !s.prepared || s.poisoned.Load() {
 		return ErrNamespace
 	}
 	if s.generation == ^uint64(0) {
