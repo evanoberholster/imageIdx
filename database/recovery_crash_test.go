@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	"github.com/cockroachdb/pebble/v2"
+	schema "github.com/evanoberholster/imageIdx/schema"
+	"github.com/evanoberholster/imageIdx/store"
 )
 
 func TestRebuildCrashChild(t *testing.T) {
@@ -39,7 +41,7 @@ func TestCrashDuringStartupRebuild(t *testing.T) {
 		t.Run(phase, func(t *testing.T) {
 			data, dir := paths(t)
 			db := openTest(t, data, dir)
-			g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Record: []byte("kept"), Projection: projection(1, 'x')})
+			g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Record: []byte("kept"), Projection: projection(1, 'x')})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -62,7 +64,7 @@ func TestCrashDuringStartupRebuild(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			if got, err := db.Get(common.EntityImage, 1); err != nil || string(got) != "kept" {
+			if got, err := db.Get(schema.EntityImage, 1); err != nil || string(got) != "kept" {
 				t.Fatalf("canonical: %q %v", got, err)
 			}
 			contains(t, db, 1, 'x', true)
@@ -76,7 +78,7 @@ func TestCrashDuringStartupRebuild(t *testing.T) {
 func TestCorruptActivationRecordDoesNotPublish(t *testing.T) {
 	data, dir := paths(t)
 	db := openTest(t, data, dir)
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
+	g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +112,46 @@ func TestCorruptActivationRecordDoesNotPublish(t *testing.T) {
 		t.Fatalf("verified stage discarded: %v", err)
 	}
 	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	contains(t, db, 1, 'a', true)
+}
+
+func TestResumeIndexActivationUsesAuthoritativeSchema(t *testing.T) {
+	data, dir := paths(t)
+	db := openTest(t, data, dir)
+	g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, g)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRebuildCrashChild$")
+	cmd.Env = append(os.Environ(), "IMAGEIDX_REBUILD_PHASE=after rebuild verified", "IMAGEIDX_REBUILD_ROOT="+filepath.Dir(data))
+	var exit *exec.ExitError
+	if err := cmd.Run(); !errors.As(err, &exit) || exit.ExitCode() != 74 {
+		t.Fatalf("child: %v", err)
+	}
+	pdb, err := pebble.Open(data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.EncodeKey(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+	if err := pdb.Delete(key[:], pebble.Sync); err != nil {
+		_ = pdb.Close()
+		t.Fatal(err)
+	}
+	if err := pdb.Close(); err != nil {
 		t.Fatal(err)
 	}
 	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})

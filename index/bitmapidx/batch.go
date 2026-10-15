@@ -4,7 +4,7 @@ import (
 	"errors"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 var (
@@ -56,15 +56,15 @@ func (b *Batch) Add(entries ...Entry) error {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind == common.KindBitmapString {
+	if namespace.Kind == schema.KindBitmapString {
 		return ErrUnsupportedOperation
 	}
-	if namespace.Kind == common.KindBitmapBSI {
+	if namespace.Kind == schema.KindBitmapBSI {
 		for _, entry := range entries {
 			if entry.ImageID == 0 {
 				return ErrInvalidImageID
 			}
-			if entry.Value.Kind != common.KindBitmapBSI {
+			if entry.Value.Kind != schema.KindBitmapBSI {
 				return ErrValueKind
 			}
 			if entry.Value.Int < 0 {
@@ -100,15 +100,15 @@ func (b *Batch) Remove(entries ...Entry) error {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind == common.KindBitmapString {
+	if namespace.Kind == schema.KindBitmapString {
 		return ErrUnsupportedOperation
 	}
-	if namespace.Kind == common.KindBitmapBSI {
+	if namespace.Kind == schema.KindBitmapBSI {
 		for _, entry := range entries {
 			if entry.ImageID == 0 {
 				return ErrInvalidImageID
 			}
-			if entry.Value.Kind != common.KindBitmapBSI {
+			if entry.Value.Kind != schema.KindBitmapBSI {
 				return ErrValueKind
 			}
 			if err := b.stageBSI(bsiOp{id: entry.ImageID, flags: bsiFlagRemove}); err != nil {
@@ -139,7 +139,7 @@ func (b *Batch) BSIMove(moves ...BSIMove) error {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind != common.KindBitmapBSI {
+	if namespace.Kind != schema.KindBitmapBSI {
 		return ErrBSINotBSI
 	}
 	for _, move := range moves {
@@ -192,7 +192,7 @@ func (b *Batch) Move(moves ...Move) error {
 		return ErrBatchClosed
 	}
 	namespace := b.index.spec()
-	if namespace.Kind != common.KindBitmapContinuous {
+	if namespace.Kind != schema.KindBitmapContinuous {
 		return ErrNamespaceMismatch
 	}
 	for _, move := range moves {
@@ -219,7 +219,7 @@ func (b *Batch) ReplaceText(changes ...TextReplacement) error {
 	if b.sealed.Load() {
 		return ErrBatchClosed
 	}
-	if b.index.spec().Kind != common.KindBitmapString {
+	if b.index.spec().Kind != schema.KindBitmapString {
 		return ErrNamespaceMismatch
 	}
 	for _, change := range changes {
@@ -302,7 +302,7 @@ func (b *Batch) Apply() error {
 	if i.closed.Load() {
 		return ErrClosed
 	}
-	if i.spec().Kind == common.KindBitmapBSI {
+	if i.spec().Kind == schema.KindBitmapBSI {
 		if len(b.bsi) == 0 {
 			return nil
 		}
@@ -391,13 +391,13 @@ func (b *Batch) expand() (namespaceMutation, error) {
 			if _, ok := after[token]; ok {
 				continue
 			}
-			mutation.Remove = append(mutation.Remove, Entry{ImageID: change.ImageID, Value: Value{Kind: common.KindBitmapString, Bytes: []byte(token)}})
+			mutation.Remove = append(mutation.Remove, Entry{ImageID: change.ImageID, Value: Value{Kind: schema.KindBitmapString, Bytes: []byte(token)}})
 		}
 		for token := range after {
 			if _, ok := before[token]; ok {
 				continue
 			}
-			mutation.Add = append(mutation.Add, Entry{ImageID: change.ImageID, Value: Value{Kind: common.KindBitmapString, Bytes: []byte(token)}})
+			mutation.Add = append(mutation.Add, Entry{ImageID: change.ImageID, Value: Value{Kind: schema.KindBitmapString, Bytes: []byte(token)}})
 		}
 	}
 	return mutation, nil

@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Every Apply returning nil is recoverable after reopening, even when callers
@@ -27,7 +27,7 @@ func TestConcurrentSyncApplyReopen(t *testing.T) {
 			defer wg.Done()
 			batch := NewBatch(1)
 			for n := 0; n < perWriter; n++ {
-				id := common.ValueID(next.Add(1))
+				id := schema.ValueID(next.Add(1))
 				batch.Reset()
 				batch.Append(Insert(id, uint64(id)*testQuantum))
 				for {

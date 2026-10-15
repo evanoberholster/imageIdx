@@ -4,7 +4,7 @@
 // bitmapidx (the KindBitmap* kinds).
 //
 // A Store owns every underlying engine instance for one root directory. Every
-// namespace is declared in a common.Schema before Create/Open; namespaces are
+// namespace is declared in a schematypes.Definitions before Create/Open; namespaces are
 // never registered at runtime. Routing is a dense, allocation-free numeric
 // table, and every hot path avoids maps and reflection.
 //
@@ -22,7 +22,7 @@ package index
 import (
 	"errors"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -77,15 +77,15 @@ var (
 // Spec declares the namespace schema for a new Store. Every namespace must be
 // registered before Create; the schema is persisted and validated on Open.
 type Spec struct {
-	Schema *common.Schema
+	Schema *schematypes.Definitions
 }
 
 // Options carries runtime policy shared by all namespaces. Persisted
-// per-namespace configuration lives in common.NamespaceDef.Config instead.
+// per-namespace configuration lives in schematypes.NamespaceDef.Config instead.
 type Options struct {
 	// Durability selects the durability policy passed to engines that expose
 	// one (simhash, vectoridx). timeidx always commits synchronously.
-	Durability common.Durability
+	Durability schematypes.Durability
 	// RadixArenaBytes is the mmap arena size for each radixhash namespace.
 	RadixArenaBytes uint64
 	// Vector configures each vector namespace. Dimensions/ElementType/Metric are
@@ -95,7 +95,7 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if !o.Durability.Valid() {
-		o.Durability = common.DurabilityOS
+		o.Durability = schematypes.DurabilityOS
 	}
 	if o.RadixArenaBytes == 0 {
 		o.RadixArenaBytes = 64 << 20
@@ -107,7 +107,7 @@ func (o Options) withDefaults() Options {
 type Option func(*Options)
 
 // WithDurability sets the durability policy for engines that support one.
-func WithDurability(d common.Durability) Option {
+func WithDurability(d schematypes.Durability) Option {
 	return func(o *Options) { o.Durability = d }
 }
 
@@ -118,25 +118,25 @@ func WithRadixArenaBytes(n uint64) Option {
 
 // TimeValue is one timestamp for the given timestamp namespace.
 type TimeValue struct {
-	Namespace common.Namespace
+	Namespace schematypes.Namespace
 	Timestamp uint64
 }
 
 // GeoValue is one S2 geographic key for the given geo namespace.
 type GeoValue struct {
-	Namespace common.Namespace
+	Namespace schematypes.Namespace
 	Key       geoidx.S2Key
 }
 
 // SimValue is one perceptual-hash record for the given similarity namespace.
 type SimValue struct {
-	Namespace common.Namespace
+	Namespace schematypes.Namespace
 	Record    simhash.Record
 }
 
 // HashValue is one exact 256-bit hash for the given exact-hash namespace.
 type HashValue struct {
-	Namespace common.Namespace
+	Namespace schematypes.Namespace
 	Hash      radixhash.Hash
 }
 
@@ -144,7 +144,7 @@ type HashValue struct {
 // matching Element is used; the others must be nil. It carries the element
 // slices directly so callers avoid interface boxing on the mutation path.
 type VectorValue struct {
-	Namespace common.Namespace
+	Namespace schematypes.Namespace
 	Element   vectoridx.ElementType
 	Float32   []float32
 	Int8      []int8
@@ -155,14 +155,14 @@ type VectorValue struct {
 
 // BitmapValue is one typed bitmap value for the given bitmap namespace.
 type BitmapValue struct {
-	Namespace common.Namespace
+	Namespace schematypes.Namespace
 	Value     bitmapidx.Value
 }
 
 // Entry is a set of index associations for one entity. The entity kind is
 // implied by each value's namespace schema, never stored per record.
 type Entry struct {
-	ValueID common.ValueID
+	ValueID schematypes.ValueID
 
 	Times   []TimeValue
 	Geos    []GeoValue
@@ -188,9 +188,9 @@ type Change struct {
 // a namespace is treated as unavailable until the process is reopened (each
 // engine is individually consistent after reopen) or the namespace is rebuilt.
 type NamespaceHealth struct {
-	Namespace    common.Namespace
-	Kind         common.NamespaceKind
-	Entity       common.EntityKind
+	Namespace    schematypes.Namespace
+	Kind         schematypes.NamespaceKind
+	Entity       schematypes.EntityKind
 	Available    bool
 	NeedsRebuild bool
 	Corrupt      bool

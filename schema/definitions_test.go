@@ -1,13 +1,16 @@
-package common
+package schema
 
 import (
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
+	"math/rand"
 	"slices"
 	"testing"
 )
 
 func TestSchemaRegistrationAndUniqueness(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	defs := []NamespaceDef{
 		{Namespace: NamespaceLocation, Name: "location", Kind: KindBitmapGeo, Config: []byte{1, 2, 3}},
 		{Namespace: NamespaceTag, Name: "tag", Kind: KindBitmapEnum},
@@ -57,7 +60,7 @@ func TestSchemaRegistrationAndUniqueness(t *testing.T) {
 }
 
 func TestSchemaRoundTrip(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	if err := schema.RegisterAll(
 		NamespaceDef{Namespace: NamespaceAlbum, Name: "album", Kind: KindBitmapEnum, Config: []byte("codec")},
 		NamespaceDef{Namespace: 700, Name: "sha256", Kind: KindHashExact, Config: []byte{9}},
@@ -69,7 +72,7 @@ func TestSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var restored Schema
+	var restored Definitions
 	if err := restored.UnmarshalBinary(data); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +94,7 @@ func TestSchemaRoundTrip(t *testing.T) {
 }
 
 func TestSchemaRejectsCorruption(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	if err := schema.Register(NamespaceDef{Namespace: 1, Name: "a", Kind: KindBitmapEnum}); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +112,7 @@ func TestSchemaRejectsCorruption(t *testing.T) {
 	cases["crc"][6] ^= 0xFF
 	cases["magic"][0] ^= 0xFF
 	cases["version"][4] = 9
-	var target Schema
+	var target Definitions
 	for name, corrupted := range cases {
 		if err := target.UnmarshalBinary(corrupted); !errors.Is(err, ErrCorruptSchema) {
 			t.Fatalf("%s: err = %v, want ErrCorruptSchema", name, err)
@@ -128,7 +131,7 @@ func TestSchemaRejectsCorruption(t *testing.T) {
 }
 
 func TestSchemaDefensiveCopies(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	config := []byte{1, 2, 3}
 	if err := schema.Register(NamespaceDef{Namespace: 5, Name: "copy", Kind: KindVector, Config: config}); err != nil {
 		t.Fatal(err)
@@ -137,6 +140,60 @@ func TestSchemaDefensiveCopies(t *testing.T) {
 	def, _ := schema.Lookup(5)
 	if def.Config[0] != 1 {
 		t.Fatal("Register retained caller config bytes")
+	}
+	def.Config[0] = 42
+	byName, _ := schema.LookupName("copy")
+	byName.Config[0] = 43
+	all := schema.Defs()
+	all[0].Config[0] = 44
+	byKind := schema.DefsOfKind(KindVector)
+	byKind[0].Config[0] = 45
+	if got, _ := schema.Lookup(5); got.Config[0] != 1 {
+		t.Fatalf("mutable returned config: %v", got.Config)
+	}
+	if got, _ := schema.LookupIdentity(5); got.Config != nil || got.Kind != KindVector {
+		t.Fatalf("identity: %+v", got)
+	}
+	if n := testing.AllocsPerRun(100, func() { _, _ = schema.LookupIdentity(5) }); n != 0 {
+		t.Fatalf("identity lookup allocs: %g", n)
+	}
+}
+
+func TestSchemaMalformedLengthsAndNames(t *testing.T) {
+	d := NewDefinitions()
+	if err := d.Register(NamespaceDef{Namespace: 1, Name: string([]byte{0xff}), Kind: KindKV}); !errors.Is(err, ErrNamespaceName) {
+		t.Fatalf("invalid UTF-8: %v", err)
+	}
+	if err := d.Register(NamespaceDef{Namespace: 1, Name: "x", Kind: KindKV}); err != nil {
+		t.Fatal(err)
+	}
+	good, _ := d.MarshalBinary()
+	for name, change := range map[string]func([]byte){
+		"oversized config": func(b []byte) { binary.LittleEndian.PutUint32(b[16:20], ^uint32(0)) },
+		"oversized name":   func(b []byte) { binary.LittleEndian.PutUint16(b[14:16], ^uint16(0)) },
+		"bad entity":       func(b []byte) { b[13] = 0xff },
+		"legacy padding":   func(b []byte) { binary.LittleEndian.PutUint16(b[4:6], schemaVersionLegacy); b[13] = 1 },
+		"trailing":         func(b []byte) { binary.LittleEndian.PutUint32(b[6:10], 0) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := slices.Clone(good)
+			change(bad)
+			binary.LittleEndian.PutUint32(bad[len(bad)-4:], crc32.ChecksumIEEE(bad[:len(bad)-4]))
+			var got Definitions
+			if err := got.UnmarshalBinary(bad); err == nil {
+				t.Fatal("accepted malformed input")
+			}
+		})
+	}
+}
+
+func TestSchemaRandomMalformedInputNeverPanics(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	for i := 0; i < 2000; i++ {
+		buf := make([]byte, rng.Intn(160))
+		_, _ = rng.Read(buf)
+		var defs Definitions
+		_ = defs.UnmarshalBinary(buf)
 	}
 }
 

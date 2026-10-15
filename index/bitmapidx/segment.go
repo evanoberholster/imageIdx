@@ -7,7 +7,7 @@ import (
 	"os"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar"
 )
@@ -210,7 +210,7 @@ func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, store
 		return fail()
 	}
 	var indexes []*Index
-	byType := make(map[common.Namespace]*Index)
+	byType := make(map[schema.Namespace]*Index)
 	for _, spec := range specs {
 		index, err := NewMemory(spec, config)
 		if err != nil {
@@ -224,7 +224,7 @@ func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, store
 	var previous NamespaceKey
 	for n := uint64(0); n < count; n++ {
 		record := mapping[dirOffset+n*64 : dirOffset+(n+1)*64]
-		key := NamespaceKey{Namespace: common.Namespace(binary.LittleEndian.Uint16(record[0:2])), Slot: binary.LittleEndian.Uint16(record[2:4]), Hash: binary.LittleEndian.Uint64(record[8:16])}
+		key := NamespaceKey{Namespace: schema.Namespace(binary.LittleEndian.Uint16(record[0:2])), Slot: binary.LittleEndian.Uint16(record[2:4]), Hash: binary.LittleEndian.Uint64(record[8:16])}
 		if n > 0 && compareNamespaceKey(previous, key) >= 0 {
 			return fail()
 		}
@@ -263,7 +263,7 @@ func openNamespaceSegment(path string, gen uint64, config NamespaceConfig, store
 			if valueLen != 0 || key.Slot != 0 || card == 0 {
 				return fail()
 			}
-			if spec.Kind == common.KindBitmapBSI && key.Hash >= bsiMaxSlices {
+			if spec.Kind == schema.KindBitmapBSI && key.Hash >= bsiMaxSlices {
 				return fail()
 			}
 		} else {

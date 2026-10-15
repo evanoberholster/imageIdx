@@ -4,26 +4,26 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
 // bsiSchema declares one BSI16 namespace alongside an enum namespace so the
 // unified Store routes both through the shared bitmap engine.
-func bsiSchema(t testing.TB) *common.Schema {
+func bsiSchema(t testing.TB) *schematypes.Definitions {
 	t.Helper()
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	bsiDef, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-		Namespace: 40, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
-	}, "quality", common.EntityImage)
+		Namespace: 40, Kind: schematypes.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+	}, "quality", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tagDef, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-		Namespace: 41, Kind: common.KindBitmapEnum,
+		Namespace: 41, Kind: schematypes.KindBitmapEnum,
 		Normalizer: bitmapidx.CodecSpec{Code: bitmapidx.NormalizerIdentity, Version: 1},
-	}, "tags", common.EntityImage)
+	}, "tags", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestUnifiedBSINamespace(t *testing.T) {
 	if !ok {
 		t.Fatal("BSI namespace missing")
 	}
-	for id, value := range map[common.ValueID]uint64{100: 85, 200: 12, 300: 85, 400: 0} {
+	for id, value := range map[schematypes.ValueID]uint64{100: 85, 200: 12, 300: 85, 400: 0} {
 		if err := bsi.Set(id, value); err != nil {
 			t.Fatalf("Set(%d,%d): %v", id, value, err)
 		}
@@ -52,14 +52,14 @@ func TestUnifiedBSINamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := equal.AppendTo(nil); !slices.Equal(got, []common.ValueID{100, 300}) {
+	if got := equal.AppendTo(nil); !slices.Equal(got, []schematypes.ValueID{100, 300}) {
 		t.Fatalf("Equal(85) = %v", got)
 	}
 	inRange, err := bsi.BSIRange(1, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := inRange.AppendTo(nil); !slices.Equal(got, []common.ValueID{100, 200, 300}) {
+	if got := inRange.AppendTo(nil); !slices.Equal(got, []schematypes.ValueID{100, 200, 300}) {
 		t.Fatalf("Range(1,100) = %v", got)
 	}
 
@@ -101,7 +101,7 @@ func TestUnifiedBSINamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := matched.AppendTo(nil); !slices.Equal(got, []common.ValueID{100}) {
+	if got := matched.AppendTo(nil); !slices.Equal(got, []schematypes.ValueID{100}) {
 		t.Fatalf("tag match = %v", got)
 	}
 }

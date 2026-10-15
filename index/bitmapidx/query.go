@@ -6,7 +6,7 @@ import (
 	"sort"
 	"sync"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -153,7 +153,7 @@ func (i *Index) MatchValues(values ...Value) (result roar.Bitmap, resultErr erro
 // nothing.
 func (i *Index) MatchText(query string) (roar.Bitmap, error) {
 	namespace := i.spec()
-	if namespace.Kind != common.KindBitmapString {
+	if namespace.Kind != schema.KindBitmapString {
 		return roar.Bitmap{}, ErrNamespaceMismatch
 	}
 	tokens, err := i.analyzer.TokenSet(query, nil)
@@ -165,7 +165,7 @@ func (i *Index) MatchText(query string) (roar.Bitmap, error) {
 	}
 	values := make([]Value, 0, len(tokens))
 	for _, text := range tokens {
-		values = append(values, Value{Kind: common.KindBitmapString, Bytes: []byte(text)})
+		values = append(values, Value{Kind: schema.KindBitmapString, Bytes: []byte(text)})
 	}
 	return i.MatchValues(values...)
 }
@@ -286,7 +286,7 @@ func (v *namespaceView) matchResolved(keys []NamespaceKey) (result roar.Bitmap, 
 
 // ValueIDs appends every image holding value to dst in ascending order.
 // Unknown values append nothing. It materializes only the one posting.
-func (i *Index) ValueIDs(dst []common.ImageID, value Value) ([]common.ImageID, error) {
+func (i *Index) ValueIDs(dst []schema.ImageID, value Value) ([]schema.ImageID, error) {
 	namespace := i.spec()
 	base, canonical, err := i.keyForValue(namespace, value)
 	if err != nil {
@@ -320,7 +320,7 @@ func (i *Index) ValueIDs(dst []common.ImageID, value Value) ([]common.ImageID, e
 // their effective postings.
 func (i *Index) Range(bounds NumericRange) (result roar.Bitmap, resultErr error) {
 	namespace := i.spec()
-	if namespace.Kind != common.KindBitmapContinuous {
+	if namespace.Kind != schema.KindBitmapContinuous {
 		return roar.Bitmap{}, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -357,7 +357,7 @@ func (i *Index) Range(bounds NumericRange) (result roar.Bitmap, resultErr error)
 // additions minus removals. Multi-valued overlap makes it an upper bound.
 func (i *Index) EstimateRange(bounds NumericRange) (uint64, error) {
 	namespace := i.spec()
-	if namespace.Kind != common.KindBitmapContinuous {
+	if namespace.Kind != schema.KindBitmapContinuous {
 		return 0, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -455,7 +455,7 @@ func (i *Index) CountValues(values ...Value) (uint64, error) {
 // per call.
 func (i *Index) CountRange(bounds NumericRange) (uint64, error) {
 	namespace := i.spec()
-	if namespace.Kind != common.KindBitmapContinuous {
+	if namespace.Kind != schema.KindBitmapContinuous {
 		return 0, ErrInvalidRange
 	}
 	if bounds.empty() {
@@ -486,7 +486,7 @@ func (i *Index) CountRange(bounds NumericRange) (uint64, error) {
 
 // FilterValues appends the candidates holding every supplied value to
 // dst. No values append nothing: an empty conjunction matches nothing.
-func (i *Index) FilterValues(dst, candidates []common.ImageID, values ...Value) ([]common.ImageID, error) {
+func (i *Index) FilterValues(dst, candidates []schema.ImageID, values ...Value) ([]schema.ImageID, error) {
 	if len(values) == 0 {
 		return dst, nil
 	}
@@ -508,8 +508,8 @@ func (i *Index) FilterValues(dst, candidates []common.ImageID, values ...Value) 
 
 // FilterRange preserves order and duplicates; dst=candidates[:0] is safe.
 // It probes candidates or unions postings, according to the estimated work.
-func (i *Index) FilterRange(dst, candidates []common.ImageID, bounds NumericRange) ([]common.ImageID, error) {
-	if i.spec().Kind != common.KindBitmapContinuous {
+func (i *Index) FilterRange(dst, candidates []schema.ImageID, bounds NumericRange) ([]schema.ImageID, error) {
+	if i.spec().Kind != schema.KindBitmapContinuous {
 		return dst, ErrInvalidRange
 	}
 	if bounds.empty() || len(candidates) == 0 {
@@ -543,7 +543,7 @@ func (i *Index) FilterRange(dst, candidates []common.ImageID, bounds NumericRang
 
 // filterBitmap appends the candidates present in bit, tolerating unsorted
 // input. It probes with a cursor and allocates nothing beyond dst growth.
-func filterBitmap(dst, candidates []common.ImageID, bit roar.Bitmap) []common.ImageID {
+func filterBitmap(dst, candidates []schema.ImageID, bit roar.Bitmap) []schema.ImageID {
 	if bit.IsEmpty() {
 		return dst
 	}
@@ -645,7 +645,7 @@ func (i *Index) detachOwned(result *roar.Bitmap, owned bool) {
 // AppendTo appends every live ImageID in the namespace to dst in ascending
 // order. It is a full-namespace scan for diagnostics and benchmarks; prefer a
 // typed namespace query. It materializes merged deltas.
-func (i *Index) AppendTo(dst []common.ImageID) []common.ImageID {
+func (i *Index) AppendTo(dst []schema.ImageID) []schema.ImageID {
 	token := i.readers.Acquire()
 	defer i.readers.Release(token)
 	if i.closed.Load() {

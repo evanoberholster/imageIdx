@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // appendTestBatch writes a redo batch frame without applying it, simulating a
@@ -65,7 +65,7 @@ func TestUpsertBatchOneGeneration(t *testing.T) {
 	before := st.Generation()
 	updates := make([]Update, 64)
 	for i := range updates {
-		updates[i] = Update{ImageID: common.ImageID(i + 1), Record: randRecords(int64(100+i), 1)[0]}
+		updates[i] = Update{ImageID: schema.ImageID(i + 1), Record: randRecords(int64(100+i), 1)[0]}
 	}
 	if err := st.UpsertBatch(updates); err != nil {
 		t.Fatalf("UpsertBatch: %v", err)
@@ -110,7 +110,7 @@ func TestUpsertBatchMatchesIndividual(t *testing.T) {
 	}
 	updates := make([]Update, 64)
 	for i := range updates {
-		updates[i] = Update{ImageID: common.ImageID(1 + (i*7)%512), Record: randRecords(int64(200+i), 1)[0]}
+		updates[i] = Update{ImageID: schema.ImageID(1 + (i*7)%512), Record: randRecords(int64(200+i), 1)[0]}
 	}
 	if err := st.UpsertBatch(updates); err != nil {
 		t.Fatalf("UpsertBatch: %v", err)
@@ -130,7 +130,7 @@ func TestUpsertBatchMatchesIndividual(t *testing.T) {
 			t.Fatalf("Upsert: %v", err)
 		}
 	}
-	for id := common.ImageID(1); id <= 512; id++ {
+	for id := schema.ImageID(1); id <= 512; id++ {
 		a, _ := st.Get(id)
 		b, _ := st2.Get(id)
 		if a != b {

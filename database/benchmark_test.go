@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func BenchmarkCommitAndIndex(b *testing.B) {
@@ -60,7 +60,7 @@ func BenchmarkStartupRebuild(b *testing.B) {
 					n := min(len(entries), total-first+1)
 					for j := range entries[:n] {
 						id := uint64(first + j)
-						entries[j] = Mutation{Entity: common.EntityImage, ValueID: id, Projection: projection(id, 'a')}
+						entries[j] = Mutation{Entity: schema.EntityImage, ValueID: id, Projection: projection(id, 'a')}
 					}
 					generation, err = db.Commit(entries[:n]...)
 					if err != nil {
@@ -134,5 +134,58 @@ func BenchmarkGenerationPublication(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkOpenExisting(b *testing.B) {
+	data, idxPath := paths(b)
+	db, err := Open(data, idxPath, decodeTest, Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db, err := Open(data, idxPath, decodeTest, Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkKVNamespaceAddition measures a startup-only additive change that
+// introduces KV namespaces only, which must not trigger an index rebuild.
+func BenchmarkKVNamespaceAddition(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		data, idxPath := paths(b)
+		db, err := Open(data, idxPath, decodeTest, Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		target := db.ids.Definitions()
+		for n := 0; n < 4; n++ {
+			if err := target.Register(schema.NamespaceDef{Namespace: schema.Namespace(700 + n), Name: fmt.Sprintf("extra-%d", n), Kind: schema.KindKV, Entity: schema.EntityImage}); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		db, err = Open(data, idxPath, decodeTest, Options{Definitions: target})
+		b.StopTimer()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

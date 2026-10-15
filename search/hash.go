@@ -1,7 +1,7 @@
 package search
 
 import (
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 )
 
@@ -40,7 +40,7 @@ type hashClause struct {
 	index     *radixhash.Index
 	algorithm HashAlgorithm
 	hash      radixhash.Hash
-	namespace common.Namespace // zero for a standalone index
+	namespace schema.Namespace // zero for a standalone index
 }
 
 func (hashClause) searchClause() {}

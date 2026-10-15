@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
@@ -37,9 +37,9 @@ const (
 // Perceptual must be a KindHashPerceptual namespace. All must carry
 // EntityImage.
 type MatcherSpec struct {
-	SHA256     common.Namespace
-	BLAKE3     common.Namespace
-	Perceptual common.Namespace
+	SHA256     schema.Namespace
+	BLAKE3     schema.Namespace
+	Perceptual schema.Namespace
 }
 
 // Matcher resolves import-matching namespaces once. It is safe for concurrent
@@ -55,9 +55,9 @@ type Matcher struct {
 
 	// Bound namespace numbers, checked lock-free for degradation before each
 	// match so a namespace broken after construction is never silently used.
-	sha256NS     common.Namespace
-	blake3NS     common.Namespace
-	perceptualNS common.Namespace
+	sha256NS     schema.Namespace
+	blake3NS     schema.Namespace
+	perceptualNS schema.Namespace
 
 	// resPool reuses perceptual-result buffers across queries; safe for
 	// concurrent readers. Exact lookups use a small stack buffer instead.
@@ -76,16 +76,16 @@ type liveCache struct {
 
 // Matcher binds the import matcher to the namespaces in spec.
 func (s *Store) Matcher(spec MatcherSpec) (*Matcher, error) {
-	live, liveVal, ok := s.Liveness(common.EntityImage)
+	live, liveVal, ok := s.Liveness(schema.EntityImage)
 	if !ok {
 		return nil, ErrMatcherNamespace
 	}
 	m := &Matcher{store: s, live: live, liveVal: liveVal}
-	exact := func(ns common.Namespace) (*radixhash.Index, error) {
+	exact := func(ns schema.Namespace) (*radixhash.Index, error) {
 		if ns == 0 {
 			return nil, nil
 		}
-		if def, ok := s.NamespaceDef(ns); !ok || def.Kind != common.KindHashExact || def.Entity != common.EntityImage {
+		if def, ok := s.NamespaceDef(ns); !ok || def.Kind != schema.KindHashExact || def.Entity != schema.EntityImage {
 			return nil, ErrMatcherNamespace
 		}
 		idx, ok := s.reg.radixIndex(ns)
@@ -105,7 +105,7 @@ func (s *Store) Matcher(spec MatcherSpec) (*Matcher, error) {
 		return nil, err
 	}
 	if spec.Perceptual != 0 {
-		if def, ok := s.NamespaceDef(spec.Perceptual); !ok || def.Kind != common.KindHashPerceptual || def.Entity != common.EntityImage {
+		if def, ok := s.NamespaceDef(spec.Perceptual); !ok || def.Kind != schema.KindHashPerceptual || def.Entity != schema.EntityImage {
 			return nil, ErrMatcherNamespace
 		}
 		if m.perceptual, ok = s.reg.simStore(spec.Perceptual); !ok {
@@ -149,7 +149,7 @@ type MatchParams struct {
 type Match struct {
 	Item     int
 	Kind     MatchKind
-	ImageID  common.ValueID
+	ImageID  schema.ValueID
 	Distance uint16
 	Intra    bool
 	Peer     int

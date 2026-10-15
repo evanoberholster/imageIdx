@@ -1,6 +1,7 @@
 package index
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -18,6 +18,7 @@ import (
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
 const (
@@ -35,11 +36,12 @@ type Store struct {
 	dir  string
 	opts Options
 
-	schema   *common.Schema
-	defs     []common.NamespaceDef
-	reg      registry
-	health   []NamespaceHealth // dense by namespace number
-	healthOK bool
+	schema     *schematypes.Definitions
+	defs       []schematypes.NamespaceDef
+	standalone bool // legacy/standalone indexes retain schema.bin for independent Open
+	reg        registry
+	health     []NamespaceHealth // dense by namespace number
+	healthOK   bool
 
 	bitmapStore *bitmapidx.Store
 	timeStore   *timeidx.Store
@@ -124,18 +126,33 @@ type flushScratch struct {
 // during prevalidation, so a batch of appends is validated without mutating an
 // engine.
 type simCursor struct {
-	ns   common.Namespace
+	ns   schematypes.Namespace
 	next uint64
 }
 
 // Create builds a new unified Store at dir, creating every configured
 // namespace. It fails if a unified store already exists there.
 func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
-	defs, err := validateSchema(spec.Schema)
+	return create(dir, spec.Schema, true, opts...)
+}
+
+// CreateWithDefinitions creates a database-managed index using the schema's
+// authoritative definitions. It writes only physical index metadata, not a
+// second logical schema file. Standalone callers may continue using Create.
+func CreateWithDefinitions(dir string, definitions *schematypes.Definitions, opts ...Option) (*Store, error) {
+	indexes, err := indexDefinitions(definitions)
 	if err != nil {
 		return nil, err
 	}
-	storedSchema, err := cloneSchema(spec.Schema)
+	return create(dir, indexes, false, opts...)
+}
+
+func create(dir string, definitions *schematypes.Definitions, standalone bool, opts ...Option) (*Store, error) {
+	defs, err := validateSchema(definitions)
+	if err != nil {
+		return nil, err
+	}
+	storedSchema, err := cloneSchema(definitions)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +163,7 @@ func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 	if _, err := os.Stat(filepath.Join(dir, storeBinName)); err == nil {
 		return nil, fmt.Errorf("%w: %s already exists", ErrInvalidSchema, storeBinName)
 	}
-	s := &Store{dir: dir, opts: options, schema: storedSchema, defs: defs}
+	s := &Store{dir: dir, opts: options, schema: storedSchema, defs: defs, standalone: standalone}
 	// bitmapidx.NewStore requires an empty directory (its exclusive lock checks
 	// for foreign files), so every engine is created before the unified
 	// manifest and lock exist.
@@ -176,8 +193,50 @@ func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 // failures are reported through Health and do not prevent healthy namespaces
 // from opening; a query that needs an unavailable namespace fails explicitly.
 func Open(dir string, opts ...Option) (*Store, error) {
+	return open(dir, nil, opts...)
+}
+
+// OpenWithDefinitions opens a database-managed index from the authoritative
+// schema. An old schema.bin is checked for compatibility if present, but it is
+// not required and never becomes the runtime namespace registry.
+func OpenWithDefinitions(dir string, definitions *schematypes.Definitions, opts ...Option) (*Store, error) {
+	indexes, err := indexDefinitions(definitions)
+	if err != nil {
+		return nil, err
+	}
+	return open(dir, indexes, opts...)
+}
+
+func indexDefinitions(definitions *schematypes.Definitions) (*schematypes.Definitions, error) {
+	if definitions == nil {
+		return nil, ErrSchemaRequired
+	}
+	indexes := schematypes.NewDefinitions()
+	for _, def := range definitions.Defs() {
+		if def.Kind == schematypes.KindKV {
+			continue
+		}
+		if err := indexes.Register(def); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := validateSchema(indexes); err != nil {
+		return nil, err
+	}
+	return indexes, nil
+}
+
+// ValidateDefinitions checks all index namespaces of an authoritative schema
+// without creating physical engine files. It is used before publishing a
+// prepared schema generation.
+func ValidateDefinitions(definitions *schematypes.Definitions) error {
+	_, err := indexDefinitions(definitions)
+	return err
+}
+
+func open(dir string, supplied *schematypes.Definitions, opts ...Option) (*Store, error) {
 	options := applyOptions(opts)
-	schema, safe, flags, gens, err := readSchema(dir)
+	schema, safe, flags, gens, err := readSchema(dir, supplied)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +248,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock}
+	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock, standalone: supplied == nil}
 	// The flag is written before the first removal commits, so its absence
 	// proves no removal was ever durable and the fast path is safe.
 	s.liveRemovals.Store(flags&1 != 0)
@@ -206,7 +265,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		// namespaces incomplete; they must not silently become healthy.
 		s.pendingSet = rec
 		for _, ns := range namespacesOfBitSet(rec) {
-			if _, ok := s.schema.Lookup(ns); ok {
+			if _, ok := s.schema.LookupIdentity(ns); ok {
 				s.markDegraded(ns, ErrRecoveryRequired)
 				s.health[ns].NeedsRebuild = true
 			}
@@ -230,7 +289,7 @@ func (s *Store) reconcileGenerations(gens []uint64, safe uint64) {
 			s.nsSource[def.Namespace] = 0
 			continue
 		}
-		if def.Kind == common.KindTimestamp {
+		if def.Kind == schematypes.KindTimestamp {
 			idx, ok := s.reg.timeIndex(def.Namespace)
 			if !ok {
 				s.nsSource[def.Namespace] = 0
@@ -291,14 +350,44 @@ func applyOptions(opts []Option) Options {
 }
 
 func (s *Store) writeSchema() error {
-	schemaBytes, err := s.schema.MarshalBinary()
+	if s.standalone {
+		schemaBytes, err := s.schema.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		if err := writeFileAtomic(s.dir, schemaBinName, schemaBytes); err != nil {
+			return err
+		}
+	}
+	return s.writeManifest()
+}
+
+// RetireLegacySchema removes the old logical schema copy after schema.dat has
+// been made authoritative. This is only valid for a database-managed opener;
+// standalone Open still needs schema.bin to discover its definitions.
+func (s *Store) RetireLegacySchema() error {
+	if s.standalone || s.closed.Load() {
+		return ErrInvalidSchema
+	}
+	path := filepath.Join(s.dir, schemaBinName)
+	legacy, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(s.dir, schemaBinName, schemaBytes); err != nil {
+	expected, err := s.schema.MarshalBinary()
+	if err != nil {
 		return err
 	}
-	return s.writeManifest()
+	if !bytes.Equal(legacy, expected) {
+		return errors.Join(schematypes.ErrNamespace, ErrInvalidSchema)
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return storage.SyncDir(s.dir)
 }
 
 // writeManifest persists the unified manifest: magic, version, namespace
@@ -330,7 +419,7 @@ func (s *Store) writeManifest() error {
 // readSchema loads and validates the unified manifest and schema. It returns
 // the schema, the recorded safe watermark, the header flags, and a dense
 // per-namespace generation slice indexed by namespace number.
-func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
+func readSchema(dir string, supplied *schematypes.Definitions) (*schematypes.Definitions, uint64, uint16, []uint64, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, storeBinName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -358,13 +447,30 @@ func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
 	if len(body) != count*10 {
 		return nil, 0, 0, nil, ErrCorrupt
 	}
-	schemaBytes, err := os.ReadFile(filepath.Join(dir, schemaBinName))
-	if err != nil {
+	legacy, err := os.ReadFile(filepath.Join(dir, schemaBinName))
+	if err != nil && (supplied == nil || !errors.Is(err, os.ErrNotExist)) {
 		return nil, 0, 0, nil, err
 	}
-	schema := common.NewSchema()
-	if err := schema.UnmarshalBinary(schemaBytes); err != nil {
-		return nil, 0, 0, nil, errors.Join(ErrCorrupt, err)
+	var schema *schematypes.Definitions
+	if supplied != nil {
+		schema, err = cloneSchema(supplied)
+		if err != nil {
+			return nil, 0, 0, nil, err
+		}
+		if legacy != nil {
+			current, err := schema.MarshalBinary()
+			if err != nil {
+				return nil, 0, 0, nil, err
+			}
+			if !bytes.Equal(legacy, current) {
+				return nil, 0, 0, nil, errors.Join(schematypes.ErrNamespace, ErrInvalidSchema)
+			}
+		}
+	} else {
+		schema = schematypes.NewDefinitions()
+		if err := schema.UnmarshalBinary(legacy); err != nil {
+			return nil, 0, 0, nil, errors.Join(ErrCorrupt, err)
+		}
 	}
 	defs := schema.Defs()
 	// The generation table must describe exactly the schema's namespaces: no
@@ -372,7 +478,7 @@ func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
 	if count != len(defs) {
 		return nil, 0, 0, nil, ErrCorrupt
 	}
-	var maxNS common.Namespace
+	var maxNS schematypes.Namespace
 	for _, def := range defs {
 		if def.Namespace > maxNS {
 			maxNS = def.Namespace
@@ -381,7 +487,7 @@ func readSchema(dir string) (*common.Schema, uint64, uint16, []uint64, error) {
 	gens := make([]uint64, int(maxNS)+1)
 	seen := make([]bool, int(maxNS)+1)
 	for i := 0; i < count; i++ {
-		ns := common.Namespace(binary.LittleEndian.Uint16(body[i*10:]))
+		ns := schematypes.Namespace(binary.LittleEndian.Uint16(body[i*10:]))
 		gen := binary.LittleEndian.Uint64(body[i*10+2:])
 		if _, ok := schema.Lookup(ns); !ok || int(ns) >= len(gens) || seen[ns] {
 			return nil, 0, 0, nil, ErrCorrupt
@@ -466,9 +572,9 @@ func readRecovery(dir string) ([]uint64, error) {
 	if len(body) != count*2 {
 		return nil, ErrCorrupt
 	}
-	var maxNS common.Namespace
+	var maxNS schematypes.Namespace
 	for i := 0; i < count; i++ {
-		if ns := common.Namespace(binary.LittleEndian.Uint16(body[i*2:])); ns > maxNS {
+		if ns := schematypes.Namespace(binary.LittleEndian.Uint16(body[i*2:])); ns > maxNS {
 			maxNS = ns
 		}
 	}
@@ -477,14 +583,14 @@ func readRecovery(dir string) ([]uint64, error) {
 	}
 	set := make([]uint64, int(maxNS>>6)+1)
 	for i := 0; i < count; i++ {
-		ns := common.Namespace(binary.LittleEndian.Uint16(body[i*2:]))
+		ns := schematypes.Namespace(binary.LittleEndian.Uint16(body[i*2:]))
 		set[ns>>6] |= 1 << (uint(ns) & 63)
 	}
 	return set, nil
 }
 
 // RecoveryNamespaces returns namespaces flagged by the durable recovery marker.
-func (s *Store) RecoveryNamespaces() []common.Namespace {
+func (s *Store) RecoveryNamespaces() []schematypes.Namespace {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return namespacesOfBitSet(s.pendingSet)
@@ -503,12 +609,12 @@ func (s *Store) ClearRecovery() error {
 	return s.persistRecovery()
 }
 
-func namespacesOfBitSet(set []uint64) []common.Namespace {
-	var out []common.Namespace
+func namespacesOfBitSet(set []uint64) []schematypes.Namespace {
+	var out []schematypes.Namespace
 	for w, word := range set {
 		for bit := 0; bit < 64; bit++ {
 			if word&(1<<uint(bit)) != 0 {
-				out = append(out, common.Namespace(w*64+bit))
+				out = append(out, schematypes.Namespace(w*64+bit))
 			}
 		}
 	}
@@ -529,7 +635,7 @@ func writeFileAtomic(dir, name string, data []byte) error {
 // ---- engine construction ----
 
 func (s *Store) openEngines(create bool) error {
-	var maxNS common.Namespace
+	var maxNS schematypes.Namespace
 	for _, def := range s.defs {
 		if def.Namespace > maxNS {
 			maxNS = def.Namespace
@@ -545,19 +651,19 @@ func (s *Store) openEngines(create bool) error {
 	s.nsSource = make([]uint64, int(maxNS)+1)
 	s.health = make([]NamespaceHealth, int(maxNS)+1)
 	for i := range s.health {
-		s.health[i].Namespace = common.Namespace(i)
+		s.health[i].Namespace = schematypes.Namespace(i)
 	}
-	for e := common.EntityImage; e.Valid(); e++ {
+	for e := schematypes.EntityImage; e.Valid(); e++ {
 		s.reg.liveVal[e] = livenessValues[e]
 	}
 
 	if err := s.openBitmap(create); err != nil {
-		s.markMatching(func(def common.NamespaceDef) bool { return def.Kind.IsBitmap() }, err)
+		s.markMatching(func(def schematypes.NamespaceDef) bool { return def.Kind.IsBitmap() }, err)
 	} else {
 		s.routeBitmaps()
 	}
 	if err := s.openTime(create); err != nil {
-		s.markMatching(func(def common.NamespaceDef) bool { return def.Kind == common.KindTimestamp }, err)
+		s.markMatching(func(def schematypes.NamespaceDef) bool { return def.Kind == schematypes.KindTimestamp }, err)
 	}
 	s.openGeos(create)
 	s.openSims(create)
@@ -611,7 +717,7 @@ func (s *Store) openBitmap(create bool) error {
 	}
 	specs = append(specs, bitmapidx.NamespaceSpec{
 		Namespace: livenessNamespace,
-		Kind:      common.KindBitmapEnum,
+		Kind:      schematypes.KindBitmapEnum,
 		Name:      livenessName,
 	})
 	var err error
@@ -626,7 +732,7 @@ func (s *Store) openBitmap(create bool) error {
 func (s *Store) openTime(create bool) error {
 	var inits []timeidx.NamespaceInit
 	for _, def := range s.defs {
-		if def.Kind != common.KindTimestamp {
+		if def.Kind != schematypes.KindTimestamp {
 			continue
 		}
 		inits = append(inits, timeidx.NamespaceInit{
@@ -643,7 +749,7 @@ func (s *Store) openTime(create bool) error {
 	}
 	s.timeStore = store
 	for _, res := range results {
-		def, _ := s.schema.Lookup(res.Namespace)
+		def, _ := s.schema.LookupIdentity(res.Namespace)
 		h := &s.health[res.Namespace]
 		h.Kind, h.Entity = def.Kind, def.Entity
 		if res.Err != nil {
@@ -665,7 +771,7 @@ func (s *Store) openTime(create bool) error {
 
 func (s *Store) openGeos(create bool) {
 	for _, def := range s.defs {
-		if def.Kind != common.KindGeo {
+		if def.Kind != schematypes.KindGeo {
 			continue
 		}
 		path := filepath.Join(s.dir, fmt.Sprintf("geo-%04x.idx", def.Namespace))
@@ -685,7 +791,7 @@ func (s *Store) openGeos(create bool) {
 
 func (s *Store) openSims(create bool) {
 	for _, def := range s.defs {
-		if def.Kind != common.KindHashPerceptual {
+		if def.Kind != schematypes.KindHashPerceptual {
 			continue
 		}
 		prefix := filepath.Join(s.dir, fmt.Sprintf("sim-%04x", def.Namespace))
@@ -702,7 +808,7 @@ func (s *Store) openSims(create bool) {
 
 func (s *Store) openRadixes(create bool) {
 	for _, def := range s.defs {
-		if def.Kind != common.KindHashExact {
+		if def.Kind != schematypes.KindHashExact {
 			continue
 		}
 		path := filepath.Join(s.dir, fmt.Sprintf("radix-%04x.idx", def.Namespace))
@@ -721,7 +827,7 @@ func (s *Store) openRadixes(create bool) {
 
 func (s *Store) openVectors(create bool) {
 	for _, def := range s.defs {
-		if def.Kind != common.KindVector {
+		if def.Kind != schematypes.KindVector {
 			continue
 		}
 		path := filepath.Join(s.dir, fmt.Sprintf("vector-%04x.idx", def.Namespace))
@@ -756,7 +862,7 @@ func (s *Store) openVectors(create bool) {
 
 // attach records health and, when idx opened, appends it to the engine slice
 // and installs the route.
-func (s *Store) attach(def common.NamespaceDef, err error, ok func()) {
+func (s *Store) attach(def schematypes.NamespaceDef, err error, ok func()) {
 	h := &s.health[def.Namespace]
 	h.Kind, h.Entity = def.Kind, def.Entity
 	if err != nil {
@@ -768,7 +874,7 @@ func (s *Store) attach(def common.NamespaceDef, err error, ok func()) {
 	ok()
 }
 
-func (s *Store) setRoute(def common.NamespaceDef, slot uint16) {
+func (s *Store) setRoute(def schematypes.NamespaceDef, slot uint16) {
 	s.reg.routes[def.Namespace] = route{kind: def.Kind, entity: def.Entity, slot: slot, available: true}
 	h := &s.health[def.Namespace]
 	h.Kind, h.Entity, h.Available = def.Kind, def.Entity, true
@@ -776,7 +882,7 @@ func (s *Store) setRoute(def common.NamespaceDef, slot uint16) {
 
 // markMatching records an engine-level failure against every matching
 // namespace while leaving unrelated namespaces' health untouched.
-func (s *Store) markMatching(match func(common.NamespaceDef) bool, err error) {
+func (s *Store) markMatching(match func(schematypes.NamespaceDef) bool, err error) {
 	for _, def := range s.defs {
 		if match(def) {
 			s.markUnavailable(def, err)
@@ -784,7 +890,7 @@ func (s *Store) markMatching(match func(common.NamespaceDef) bool, err error) {
 	}
 }
 
-func (s *Store) markUnavailable(def common.NamespaceDef, err error) {
+func (s *Store) markUnavailable(def schematypes.NamespaceDef, err error) {
 	h := &s.health[def.Namespace]
 	h.Kind, h.Entity = def.Kind, def.Entity
 	h.Err = err
@@ -796,7 +902,7 @@ func (s *Store) markUnavailable(def common.NamespaceDef, err error) {
 }
 
 func needsRebuild(err error) bool {
-	return errors.Is(err, timeidx.ErrRebuildRequired) || errors.Is(err, common.ErrCorruptSchema) || isCorrupt(err)
+	return errors.Is(err, timeidx.ErrRebuildRequired) || errors.Is(err, schematypes.ErrCorruptSchema) || isCorrupt(err)
 }
 
 func isCorrupt(err error) bool {
@@ -815,8 +921,8 @@ func (s *Store) Dir() string { return s.dir }
 
 // Schema returns a defensive copy of the persisted schema. Mutating the result
 // (including any NamespaceDef.Config bytes) cannot affect the Store.
-func (s *Store) Schema() *common.Schema {
-	clone := common.NewSchema()
+func (s *Store) Schema() *schematypes.Definitions {
+	clone := schematypes.NewDefinitions()
 	if data, err := s.schema.MarshalBinary(); err == nil {
 		_ = clone.UnmarshalBinary(data)
 	}
@@ -825,12 +931,11 @@ func (s *Store) Schema() *common.Schema {
 
 // NamespaceDef returns a copy of the persisted definition for a namespace. The
 // Config bytes are deep-copied so callers cannot mutate stored configuration.
-func (s *Store) NamespaceDef(ns common.Namespace) (common.NamespaceDef, bool) {
+func (s *Store) NamespaceDef(ns schematypes.Namespace) (schematypes.NamespaceDef, bool) {
 	def, ok := s.schema.Lookup(ns)
 	if !ok {
-		return common.NamespaceDef{}, false
+		return schematypes.NamespaceDef{}, false
 	}
-	def.Config = append([]byte(nil), def.Config...)
 	return def, true
 }
 
@@ -849,7 +954,7 @@ func (s *Store) Health() []NamespaceHealth {
 }
 
 // HealthOf returns the open state of one namespace.
-func (s *Store) HealthOf(ns common.Namespace) (NamespaceHealth, bool) {
+func (s *Store) HealthOf(ns schematypes.Namespace) (NamespaceHealth, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.healthOK || int(ns) >= len(s.health) {
@@ -861,10 +966,10 @@ func (s *Store) HealthOf(ns common.Namespace) (NamespaceHealth, bool) {
 // NamespaceSourceGeneration returns the durable canonical completeness
 // watermark for one declared namespace. It does not imply availability;
 // callers must also inspect HealthOf before using a damaged index.
-func (s *Store) NamespaceSourceGeneration(ns common.Namespace) (uint64, bool) {
+func (s *Store) NamespaceSourceGeneration(ns schematypes.Namespace) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.schema.Lookup(ns); !ok {
+	if _, ok := s.schema.LookupIdentity(ns); !ok {
 		return 0, false
 	}
 	return s.nsSource[ns], true
@@ -872,7 +977,7 @@ func (s *Store) NamespaceSourceGeneration(ns common.Namespace) (uint64, bool) {
 
 // isDegraded reports whether a namespace is known to be potentially incomplete
 // after a partially failed batch. It is lock-free.
-func (s *Store) isDegraded(ns common.Namespace) bool {
+func (s *Store) isDegraded(ns schematypes.Namespace) bool {
 	d := s.degraded.Load()
 	if d == nil {
 		return false
@@ -887,7 +992,7 @@ func (s *Store) isDegraded(ns common.Namespace) bool {
 // markDegraded records that a namespace may be incomplete. The caller holds mu.
 // It must not be called for a namespace that is already unavailable for another
 // reason (health is left as-is in that case).
-func (s *Store) markDegraded(ns common.Namespace, err error) {
+func (s *Store) markDegraded(ns schematypes.Namespace, err error) {
 	words := (len(s.reg.routes) + 63) / 64
 	cur := s.degraded.Load()
 	var next []uint64
@@ -911,16 +1016,16 @@ func (s *Store) markDegraded(ns common.Namespace, err error) {
 
 // DegradedNamespaces returns the namespaces currently considered stale after a
 // partially failed batch. They are unavailable until reopen or rebuild.
-func (s *Store) DegradedNamespaces() []common.Namespace {
+func (s *Store) DegradedNamespaces() []schematypes.Namespace {
 	d := s.degraded.Load()
 	if d == nil {
 		return nil
 	}
-	var out []common.Namespace
+	var out []schematypes.Namespace
 	for w, word := range *d {
 		for bit := 0; bit < 64; bit++ {
 			if word&(1<<uint(bit)) != 0 {
-				out = append(out, common.Namespace(w*64+bit))
+				out = append(out, schematypes.Namespace(w*64+bit))
 			}
 		}
 	}
@@ -1108,7 +1213,7 @@ func (s *Store) eachTime(fn func(*timeidx.Index) error) error {
 // ---- typed accessors for the search planner ----
 
 // Time returns a timestamp namespace index if it is available.
-func (s *Store) Time(ns common.Namespace) (*timeidx.Index, bool) {
+func (s *Store) Time(ns schematypes.Namespace) (*timeidx.Index, bool) {
 	if s.isDegraded(ns) {
 		return nil, false
 	}
@@ -1116,7 +1221,7 @@ func (s *Store) Time(ns common.Namespace) (*timeidx.Index, bool) {
 }
 
 // Geo returns a geographic namespace index if it is available.
-func (s *Store) Geo(ns common.Namespace) (*geoidx.Index, bool) {
+func (s *Store) Geo(ns schematypes.Namespace) (*geoidx.Index, bool) {
 	if s.isDegraded(ns) {
 		return nil, false
 	}
@@ -1124,7 +1229,7 @@ func (s *Store) Geo(ns common.Namespace) (*geoidx.Index, bool) {
 }
 
 // Sim returns a perceptual-similarity namespace store if it is available.
-func (s *Store) Sim(ns common.Namespace) (*simhash.Store, bool) {
+func (s *Store) Sim(ns schematypes.Namespace) (*simhash.Store, bool) {
 	if s.isDegraded(ns) {
 		return nil, false
 	}
@@ -1132,7 +1237,7 @@ func (s *Store) Sim(ns common.Namespace) (*simhash.Store, bool) {
 }
 
 // Hash returns an exact-hash namespace index if it is available.
-func (s *Store) Hash(ns common.Namespace) (*radixhash.Index, bool) {
+func (s *Store) Hash(ns schematypes.Namespace) (*radixhash.Index, bool) {
 	if s.isDegraded(ns) {
 		return nil, false
 	}
@@ -1140,7 +1245,7 @@ func (s *Store) Hash(ns common.Namespace) (*radixhash.Index, bool) {
 }
 
 // Vector returns a vector namespace index if it is available.
-func (s *Store) Vector(ns common.Namespace) (*vectoridx.VectorIdx, bool) {
+func (s *Store) Vector(ns schematypes.Namespace) (*vectoridx.VectorIdx, bool) {
 	if s.isDegraded(ns) {
 		return nil, false
 	}
@@ -1148,7 +1253,7 @@ func (s *Store) Vector(ns common.Namespace) (*vectoridx.VectorIdx, bool) {
 }
 
 // Bitmap returns a bitmap namespace index if it is available.
-func (s *Store) Bitmap(ns common.Namespace) (*bitmapidx.Index, bool) {
+func (s *Store) Bitmap(ns schematypes.Namespace) (*bitmapidx.Index, bool) {
 	if s.isDegraded(ns) {
 		return nil, false
 	}
@@ -1156,7 +1261,7 @@ func (s *Store) Bitmap(ns common.Namespace) (*bitmapidx.Index, bool) {
 }
 
 // Liveness returns the entity liveness bitmap and its enum value.
-func (s *Store) Liveness(entity common.EntityKind) (*bitmapidx.Index, bitmapidx.Value, bool) {
+func (s *Store) Liveness(entity schematypes.EntityKind) (*bitmapidx.Index, bitmapidx.Value, bool) {
 	return s.reg.liveness(entity)
 }
 
@@ -1165,13 +1270,13 @@ func (s *Store) Liveness(entity common.EntityKind) (*bitmapidx.Index, bitmapidx.
 func (s *Store) BitmapStore() *bitmapidx.Store { return s.bitmapStore }
 
 // EntityOf returns the entity kind of a namespace.
-func (s *Store) EntityOf(ns common.Namespace) (common.EntityKind, bool) {
+func (s *Store) EntityOf(ns schematypes.Namespace) (schematypes.EntityKind, bool) {
 	if int(ns) >= len(s.reg.routes) {
-		return common.EntityInvalid, false
+		return schematypes.EntityInvalid, false
 	}
 	rt := s.reg.routes[ns]
 	if rt.slot == noSlot {
-		return common.EntityInvalid, false
+		return schematypes.EntityInvalid, false
 	}
 	return rt.entity, true
 }

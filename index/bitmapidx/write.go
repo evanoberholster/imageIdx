@@ -5,7 +5,7 @@ import (
 	"slices"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/textanalyzer"
 	"github.com/evanoberholster/imageIdx/roar"
 )
@@ -112,8 +112,8 @@ func (i *Index) prepare(namespace NamespaceSpec, mutation namespaceMutation) ([]
 // slotted key. Empty enum bytes normalize to an empty non-nil slice.
 func (i *Index) keyForValue(namespace NamespaceSpec, value Value) (NamespaceKey, []byte, error) {
 	switch namespace.Kind {
-	case common.KindBitmapEnum:
-		if value.Kind != common.KindBitmapEnum {
+	case schema.KindBitmapEnum:
+		if value.Kind != schema.KindBitmapEnum {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		canonical, err := normalizeEnum(namespace.Normalizer, value.Bytes)
@@ -126,26 +126,26 @@ func (i *Index) keyForValue(namespace NamespaceSpec, value Value) (NamespaceKey,
 		if canonical == nil {
 			canonical = []byte{}
 		}
-		return hashCanonical(namespace.Namespace, common.KindBitmapEnum, canonical), canonical, nil
-	case common.KindBitmapBool:
-		if value.Kind != common.KindBitmapBool {
+		return hashCanonical(namespace.Namespace, schema.KindBitmapEnum, canonical), canonical, nil
+	case schema.KindBitmapBool:
+		if value.Kind != schema.KindBitmapBool {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		canonical := []byte{'0'}
 		if value.Bool {
 			canonical[0] = '1'
 		}
-		return hashCanonical(namespace.Namespace, common.KindBitmapBool, canonical), canonical, nil
-	case common.KindBitmapString:
-		if value.Kind != common.KindBitmapString {
+		return hashCanonical(namespace.Namespace, schema.KindBitmapBool, canonical), canonical, nil
+	case schema.KindBitmapString:
+		if value.Kind != schema.KindBitmapString {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		if len(value.Bytes) > MaxValueBytes {
 			return NamespaceKey{}, nil, ErrValueTooLong
 		}
-		return hashCanonical(namespace.Namespace, common.KindBitmapString, value.Bytes), value.Bytes, nil
-	case common.KindBitmapContinuous:
-		if value.Kind != common.KindBitmapContinuous {
+		return hashCanonical(namespace.Namespace, schema.KindBitmapString, value.Bytes), value.Bytes, nil
+	case schema.KindBitmapContinuous:
+		if value.Kind != schema.KindBitmapContinuous {
 			return NamespaceKey{}, nil, ErrValueKind
 		}
 		return continuousKey(namespace.Namespace, value.Int), nil, nil
@@ -301,7 +301,7 @@ func composeNamespaceDelta(view *namespaceView, changes []stagedChange) *namespa
 		adds = subtractSortedIDs(adds, rems) // remove wins within the batch
 
 		old, _ := view.active.delta(change.key)
-		var oldAdds, oldRems []common.ImageID
+		var oldAdds, oldRems []schema.ImageID
 		oldLen := 0
 		if old != nil {
 			if !old.additions.IsEmpty() {
@@ -317,7 +317,7 @@ func composeNamespaceDelta(view *namespaceView, changes []stagedChange) *namespa
 		// underlying layers: removals carry through, additions carry through.
 		stayingAdds := subtractSortedIDs(oldAdds, rems)
 		stayingRems := subtractSortedIDs(oldRems, adds)
-		var newAdds, newRems []common.ImageID
+		var newAdds, newRems []schema.ImageID
 		for _, id := range adds {
 			// Already added: underlying lacks the ID. Covered by stayingAdds.
 			if containsSortedID(oldAdds, id) {
@@ -377,20 +377,20 @@ func composeNamespaceDelta(view *namespaceView, changes []stagedChange) *namespa
 // dedupeSortedIDs sorts ids in place and returns the unique prefix. The
 // input must be caller-owned; encode and compose both rely on sorted,
 // deduplicated columns.
-func dedupeSortedIDs(ids []common.ImageID) []common.ImageID {
+func dedupeSortedIDs(ids []schema.ImageID) []schema.ImageID {
 	slices.Sort(ids)
 	return slices.Compact(ids)
 }
 
 // containsSortedID binary-searches an ascending slice.
-func containsSortedID(ids []common.ImageID, id common.ImageID) bool {
+func containsSortedID(ids []schema.ImageID, id schema.ImageID) bool {
 	_, ok := slices.BinarySearch(ids, id)
 	return ok
 }
 
 // subtractSortedIDs returns values minus minus, both ascending and
 // unique. It reuses values backing when possible; callers must own values.
-func subtractSortedIDs(values, minus []common.ImageID) []common.ImageID {
+func subtractSortedIDs(values, minus []schema.ImageID) []schema.ImageID {
 	if len(values) == 0 || len(minus) == 0 {
 		return values
 	}
@@ -413,14 +413,14 @@ func subtractSortedIDs(values, minus []common.ImageID) []common.ImageID {
 
 // mergeSortedIDs returns the ascending union of two ascending, unique
 // slices. Empty inputs are returned without allocating.
-func mergeSortedIDs(first, second []common.ImageID) []common.ImageID {
+func mergeSortedIDs(first, second []schema.ImageID) []schema.ImageID {
 	if len(first) == 0 {
 		return second
 	}
 	if len(second) == 0 {
 		return first
 	}
-	out := make([]common.ImageID, 0, len(first)+len(second))
+	out := make([]schema.ImageID, 0, len(first)+len(second))
 	left, right := 0, 0
 	for left < len(first) && right < len(second) {
 		switch {

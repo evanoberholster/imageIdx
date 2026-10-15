@@ -5,17 +5,17 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 const recordBytes = 16
 
 type shard struct {
 	times          []uint64
-	ids            []common.ValueID
+	ids            []schema.ValueID
 	offset         uint64
 	length         uint32
-	minID, maxID   common.ValueID
+	minID, maxID   schema.ValueID
 	timeCRC, idCRC uint32
 }
 
@@ -36,12 +36,12 @@ type writeScratch struct {
 
 type shardBuffer struct {
 	times []uint64
-	ids   []common.ValueID
+	ids   []schema.ValueID
 }
 
 // One backing allocation, two non-overlapping SoA columns. Limit each column's
 // capacity so appending to times can never overwrite the ID plane.
-func makeColumns(count int) ([]uint64, []common.ValueID) {
+func makeColumns(count int) ([]uint64, []schema.ValueID) {
 	data := make([]uint64, 2*count)
 	return data[:0:count], data[count : count : 2*count]
 }
@@ -49,7 +49,7 @@ func makeColumns(count int) ([]uint64, []common.ValueID) {
 // Persistent commits copy these private columns to mmap before publication,
 // so their temporary merge buffers can be reused. Heap snapshots instead own
 // fresh columns, using the same merge algorithm and never reusing reader data.
-func (scratch *writeScratch) columns(count int, reuse bool) ([]uint64, []common.ValueID) {
+func (scratch *writeScratch) columns(count int, reuse bool) ([]uint64, []schema.ValueID) {
 	if !reuse {
 		return makeColumns(count)
 	}
@@ -64,7 +64,7 @@ func (scratch *writeScratch) columns(count int, reuse bool) ([]uint64, []common.
 	return b.times[:0], b.ids[:0]
 }
 
-func pairLess(at uint64, ai common.ValueID, bt uint64, bi common.ValueID) bool {
+func pairLess(at uint64, ai schema.ValueID, bt uint64, bi schema.ValueID) bool {
 	return at < bt || (at == bt && ai < bi)
 }
 
@@ -72,7 +72,7 @@ func pairLess(at uint64, ai common.ValueID, bt uint64, bi common.ValueID) bool {
 // Mix high and low ID bits so aligned/sparse identifiers do not share one bit.
 func mutationBit(id uint64) uint64 { return ((id ^ (id >> 32)) * 0x9e3779b97f4a7c15) >> 52 }
 
-func shardFor(shards []*shard, timestamp uint64, id common.ValueID) int {
+func shardFor(shards []*shard, timestamp uint64, id schema.ValueID) int {
 	if len(shards) == 0 {
 		return -1
 	}
@@ -82,7 +82,7 @@ func shardFor(shards []*shard, timestamp uint64, id common.ValueID) int {
 	})-1)
 }
 
-func newShard(times []uint64, ids []common.ValueID) *shard {
+func newShard(times []uint64, ids []schema.ValueID) *shard {
 	s := &shard{times: times, ids: ids}
 	if len(ids) != 0 {
 		s.minID, s.maxID = ids[0], ids[0]
@@ -94,7 +94,7 @@ func newShard(times []uint64, ids []common.ValueID) *shard {
 	return s
 }
 
-func splitShards(dst []*shard, times []uint64, ids []common.ValueID, maxRecords int) []*shard {
+func splitShards(dst []*shard, times []uint64, ids []schema.ValueID, maxRecords int) []*shard {
 	chunks := (len(times) + maxRecords - 1) / maxRecords
 	for n := 0; n < chunks; n++ {
 		start, end := n*len(times)/chunks, (n+1)*len(times)/chunks
@@ -172,7 +172,7 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 			sparseBits[bit>>6] |= uint64(1) << (bit & 63)
 		}
 	}
-	touched := func(id common.ValueID) bool {
+	touched := func(id schema.ValueID) bool {
 		if id < minID || id > maxID {
 			return false
 		}
@@ -186,7 +186,7 @@ func prepare(current []*shard, ops []Mutation, maxRecords int, scratch *writeScr
 				return false
 			}
 		}
-		_, ok := slices.BinarySearchFunc(ops, id, func(a Mutation, b common.ValueID) int { return cmp.Compare(a.imageID, b) })
+		_, ok := slices.BinarySearchFunc(ops, id, func(a Mutation, b schema.ValueID) int { return cmp.Compare(a.imageID, b) })
 		return ok
 	}
 	for n, s := range current {

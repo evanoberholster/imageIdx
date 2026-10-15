@@ -6,39 +6,39 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/golang/geo/s2"
 )
 
 func TestRebuildAllFamiliesPreservesTypedValues(t *testing.T) {
 	root := t.TempDir()
 	data, dir := filepath.Join(root, "data"), filepath.Join(root, "index")
-	schema := common.NewSchema()
-	defs := []common.NamespaceDef{
-		{Namespace: 111, Name: "taken", Kind: common.KindTimestamp, Entity: common.EntityImage},
-		{Namespace: 112, Name: "location", Kind: common.KindGeo, Entity: common.EntityImage},
-		{Namespace: 113, Name: "sha256", Kind: common.KindHashExact, Entity: common.EntityImage},
-		{Namespace: 114, Name: "perceptual", Kind: common.KindHashPerceptual, Entity: common.EntityImage},
+	schema := schematypes.NewDefinitions()
+	defs := []schematypes.NamespaceDef{
+		{Namespace: 111, Name: "taken", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+		{Namespace: 112, Name: "location", Kind: schematypes.KindGeo, Entity: schematypes.EntityImage},
+		{Namespace: 113, Name: "sha256", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage},
+		{Namespace: 114, Name: "perceptual", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage},
 	}
 	for _, d := range defs {
 		if err := schema.Register(d); err != nil {
 			t.Fatal(err)
 		}
 	}
-	bsi, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 115, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16}, "score", common.EntityImage)
+	bsi, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 115, Kind: schematypes.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16}, "score", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := schema.Register(bsi); err != nil {
 		t.Fatal(err)
 	}
-	vector, err := index.VectorDef(vectoridx.Config{Namespace: 116, Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementInt8}, "embedding", common.EntityImage)
+	vector, err := index.VectorDef(vectoridx.Config{Namespace: 116, Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementInt8}, "embedding", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestRebuildAllFamiliesPreservesTypedValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Projection: projection})
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection})
 	if err != nil {
 		t.Fatal(err)
 	}

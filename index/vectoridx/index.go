@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar"
 )
@@ -414,7 +414,7 @@ func (v *VectorIdx) TombstoneCount() int {
 
 // Metadata is a copied summary of the current generation.
 type Metadata struct {
-	Namespace      common.Namespace
+	Namespace      schema.Namespace
 	Dimensions     Dimensions
 	ElementType    ElementType
 	Generation     uint64

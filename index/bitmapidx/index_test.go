@@ -9,26 +9,26 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/textanalyzer"
 )
 
-const testFocalLength common.Namespace = 100
+const testFocalLength schema.Namespace = 100
 
-func enumNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapEnum, Normalizer: CodecSpec{Code: NormalizerIdentity, Version: 1}}
+func enumNamespace(t schema.Namespace) NamespaceSpec {
+	return NamespaceSpec{Namespace: t, Kind: schema.KindBitmapEnum, Normalizer: CodecSpec{Code: NormalizerIdentity, Version: 1}}
 }
 
-func boolNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapBool}
+func boolNamespace(t schema.Namespace) NamespaceSpec {
+	return NamespaceSpec{Namespace: t, Kind: schema.KindBitmapBool}
 }
 
-func continuousNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapContinuous, Quant: Quantizer{Code: QuantIdentity, Version: 1, Scale: 1}}
+func continuousNamespace(t schema.Namespace) NamespaceSpec {
+	return NamespaceSpec{Namespace: t, Kind: schema.KindBitmapContinuous, Quant: Quantizer{Code: QuantIdentity, Version: 1, Scale: 1}}
 }
 
-func textNamespace(t common.Namespace) NamespaceSpec {
-	return NamespaceSpec{Namespace: t, Kind: common.KindBitmapString, Analyzer: CodecSpec{Code: textanalyzer.CodeLatin, Version: textanalyzer.Version}}
+func textNamespace(t schema.Namespace) NamespaceSpec {
+	return NamespaceSpec{Namespace: t, Kind: schema.KindBitmapString, Analyzer: CodecSpec{Code: textanalyzer.CodeLatin, Version: textanalyzer.Version}}
 }
 
 func mustNamespace(t *testing.T, namespace NamespaceSpec, config NamespaceConfig) *Index {
@@ -41,7 +41,7 @@ func mustNamespace(t *testing.T, namespace NamespaceSpec, config NamespaceConfig
 	return index
 }
 
-func appendIDs(t *testing.T, index *Index, value Value) []common.ImageID {
+func appendIDs(t *testing.T, index *Index, value Value) []schema.ImageID {
 	t.Helper()
 	ids, err := index.ValueIDs(nil, value)
 	if err != nil {
@@ -50,7 +50,7 @@ func appendIDs(t *testing.T, index *Index, value Value) []common.ImageID {
 	return ids
 }
 
-func matchIDs(t *testing.T, index *Index, values ...Value) []common.ImageID {
+func matchIDs(t *testing.T, index *Index, values ...Value) []schema.ImageID {
 	t.Helper()
 	match, err := index.MatchValues(values...)
 	if err != nil {
@@ -60,23 +60,23 @@ func matchIDs(t *testing.T, index *Index, values ...Value) []common.ImageID {
 }
 
 func TestHashDomainSeparation(t *testing.T) {
-	base := hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("x"))
-	if base != hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("x")) {
+	base := hashCanonical(schema.NamespaceTag, schema.KindBitmapEnum, []byte("x"))
+	if base != hashCanonical(schema.NamespaceTag, schema.KindBitmapEnum, []byte("x")) {
 		t.Fatal("hash is not deterministic")
 	}
-	if base == hashCanonical(common.NamespaceAlbum, common.KindBitmapEnum, []byte("x")) {
+	if base == hashCanonical(schema.NamespaceAlbum, schema.KindBitmapEnum, []byte("x")) {
 		t.Fatal("type is not domain-separated")
 	}
-	if base == hashCanonical(common.NamespaceTag, common.KindBitmapString, []byte("x")) {
+	if base == hashCanonical(schema.NamespaceTag, schema.KindBitmapString, []byte("x")) {
 		t.Fatal("kind is not domain-separated")
 	}
-	if base == hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("y")) {
+	if base == hashCanonical(schema.NamespaceTag, schema.KindBitmapEnum, []byte("y")) {
 		t.Fatal("value is not domain-separated")
 	}
 }
 
 func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
-	specs := []NamespaceSpec{enumNamespace(common.NamespaceTag), textNamespace(common.NamespaceTag + 1)}
+	specs := []NamespaceSpec{enumNamespace(schema.NamespaceTag), textNamespace(schema.NamespaceTag + 1)}
 	data := encodeNamespaceSpecs(specs)
 	restored, err := decodeNamespaceSpecs(data)
 	if err != nil {
@@ -88,24 +88,24 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 	var tag NamespaceSpec
 	found := false
 	for _, spec := range restored {
-		if spec.Namespace == common.NamespaceTag {
+		if spec.Namespace == schema.NamespaceTag {
 			tag, found = spec, true
 			break
 		}
 	}
-	if !found || tag.Kind != common.KindBitmapEnum {
+	if !found || tag.Kind != schema.KindBitmapEnum {
 		t.Fatalf("restored namespace = %+v, ok=%v", tag, found)
 	}
 
-	enum := enumNamespace(common.NamespaceTag)
+	enum := enumNamespace(schema.NamespaceTag)
 	def, err := enum.NamespaceDef("tag")
 	if err != nil {
 		t.Fatalf("NamespaceDef: %v", err)
 	}
-	if def.Namespace != common.NamespaceTag || def.Name != "tag" || def.Kind != common.KindBitmapEnum {
+	if def.Namespace != schema.NamespaceTag || def.Name != "tag" || def.Kind != schema.KindBitmapEnum {
 		t.Fatalf("NamespaceDef = %+v", def)
 	}
-	if _, err := enum.NamespaceDef(""); !errors.Is(err, common.ErrNamespaceName) {
+	if _, err := enum.NamespaceDef(""); !errors.Is(err, schema.ErrNamespaceName) {
 		t.Fatalf("empty schema name error = %v, want ErrNamespaceName", err)
 	}
 	back, err := NamespaceSpecFromSchemaDef(def)
@@ -118,19 +118,19 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 		t.Fatalf("round trip = %+v, want %+v", back, enum)
 	}
 	mismatchedBitmapKind := def
-	mismatchedBitmapKind.Kind = common.KindBitmapBool
+	mismatchedBitmapKind.Kind = schema.KindBitmapBool
 	if _, err := NamespaceSpecFromSchemaDef(mismatchedBitmapKind); !errors.Is(err, ErrNamespaceMismatch) {
 		t.Fatalf("mismatched bitmap kind error = %v, want ErrNamespaceMismatch", err)
 	}
-	wrongKind := common.NamespaceDef{Namespace: common.NamespaceTag, Name: "tag", Kind: common.KindVector, Config: def.Config}
+	wrongKind := schema.NamespaceDef{Namespace: schema.NamespaceTag, Name: "tag", Kind: schema.KindVector, Config: def.Config}
 	if _, err := NamespaceSpecFromSchemaDef(wrongKind); !errors.Is(err, ErrNamespaceMismatch) {
 		t.Fatalf("wrong kind error = %v, want ErrNamespaceMismatch", err)
 	}
 
-	if err := validateNamespaceSpecs([]NamespaceSpec{enumNamespace(common.NamespaceTag), boolNamespace(common.NamespaceTag)}); !errors.Is(err, common.ErrNamespaceDuplicate) {
+	if err := validateNamespaceSpecs([]NamespaceSpec{enumNamespace(schema.NamespaceTag), boolNamespace(schema.NamespaceTag)}); !errors.Is(err, schema.ErrNamespaceDuplicate) {
 		t.Fatalf("duplicate namespace error = %v, want ErrNamespaceDuplicate", err)
 	}
-	bad := textNamespace(common.NamespaceTag + 2)
+	bad := textNamespace(schema.NamespaceTag + 2)
 	bad.Analyzer.Code = 99
 	if err := validateNamespaceSpecs([]NamespaceSpec{bad}); !errors.Is(err, ErrInvalidNamespace) {
 		t.Fatalf("bad codec error = %v, want ErrInvalidNamespace", err)
@@ -139,13 +139,13 @@ func TestNamespaceSpecSchemaRoundTrip(t *testing.T) {
 
 func TestBitmapKindWireCodes(t *testing.T) {
 	for _, tc := range []struct {
-		kind common.NamespaceKind
+		kind schema.NamespaceKind
 		code byte
 	}{
-		{common.KindBitmapEnum, 1},
-		{common.KindBitmapBool, 2},
-		{common.KindBitmapString, 3},
-		{common.KindBitmapContinuous, 4},
+		{schema.KindBitmapEnum, 1},
+		{schema.KindBitmapBool, 2},
+		{schema.KindBitmapString, 3},
+		{schema.KindBitmapContinuous, 4},
 	} {
 		if got := bitmapKindCode(tc.kind); got != tc.code {
 			t.Errorf("bitmapKindCode(%v) = %d, want %d", tc.kind, got, tc.code)
@@ -158,13 +158,13 @@ func TestBitmapKindWireCodes(t *testing.T) {
 		t.Fatalf("bitmapKindFromCode(0) = %v, want invalid kind", got)
 	}
 	// Geography moved to geoidx: the bitmap kind no longer has a wire code.
-	if got := bitmapKindCode(common.KindBitmapGeo); got != 0 {
+	if got := bitmapKindCode(schema.KindBitmapGeo); got != 0 {
 		t.Fatalf("bitmapKindCode(geo) = %d, want 0", got)
 	}
 }
 
 func TestLegacyStorageByteStillDecodes(t *testing.T) {
-	wire := appendNamespace(nil, enumNamespace(common.NamespaceTag))
+	wire := appendNamespace(nil, enumNamespace(schema.NamespaceTag))
 	if wire[3] != 2 {
 		t.Fatalf("storage byte = %d, want 2", wire[3])
 	}
@@ -180,12 +180,12 @@ func TestLegacyStorageByteStillDecodes(t *testing.T) {
 
 func TestHashCollisionSlots(t *testing.T) {
 	original := hashCanonical
-	hashCanonical = func(t common.Namespace, _ common.NamespaceKind, _ []byte) NamespaceKey {
+	hashCanonical = func(t schema.Namespace, _ schema.NamespaceKind, _ []byte) NamespaceKey {
 		return NamespaceKey{Namespace: t, Hash: 0xc0111ded}
 	}
 	t.Cleanup(func() { hashCanonical = original })
 
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
 			Entry{ImageID: 1, Value: EnumStringValue("alpha")},
@@ -213,11 +213,11 @@ func TestHashCollisionSlots(t *testing.T) {
 	}
 	for _, check := range []struct {
 		value Value
-		want  []common.ImageID
+		want  []schema.ImageID
 	}{
-		{EnumStringValue("alpha"), []common.ImageID{1}},
-		{EnumStringValue("beta"), []common.ImageID{2}},
-		{EnumStringValue("gamma"), []common.ImageID{3}},
+		{EnumStringValue("alpha"), []schema.ImageID{1}},
+		{EnumStringValue("beta"), []schema.ImageID{2}},
+		{EnumStringValue("gamma"), []schema.ImageID{3}},
 	} {
 		if got := appendIDs(t, index, check.value); !slices.Equal(got, check.want) {
 			t.Fatalf("%s = %v, want %v", check.value.Bytes, got, check.want)
@@ -231,10 +231,10 @@ func TestHashCollisionSlots(t *testing.T) {
 	commit(t, index, func(b *Batch) error {
 		return b.Remove(Entry{ImageID: 2, Value: EnumStringValue("beta")})
 	})
-	if got := appendIDs(t, index, EnumStringValue("alpha")); !slices.Equal(got, []common.ImageID{1}) {
+	if got := appendIDs(t, index, EnumStringValue("alpha")); !slices.Equal(got, []schema.ImageID{1}) {
 		t.Fatalf("alpha after beta removal = %v", got)
 	}
-	if got := appendIDs(t, index, EnumStringValue("gamma")); !slices.Equal(got, []common.ImageID{3}) {
+	if got := appendIDs(t, index, EnumStringValue("gamma")); !slices.Equal(got, []schema.ImageID{3}) {
 		t.Fatalf("gamma after beta removal = %v", got)
 	}
 	if got := appendIDs(t, index, EnumStringValue("beta")); len(got) != 0 {
@@ -251,16 +251,16 @@ func TestHashCollisionSlots(t *testing.T) {
 	if _, ok, err := index.KeyForValue(EnumStringValue("beta")); err != nil || ok {
 		t.Fatalf("beta after vacuum: ok=%v err=%v", ok, err)
 	}
-	if got := appendIDs(t, index, EnumStringValue("alpha")); !slices.Equal(got, []common.ImageID{1}) {
+	if got := appendIDs(t, index, EnumStringValue("alpha")); !slices.Equal(got, []schema.ImageID{1}) {
 		t.Fatalf("alpha after vacuum = %v", got)
 	}
 	commit(t, index, func(b *Batch) error {
 		return b.Add(Entry{ImageID: 4, Value: EnumStringValue("beta")})
 	})
-	if got := appendIDs(t, index, EnumStringValue("beta")); !slices.Equal(got, []common.ImageID{4}) {
+	if got := appendIDs(t, index, EnumStringValue("beta")); !slices.Equal(got, []schema.ImageID{4}) {
 		t.Fatalf("beta after re-add = %v", got)
 	}
-	if got := appendIDs(t, index, EnumStringValue("gamma")); !slices.Equal(got, []common.ImageID{3}) {
+	if got := appendIDs(t, index, EnumStringValue("gamma")); !slices.Equal(got, []schema.ImageID{3}) {
 		t.Fatalf("gamma after re-add = %v", got)
 	}
 	var values []string
@@ -275,8 +275,8 @@ func TestHashCollisionSlots(t *testing.T) {
 }
 
 func TestNamespaceIndexEnumLifecycle(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
-	if index.Spec().Kind != common.KindBitmapEnum {
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
+	if index.Spec().Kind != schema.KindBitmapEnum {
 		t.Fatalf("kind = %v", index.Spec().Kind)
 	}
 	commit(t, index, func(b *Batch) error {
@@ -286,7 +286,7 @@ func TestNamespaceIndexEnumLifecycle(t *testing.T) {
 			Entry{ImageID: 3, Value: EnumStringValue("Rome")},
 		)
 	})
-	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []common.ImageID{1, 2}) {
+	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []schema.ImageID{1, 2}) {
 		t.Fatalf("Paris = %v", got)
 	}
 	if got := matchIDs(t, index, EnumStringValue("Paris"), EnumStringValue("Rome")); len(got) != 0 {
@@ -306,14 +306,14 @@ func TestNamespaceIndexEnumLifecycle(t *testing.T) {
 		}
 		return b.Remove(Entry{ImageID: 4, Value: EnumStringValue("Paris")})
 	})
-	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []common.ImageID{1, 2}) {
+	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []schema.ImageID{1, 2}) {
 		t.Fatalf("Paris after remove-wins = %v", got)
 	}
 
 	commit(t, index, func(b *Batch) error {
 		return b.Remove(Entry{ImageID: 1, Value: EnumStringValue("Paris")})
 	})
-	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []common.ImageID{2}) {
+	if got := matchIDs(t, index, EnumStringValue("Paris")); !slices.Equal(got, []schema.ImageID{2}) {
 		t.Fatalf("Paris after remove = %v", got)
 	}
 
@@ -321,14 +321,14 @@ func TestNamespaceIndexEnumLifecycle(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("CountValues = %d, %v", count, err)
 	}
-	filtered, err := index.FilterValues(nil, []common.ImageID{1, 2, 3, 4}, EnumStringValue("Paris"))
-	if err != nil || !slices.Equal(filtered, []common.ImageID{2}) {
+	filtered, err := index.FilterValues(nil, []schema.ImageID{1, 2, 3, 4}, EnumStringValue("Paris"))
+	if err != nil || !slices.Equal(filtered, []schema.ImageID{2}) {
 		t.Fatalf("FilterValues = %v, %v", filtered, err)
 	}
 }
 
 func TestNamespaceIndexBoolExplicitFalse(t *testing.T) {
-	index := mustNamespace(t, boolNamespace(common.NamespaceFlag), NamespaceConfig{})
+	index := mustNamespace(t, boolNamespace(schema.NamespaceFlag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
 			Entry{ImageID: 1, Value: BoolValue(false)},
@@ -342,11 +342,11 @@ func TestNamespaceIndexBoolExplicitFalse(t *testing.T) {
 		t.Fatal("absent image reported as false member")
 	}
 	falseIDs := appendIDs(t, index, BoolValue(false))
-	if !slices.Equal(falseIDs, []common.ImageID{1}) {
+	if !slices.Equal(falseIDs, []schema.ImageID{1}) {
 		t.Fatalf("false IDs = %v", falseIDs)
 	}
 	trueIDs := appendIDs(t, index, BoolValue(true))
-	if !slices.Equal(trueIDs, []common.ImageID{2}) {
+	if !slices.Equal(trueIDs, []schema.ImageID{2}) {
 		t.Fatalf("true IDs = %v", trueIDs)
 	}
 }
@@ -356,7 +356,7 @@ func TestNamespaceIndexContinuousRange(t *testing.T) {
 	values := []int64{math.MinInt64, -100, -1, 0, 1, 50, 64, 70, 100, math.MaxInt64}
 	for n, value := range values {
 		commit(t, index, func(b *Batch) error {
-			return b.Add(Entry{ImageID: common.ImageID(n + 1), Value: IntValue(value)})
+			return b.Add(Entry{ImageID: schema.ImageID(n + 1), Value: IntValue(value)})
 		})
 	}
 	check := func(bounds NumericRange, want []int64) {
@@ -366,9 +366,9 @@ func TestNamespaceIndexContinuousRange(t *testing.T) {
 			t.Fatalf("Range: %v", err)
 		}
 		got := match.AppendTo(nil)
-		ids := make([]common.ImageID, 0, len(want))
+		ids := make([]schema.ImageID, 0, len(want))
 		for _, value := range want {
-			ids = append(ids, common.ImageID(slices.Index(values, value)+1))
+			ids = append(ids, schema.ImageID(slices.Index(values, value)+1))
 		}
 		if !slices.Equal(got, ids) {
 			t.Fatalf("Range %+v = %v, want %v", bounds, got, ids)
@@ -394,7 +394,7 @@ func TestNamespaceIndexContinuousRange(t *testing.T) {
 		t.Fatalf("Range: %v", err)
 	}
 
-	enum := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	enum := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	if _, err := enum.Range(Between(0, 1)); !errors.Is(err, ErrInvalidRange) {
 		t.Fatalf("Range on enum = %v, want ErrInvalidRange", err)
 	}
@@ -414,14 +414,14 @@ func TestNamespaceIndexMove(t *testing.T) {
 	if ids := appendIDs(t, index, IntValue(24)); len(ids) != 0 {
 		t.Fatalf("old value still present: %v", ids)
 	}
-	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{1}) {
+	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []schema.ImageID{1}) {
 		t.Fatalf("new value = %v", ids)
 	}
 	// Same-value move is a no-op, not add/remove cancellation.
 	commit(t, index, func(b *Batch) error {
 		return b.Move(Move{ImageID: 1, From: 35, To: 35})
 	})
-	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{1}) {
+	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []schema.ImageID{1}) {
 		t.Fatalf("same-value move removed membership: %v", ids)
 	}
 	{
@@ -437,7 +437,7 @@ func TestNamespaceIndexMove(t *testing.T) {
 }
 
 func TestNamespaceIndexTextReplace(t *testing.T) {
-	index := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, textNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.ReplaceText(
 			TextReplacement{ImageID: 1, After: []string{"Golden Gate Bridge"}},
@@ -448,11 +448,11 @@ func TestNamespaceIndexTextReplace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchText: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 2}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []schema.ImageID{1, 2}) {
 		t.Fatalf("golden gate = %v", got)
 	}
 	match, _ = index.MatchText("bridge")
-	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []schema.ImageID{1}) {
 		t.Fatalf("bridge = %v", got)
 	}
 	commit(t, index, func(b *Batch) error {
@@ -464,7 +464,7 @@ func TestNamespaceIndexTextReplace(t *testing.T) {
 	}
 	// Token retained in both old and new text must not be removed.
 	match, _ = index.MatchText("golden")
-	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1, 2}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []schema.ImageID{1, 2}) {
 		t.Fatalf("golden after overlapping replace = %v", got)
 	}
 	// Zero-token queries match nothing.
@@ -475,7 +475,7 @@ func TestNamespaceIndexTextReplace(t *testing.T) {
 	{
 		batch := index.NewBatch()
 		defer batch.Close()
-		if err := batch.Add(Entry{ImageID: 3, Value: Value{Kind: common.KindBitmapString, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
+		if err := batch.Add(Entry{ImageID: 3, Value: Value{Kind: schema.KindBitmapString, Bytes: []byte("x")}}); !errors.Is(err, ErrUnsupportedOperation) {
 			t.Fatalf("text Add error = %v, want ErrUnsupportedOperation", err)
 		}
 	}
@@ -483,7 +483,7 @@ func TestNamespaceIndexTextReplace(t *testing.T) {
 
 func TestNamespaceIndexDeltaRotationAndCompaction(t *testing.T) {
 	config := NamespaceConfig{ActiveTarget: 3, HardDeltaLimit: 8, MaxDeltaValues: 2}
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), config)
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), config)
 	commit(t, index, func(b *Batch) error {
 		return b.Add(Entry{ImageID: 1, Value: EnumStringValue("a")})
 	})
@@ -498,35 +498,35 @@ func TestNamespaceIndexDeltaRotationAndCompaction(t *testing.T) {
 	if err := index.WaitIdle(context.Background()); err != nil {
 		t.Fatalf("WaitIdle: %v", err)
 	}
-	if got := matchIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []common.ImageID{1, 2, 3, 4}) {
+	if got := matchIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []schema.ImageID{1, 2, 3, 4}) {
 		t.Fatalf("after rotation = %v", got)
 	}
 	// A batch above HardDeltaLimit folds the base directly.
 	large := make([]Entry, 0, 12)
-	for id := common.ImageID(10); id < 22; id++ {
+	for id := schema.ImageID(10); id < 22; id++ {
 		large = append(large, Entry{ImageID: id, Value: EnumStringValue("b")})
 	}
 	commit(t, index, func(b *Batch) error { return b.Add(large...) })
 	if got := matchIDs(t, index, EnumStringValue("b")); len(got) != 12 {
 		t.Fatalf("large add = %v", got)
 	}
-	if got := matchIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []common.ImageID{1, 2, 3, 4}) {
+	if got := matchIDs(t, index, EnumStringValue("a")); !slices.Equal(got, []schema.ImageID{1, 2, 3, 4}) {
 		t.Fatalf("base preserved = %v", got)
 	}
 
 	// Delta beyond MaxDeltaValues folds too.
 	for value := 0; value < 4; value++ {
 		commit(t, index, func(b *Batch) error {
-			return b.Add(Entry{ImageID: common.ImageID(100 + value), Value: EnumStringValue(string(rune('p' + value)))})
+			return b.Add(Entry{ImageID: schema.ImageID(100 + value), Value: EnumStringValue(string(rune('p' + value)))})
 		})
 	}
-	if got := matchIDs(t, index, EnumStringValue("p")); !slices.Equal(got, []common.ImageID{100}) {
+	if got := matchIDs(t, index, EnumStringValue("p")); !slices.Equal(got, []schema.ImageID{100}) {
 		t.Fatalf("folded value = %v", got)
 	}
 }
 
 func TestNamespaceIndexVacuumDropsDeadValues(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
 			Entry{ImageID: 1, Value: EnumStringValue("dead")},
@@ -545,7 +545,7 @@ func TestNamespaceIndexVacuumDropsDeadValues(t *testing.T) {
 	if _, ok, err := index.KeyForValue(EnumStringValue("dead")); err != nil || ok {
 		t.Fatalf("dead after vacuum: ok=%v err=%v", ok, err)
 	}
-	if got := matchIDs(t, index, EnumStringValue("live")); !slices.Equal(got, []common.ImageID{2}) {
+	if got := matchIDs(t, index, EnumStringValue("live")); !slices.Equal(got, []schema.ImageID{2}) {
 		t.Fatalf("live after vacuum = %v", got)
 	}
 	var visited []string
@@ -559,7 +559,7 @@ func TestNamespaceIndexVacuumDropsDeadValues(t *testing.T) {
 }
 
 func TestNamespaceIndexPrefixAndLookup(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(
 			Entry{ImageID: 1, Value: EnumStringValue("Trekking")},
@@ -592,10 +592,10 @@ func TestNamespaceIndexPrefixAndLookup(t *testing.T) {
 }
 
 func TestNamespaceIndexValidation(t *testing.T) {
-	if _, err := NewMemory(NamespaceSpec{Namespace: 0, Kind: common.KindBitmapEnum}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
+	if _, err := NewMemory(NamespaceSpec{Namespace: 0, Kind: schema.KindBitmapEnum}, NamespaceConfig{}); !errors.Is(err, ErrInvalidNamespace) {
 		t.Fatalf("zero type error = %v", err)
 	}
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	{
 		batch := index.NewBatch()
 		defer batch.Close()
@@ -613,7 +613,7 @@ func TestNamespaceIndexValidation(t *testing.T) {
 }
 
 func TestNamespaceIndexConcurrentReadersWriters(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{ActiveTarget: 64, HardDeltaLimit: 128})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{ActiveTarget: 64, HardDeltaLimit: 128})
 	var wait sync.WaitGroup
 	stop := make(chan struct{})
 	for reader := 0; reader < 4; reader++ {
@@ -627,13 +627,13 @@ func TestNamespaceIndexConcurrentReadersWriters(t *testing.T) {
 				default:
 				}
 				_, _ = index.MatchValues(EnumStringValue("a"))
-				_ = index.ContainsKey(1, hashCanonical(common.NamespaceTag, common.KindBitmapEnum, []byte("a")))
+				_ = index.ContainsKey(1, hashCanonical(schema.NamespaceTag, schema.KindBitmapEnum, []byte("a")))
 				_, _, _ = index.KeyForValue(EnumStringValue("a"))
 			}
 		}()
 	}
 	for batch := 0; batch < 200; batch++ {
-		id := common.ImageID(batch + 1)
+		id := schema.ImageID(batch + 1)
 		commit(t, index, func(b *Batch) error { return b.Add(Entry{ImageID: id, Value: EnumStringValue("a")}) })
 		if batch%3 == 0 {
 			commit(t, index, func(b *Batch) error { return b.Remove(Entry{ImageID: id, Value: EnumStringValue("a")}) })
@@ -644,7 +644,7 @@ func TestNamespaceIndexConcurrentReadersWriters(t *testing.T) {
 }
 
 func TestNamespaceIndexTextAnalyzerPipeline(t *testing.T) {
-	index := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, textNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.ReplaceText(TextReplacement{ImageID: 1, After: []string{"Café au lait!"}})
 	})
@@ -652,7 +652,7 @@ func TestNamespaceIndexTextAnalyzerPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchText: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []schema.ImageID{1}) {
 		t.Fatalf("accent-folded match = %v", got)
 	}
 }
@@ -686,13 +686,13 @@ func TestNamespaceIndexMoveToEmpty(t *testing.T) {
 	commit(t, index, func(b *Batch) error {
 		return b.Move(Move{ImageID: 2, To: 35})
 	})
-	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []common.ImageID{2}) {
+	if ids := appendIDs(t, index, IntValue(35)); !slices.Equal(ids, []schema.ImageID{2}) {
 		t.Fatalf("insert-move = %v", ids)
 	}
 }
 
 func TestNamespaceIndexClose(t *testing.T) {
-	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatalf("NewMemory: %v", err)
 	}
@@ -754,7 +754,7 @@ func TestNamespaceIndexClose(t *testing.T) {
 }
 
 func TestMatchValuesEmpty(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	defer func() { _ = index.Close() }()
 	commit(t, index, func(b *Batch) error {
 		return b.Add(Entry{ImageID: 1, Value: EnumStringValue("x")})
@@ -766,20 +766,20 @@ func TestMatchValuesEmpty(t *testing.T) {
 	if count, err := index.CountValues(); err != nil || count != 0 {
 		t.Fatalf("empty CountValues = %d, %v; want 0, nil", count, err)
 	}
-	if got, err := index.FilterValues([]common.ImageID{9}, []common.ImageID{1, 2}); err != nil || !slices.Equal(got, []common.ImageID{9}) {
+	if got, err := index.FilterValues([]schema.ImageID{9}, []schema.ImageID{1, 2}); err != nil || !slices.Equal(got, []schema.ImageID{9}) {
 		t.Fatalf("empty FilterValues = %v, %v; want [9], nil", got, err)
 	}
 }
 
 func TestDictionaryCompaction(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	defer func() { _ = index.Close() }()
 	const values = dictActiveTargetEntries + 100
 	adds := make([]Entry, 0, values)
 	for n := 0; n < values; n++ {
 		adds = append(adds, Entry{
-			ImageID: common.ImageID(n + 1),
-			Value:   Value{Kind: common.KindBitmapEnum, Bytes: []byte{byte(n), byte(n >> 8)}},
+			ImageID: schema.ImageID(n + 1),
+			Value:   Value{Kind: schema.KindBitmapEnum, Bytes: []byte{byte(n), byte(n >> 8)}},
 		})
 	}
 	commit(t, index, func(b *Batch) error { return b.Add(adds...) })
@@ -792,11 +792,11 @@ func TestDictionaryCompaction(t *testing.T) {
 	if len(view.dict.base) != values {
 		t.Fatalf("base entries = %d, want %d", len(view.dict.base), values)
 	}
-	first := Value{Kind: common.KindBitmapEnum, Bytes: []byte{0, 0}}
+	first := Value{Kind: schema.KindBitmapEnum, Bytes: []byte{0, 0}}
 	if _, ok, err := index.KeyForValue(first); err != nil || !ok {
 		t.Fatalf("KeyForValue ok = %v, %v; want true, nil", ok, err)
 	}
-	if ids, err := index.ValueIDs(nil, first); err != nil || !slices.Equal(ids, []common.ImageID{1}) {
+	if ids, err := index.ValueIDs(nil, first); err != nil || !slices.Equal(ids, []schema.ImageID{1}) {
 		t.Fatalf("ValueIDs = %v, %v; want [1], nil", ids, err)
 	}
 	visited := 0
@@ -814,7 +814,7 @@ func shortContext(t *testing.T) context.Context {
 }
 
 func TestReplaceTextRejectsDuplicateImage(t *testing.T) {
-	index := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, textNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha"}})
 	})
@@ -835,7 +835,7 @@ func TestReplaceTextRejectsDuplicateImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchText: %v", err)
 	}
-	if got := match.AppendTo(nil); !slices.Equal(got, []common.ImageID{1}) {
+	if got := match.AppendTo(nil); !slices.Equal(got, []schema.ImageID{1}) {
 		t.Fatalf("alpha membership = %v, want [1]", got)
 	}
 }
@@ -857,7 +857,7 @@ func closeWithin(t *testing.T, index *Index, what string) {
 }
 
 func TestIterateCallbackPanicReleasesReader(t *testing.T) {
-	index := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, textNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha"}})
 	})
@@ -869,7 +869,7 @@ func TestIterateCallbackPanicReleasesReader(t *testing.T) {
 }
 
 func TestPrefixCallbackPanicReleasesReader(t *testing.T) {
-	index := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, textNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha"}})
 	})

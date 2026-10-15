@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/bench"
 )
 
@@ -99,14 +99,14 @@ func benchmarkNamespaceIndexMixedRun(b *testing.B, duration time.Duration, write
 // exercise the mmap-backed base rather than an in-memory delta.
 func buildMixedStore(tb testing.TB, dir string, n int, values []Value) (*Store, *Index) {
 	tb.Helper()
-	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilityOS)
+	store, err := NewStore(dir, []NamespaceSpec{enumNamespace(schema.NamespaceTag)}, NamespaceConfig{}, schema.DurabilityOS)
 	if err != nil {
 		tb.Fatalf("NewMemory: %v", err)
 	}
-	index, ok := store.Lookup(common.NamespaceTag)
+	index, ok := store.Lookup(schema.NamespaceTag)
 	if !ok {
 		_ = store.Close()
-		tb.Fatal("common.NamespaceTag is not registered")
+		tb.Fatal("schema.NamespaceTag is not registered")
 	}
 	entries := make([]Entry, 0, MaxNamespaceBatchUpdates)
 	flush := func() {
@@ -119,7 +119,7 @@ func buildMixedStore(tb testing.TB, dir string, n int, values []Value) (*Store, 
 	assignment := bench.NewRNG(mixedSeed).Perm(n)
 	for id := 1; id <= n; id++ {
 		value := values[assignment[id-1]%len(values)]
-		entries = append(entries, Entry{ImageID: common.ImageID(id), Value: value})
+		entries = append(entries, Entry{ImageID: schema.ImageID(id), Value: value})
 		if len(entries) == cap(entries) {
 			flush()
 		}
@@ -192,7 +192,7 @@ func runMixedWorkload(store *Store, index *Index, plan []bench.Op, reads []int, 
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			var buffer []common.ImageID
+			var buffer []schema.ImageID
 			position := 0
 			result.readIssued[lane] = bench.OpenLoop(duration, readRatePerLane, 1, result.readRecorders[lane], func() {
 				readCount.Add(1)
@@ -222,7 +222,7 @@ func runMixedWorkload(store *Store, index *Index, plan []bench.Op, reads []int, 
 				switch nextMutation(plan, &mutationCursor) {
 				case bench.Write:
 					writeCount.Add(1)
-					id := common.ImageID(nextID.Add(1))
+					id := schema.ImageID(nextID.Add(1))
 					entry := Entry{ImageID: id, Value: values[id%uint64(len(values))]}
 					if err := batch.Reset(); err != nil {
 						fail(err)
@@ -368,7 +368,7 @@ func (p *mixedIDPool) pop() (Entry, bool) {
 	return entry, true
 }
 
-func mixedSortedUnique(ids []common.ImageID) bool {
+func mixedSortedUnique(ids []schema.ImageID) bool {
 	if !slices.IsSorted(ids) {
 		return false
 	}

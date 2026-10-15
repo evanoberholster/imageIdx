@@ -1,13 +1,10 @@
-// Package common defines the domain primitives and schema shared by every
-// imageIdx index package: image, user, and group identifiers, write
-// durability, and the namespace/schema vocabulary that identifies each
-// indexed collection.
+// Package schema defines entity identity, namespace definitions, and durable
+// entity-scoped ValueID allocation shared across imageIdx packages.
 //
 // Namespaces are the single identity for an indexed collection across all
 // index kinds (bitmap namespaces, timestamp indexes, hash indexes, and
-// vector spaces). They are defined as part of a Schema, and both namespace
-// numbers and names are unique within it.
-package common
+// vector spaces). Numbers and names are unique within a Definitions registry.
+package schema
 
 // ImageID identifies an image across every index and persisted format. It is
 // an alias so existing uint64 storage and batch APIs remain zero-conversion.

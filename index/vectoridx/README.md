@@ -11,11 +11,11 @@ scalar kernels here are their correctness reference.
 
 ## Concepts
 
-- **Direct identity.** `Namespace` (`common.Namespace`, registered as
-  `common.KindVector`) is the shared schema identity of one vector space.
+- **Direct identity.** `Namespace` (`schema.Namespace`, registered as
+  `schema.KindVector`) is the shared schema identity of one vector space.
   `NodeID` (`uint32`) is the stored identifier; HNSW edges store NodeIDs,
   never pointers or ordinals. Results widen the stored NodeID to
-  `common.ValueID` (`Result{ValueID, Score}`).
+  `schema.ValueID` (`Result{ValueID, Score}`).
 - **Dense physical data.** Vectors pack contiguously in insertion-ordinal
   order even when NodeIDs are sparse. A dense O(1) table serves dense ID
   ranges with atomic fills; the sorted `NodeID → ordinal` locator covers
@@ -48,7 +48,7 @@ scalar kernels here are their correctness reference.
 
 ```go
 idx, err := vectoridx.NewStore(path, vectoridx.Config{
-    Namespace:   1, // common.Namespace registered as common.KindVector
+    Namespace:   1, // schema.Namespace registered as schema.KindVector
     Dimensions:  vectoridx.Dim512,
     ElementType: vectoridx.ElementFloat32,
 }, vectoridx.DurabilitySync)
@@ -78,7 +78,7 @@ Filter with any bitmap representation:
 
 ```go
 filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
-    imageID, ok := imageForValue(common.ValueID(id))
+    imageID, ok := imageForValue(schema.ValueID(id))
     return ok && bitmap.Contains(imageID)
 })
 ```

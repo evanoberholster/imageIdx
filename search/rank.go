@@ -8,7 +8,7 @@ import (
 	"slices"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
@@ -16,7 +16,7 @@ import (
 // RankedResult preserves the ranker's native score precision. Lower scores
 // sort first; equal scores break ties by ascending ImageID.
 type RankedResult[S uint64 | float64] struct {
-	ImageID common.ImageID
+	ImageID schema.ImageID
 	Score   S
 }
 
@@ -293,7 +293,7 @@ func FilterGeo(dst, candidates []ImageID, index *geoidx.Index, cellIDs ...uint64
 // Because the plan is applied
 // after ranking, a selective plan can under-fill; over-fetch from the ranked
 // source, or filter during ANN traversal with a CandidateFilter instead.
-func (plan Plan) FilterRanked[T any](ctx context.Context, dst []Result, workspace *Workspace, ranked []T, imageID func(T) (common.ImageID, bool), score func(T) uint64) ([]Result, error) {
+func (plan Plan) FilterRanked[T any](ctx context.Context, dst []Result, workspace *Workspace, ranked []T, imageID func(T) (schema.ImageID, bool), score func(T) uint64) ([]Result, error) {
 	if len(ranked) == 0 || plan.IsEmpty() {
 		return dst, ctx.Err()
 	}

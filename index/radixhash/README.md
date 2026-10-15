@@ -2,7 +2,7 @@
 
 A persistent, mmap-oriented exact hash index for fixed-width **256-bit**
 digests (SHA-256, BLAKE3-256). It maps a digest to one or more
-`common.ImageID` values, allows duplicate digests, and is optimized for
+`schema.ImageID` values, allows duplicate digests, and is optimized for
 lock-free reads, batched copy-on-write writes, and lazy allocation.
 
 An index holds exactly **one** hash algorithm. Use a separate index (and

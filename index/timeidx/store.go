@@ -8,11 +8,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 type namespaceEntry struct {
-	namespace common.Namespace
+	namespace schema.Namespace
 	index     *Index
 	err       error
 }
@@ -45,8 +45,8 @@ func NewNamespaceStore(dir string, config Config, durability Durability) (*Store
 	return &Store{dir: dir, config: cfg, durability: durability}, nil
 }
 
-func namespacePosition(entries []namespaceEntry, ns common.Namespace) (int, bool) {
-	return slices.BinarySearchFunc(entries, ns, func(e namespaceEntry, ns common.Namespace) int { return cmp.Compare(e.namespace, ns) })
+func namespacePosition(entries []namespaceEntry, ns schema.Namespace) (int, bool) {
+	return slices.BinarySearchFunc(entries, ns, func(e namespaceEntry, ns schema.Namespace) int { return cmp.Compare(e.namespace, ns) })
 }
 
 // SealStartup ends registration permanently. Call before sharing the Store.
@@ -65,7 +65,7 @@ func (s *Store) SealStartup() error {
 // Namespace resolves only the published registry. A returned index remains safe
 // to call during concurrent shutdown: its operations check the shared closed flag
 // and pin mapped data using its own reader tracker.
-func (s *Store) Namespace(ns common.Namespace) (*Index, bool) {
+func (s *Store) Namespace(ns schema.Namespace) (*Index, bool) {
 	if s.closed.Load() {
 		return nil, false
 	}
@@ -80,7 +80,7 @@ func (s *Store) Namespace(ns common.Namespace) (*Index, bool) {
 	return r.indexes[pos].index, true
 }
 
-func (s *Store) CreateNamespace(ns common.Namespace) (*Index, error) {
+func (s *Store) CreateNamespace(ns schema.Namespace) (*Index, error) {
 	return s.CreateNamespaceWithSpec(Spec{Namespace: ns})
 }
 
@@ -110,7 +110,7 @@ func (s *Store) CreateNamespaceWithSpec(spec Spec) (*Index, error) {
 
 // OpenNamespace registers during startup; once sealed it only resolves existing
 // members and never opens another file or reassigns a closed member's ID.
-func (s *Store) OpenNamespace(ns common.Namespace) (*Index, error) {
+func (s *Store) OpenNamespace(ns schema.Namespace) (*Index, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed.Load() {
@@ -142,7 +142,7 @@ func (s *Store) OpenNamespace(ns common.Namespace) (*Index, error) {
 }
 
 // CloseNamespace is startup-only. Runtime shutdown closes the entire Store.
-func (s *Store) CloseNamespace(ns common.Namespace) error {
+func (s *Store) CloseNamespace(ns schema.Namespace) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed.Load() {
@@ -186,7 +186,7 @@ type NamespaceInit struct {
 	RequiredSourceGeneration uint64
 }
 type NamespaceResult struct {
-	Namespace common.Namespace
+	Namespace schema.Namespace
 	Err       error
 }
 
@@ -244,7 +244,7 @@ func InitializeStore(dir string, namespaces []NamespaceInit, config Config, dura
 }
 
 // NamespaceError reports initialization failure without registry locking.
-func (s *Store) NamespaceError(ns common.Namespace) error {
+func (s *Store) NamespaceError(ns schema.Namespace) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}

@@ -1,4 +1,4 @@
-package common
+package schema
 
 import (
 	"encoding/binary"
@@ -11,6 +11,7 @@ func TestEntityKindValidityAndNames(t *testing.T) {
 	kinds := []EntityKind{
 		EntityImage, EntityFace, EntityPerson, EntityObject, EntityAlbum,
 		EntityEvent, EntityPlace, EntityAsset, EntityCollection, EntityStack,
+		EntityUser, EntityLocation, EntityTag,
 	}
 	if EntityKindCount != len(kinds) {
 		t.Fatalf("EntityKindCount = %d, want %d", EntityKindCount, len(kinds))
@@ -50,11 +51,13 @@ func TestEntityAliasesAreValueID(t *testing.T) {
 		_ AssetID      = ValueID(1)
 		_ CollectionID = ValueID(1)
 		_ StackID      = ValueID(1)
+		_ LocationID   = ValueID(1)
+		_ TagID        = ValueID(1)
 	)
 }
 
 func TestSchemaEntityRoundTrip(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	if err := schema.RegisterAll(
 		NamespaceDef{Namespace: 1, Name: "time", Kind: KindTimestamp, Entity: EntityImage},
 		NamespaceDef{Namespace: 2, Name: "faces", Kind: KindVector, Entity: EntityFace},
@@ -65,7 +68,7 @@ func TestSchemaEntityRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var restored Schema
+	var restored Definitions
 	if err := restored.UnmarshalBinary(data); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +84,7 @@ func TestSchemaEntityRoundTrip(t *testing.T) {
 // (identical layout, zero entity byte) still loads and yields EntityInvalid
 // rather than silently reinterpreting the reserved byte.
 func TestSchemaLegacyVersionReadsEntityInvalid(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	if err := schema.Register(NamespaceDef{Namespace: 3, Name: "cap", Kind: KindTimestamp}); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +96,7 @@ func TestSchemaLegacyVersionReadsEntityInvalid(t *testing.T) {
 	binary.LittleEndian.PutUint16(body[4:6], schemaVersionLegacy)
 	legacy := binary.LittleEndian.AppendUint32(body, crc32.ChecksumIEEE(body))
 
-	var restored Schema
+	var restored Definitions
 	if err := restored.UnmarshalBinary(legacy); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +106,7 @@ func TestSchemaLegacyVersionReadsEntityInvalid(t *testing.T) {
 }
 
 func TestSchemaRejectsInvalidEntity(t *testing.T) {
-	schema := NewSchema()
+	schema := NewDefinitions()
 	if err := schema.Register(NamespaceDef{Namespace: 4, Name: "bad", Kind: KindTimestamp, Entity: EntityKind(200)}); !errors.Is(err, ErrNamespaceEntity) {
 		t.Fatalf("err = %v, want ErrNamespaceEntity", err)
 	}

@@ -5,7 +5,7 @@ import (
 	"math"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -19,37 +19,37 @@ import (
 // reused across batches; they are only touched while mu is held.
 
 type stagedTime struct {
-	ns common.Namespace
+	ns schema.Namespace
 	m  timeidx.Mutation
 }
 
 type stagedGeo struct {
-	ns     common.Namespace
+	ns     schema.Namespace
 	entry  geoidx.Entry
 	delete bool
 }
 
 type stagedSim struct {
-	ns  common.Namespace
-	id  common.ValueID
+	ns  schema.Namespace
+	id  schema.ValueID
 	rec simhash.Record
 }
 
 type stagedHash struct {
-	ns     common.Namespace
+	ns     schema.Namespace
 	entry  radixhash.Entry
 	delete bool
 }
 
 type stagedBitmap struct {
-	ns     common.Namespace
+	ns     schema.Namespace
 	entry  bitmapidx.Entry
 	delete bool
 }
 
 type stagedVector struct {
-	ns     common.Namespace
-	id     common.ValueID
+	ns     schema.Namespace
+	id     schema.ValueID
 	value  VectorValue
 	delete bool
 }
@@ -81,64 +81,64 @@ func (s *Store) resetStage() {
 
 // ---- staging (no engine mutation) ----
 
-func (s *Store) stageTime(v TimeValue, id common.ValueID, entity common.EntityKind) {
+func (s *Store) stageTime(v TimeValue, id schema.ValueID, entity schema.EntityKind) {
 	s.stage.time = append(s.stage.time, stagedTime{ns: v.Namespace, m: timeidx.Insert(id, v.Timestamp)})
 	s.stageLiveAdd(entity, id)
 }
 
-func (s *Store) stageTimeDelete(ns common.Namespace, id common.ValueID) {
+func (s *Store) stageTimeDelete(ns schema.Namespace, id schema.ValueID) {
 	s.stage.time = append(s.stage.time, stagedTime{ns: ns, m: timeidx.Delete(id, 0)})
 }
 
-func (s *Store) stageGeo(v GeoValue, id common.ValueID, entity common.EntityKind) {
+func (s *Store) stageGeo(v GeoValue, id schema.ValueID, entity schema.EntityKind) {
 	s.stage.geo = append(s.stage.geo, stagedGeo{ns: v.Namespace, entry: geoidx.Entry{Key: v.Key, ImageID: id}})
 	s.stageLiveAdd(entity, id)
 }
 
-func (s *Store) stageGeoDelete(ns common.Namespace, key geoidx.S2Key, id common.ValueID) {
+func (s *Store) stageGeoDelete(ns schema.Namespace, key geoidx.S2Key, id schema.ValueID) {
 	s.stage.geo = append(s.stage.geo, stagedGeo{ns: ns, entry: geoidx.Entry{Key: key, ImageID: id}, delete: true})
 }
 
-func (s *Store) stageSim(v SimValue, id common.ValueID, entity common.EntityKind) {
+func (s *Store) stageSim(v SimValue, id schema.ValueID, entity schema.EntityKind) {
 	s.stage.sim = append(s.stage.sim, stagedSim{ns: v.Namespace, id: id, rec: v.Record})
 	s.stageLiveAdd(entity, id)
 }
 
-func (s *Store) stageHash(v HashValue, id common.ValueID, entity common.EntityKind) {
+func (s *Store) stageHash(v HashValue, id schema.ValueID, entity schema.EntityKind) {
 	s.stage.hash = append(s.stage.hash, stagedHash{ns: v.Namespace, entry: radixhash.Entry{Hash: v.Hash, ImageID: id}})
 	s.stageLiveAdd(entity, id)
 }
 
-func (s *Store) stageHashDelete(v HashValue, id common.ValueID) {
+func (s *Store) stageHashDelete(v HashValue, id schema.ValueID) {
 	s.stage.hash = append(s.stage.hash, stagedHash{ns: v.Namespace, entry: radixhash.Entry{Hash: v.Hash, ImageID: id}, delete: true})
 }
 
-func (s *Store) stageBitmap(v BitmapValue, id common.ValueID, entity common.EntityKind) {
+func (s *Store) stageBitmap(v BitmapValue, id schema.ValueID, entity schema.EntityKind) {
 	s.stage.bitmap = append(s.stage.bitmap, stagedBitmap{ns: v.Namespace, entry: bitmapidx.Entry{ImageID: id, Value: v.Value}})
 	s.stageLiveAdd(entity, id)
 }
 
-func (s *Store) stageBitmapDelete(v BitmapValue, id common.ValueID) {
+func (s *Store) stageBitmapDelete(v BitmapValue, id schema.ValueID) {
 	s.stage.bitmap = append(s.stage.bitmap, stagedBitmap{ns: v.Namespace, entry: bitmapidx.Entry{ImageID: id, Value: v.Value}, delete: true})
 }
 
-func (s *Store) stageVector(v VectorValue, id common.ValueID, entity common.EntityKind) {
+func (s *Store) stageVector(v VectorValue, id schema.ValueID, entity schema.EntityKind) {
 	s.stage.vector = append(s.stage.vector, stagedVector{ns: v.Namespace, id: id, value: v})
 	s.stageLiveAdd(entity, id)
 }
 
-func (s *Store) stageVectorDelete(ns common.Namespace, id common.ValueID) {
+func (s *Store) stageVectorDelete(ns schema.Namespace, id schema.ValueID) {
 	s.stage.vector = append(s.stage.vector, stagedVector{ns: ns, id: id, delete: true})
 }
 
-func (s *Store) stageLiveAdd(entity common.EntityKind, id common.ValueID) {
+func (s *Store) stageLiveAdd(entity schema.EntityKind, id schema.ValueID) {
 	if id == 0 {
 		return
 	}
 	s.stage.live = append(s.stage.live, stagedLive{add: true, entry: bitmapidx.Entry{ImageID: id, Value: livenessValue(entity)}})
 }
 
-func (s *Store) stageLiveRemove(entity common.EntityKind, id common.ValueID) {
+func (s *Store) stageLiveRemove(entity schema.EntityKind, id schema.ValueID) {
 	s.stage.live = append(s.stage.live, stagedLive{add: false, entry: bitmapidx.Entry{ImageID: id, Value: livenessValue(entity)}})
 }
 
@@ -201,7 +201,7 @@ func (s *Store) stageHasLivenessRemoval() bool {
 	return false
 }
 
-func sortStageByNS[T any](ops []T, ns func(T) common.Namespace) {
+func sortStageByNS[T any](ops []T, ns func(T) schema.Namespace) {
 	slices.SortStableFunc(ops, func(a, b T) int { return cmp.Compare(ns(a), ns(b)) })
 }
 
@@ -214,7 +214,7 @@ func (s *Store) flushTime() error {
 		s.flush.timeCap = len(s.stage.time)
 	}
 	batch := s.flush.timeBatch
-	sortStageByNS(s.stage.time, func(o stagedTime) common.Namespace { return o.ns })
+	sortStageByNS(s.stage.time, func(o stagedTime) schema.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.time); {
 		j := i
 		for j < len(s.stage.time) && s.stage.time[j].ns == s.stage.time[i].ns {
@@ -246,7 +246,7 @@ func (s *Store) flushTime() error {
 }
 
 func (s *Store) flushGeo() error {
-	sortStageByNS(s.stage.geo, func(o stagedGeo) common.Namespace { return o.ns })
+	sortStageByNS(s.stage.geo, func(o stagedGeo) schema.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.geo); {
 		j := i
 		for j < len(s.stage.geo) && s.stage.geo[j].ns == s.stage.geo[i].ns {
@@ -277,7 +277,7 @@ func (s *Store) flushGeo() error {
 }
 
 func (s *Store) flushSim() error {
-	sortStageByNS(s.stage.sim, func(o stagedSim) common.Namespace { return o.ns })
+	sortStageByNS(s.stage.sim, func(o stagedSim) schema.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.sim); {
 		j := i
 		for j < len(s.stage.sim) && s.stage.sim[j].ns == s.stage.sim[i].ns {
@@ -340,7 +340,7 @@ func (s *Store) flushSimNamespace(ops []stagedSim) error {
 }
 
 func (s *Store) flushHash() error {
-	sortStageByNS(s.stage.hash, func(o stagedHash) common.Namespace { return o.ns })
+	sortStageByNS(s.stage.hash, func(o stagedHash) schema.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.hash); {
 		j := i
 		for j < len(s.stage.hash) && s.stage.hash[j].ns == s.stage.hash[i].ns {
@@ -376,7 +376,7 @@ func (s *Store) flushHash() error {
 }
 
 func (s *Store) flushBitmap() error {
-	sortStageByNS(s.stage.bitmap, func(o stagedBitmap) common.Namespace { return o.ns })
+	sortStageByNS(s.stage.bitmap, func(o stagedBitmap) schema.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.bitmap); {
 		j := i
 		for j < len(s.stage.bitmap) && s.stage.bitmap[j].ns == s.stage.bitmap[i].ns {
@@ -459,7 +459,7 @@ func (s *Store) flushLiveness(add bool) error {
 // API, so operations are applied one typed vector at a time, in staged order,
 // grouped by namespace. Staging itself never touches the engine.
 func (s *Store) flushVector() error {
-	sortStageByNS(s.stage.vector, func(o stagedVector) common.Namespace { return o.ns })
+	sortStageByNS(s.stage.vector, func(o stagedVector) schema.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.vector); {
 		j := i
 		for j < len(s.stage.vector) && s.stage.vector[j].ns == s.stage.vector[i].ns {

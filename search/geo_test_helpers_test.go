@@ -3,7 +3,7 @@ package search
 import (
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 )
 
@@ -15,7 +15,7 @@ type geoEntry struct {
 }
 
 // newTestGeoNamespace builds a compacted in-memory geoidx index.
-func newTestGeoNamespace(t testing.TB, ns common.Namespace, entries []geoEntry) *geoidx.Index {
+func newTestGeoNamespace(t testing.TB, ns schema.Namespace, entries []geoEntry) *geoidx.Index {
 	t.Helper()
 	index, err := geoidx.NewMemory(geoidx.Config{Namespace: ns})
 	if err != nil {

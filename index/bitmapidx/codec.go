@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 const registryVersion uint16 = 1
@@ -60,35 +60,35 @@ func decodeNamespaceSpecs(data []byte) ([]NamespaceSpec, error) {
 }
 
 // bitmapKindCode keeps the original bitmap wire and hash domain codes stable.
-func bitmapKindCode(kind common.NamespaceKind) byte {
+func bitmapKindCode(kind schema.NamespaceKind) byte {
 	switch kind {
-	case common.KindBitmapEnum:
+	case schema.KindBitmapEnum:
 		return 1
-	case common.KindBitmapBool:
+	case schema.KindBitmapBool:
 		return 2
-	case common.KindBitmapString:
+	case schema.KindBitmapString:
 		return 3
-	case common.KindBitmapContinuous:
+	case schema.KindBitmapContinuous:
 		return 4
-	case common.KindBitmapBSI:
+	case schema.KindBitmapBSI:
 		return 5
 	default:
 		return 0
 	}
 }
 
-func bitmapKindFromCode(code byte) common.NamespaceKind {
+func bitmapKindFromCode(code byte) schema.NamespaceKind {
 	switch code {
 	case 1:
-		return common.KindBitmapEnum
+		return schema.KindBitmapEnum
 	case 2:
-		return common.KindBitmapBool
+		return schema.KindBitmapBool
 	case 3:
-		return common.KindBitmapString
+		return schema.KindBitmapString
 	case 4:
-		return common.KindBitmapContinuous
+		return schema.KindBitmapContinuous
 	case 5:
-		return common.KindBitmapBSI
+		return schema.KindBitmapBSI
 	default:
 		return 0
 	}
@@ -127,7 +127,7 @@ func decodeNamespace(data []byte, offset int) (NamespaceSpec, int, error) {
 		return NamespaceSpec{}, 0, ErrInvalidNamespace
 	}
 	namespace := NamespaceSpec{
-		Namespace: common.Namespace(binary.LittleEndian.Uint16(data[offset : offset+2])),
+		Namespace: schema.Namespace(binary.LittleEndian.Uint16(data[offset : offset+2])),
 		Kind:      bitmapKindFromCode(data[offset+2]),
 		BSIWidth:  data[offset+28], // former geo codec slot byte 0
 		Flags:     binary.LittleEndian.Uint32(data[offset+4 : offset+8]),

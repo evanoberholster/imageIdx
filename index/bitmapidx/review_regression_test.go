@@ -4,12 +4,12 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
 func TestFilterValuesPreservesCandidateOrderWithDeltas(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	defer index.Close()
 	value := EnumStringValue("review-filter")
 	commit(t, index, func(batch *Batch) error {
@@ -21,15 +21,15 @@ func TestFilterValuesPreservesCandidateOrderWithDeltas(t *testing.T) {
 	commit(t, index, func(batch *Batch) error {
 		return batch.Add(Entry{ImageID: 4, Value: value})
 	})
-	candidates := []common.ImageID{3, 2, 4, 1, 3}
+	candidates := []schema.ImageID{3, 2, 4, 1, 3}
 	got, err := index.FilterValues(candidates[:0], candidates, value)
-	if err != nil || !slices.Equal(got, []common.ImageID{3, 4, 1, 3}) {
+	if err != nil || !slices.Equal(got, []schema.ImageID{3, 4, 1, 3}) {
 		t.Fatalf("FilterValues = %v, %v", got, err)
 	}
 }
 
 func TestEffectiveTableMergesLayeredChanges(t *testing.T) {
-	key := func(n int64) NamespaceKey { return continuousKey(common.NamespaceRating, n) }
+	key := func(n int64) NamespaceKey { return continuousKey(schema.NamespaceRating, n) }
 	base := postingTable{
 		keys: []NamespaceKey{key(1), key(3), key(5)},
 		postings: []posting{
@@ -41,18 +41,18 @@ func TestEffectiveTableMergesLayeredChanges(t *testing.T) {
 	frozen := &namespaceDelta{
 		keys: []NamespaceKey{key(1), key(2), key(3)},
 		values: map[NamespaceKey]*bitmapDelta{
-			key(1): newBitmapDelta(nil, []common.ImageID{1}),
-			key(2): newBitmapDelta([]common.ImageID{2}, nil),
-			key(3): newBitmapDelta([]common.ImageID{30}, nil),
+			key(1): newBitmapDelta(nil, []schema.ImageID{1}),
+			key(2): newBitmapDelta([]schema.ImageID{2}, nil),
+			key(3): newBitmapDelta([]schema.ImageID{30}, nil),
 		},
 	}
 	active := &namespaceDelta{
 		keys: []NamespaceKey{key(1), key(2), key(3), key(4)},
 		values: map[NamespaceKey]*bitmapDelta{
-			key(1): newBitmapDelta([]common.ImageID{1}, nil),
-			key(2): newBitmapDelta(nil, []common.ImageID{2}),
-			key(3): newBitmapDelta(nil, []common.ImageID{3}),
-			key(4): newBitmapDelta([]common.ImageID{4}, nil),
+			key(1): newBitmapDelta([]schema.ImageID{1}, nil),
+			key(2): newBitmapDelta(nil, []schema.ImageID{2}),
+			key(3): newBitmapDelta(nil, []schema.ImageID{3}),
+			key(4): newBitmapDelta([]schema.ImageID{4}, nil),
 		},
 	}
 	view := &namespaceView{base: base}
@@ -61,18 +61,18 @@ func TestEffectiveTableMergesLayeredChanges(t *testing.T) {
 	if !slices.Equal(got.keys, wantKeys) {
 		t.Fatalf("keys = %v, want %v", got.keys, wantKeys)
 	}
-	for n, wantID := range []common.ImageID{1, 30, 4, 5} {
-		if ids := got.postings[n].appendTo(nil); !slices.Equal(ids, []common.ImageID{wantID}) {
+	for n, wantID := range []schema.ImageID{1, 30, 4, 5} {
+		if ids := got.postings[n].appendTo(nil); !slices.Equal(ids, []schema.ImageID{wantID}) {
 			t.Fatalf("posting %d = %v, want %d", n, ids, wantID)
 		}
 	}
-	if ids := base.postings[0].appendTo(nil); !slices.Equal(ids, []common.ImageID{1}) {
+	if ids := base.postings[0].appendTo(nil); !slices.Equal(ids, []schema.ImageID{1}) {
 		t.Fatalf("source base mutated: %v", ids)
 	}
 }
 
 func TestContinuousKeysMergeSortedLayers(t *testing.T) {
-	key := func(n int64) NamespaceKey { return continuousKey(common.NamespaceRating, n) }
+	key := func(n int64) NamespaceKey { return continuousKey(schema.NamespaceRating, n) }
 	view := &namespaceView{
 		base:   postingTable{keys: []NamespaceKey{key(1), key(3), key(5)}},
 		frozen: &namespaceDelta{keys: []NamespaceKey{key(2), key(3)}},
@@ -85,7 +85,7 @@ func TestContinuousKeysMergeSortedLayers(t *testing.T) {
 }
 
 func TestDictionaryMergedPrefersActive(t *testing.T) {
-	key := continuousKey(common.NamespaceRating, 1)
+	key := continuousKey(schema.NamespaceRating, 1)
 	view := &dictionaryView{
 		base:   []dictEntry{{key: key, chunk: 0, length: 4}},
 		active: []dictEntry{{key: key, chunk: 1, length: 6}},
@@ -99,7 +99,7 @@ func TestDictionaryMergedPrefersActive(t *testing.T) {
 
 func BenchmarkEffectiveTableWideDelta(b *testing.B) {
 	const baseCount, deltaCount = 1024, 256
-	key := func(n int64) NamespaceKey { return continuousKey(common.NamespaceRating, n) }
+	key := func(n int64) NamespaceKey { return continuousKey(schema.NamespaceRating, n) }
 	base := postingTable{
 		keys:     make([]NamespaceKey, baseCount),
 		postings: make([]posting, baseCount),
@@ -115,7 +115,7 @@ func BenchmarkEffectiveTableWideDelta(b *testing.B) {
 	for n := range delta.keys {
 		k := key(int64(n*2 + 1))
 		delta.keys[n] = k
-		delta.values[k] = newBitmapDelta([]common.ImageID{common.ImageID(baseCount + n + 1)}, nil)
+		delta.values[k] = newBitmapDelta([]schema.ImageID{schema.ImageID(baseCount + n + 1)}, nil)
 	}
 	view := &namespaceView{base: base}
 	b.ReportAllocs()

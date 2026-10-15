@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
@@ -37,11 +37,11 @@ func minAllocs(samples, runs int, f func()) float64 {
 func TestGrantsAddNoAllocations(t *testing.T) {
 	ctx := context.Background()
 	store := aclStore(t, true)
-	userNamespace, ok := store.Lookup(common.NamespaceUserACL)
+	userNamespace, ok := store.Lookup(schema.NamespaceUserACL)
 	if !ok {
 		t.Fatal("missing user ACL namespace")
 	}
-	groupNamespace, ok := store.Lookup(common.NamespaceGroupACL)
+	groupNamespace, ok := store.Lookup(schema.NamespaceGroupACL)
 	if !ok {
 		t.Fatal("missing group ACL namespace")
 	}
@@ -63,7 +63,7 @@ func TestGrantsAddNoAllocations(t *testing.T) {
 	stackUserValue := func(id uint64) bitmapidx.Value {
 		var key [8]byte
 		binary.LittleEndian.PutUint64(key[:], id)
-		return bitmapidx.Value{Kind: common.KindBitmapEnum, Bytes: key[:]}
+		return bitmapidx.Value{Kind: schema.KindBitmapEnum, Bytes: key[:]}
 	}
 	manualContains := func() { _, _ = userNamespace.Contains(1, stackUserValue(42)) }
 	helperContains := func() { _, _ = users.Contains(42, 1) }

@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -61,7 +61,7 @@ func TestRecoveryMarkerPersistsPartialFailure(t *testing.T) {
 	}
 	rec := reopened.RecoveryNamespaces()
 	slices.Sort(rec)
-	if !slices.Contains(rec, common.Namespace(1)) || !slices.Contains(rec, common.Namespace(4)) {
+	if !slices.Contains(rec, schematypes.Namespace(1)) || !slices.Contains(rec, schematypes.Namespace(4)) {
 		t.Fatalf("RecoveryNamespaces = %v, want [1 4]", rec)
 	}
 	if h, _ := reopened.HealthOf(1); !h.NeedsRebuild {
@@ -75,7 +75,7 @@ func TestRecoveryMarkerPersistsPartialFailure(t *testing.T) {
 	if err := reopened.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
-	if rec := reopened.RecoveryNamespaces(); !slices.Contains(rec, common.Namespace(1)) || !slices.Contains(rec, common.Namespace(4)) {
+	if rec := reopened.RecoveryNamespaces(); !slices.Contains(rec, schematypes.Namespace(1)) || !slices.Contains(rec, schematypes.Namespace(4)) {
 		t.Fatalf("maintenance cleared recovery marker: %v", rec)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "recovery.bin")); err != nil {
@@ -93,8 +93,8 @@ func TestRecoveryMarkerPersistsPartialFailure(t *testing.T) {
 // unlike updates, appends require a manifest checkpoint to survive reopen.
 func TestSimHashGenerationBarrierPersistsNewAppend(t *testing.T) {
 	dir := t.TempDir()
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: 3, Name: "sim", Kind: common.KindHashPerceptual, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 3, Name: "sim", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := index.Create(dir, index.Spec{Schema: schema})
@@ -171,7 +171,7 @@ func TestSingleNamespaceBatchAvoidsMarker(t *testing.T) {
 	defer db.Close()
 	batch := db.NewBatch(3)
 	for i := 1; i <= 3; i++ {
-		if err := batch.Add(index.Entry{ValueID: common.ValueID(i), Times: []index.TimeValue{{Namespace: 1, Timestamp: uint64(i)}}}); err != nil {
+		if err := batch.Add(index.Entry{ValueID: schematypes.ValueID(i), Times: []index.TimeValue{{Namespace: 1, Timestamp: uint64(i)}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -327,10 +327,10 @@ func TestApplyWithGenerationDurableWithoutCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ids := matchIDs(mustMatch(t, m, hA)); !slices.Equal(ids, []common.ValueID{200}) {
+	if ids := matchIDs(mustMatch(t, m, hA)); !slices.Equal(ids, []schematypes.ValueID{200}) {
 		t.Fatalf("hA after reopen = %v, want [200]", ids)
 	}
-	if ids := matchIDs(mustMatch(t, m, hB)); !slices.Equal(ids, []common.ValueID{201}) {
+	if ids := matchIDs(mustMatch(t, m, hB)); !slices.Equal(ids, []schematypes.ValueID{201}) {
 		t.Fatalf("hB after reopen = %v, want [201]", ids)
 	}
 }

@@ -8,16 +8,19 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
+	"github.com/evanoberholster/imageIdx/internal/storage"
+	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
-const journalNS common.Namespace = 65533
-const metadataNS common.Namespace = 65534
+const journalNS schema.Namespace = 65533
+const metadataNS schema.Namespace = 65534
 
 var (
 	ErrRecoveryRequired = errors.New("database: index recovery required; journal retained")
@@ -48,12 +51,24 @@ type Options struct {
 	BatchSize  int    // defaults to 64; one publisher processes batches in order
 	MaxPending uint64 // maximum unacknowledged mutations; zero means no limit
 	Recovery   RecoveryPolicy
-	boundary   func(string) // deterministic process-crash injection in package tests
+	// Definitions, if provided, is the authoritative complete namespace model.
+	// Existing KV and index metadata must agree with it. When omitted on an
+	// existing database, the persisted schema file is authoritative.
+	Definitions *schema.Definitions
+	// CanonicalNamespaces overrides the historical canonical KV namespace for
+	// an entity. Zero retains its original assignment. Supply the same values
+	// on every reopen; persisted definitions reject any reassignment.
+	CanonicalNamespaces [schema.EntityKindCount + 1]schema.Namespace
+	boundary            func(string) // deterministic process-crash injection in package tests
 }
 
 type DB struct {
+	owner     *os.File   // serializes schema startup, including close/reopen transitions
 	mu        sync.Mutex // serializes sequence allocation with the Pebble commit
 	values    *store.Store
+	ids       *schema.Schema
+	canonical [schema.EntityKindCount + 1]schema.Namespace
+	idsClosed atomic.Bool
 	indexes   *index.Store
 	decode    Decoder
 	options   Options
@@ -74,6 +89,9 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if decode == nil {
 		return nil, ErrInvalidMutation
 	}
+	if dir == "" {
+		return nil, store.ErrInvalidDir
+	}
 	if indexDir == "" || filepath.Clean(indexDir) == string(filepath.Separator) || filepath.Base(filepath.Clean(indexDir)) == "." {
 		return nil, fmt.Errorf("%w: unsafe index directory", ErrInvalidMutation)
 	}
@@ -83,39 +101,270 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if options.BatchSize > 64 {
 		return nil, fmt.Errorf("%w: batch size > 64", ErrInvalidMutation)
 	}
-	values, err := store.Open(dir, canonicalSpecs()...)
+	owner, err := storage.AcquireLock(filepath.Dir(dir), "."+filepath.Base(filepath.Clean(dir))+".database.lock", false)
 	if err != nil {
 		return nil, err
 	}
-	return openWithValues(values, indexDir, decode, options)
+	owned := true
+	defer func() {
+		if owned {
+			_ = storage.ReleaseLock(owner)
+		}
+	}()
+	var existing *schema.Schema
+	var fresh bool
+	path := filepath.Join(dir, "schema.dat")
+	_, statErr := os.Stat(path)
+	if errors.Is(statErr, os.ErrNotExist) {
+		present, complete, err := store.InspectDatabase(dir)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			return nil, errors.Join(schema.ErrCorrupt, fmt.Errorf("database: missing authoritative schema.dat"))
+		}
+		fresh = !present
+	} else if statErr != nil {
+		return nil, statErr
+	}
+	if statErr == nil {
+		var openErr error
+		existing, openErr = schema.Open(path, schema.Options{})
+		if openErr != nil {
+			return nil, openErr
+		}
+		if existing.PreparedDefinitions() != nil {
+			if err := recoverPreparedSchema(existing, dir, indexDir, decode, options); err != nil {
+				_ = existing.Close()
+				return nil, err
+			}
+		}
+	}
+	if existing != nil && options.Definitions != nil && validateDefinitions(existing.Definitions(), options.Definitions) != nil {
+		var err error
+		existing, err = prepareSchemaAddition(existing, path, dir, indexDir, options.Definitions, decode, options)
+		if err != nil {
+			if existing != nil {
+				_ = existing.Close()
+			}
+			return nil, err
+		}
+	}
+	canonical, err := canonicalNamespaces(options.CanonicalNamespaces)
+	if existing != nil {
+		canonical, err = persistedCanonical(existing.Definitions(), options.CanonicalNamespaces)
+		if err == nil && options.Definitions != nil {
+			err = validateDefinitions(existing.Definitions(), options.Definitions)
+		}
+	}
+	if err != nil {
+		if existing != nil {
+			_ = existing.Close()
+		}
+		return nil, err
+	}
+	if fresh {
+		// Validate the independently created index before creating schema.dat.
+		// New Pebble directories are opened only after the central file is
+		// durable; the fresh path never writes a Pebble schema registry.
+		idx, err := index.Open(indexDir)
+		if err != nil {
+			return nil, err
+		}
+		defs := schema.NewDefinitions()
+		for _, spec := range canonicalSpecsFor(canonical) {
+			if spec.Entity.Valid() {
+				if err = defs.Register(spec.NamespaceDef()); err != nil {
+					break
+				}
+			}
+		}
+		if err == nil {
+			for _, def := range idx.Schema().Defs() {
+				if def.Namespace == journalNS || def.Namespace == metadataNS || def.Namespace == 0xFFF0 {
+					err = schema.ErrNamespace
+					break
+				}
+				if err = defs.Register(def); err != nil {
+					break
+				}
+			}
+		}
+		if err == nil && options.Definitions != nil {
+			err = validateDefinitions(options.Definitions, defs)
+		}
+		closeErr := idx.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+		entities := make([]schema.EntityConfig, 0, schema.EntityKindCount)
+		for e := schema.EntityImage; e.Valid(); e++ {
+			entities = append(entities, schema.EntityConfig{Entity: e, ReserveSize: 1000})
+		}
+		existing, err = schema.Open(path, schema.Options{Definitions: defs, Entities: entities})
+		if err != nil {
+			return nil, err
+		}
+	}
+	var values *store.Store
+	if existing != nil {
+		if !fresh {
+			present, _, err := store.InspectDatabase(dir)
+			if err != nil {
+				_ = existing.Close()
+				return nil, err
+			}
+			if !present {
+				_ = existing.Close()
+				return nil, schema.ErrCorrupt
+			}
+		}
+		kv, err := kvDefinitions(existing.Definitions())
+		if err != nil {
+			_ = existing.Close()
+			return nil, err
+		}
+		values, err = store.Open(dir, kv)
+		if err == nil && !existing.LegacyRetired() {
+			err = values.ValidateLegacyDefinitions(kv)
+			if err != nil {
+				_ = values.Close()
+			}
+		}
+	} else {
+		values, err = store.OpenLegacyWithExtension(dir, canonicalSpecsFor(canonical)...)
+	}
+	if err != nil {
+		if existing != nil {
+			_ = existing.Close()
+		}
+		return nil, err
+	}
+	db, err := openWithValues(values, dir, indexDir, decode, options, existing, canonical)
+	if err != nil {
+		return nil, err
+	}
+	db.owner, owned = owner, false
+	return db, nil
 }
 
 func canonicalSpecs() []store.Spec {
-	specs := make([]store.Spec, 0, 12)
-	for e := common.EntityImage; e <= common.EntityStack; e++ {
-		specs = append(specs, store.Spec{Namespace: common.Namespace(e), Name: "entity-" + e.String()})
+	canonical, _ := canonicalNamespaces([schema.EntityKindCount + 1]schema.Namespace{})
+	return canonicalSpecsFor(canonical)
+}
+
+func canonicalNamespaces(overrides [schema.EntityKindCount + 1]schema.Namespace) ([schema.EntityKindCount + 1]schema.Namespace, error) {
+	var canonical [schema.EntityKindCount + 1]schema.Namespace
+	var seen [1 << 16]bool
+	for e := schema.EntityImage; e.Valid(); e++ {
+		ns := overrides[e]
+		if ns == 0 {
+			ns = schema.Namespace(e)
+		} // historical persisted assignment
+		if ns == journalNS || ns == metadataNS || ns == 0xFFF0 || seen[ns] {
+			return canonical, fmt.Errorf("%w: invalid or duplicate canonical namespace %d", ErrInvalidMutation, ns)
+		}
+		seen[ns] = true
+		canonical[e] = ns
+	}
+	return canonical, nil
+}
+
+func persistedCanonical(defs *schema.Definitions, overrides [schema.EntityKindCount + 1]schema.Namespace) ([schema.EntityKindCount + 1]schema.Namespace, error) {
+	var canonical [schema.EntityKindCount + 1]schema.Namespace
+	var seen [1 << 16]bool
+	for _, def := range defs.DefsOfKind(schema.KindKV) {
+		for e := schema.EntityImage; e.Valid(); e++ {
+			if def.Name != "entity-"+e.String() {
+				continue
+			}
+			if canonical[e] != 0 || seen[def.Namespace] || def.Entity != e {
+				return canonical, schema.ErrNamespace
+			}
+			canonical[e], seen[def.Namespace] = def.Namespace, true
+		}
+	}
+	for e := schema.EntityImage; e.Valid(); e++ {
+		if canonical[e] == 0 || (overrides[e] != 0 && overrides[e] != canonical[e]) ||
+			canonical[e] == journalNS || canonical[e] == metadataNS || canonical[e] == 0xFFF0 {
+			return canonical, schema.ErrNamespace
+		}
+	}
+	return canonical, nil
+}
+
+func canonicalSpecsFor(canonical [schema.EntityKindCount + 1]schema.Namespace) []store.Spec {
+	specs := make([]store.Spec, 0, schema.EntityKindCount+2)
+	for e := schema.EntityImage; e <= schema.EntityStack; e++ {
+		specs = append(specs, store.Spec{Namespace: canonical[e], Name: "entity-" + e.String(), Entity: e})
 	}
 	specs = append(specs, store.Spec{Namespace: journalNS, Name: "mutation-journal"}, store.Spec{Namespace: metadataNS, Name: "database-generations"})
+	// Append new entity namespaces after the historical schema entries: the
+	// explicit additive schema upgrade checks their stable original prefix.
+	for e := schema.EntityUser; e.Valid(); e++ {
+		specs = append(specs, store.Spec{Namespace: canonical[e], Name: "entity-" + e.String(), Entity: e})
+	}
 	return specs
 }
 
-func openWithValues(values *store.Store, indexDir string, decode Decoder, options Options) (*DB, error) {
+func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, options Options, existing *schema.Schema, canonical [schema.EntityKindCount + 1]schema.Namespace) (*DB, error) {
+	if existing != nil && !existing.LegacyRetired() {
+		stored, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+		if err == nil {
+			backup := schema.NewDefinitions()
+			if err = backup.UnmarshalBinary(stored); err == nil {
+				err = validateLegacyIndexCopy(existing.Definitions(), backup)
+			}
+		} else if errors.Is(err, store.ErrNotFound) {
+			err = nil
+		}
+		if err != nil {
+			_ = existing.Close()
+			_ = values.Close()
+			return nil, errors.Join(ErrRecoveryRequired, err)
+		}
+	}
 	// A prior activation must be completed before reading the active index.
-	if err := resumeActivation(indexDir, values, options.boundary); err != nil {
+	var authoritative *schema.Definitions
+	if existing != nil {
+		authoritative = existing.Definitions()
+	}
+	if err := resumeActivation(indexDir, values, authoritative, options.boundary); err != nil {
+		if existing != nil {
+			_ = existing.Close()
+		}
 		_ = values.Close()
 		return nil, err
 	}
-	idx, err := index.Open(indexDir)
+	var idx *index.Store
+	var err error
+	if authoritative != nil {
+		idx, err = index.OpenWithDefinitions(indexDir, authoritative)
+	} else {
+		idx, err = index.Open(indexDir) // one-time legacy bootstrap
+	}
 	openErr := err
 	if err != nil && options.Recovery != RecoveryAutomatic {
+		if existing != nil {
+			_ = existing.Close()
+		}
 		_ = values.Close()
 		return nil, errors.Join(ErrRecoveryRequired, err)
 	}
-	db := &DB{values: values, indexes: idx, decode: decode, options: options,
+	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, options: options,
 		wake: make(chan struct{}, 1), changed: make(chan struct{}), done: make(chan struct{})}
 	ready := false
 	defer func() {
 		if !ready {
+			if db.ids != nil {
+				_ = db.ids.Close()
+			}
 			if db.indexes != nil {
 				_ = db.indexes.Close()
 			}
@@ -139,7 +388,15 @@ func openWithValues(values *store.Store, indexDir string, decode Decoder, option
 	if db.indexes == nil {
 		return nil, fmt.Errorf("%w: index cannot open: %v", ErrRecoveryRequired, openErr)
 	}
-	if err := db.persistSchema(); err != nil {
+	// On the bootstrap path, reject a conflicting legacy index backup before
+	// creating the central file or publishing the allocator migration marker.
+	hadSchema := db.ids != nil
+	if !hadSchema {
+		if err := db.persistSchema(); err != nil {
+			return nil, err
+		}
+	}
+	if err := db.openIDs(dir); err != nil {
 		return nil, err
 	}
 	idx = db.indexes
@@ -170,6 +427,49 @@ func openWithValues(values *store.Store, indexDir string, decode Decoder, option
 	if db.indexed != 0 {
 		if err = db.cleanup(0, db.indexed); err != nil {
 			return nil, err
+		}
+	}
+	// The central allocator and logical schema are now durable, and the
+	// database and index have passed consistency checks. Retire legacy copies
+	// one at a time; an interrupted cleanup is safe to repeat on the next Open.
+	if hadSchema == false {
+		if err := db.indexes.Close(); err != nil {
+			return nil, err
+		}
+		db.indexes = nil
+		db.indexes, err = index.OpenWithDefinitions(indexDir, db.ids.Definitions())
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !db.ids.LegacyRetired() {
+		if err := values.RemoveLegacyDefinitions(); err != nil {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy Pebble schema cleanup")
+		}
+		if _, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID}); err == nil {
+			if err := values.Delete(store.Key{Namespace: metadataNS, ID: schemaKeyID}); err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy index backup cleanup")
+		}
+		if err := db.indexes.RetireLegacySchema(); err != nil {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy index schema cleanup")
+		}
+		if err := db.ids.MarkLegacyRetired(); err != nil {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy retirement sync")
 		}
 	}
 	go db.run()
@@ -213,8 +513,8 @@ func (db *DB) notify() { close(db.changed); db.changed = make(chan struct{}) }
 // representation of the *complete* index.Entry for this entity after a Put;
 // Delete ignores it. The caller owns Record and Projection until Commit returns.
 type Mutation struct {
-	Entity     common.EntityKind
-	ValueID    common.ValueID
+	Entity     schema.EntityKind
+	ValueID    schema.ValueID
 	Delete     bool
 	Record     []byte
 	Projection []byte
@@ -222,6 +522,11 @@ type Mutation struct {
 
 // Commit atomically writes canonical records, ordered journal entries, and the
 // next sequence in one synced Pebble batch. Returns the last generation.
+// Explicit ValueIDs are caller-owned: an existing ID updates that record, and
+// a new ID creates it. EnsureMinimum prevents future allocator reuse but cannot
+// prevent collision with IDs already issued to concurrent callers. Bulk import
+// must be serialized by the caller before allowing NextID on that entity;
+// runtime explicit inserts use last-writer-wins canonical record semantics.
 // A failed commit does not consume a sequence. Search is eventually consistent;
 // pass the returned generation to WaitIndexed before requiring fresh results.
 func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
@@ -258,7 +563,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 				return 0, err
 			}
 		}
-		key := store.Key{Namespace: common.Namespace(m.Entity), ID: m.ValueID}
+		key := store.Key{Namespace: db.canonical[m.Entity], ID: m.ValueID}
 		prior, err := db.values.Get(key)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return 0, err
@@ -305,6 +610,14 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			return 0, err
 		}
 	}
+	// Reconcile explicit IDs before publishing canonical records, including
+	// deletions. This protects *future* reservations only, not IDs already
+	// issued to a concurrent caller (see Commit's conflict policy).
+	for _, m := range mutations {
+		if err := db.ids.EnsureMinimum(m.Entity, m.ValueID); err != nil {
+			return 0, err
+		}
+	}
 	gen := db.committed + uint64(len(mutations))
 	if err := putGeneration(b, 1, gen); err != nil {
 		return 0, err
@@ -329,7 +642,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 }
 
 // Get returns an owned copy of the authoritative record, without projection.
-func (db *DB) Get(entity common.EntityKind, id common.ValueID) ([]byte, error) {
+func (db *DB) Get(entity schema.EntityKind, id schema.ValueID) ([]byte, error) {
 	if !entity.Valid() || id == 0 {
 		return nil, ErrInvalidMutation
 	}
@@ -338,7 +651,7 @@ func (db *DB) Get(entity common.EntityKind, id common.ValueID) ([]byte, error) {
 	if db.closed {
 		return nil, ErrClosed
 	}
-	v, err := db.values.Get(store.Key{Namespace: common.Namespace(entity), ID: id})
+	v, err := db.values.Get(store.Key{Namespace: db.canonical[entity], ID: id})
 	if err != nil {
 		return nil, err
 	}
@@ -358,6 +671,35 @@ func (db *DB) Get(entity common.EntityKind, id common.ValueID) ([]byte, error) {
 func (db *DB) DatabaseGeneration() uint64 { db.mu.Lock(); defer db.mu.Unlock(); return db.committed }
 func (db *DB) IndexedGeneration() uint64  { db.mu.Lock(); defer db.mu.Unlock(); return db.indexed }
 func (db *DB) Index() *index.Store        { return db.indexes }
+
+// NextID reserves a unique entity ID before its canonical record is committed.
+// Abandoned IDs are never recycled. Close rejects new calls and drains those
+// already admitted before closing the backing Pebble database.
+func (db *DB) NextID(entity schema.EntityKind) (schema.ValueID, error) {
+	if !entity.Valid() {
+		return 0, schema.ErrNamespace
+	}
+	if db.idsClosed.Load() {
+		return 0, schema.ErrClosed
+	}
+	return db.ids.NextID(entity)
+}
+
+// PrepareImport establishes the maximum ID of a completed bulk import before
+// concurrent allocation begins. Callers must exclude NextID/Commit for this
+// entity while reconciling; this method does not revoke already issued IDs.
+// It is safe to repeat after a crash, and never reduces the durable watermark.
+func (db *DB) PrepareImport(entity schema.EntityKind, maximum schema.ValueID) error {
+	if !entity.Valid() {
+		return ErrInvalidMutation
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrClosed
+	}
+	return db.ids.EnsureMinimum(entity, maximum)
+}
 
 // WaitIndexed waits without polling or per-waiter goroutines. Permanent
 // coordinator failures wake all waiters and preserve the unacknowledged journal.
@@ -401,9 +743,11 @@ func (db *DB) Close() error {
 		return nil
 	}
 	db.closed = true
+	db.idsClosed.Store(true)
 	db.notify()
 	db.signal()
 	db.mu.Unlock()
+	idsErr := db.ids.Close()
 	<-db.done
-	return errors.Join(db.indexes.Close(), db.values.Close())
+	return errors.Join(idsErr, db.indexes.Close(), db.values.Close(), storage.ReleaseLock(db.owner))
 }

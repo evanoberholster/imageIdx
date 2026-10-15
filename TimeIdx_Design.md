@@ -18,8 +18,8 @@ The initial lifecycle description below is historical where it differs.
 | T01 | Exact unsigned nanoseconds since 1900-01-01 UTC; no quantization | User: A |
 | T04 | Support 1900–2100, including pre-1970 instants | User |
 | D01 | Changed persistent `Apply` completes a COW commit before returning | User: A |
-| Namespace | `common.Namespace`; independent file, allocator, generation and lifetime | User requirements |
-| Cardinality | One time per `common.ValueID` per namespace; repeated times allowed | User requirements |
+| Namespace | `schema.Namespace`; independent file, allocator, generation and lifetime | User requirements |
+| Cardinality | One time per `schema.ValueID` per namespace; repeated times allowed | User requirements |
 | Atomicity | Whole-batch acceptance, publication and recovery; no cross-namespace transaction | User requirements |
 | Shards | Adaptive composite-order size bounds; configurable maximum | User requirements |
 | Default shard limit | 4 KiB after measured clustered/historical sweeps | Benchmark evidence |
@@ -60,7 +60,7 @@ conversion helpers. `TimestampShift=24` survives only as a deprecated source
 compatibility constant: it no longer affects indexing. On nanoseconds that
 shift would be 16.777216 ms, not 50 ms.
 
-`common.ValueID` stays generic and full-width. Zero and MaxUint64 IDs are valid.
+`schema.ValueID` stays generic and full-width. Zero and MaxUint64 IDs are valid.
 Multiple namespaces may independently contain the same ID and timestamp.
 
 ## Ownership and API compatibility
@@ -75,7 +75,7 @@ Resolve an index once and call `Index.Search`/`Apply` directly. Manager locks
 never enter searches or writes. Its lifecycle mutex serializes registration
 and close operations, which may wait for readers; unrelated resolved indexes
 continue searching and writing. Register `Spec.NamespaceDef()` in the owning
-`common.Schema` before sharing the collection with the planner.
+`schema.Definitions` before sharing the collection with the planner.
 
 Existing `NewMemory`, `NewStore`, `OpenStore`, `Search`, `SearchExact`,
 `EstimateRange`, `NewBatch`, `Insert`, `Delete` and `Move` signatures remain.

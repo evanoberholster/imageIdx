@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestPrincipalValidation(t *testing.T) {
@@ -16,11 +16,11 @@ func TestPrincipalValidation(t *testing.T) {
 	}
 	// Only zero is rejected: every other ID, extremes included, is a
 	// valid principal with no syntax to validate.
-	for _, id := range []common.UserID{1, 42, ^common.UserID(0)} {
+	for _, id := range []schema.UserID{1, 42, ^schema.UserID(0)} {
 		if _, err := NewUserACL(id); err != nil {
 			t.Fatalf("NewUserACL(%d) err = %v, want nil", id, err)
 		}
-		if _, err := NewGroupACL(common.GroupID(id)); err != nil {
+		if _, err := NewGroupACL(schema.GroupID(id)); err != nil {
 			t.Fatalf("NewGroupACL(%d) err = %v, want nil", id, err)
 		}
 	}
@@ -33,7 +33,7 @@ func TestPrincipalValidation(t *testing.T) {
 func TestPrincipalValueRoundTrip(t *testing.T) {
 	user, _ := NewUserACL(42)
 	value := user.Value()
-	if value.Kind != common.KindBitmapEnum {
+	if value.Kind != schema.KindBitmapEnum {
 		t.Fatalf("user Value kind = %v, want KindBitmapEnum", value.Kind)
 	}
 	// Fixed 8-byte little-endian key.

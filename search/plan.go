@@ -6,7 +6,7 @@ import (
 	"errors"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -46,7 +46,7 @@ type Stage struct {
 	Kind     StageKind
 	Estimate uint64
 	// Namespace is zero for timestamp, ACL, and standalone hash stages.
-	Namespace        common.Namespace
+	Namespace        schema.Namespace
 	Predicate        string
 	CanProbe         bool
 	OrderedSource    bool
@@ -81,7 +81,7 @@ type stage struct {
 	hashIndex     *radixhash.Index
 	hashAlgorithm HashAlgorithm
 	hashValue     radixhash.Hash
-	hashNamespace common.Namespace
+	hashNamespace schema.Namespace
 }
 
 func (s *stage) metadata() Stage {

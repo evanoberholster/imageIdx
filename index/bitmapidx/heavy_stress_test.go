@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // TestHeavyStress is an opt-in, large-scale soak: many namespaces, a large item
@@ -39,9 +39,9 @@ func TestHeavyStress(t *testing.T) {
 	valuesN := heavyInt("HEAVY_VALUES_PER_NAMESPACE", 64)
 	checkpointEvery := heavyInt("HEAVY_CHECKPOINT_EVERY", 2_000_000)
 	batchSize := heavyInt("HEAVY_BATCH", 64)
-	durability := common.DurabilityOS
+	durability := schema.DurabilityOS
 	if os.Getenv("HEAVY_DURABILITY") == "sync" {
-		durability = common.DurabilitySync
+		durability = schema.DurabilitySync
 	}
 	if namespacesN < 1 || items < 1 || perItem < 1 || valuesN < 1 || writers < 0 || readers < 0 || batchSize < 1 {
 		t.Fatal("invalid heavy parameters")
@@ -49,19 +49,19 @@ func TestHeavyStress(t *testing.T) {
 	if perItem > namespacesN {
 		perItem = namespacesN
 	}
-	const firstType = common.Namespace(100)
+	const firstType = schema.Namespace(100)
 
 	namespaces := make([]NamespaceSpec, namespacesN)
 	for f := 0; f < namespacesN; f++ {
-		namespaces[f] = enumNamespace(firstType + common.Namespace(f))
+		namespaces[f] = enumNamespace(firstType + schema.Namespace(f))
 	}
 	config := NamespaceConfig{}
 	dir := t.TempDir()
 	// Bulk load is always written with OS durability; a sync-mode run reopens
 	// the checkpointed store so the measured phase pays per-write fsync.
 	loadDurability := durability
-	if durability == common.DurabilitySync {
-		loadDurability = common.DurabilityOS
+	if durability == schema.DurabilitySync {
+		loadDurability = schema.DurabilityOS
 	}
 	store, err := NewStore(dir, namespaces, config, loadDurability)
 	if err != nil {
@@ -70,7 +70,7 @@ func TestHeavyStress(t *testing.T) {
 	defer func() { _ = store.Close() }()
 	indexes := make([]*Index, namespacesN)
 	for f := 0; f < namespacesN; f++ {
-		index, ok := store.Lookup(firstType + common.Namespace(f))
+		index, ok := store.Lookup(firstType + schema.Namespace(f))
 		if !ok {
 			t.Fatalf("namespace %d missing", f)
 		}
@@ -155,7 +155,7 @@ func TestHeavyStress(t *testing.T) {
 			chosen[n] = f
 			n++
 			v := valueFor(item)
-			batches[f] = append(batches[f], Entry{ImageID: common.ImageID(item), Value: EnumBytesValue(values[f][v])})
+			batches[f] = append(batches[f], Entry{ImageID: schema.ImageID(item), Value: EnumBytesValue(values[f][v])})
 			if len(batches[f]) == cap(batches[f]) {
 				if err := flush(f); err != nil {
 					t.Fatalf("load flush: %v", err)
@@ -189,7 +189,7 @@ func TestHeavyStress(t *testing.T) {
 		}
 		indexes = indexes[:0]
 		for f := 0; f < namespacesN; f++ {
-			index, ok := store.Lookup(firstType + common.Namespace(f))
+			index, ok := store.Lookup(firstType + schema.Namespace(f))
 			if !ok {
 				t.Fatalf("namespace %d missing after reopen", f)
 			}
@@ -237,7 +237,7 @@ func TestHeavyStress(t *testing.T) {
 				f := (lo + src.Intn(perWriter)) % namespacesN
 				entries = entries[:0]
 				for n := 0; n < batchSize; n++ {
-					id := common.ImageID(src.Intn(items) + 1)
+					id := schema.ImageID(src.Intn(items) + 1)
 					v := src.Intn(valuesN)
 					entries = append(entries, Entry{ImageID: id, Value: EnumBytesValue(values[f][v])})
 				}
@@ -283,7 +283,7 @@ func TestHeavyStress(t *testing.T) {
 					fail(err)
 					return
 				}
-				id := common.ImageID(src.Intn(items) + 1)
+				id := schema.ImageID(src.Intn(items) + 1)
 				if _, err := indexes[f].Contains(id, value); err != nil {
 					fail(err)
 					return
@@ -360,7 +360,7 @@ func TestHeavyStress(t *testing.T) {
 	t.Logf("heap: start=%dMiB peak=%dMiB end=%dMiB goroutines=%d GOMAXPROCS=%d",
 		memBefore.HeapAlloc>>20, peakHeap>>20, memAfter.HeapAlloc>>20, runtime.NumGoroutine(), runtime.GOMAXPROCS(0))
 
-	reopened, err := OpenStore(dir, config, common.DurabilityOS)
+	reopened, err := OpenStore(dir, config, schema.DurabilityOS)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -373,8 +373,8 @@ func TestHeavyStress(t *testing.T) {
 		item := (s*sample)%items + 1
 		f := namespaceFor(item, 0)
 		v := valueFor(item)
-		idx, _ := reopened.Lookup(firstType + common.Namespace(f))
-		ok, err := idx.Contains(common.ImageID(item), EnumBytesValue(values[f][v]))
+		idx, _ := reopened.Lookup(firstType + schema.Namespace(f))
+		ok, err := idx.Contains(schema.ImageID(item), EnumBytesValue(values[f][v]))
 		if err != nil || !ok {
 			t.Fatalf("reopen spot-check item=%d namespace=%d ok=%v err=%v", item, f, ok, err)
 		}

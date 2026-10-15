@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
@@ -17,7 +17,7 @@ import (
 type Config struct {
 	// Namespace labels the collection for the higher-level search planner. It
 	// has no effect on storage layout and is supplied again on Open.
-	Namespace common.Namespace
+	Namespace schema.Namespace
 	// MaxCells is the default cover cell budget for region queries that do not
 	// specify one. Values <= 0 select DefaultMaxCells.
 	MaxCells int
@@ -110,7 +110,7 @@ func recordsForBytes(bytes int64) int {
 // location. Mutation layers are kept sorted by id and never mutated after
 // publication.
 type mutation struct {
-	id  common.ImageID
+	id  schema.ImageID
 	key S2Key
 	add bool
 }
@@ -131,7 +131,7 @@ type mutationSet struct {
 // allocate a huge bitset.
 func newMutationSet(layer []mutation, bound int) mutationSet {
 	set := mutationSet{layer: layer}
-	limit := common.ImageID(0)
+	limit := schema.ImageID(0)
 	for n := range layer {
 		if layer[n].id > limit {
 			limit = layer[n].id
@@ -150,7 +150,7 @@ func newMutationSet(layer []mutation, bound int) mutationSet {
 }
 
 // touched reports whether id is named by the set's layer.
-func (s mutationSet) touched(id common.ImageID) bool {
+func (s mutationSet) touched(id schema.ImageID) bool {
 	if s.bits != nil {
 		word := id >> 6
 		if int(word) < len(s.bits) {
@@ -172,7 +172,7 @@ type view struct {
 	frozen  []mutation
 	layers  [][]mutation
 	active  []mutation
-	maxID   common.ImageID
+	maxID   schema.ImageID
 	entries int
 
 	deltaOnce sync.Once
@@ -196,7 +196,7 @@ type Index struct {
 	active   []mutation
 	layers   [][]mutation
 	frozen   []mutation
-	deltaMax common.ImageID
+	deltaMax schema.ImageID
 	gen      uint64
 
 	// lastScannedShards is the number of shards whose base ImageIDs were scanned
@@ -240,7 +240,7 @@ func NewMemory(config Config) (*Index, error) {
 
 // maxImageID returns the largest ImageID across the base bound and the pending
 // mutation state.
-func maxImageID(baseMax common.ImageID, frozen []mutation, layers [][]mutation, active []mutation) common.ImageID {
+func maxImageID(baseMax schema.ImageID, frozen []mutation, layers [][]mutation, active []mutation) schema.ImageID {
 	best := baseMax
 	maxLayer := func(layer []mutation) {
 		for n := range layer {
@@ -296,7 +296,7 @@ func viewDelta(v *view) []mutation {
 
 // deltaTouched reports whether id is named by the effective delta, using the
 // cached membership set.
-func deltaTouched(v *view, id common.ImageID) bool {
+func deltaTouched(v *view, id schema.ImageID) bool {
 	return v.deltaSet.touched(id)
 }
 
@@ -335,7 +335,7 @@ func (i *Index) withView(fn func(*view)) {
 }
 
 // Insert records id at key.
-func (i *Index) Insert(key S2Key, id common.ImageID) error {
+func (i *Index) Insert(key S2Key, id schema.ImageID) error {
 	var ops [1]mutation
 	ops[0] = mutation{id: id, key: key, add: true}
 	return i.apply(ops[:])
@@ -345,7 +345,7 @@ func (i *Index) Insert(key S2Key, id common.ImageID) error {
 // so the supplied key is advisory and a stale key does not prevent removal. A
 // move is Delete(oldKey, id) then Insert(newKey, id); the caller supplies
 // oldKey from imagemetadata.
-func (i *Index) Delete(key S2Key, id common.ImageID) error {
+func (i *Index) Delete(key S2Key, id schema.ImageID) error {
 	var ops [1]mutation
 	ops[0] = mutation{id: id, key: key, add: false}
 	return i.apply(ops[:])
@@ -533,8 +533,8 @@ func upsertMutation(muts []mutation, op mutation) []mutation {
 	return slices.Insert(muts, index, op)
 }
 
-func mutationIndex(muts []mutation, id common.ImageID) (int, bool) {
-	return slices.BinarySearchFunc(muts, id, func(m mutation, id common.ImageID) int {
+func mutationIndex(muts []mutation, id schema.ImageID) (int, bool) {
+	return slices.BinarySearchFunc(muts, id, func(m mutation, id schema.ImageID) int {
 		return cmp.Compare(m.id, id)
 	})
 }
@@ -592,8 +592,8 @@ func (i *Index) baseEntriesLocked() int {
 
 // maxShardIDLocked returns the largest ImageID among committed shards. The caller
 // holds mu.
-func (i *Index) maxShardIDLocked() common.ImageID {
-	var best common.ImageID
+func (i *Index) maxShardIDLocked() schema.ImageID {
+	var best schema.ImageID
 	for _, s := range i.shards {
 		if s.maxID > best {
 			best = s.maxID
@@ -694,7 +694,7 @@ func (i *Index) Generation() uint64 {
 }
 
 // Namespace returns the namespace configured for this index.
-func (i *Index) Namespace() common.Namespace { return i.config.Namespace }
+func (i *Index) Namespace() schema.Namespace { return i.config.Namespace }
 
 // Len returns the effective number of stored locations (base minus deletes plus
 // inserts).

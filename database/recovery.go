@@ -9,8 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
 
@@ -27,7 +27,7 @@ const (
 )
 
 type RecoveryStatus struct {
-	Namespace  common.Namespace
+	Namespace  schematypes.Namespace
 	State      RecoveryState
 	Generation uint64
 	Err        error
@@ -83,12 +83,12 @@ func (db *DB) needsRecovery() bool {
 
 const schemaKeyID uint64 = 4
 
-func (db *DB) persistedSchema() (*common.Schema, error) {
+func (db *DB) persistedSchema() (*schematypes.Definitions, error) {
 	data, err := db.values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
 	if err != nil {
 		return nil, err
 	}
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	if err := schema.UnmarshalBinary(data); err != nil {
 		return nil, fmt.Errorf("%w: canonical schema: %v", ErrRecoveryRequired, err)
 	}
@@ -120,20 +120,55 @@ func (db *DB) persistSchema() error {
 // store cannot independently replace a corrupt namespace in the current
 // single-directory format, so every declared namespace is reconstructed.
 func (db *DB) rebuildOnOpen(dir string) error {
-	schema, err := db.persistedSchema()
-	if errors.Is(err, store.ErrNotFound) && db.indexes != nil {
-		schema = db.indexes.Schema()
-		data, e := schema.MarshalBinary()
-		if e != nil {
-			return e
+	return db.rebuildWithDefinitions(dir, nil)
+}
+
+// rebuildWithDefinitions also serves prepared schema additions. The target is
+// already durable in schema.dat; only the index's physical generation is
+// replaced. nil means ordinary recovery under the currently active schema.
+func (db *DB) rebuildWithDefinitions(dir string, target *schematypes.Definitions) error {
+	var schema *schematypes.Definitions
+	var err error
+	if target != nil {
+		schema = schematypes.NewDefinitions()
+		for _, def := range target.Defs() {
+			if def.Kind != schematypes.KindKV {
+				if err := schema.Register(def); err != nil {
+					return err
+				}
+			}
 		}
-		if e = db.values.Set(store.Key{Namespace: metadataNS, ID: schemaKeyID}, data); e != nil {
-			return e
+	} else if db.ids != nil {
+		// Never reconstruct an existing database's logical schema from a
+		// surviving index or Pebble backup; both can be absent after migration.
+		schema = schematypes.NewDefinitions()
+		for _, def := range db.ids.Definitions().Defs() {
+			if def.Kind != schematypes.KindKV {
+				if err := schema.Register(def); err != nil {
+					return err
+				}
+			}
 		}
-		err = nil
-	}
-	if err != nil {
-		return fmt.Errorf("%w: no authoritative schema: %v", ErrRecoveryRequired, err)
+	} else {
+		// A database with no schema.dat can only use the explicit one-time
+		// legacy bootstrap path, before it publishes an authoritative file.
+		schema, err = db.persistedSchema()
+		missingBackup := errors.Is(err, store.ErrNotFound)
+		if missingBackup && db.indexes != nil {
+			schema, err = db.indexes.Schema(), nil
+		}
+		if err != nil {
+			return fmt.Errorf("%w: no authoritative schema: %v", ErrRecoveryRequired, err)
+		}
+		if missingBackup {
+			data, err := schema.MarshalBinary()
+			if err != nil {
+				return err
+			}
+			if err := db.values.Set(store.Key{Namespace: metadataNS, ID: schemaKeyID}, data); err != nil {
+				return err
+			}
+		}
 	}
 	marker := activationPath(dir)
 	if _, err := os.Stat(marker); err == nil {
@@ -162,12 +197,21 @@ func (db *DB) rebuildOnOpen(dir string) error {
 	if db.options.boundary != nil {
 		db.options.boundary("before rebuild")
 	}
-	stage, err := index.Create(stagePath(dir), index.Spec{Schema: schema})
+	var stage *index.Store
+	if target != nil || db.ids != nil {
+		definitions := target
+		if definitions == nil {
+			definitions = db.ids.Definitions()
+		}
+		stage, err = index.CreateWithDefinitions(stagePath(dir), definitions)
+	} else {
+		stage, err = index.Create(stagePath(dir), index.Spec{Schema: schema})
+	}
 	if err != nil {
 		return err
 	}
 	batch := stage.NewBatch(db.options.BatchSize)
-	for entity := common.EntityImage; entity.Valid(); entity++ {
+	for entity := schematypes.EntityImage; entity.Valid(); entity++ {
 		if err = db.scanRebuild(stage, schema, batch, entity); err != nil {
 			break
 		}
@@ -190,7 +234,13 @@ func (db *DB) rebuildOnOpen(dir string) error {
 	if err != nil {
 		return errors.Join(ErrRecoveryRequired, fmt.Errorf("staging: %w", err))
 	}
-	if err := verifyReplacement(stagePath(dir), db.committed, fingerprint); err != nil {
+	var authoritative *schematypes.Definitions
+	if target != nil {
+		authoritative = target
+	} else if db.ids != nil {
+		authoritative = db.ids.Definitions()
+	}
+	if err := verifyReplacement(stagePath(dir), db.committed, fingerprint, authoritative); err != nil {
 		return err
 	}
 	if err := syncDirectory(stagePath(dir)); err != nil {
@@ -208,10 +258,14 @@ func (db *DB) rebuildOnOpen(dir string) error {
 		}
 		db.indexes = nil
 	}
-	if err := resumeActivation(dir, db.values, db.options.boundary); err != nil {
+	if err := resumeActivation(dir, db.values, authoritative, db.options.boundary); err != nil {
 		return err
 	}
-	db.indexes, err = index.Open(dir)
+	if authoritative != nil {
+		db.indexes, err = index.OpenWithDefinitions(dir, authoritative)
+	} else {
+		db.indexes, err = index.Open(dir)
+	}
 	if err != nil {
 		return err
 	}
@@ -221,7 +275,7 @@ func (db *DB) rebuildOnOpen(dir string) error {
 	return nil
 }
 
-func (db *DB) scanRebuild(stage *index.Store, schema *common.Schema, batch *index.Batch, entity common.EntityKind) error {
+func (db *DB) scanRebuild(stage *index.Store, schema *schematypes.Definitions, batch *index.Batch, entity schematypes.EntityKind) error {
 	// Decoders may return slices borrowing their input. Pebble iterator values
 	// are valid only until the next step, so keep one reusable projection
 	// buffer per staged record until Apply has finished consuming the batch.
@@ -246,7 +300,7 @@ func (db *DB) scanRebuild(stage *index.Store, schema *common.Schema, batch *inde
 		used = 0
 		return nil
 	}
-	err := db.values.ScanFrom(common.Namespace(entity), 0, func(key store.Key, raw []byte) (bool, error) {
+	err := db.values.ScanFrom(db.canonical[entity], 0, func(key store.Key, raw []byte) (bool, error) {
 		if db.options.boundary != nil {
 			db.options.boundary("during rebuild scan")
 		}
@@ -285,8 +339,8 @@ func (db *DB) scanRebuild(stage *index.Store, schema *common.Schema, batch *inde
 	return flush()
 }
 
-func validateProjection(schema *common.Schema, entity common.EntityKind, entry index.Entry) error {
-	check := func(ns common.Namespace) error {
+func validateProjection(schema *schematypes.Definitions, entity schematypes.EntityKind, entry index.Entry) error {
+	check := func(ns schematypes.Namespace) error {
 		def, ok := schema.Lookup(ns)
 		if !ok || def.Entity != entity {
 			return fmt.Errorf("%w: namespace %d does not belong to entity %d", ErrCorruptJournal, ns, entity)
@@ -405,8 +459,14 @@ func exists(path string) (bool, error) {
 	return false, err
 }
 
-func verifyReplacement(path string, generation uint64, schemaCRC uint32) error {
-	idx, err := index.Open(path)
+func verifyReplacement(path string, generation uint64, schemaCRC uint32, authoritative *schematypes.Definitions) error {
+	var idx *index.Store
+	var err error
+	if authoritative != nil {
+		idx, err = index.OpenWithDefinitions(path, authoritative)
+	} else {
+		idx, err = index.Open(path)
+	}
 	if err != nil {
 		return err
 	}
@@ -429,7 +489,7 @@ func verifyReplacement(path string, generation uint64, schemaCRC uint32) error {
 // resumeActivation is called only during Open, before publishing any index
 // pointers. The verified marker is the atomic *authorization* to publish;
 // directory renames are retried until indexDir names the verified generation.
-func resumeActivation(dir string, values *store.Store, boundary func(string)) error {
+func resumeActivation(dir string, values *store.Store, authoritative *schematypes.Definitions, boundary func(string)) error {
 	if _, err := os.Stat(activationPath(dir)); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
@@ -439,7 +499,21 @@ func resumeActivation(dir string, values *store.Store, boundary func(string)) er
 	if err != nil {
 		return err
 	}
-	canonicalSchema, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+	var canonicalSchema []byte
+	if authoritative != nil {
+		indexDefs := schematypes.NewDefinitions()
+		for _, def := range authoritative.Defs() {
+			if def.Kind != schematypes.KindKV {
+				if err := indexDefs.Register(def); err != nil {
+					return errors.Join(ErrRecoveryRequired, err)
+				}
+			}
+		}
+		canonicalSchema, err = indexDefs.MarshalBinary()
+	} else {
+		// Only the one-time legacy bootstrap may use Pebble's schema copy.
+		canonicalSchema, err = values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+	}
 	if err != nil || crc32.ChecksumIEEE(canonicalSchema) != a.schemaCRC {
 		return ErrRecoveryRequired
 	}
@@ -474,7 +548,7 @@ func resumeActivation(dir string, values *store.Store, boundary func(string)) er
 		return syncDirectory(parent)
 	}
 	if stage {
-		if err := verifyReplacement(stagePath(dir), a.generation, a.schemaCRC); err != nil {
+		if err := verifyReplacement(stagePath(dir), a.generation, a.schemaCRC, authoritative); err != nil {
 			return err
 		}
 		if active {
@@ -509,7 +583,7 @@ func resumeActivation(dir string, values *store.Store, boundary func(string)) er
 		}
 		return ErrRecoveryRequired
 	}
-	if err := verifyReplacement(dir, a.generation, a.schemaCRC); err != nil {
+	if err := verifyReplacement(dir, a.generation, a.schemaCRC, authoritative); err != nil {
 		return err
 	}
 	backup, err = exists(backupPath(dir))

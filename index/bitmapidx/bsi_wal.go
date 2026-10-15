@@ -3,7 +3,7 @@ package bitmapidx
 import (
 	"encoding/binary"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // BSI WAL records are logical value transitions, never per-bit changes, so one
@@ -29,7 +29,7 @@ const (
 
 // bsiReplayOp is one decoded logical transition reduced to its resulting state.
 type bsiReplayOp struct {
-	id      common.ValueID
+	id      schema.ValueID
 	value   uint32
 	present bool
 }

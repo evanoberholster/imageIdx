@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func shardBenchConfig(target int64) Config {
@@ -29,7 +29,7 @@ func BenchmarkShardTargetSize(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		entries[i] = Entry{Key: key, ImageID: common.ImageID(i + 1)}
+		entries[i] = Entry{Key: key, ImageID: schema.ImageID(i + 1)}
 	}
 	ranges := CoverCap(nil, geoNewCap(2000), CoverOptions{MaxCells: 16})
 	exactKey, _ := KeyFromLatLng(geoBenchLat, geoBenchLng)
@@ -60,14 +60,14 @@ func BenchmarkShardTargetSize(b *testing.B) {
 			b.Logf("shards=%d", len(index.view.Load().shards))
 
 			b.Run("range", func(b *testing.B) {
-				dst := make([]common.ImageID, 0, 4096)
+				dst := make([]schema.ImageID, 0, 4096)
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
 					dst = index.SearchRanges(dst[:0], ranges)
 				}
 			})
 			b.Run("exact", func(b *testing.B) {
-				dst := make([]common.ImageID, 0, 256)
+				dst := make([]schema.ImageID, 0, 256)
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
 					dst = index.SearchRanges(dst[:0], exact)
@@ -224,7 +224,7 @@ func BenchmarkShardInsertBatch(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
-					batch[j] = Entry{Key: key, ImageID: common.ImageID(n + i*64 + j + 1)}
+					batch[j] = Entry{Key: key, ImageID: schema.ImageID(n + i*64 + j + 1)}
 				}
 				if err := index.InsertBatch(batch); err != nil {
 					b.Fatal(err)

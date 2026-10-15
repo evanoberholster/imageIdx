@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestConfigValidation(t *testing.T) {
@@ -426,7 +426,7 @@ func TestReAddEntryAfterDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ValueID != common.ValueID(entry) || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != schema.ValueID(entry) || results[0].Score != 0 {
 		t.Fatalf("entry self-search after re-add = %+v", results)
 	}
 }

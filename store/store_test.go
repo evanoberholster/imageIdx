@@ -6,7 +6,8 @@ import (
 	"math"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	"github.com/cockroachdb/pebble/v2"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestKeyEncoding(t *testing.T) {
@@ -34,10 +35,67 @@ func TestKeyEncoding(t *testing.T) {
 	}
 }
 
+func TestOpenDefinitionsUsesAuthoritativeKVModel(t *testing.T) {
+	dir := t.TempDir()
+	defs := schema.NewDefinitions()
+	if err := defs.Register(schema.NamespaceDef{Namespace: 100, Name: "image-metadata", Kind: schema.KindKV, Entity: schema.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(Key{Namespace: 100, ID: 1}, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, err := s.Get(Key{Namespace: 100, ID: 1}); err != nil || string(value) != "value" {
+		t.Fatalf("reopen: %q %v", value, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	other := schema.NewDefinitions()
+	_ = other.Register(schema.NamespaceDef{Namespace: 100, Name: "different", Kind: schema.KindKV, Entity: schema.EntityImage})
+	// Pebble cannot compare namespace names: the caller's authoritative schema
+	// determines their meaning, and no serialized registry is stored here.
+	s, err = Open(dir, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pdb, err := pebble.Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, closer, err := pdb.Get(schemaKey[:]); !errors.Is(err, pebble.ErrNotFound) {
+		if closer != nil {
+			_ = closer.Close()
+		}
+		t.Fatalf("schema persisted by OpenDefinitions: %v", err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	invalid := schema.NewDefinitions()
+	_ = invalid.Register(schema.NamespaceDef{Namespace: 100, Name: "index", Kind: schema.KindTimestamp, Entity: schema.EntityImage})
+	if _, err := Open(dir, invalid); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("accepted index kind: %v", err)
+	}
+}
+
 func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 	dir := t.TempDir()
-	specs := []Spec{{Namespace: 1, Name: "photos"}, {Namespace: common.Namespace(math.MaxUint16), Name: "last"}}
-	s, err := Open(dir, specs...)
+	specs := []Spec{{Namespace: 1, Name: "photos"}, {Namespace: schema.Namespace(math.MaxUint16), Name: "last"}}
+	s, err := OpenLegacy(dir, specs...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +103,7 @@ func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 		{Namespace: 1, ID: 2, Flags: 1},
 		{Namespace: 1, ID: 1, Flags: 2},
 		{Namespace: 1, ID: 1, Flags: 1},
-		{Namespace: common.Namespace(math.MaxUint16), ID: 5, Flags: 0},
+		{Namespace: schema.Namespace(math.MaxUint16), ID: 5, Flags: 0},
 	}
 	for _, key := range keys {
 		if err := s.Set(key, []byte{byte(key.Flags)}); err != nil {
@@ -55,7 +113,7 @@ func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(dir, specs...)
+	s, err = OpenLegacy(dir, specs...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +141,7 @@ func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 		}
 	}
 	got = nil
-	if err := s.Scan(common.Namespace(math.MaxUint16), func(key Key, _ []byte) error {
+	if err := s.Scan(schema.Namespace(math.MaxUint16), func(key Key, _ []byte) error {
 		got = append(got, key)
 		return nil
 	}); err != nil || len(got) != 1 || got[0] != keys[3] {
@@ -102,17 +160,45 @@ func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 
 func TestStoreRejectsDifferentSchema(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Spec{Namespace: 1, Name: "photos"})
+	s, err := OpenLegacy(dir, Spec{Namespace: 1, Name: "photos"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(dir, Spec{Namespace: 1, Name: "videos"}); !errors.Is(err, ErrSchemaMismatch) {
+	if _, err := OpenLegacy(dir, Spec{Namespace: 1, Name: "videos"}); !errors.Is(err, ErrSchemaMismatch) {
 		t.Fatalf("mismatched schema: %v", err)
 	}
-	if _, err := Open(dir, Spec{Namespace: 0, Name: "invalid"}); !errors.Is(err, common.ErrNamespaceInvalid) {
+	if _, err := OpenLegacy(dir, Spec{Namespace: 0, Name: "invalid"}); !errors.Is(err, schema.ErrNamespaceInvalid) {
 		t.Fatalf("invalid namespace: %v", err)
+	}
+}
+
+func TestExplicitAppendOnlySchemaExtension(t *testing.T) {
+	dir := t.TempDir()
+	base := []Spec{{Namespace: 1, Name: "photos"}}
+	s, err := OpenLegacy(dir, base...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenLegacyWithExtension(dir, Spec{Namespace: 1, Name: "renamed"}, Spec{Namespace: 2, Name: "users"}); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("changed old definition: %v", err)
+	}
+	if _, err := OpenLegacy(dir, base[0], Spec{Namespace: 2, Name: "users"}); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("implicit extension: %v", err)
+	}
+	s, err = OpenLegacyWithExtension(dir, base[0], Spec{Namespace: 2, Name: "users"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenLegacyWithExtension(dir, base...); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("removed definition: %v", err)
 	}
 }

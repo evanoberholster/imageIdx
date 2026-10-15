@@ -4,7 +4,7 @@ import (
 	"math/bits"
 	"sync"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -30,15 +30,15 @@ const (
 
 // bsiSliceKey returns the posting key for one BSI slice. Slot is always zero:
 // BSI values are never hashed and never collide.
-func bsiSliceKey(ns common.Namespace, slice uint64) NamespaceKey {
+func bsiSliceKey(ns schema.Namespace, slice uint64) NamespaceKey {
 	return NamespaceKey{Namespace: ns, Hash: slice}
 }
 
 // namespaceUsesDictionary reports whether a kind stores canonical bytes in the
 // value dictionary. Continuous and BSI values have no canonical bytes.
-func namespaceUsesDictionary(kind common.NamespaceKind) bool {
+func namespaceUsesDictionary(kind schema.NamespaceKind) bool {
 	switch kind {
-	case common.KindBitmapEnum, common.KindBitmapBool, common.KindBitmapString:
+	case schema.KindBitmapEnum, schema.KindBitmapBool, schema.KindBitmapString:
 		return true
 	default:
 		return false
@@ -74,12 +74,12 @@ func (v *namespaceView) bsiSlice(key NamespaceKey) (roar.Bitmap, bool) {
 }
 
 // bsiExists returns the existence bitmap of a BSI namespace.
-func (v *namespaceView) bsiExists(ns common.Namespace) (roar.Bitmap, bool) {
+func (v *namespaceView) bsiExists(ns schema.Namespace) (roar.Bitmap, bool) {
 	return v.bsiSlice(bsiSliceKey(ns, bsiExistsSlice))
 }
 
 // bsiValueAt reconstructs the value stored for id, if any, from the bit slices.
-func (v *namespaceView) bsiValueAt(ns common.Namespace, width uint8, id common.ValueID) (uint64, bool) {
+func (v *namespaceView) bsiValueAt(ns schema.Namespace, width uint8, id schema.ValueID) (uint64, bool) {
 	if !v.contains(bsiSliceKey(ns, bsiExistsSlice), id) {
 		return 0, false
 	}
@@ -106,7 +106,7 @@ type bsiSlices struct {
 
 // resolveBSISlices fills out with the namespace's effective slice postings.
 // Absent slices stay zero, which the comparison kernels treat as an empty set.
-func (v *namespaceView) resolveBSISlices(ns common.Namespace, width uint8, out *bsiSlices) {
+func (v *namespaceView) resolveBSISlices(ns schema.Namespace, width uint8, out *bsiSlices) {
 	out.width = width
 	out.hasExists = false
 	out.exists = roar.Bitmap{}
@@ -125,7 +125,7 @@ func (v *namespaceView) resolveBSISlices(ns common.Namespace, width uint8, out *
 }
 
 // bitAt returns id's value bit, treating an absent slice as all zeros.
-func (s *bsiSlices) bitAt(id common.ValueID, bit uint8) bool {
+func (s *bsiSlices) bitAt(id schema.ValueID, bit uint8) bool {
 	if bit >= s.width || !s.hasBit[bit] {
 		return false
 	}
@@ -349,7 +349,7 @@ func bsiRangeInto(s *bsiSlices, r ValueRange, sc *bsiScratch) roar.Bitmap {
 // bsiCandidateInRange reports whether one candidate's value lies in r without
 // materializing a range bitmap or reconstructing the full value: each bound is
 // tested most-significant-bit first and stops at the first differing bit.
-func bsiCandidateInRange(s *bsiSlices, id common.ValueID, r ValueRange) bool {
+func bsiCandidateInRange(s *bsiSlices, id schema.ValueID, r ValueRange) bool {
 	if !s.hasExists || !s.exists.Contains(id) {
 		return false
 	}
@@ -363,7 +363,7 @@ func bsiCandidateInRange(s *bsiSlices, id common.ValueID, r ValueRange) bool {
 }
 
 // bsiCandidateAtLeast reports value >= bound (or > bound when !inclusive).
-func bsiCandidateAtLeast(s *bsiSlices, id common.ValueID, bound uint64, inclusive bool) bool {
+func bsiCandidateAtLeast(s *bsiSlices, id schema.ValueID, bound uint64, inclusive bool) bool {
 	for bit := int(s.width) - 1; bit >= 0; bit-- {
 		c := s.bitAt(id, uint8(bit))
 		b := bound&(uint64(1)<<uint(bit)) != 0
@@ -375,7 +375,7 @@ func bsiCandidateAtLeast(s *bsiSlices, id common.ValueID, bound uint64, inclusiv
 }
 
 // bsiCandidateAtMost reports value <= bound (or < bound when !inclusive).
-func bsiCandidateAtMost(s *bsiSlices, id common.ValueID, bound uint64, inclusive bool) bool {
+func bsiCandidateAtMost(s *bsiSlices, id schema.ValueID, bound uint64, inclusive bool) bool {
 	for bit := int(s.width) - 1; bit >= 0; bit-- {
 		c := s.bitAt(id, uint8(bit))
 		b := bound&(uint64(1)<<uint(bit)) != 0
@@ -388,13 +388,13 @@ func bsiCandidateAtMost(s *bsiSlices, id common.ValueID, bound uint64, inclusive
 
 // bsiBitAt reports id's value bit by probing the view directly, touching only
 // that bit's slice. It resolves no slice directory and allocates nothing.
-func (v *namespaceView) bsiBitAt(ns common.Namespace, bit uint8, id common.ValueID) bool {
+func (v *namespaceView) bsiBitAt(ns schema.Namespace, bit uint8, id schema.ValueID) bool {
 	return v.contains(bsiSliceKey(ns, uint64(bit)+1), id)
 }
 
 // bsiCompareToBound compares id's value against bound, returning -1, 0, or 1.
 // It reads bits most-significant first and stops at the first difference.
-func (v *namespaceView) bsiCompareToBound(ns common.Namespace, width uint8, id common.ValueID, bound uint64) int {
+func (v *namespaceView) bsiCompareToBound(ns schema.Namespace, width uint8, id schema.ValueID, bound uint64) int {
 	for bit := int(width) - 1; bit >= 0; bit-- {
 		c := v.bsiBitAt(ns, uint8(bit), id)
 		b := bound&(uint64(1)<<uint(bit)) != 0
@@ -412,7 +412,7 @@ func (v *namespaceView) bsiCompareToBound(ns common.Namespace, width uint8, id c
 // bits a comparison needs, most-significant first, stopping at the first
 // difference. It is the small-candidate path: no slice resolution, no scratch,
 // no allocation when dst has capacity.
-func (v *namespaceView) bsiCandidateInRangeLazy(ns common.Namespace, width uint8, id common.ValueID, r ValueRange) bool {
+func (v *namespaceView) bsiCandidateInRangeLazy(ns schema.Namespace, width uint8, id schema.ValueID, r ValueRange) bool {
 	if !v.contains(bsiSliceKey(ns, bsiExistsSlice), id) {
 		return false
 	}
@@ -509,7 +509,7 @@ func (i *Index) bsiRead() (view *namespaceView, token uint32, ok bool) {
 // bsiSpec returns the namespace definition, requiring a BSI kind.
 func (i *Index) bsiSpec() (NamespaceSpec, error) {
 	spec := i.spec()
-	if spec.Kind != common.KindBitmapBSI {
+	if spec.Kind != schema.KindBitmapBSI {
 		return NamespaceSpec{}, ErrBSINotBSI
 	}
 	return spec, nil
@@ -587,7 +587,7 @@ func (i *Index) bsiExcludeEqual(spec NamespaceSpec, value uint64) (roar.Bitmap, 
 }
 
 // Equal returns the ValueIDs whose BSI value equals value. The result is a
-// roaring bitmap of common.ValueID, ready for use in the unified search API.
+// roaring bitmap of schema.ValueID, ready for use in the unified search API.
 func (i *Index) Equal(value uint64) (roar.Bitmap, error) {
 	spec, err := i.bsiValidateSpec(value)
 	if err != nil {
@@ -774,7 +774,7 @@ const bsiLazyCandidateThreshold = 4
 // preserving candidate order and duplicates. dst=candidates[:0] is safe. Small
 // candidate sets probe the view directly; larger sets resolve the slice
 // directory and either probe it or materialize the range bitmap once.
-func (i *Index) BSIFilterRange(dst, candidates []common.ValueID, r ValueRange) ([]common.ValueID, error) {
+func (i *Index) BSIFilterRange(dst, candidates []schema.ValueID, r ValueRange) ([]schema.ValueID, error) {
 	spec, err := i.bsiRangeSpec(r)
 	if err != nil || r.empty() || len(candidates) == 0 {
 		return dst, err
@@ -824,7 +824,7 @@ func (i *Index) BSIFilterRange(dst, candidates []common.ValueID, r ValueRange) (
 // Set stores value for id, inserting or replacing as needed. ValueID zero is
 // reserved; a value wider than the namespace BSI width is rejected rather than
 // truncated. Set is durable under DurabilitySync once it returns.
-func (i *Index) Set(id common.ValueID, value uint64) error {
+func (i *Index) Set(id schema.ValueID, value uint64) error {
 	spec, err := i.bsiSpec()
 	if err != nil {
 		return err
@@ -839,7 +839,7 @@ func (i *Index) Set(id common.ValueID, value uint64) error {
 }
 
 // Delete removes id's value. Deleting an absent ValueID is a no-op.
-func (i *Index) Delete(id common.ValueID) error {
+func (i *Index) Delete(id schema.ValueID) error {
 	if _, err := i.bsiSpec(); err != nil {
 		return err
 	}
@@ -866,7 +866,7 @@ func (i *Index) applyBSIOps(ops ...bsiOp) error {
 
 // Get returns the value stored for id. ok is false when id holds no value.
 // ValueID zero is reserved and reported with ErrInvalidImageID.
-func (i *Index) Get(id common.ValueID) (value uint64, ok bool, err error) {
+func (i *Index) Get(id schema.ValueID) (value uint64, ok bool, err error) {
 	spec, err := i.bsiSpec()
 	if err != nil {
 		return 0, false, err
@@ -886,7 +886,7 @@ func (i *Index) Get(id common.ValueID) (value uint64, ok bool, err error) {
 // bsiOp is one prepared logical BSI transition. flags carries the presence and
 // mode bits.
 type bsiOp struct {
-	id    common.ValueID
+	id    schema.ValueID
 	from  uint32
 	to    uint32
 	flags uint8
@@ -908,8 +908,8 @@ func (op bsiOp) hasNew() bool {
 // bsiSliceDelta accumulates slice membership changes for one batch. add and
 // remove hold unsorted ValueIDs; existence is index zero.
 type bsiSliceDelta struct {
-	add    []common.ValueID
-	remove []common.ValueID
+	add    []schema.ValueID
+	remove []schema.ValueID
 }
 
 // bsiExpand validates op against the current value and folds its slice

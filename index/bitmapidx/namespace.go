@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/textanalyzer"
 	"github.com/zeebo/xxh3"
 )
@@ -82,12 +82,12 @@ const (
 // NamespaceSpec is one registered metadata namespace: its stable number,
 // value shape, and the codecs that interpret values. Only the codecs for the
 // namespace's kind are consulted; the rest must be zero. Definitions are
-// immutable once registered. Schema names belong to common.NamespaceDef.
+// immutable once registered. Schema names belong to schema.NamespaceDef.
 //
 // Geography is not a bitmap kind: geographic indexing lives in index/geoidx.
 type NamespaceSpec struct {
-	Namespace  common.Namespace
-	Kind       common.NamespaceKind
+	Namespace  schema.Namespace
+	Kind       schema.NamespaceKind
 	Name       string    // Namespace Name; not persisted, only for user display
 	BSIWidth   uint8     // KindBitmapBSI only: BSIWidth16 or BSIWidth32
 	Quant      Quantizer // KindBitmapContinuous only
@@ -174,7 +174,7 @@ func validateNamespace(f NamespaceSpec) error {
 	}
 	// Only BSI namespaces carry a width; every other kind must leave it zero so
 	// a mismatched persisted width is rejected rather than silently ignored.
-	if f.Kind == common.KindBitmapBSI {
+	if f.Kind == schema.KindBitmapBSI {
 		if f.BSIWidth != BSIWidth16 && f.BSIWidth != BSIWidth32 {
 			return ErrInvalidBSIWidth
 		}
@@ -182,23 +182,23 @@ func validateNamespace(f NamespaceSpec) error {
 		return ErrInvalidNamespace
 	}
 	switch f.Kind {
-	case common.KindBitmapEnum:
+	case schema.KindBitmapEnum:
 		if _, err := normalizeEnum(f.Normalizer, nil); err != nil {
 			return err
 		}
-	case common.KindBitmapBool:
-	case common.KindBitmapString:
+	case schema.KindBitmapBool:
+	case schema.KindBitmapString:
 		if _, err := textanalyzer.New(f.Analyzer.Code, f.Analyzer.Version, f.Analyzer.Params); err != nil {
 			return errors.Join(ErrInvalidNamespace, err)
 		}
-	case common.KindBitmapContinuous:
+	case schema.KindBitmapContinuous:
 		if f.Quant.Code == 0 || f.Quant.Version == 0 || f.Quant.Scale <= 0 {
 			return ErrInvalidNamespace
 		}
 		if f.Quant.Code == QuantIdentity && (f.Quant.Scale != 1 || f.Quant.Offset != 0) {
 			return ErrInvalidNamespace
 		}
-	case common.KindBitmapBSI:
+	case schema.KindBitmapBSI:
 		// Width is validated above.
 	default:
 		return ErrInvalidNamespace
@@ -240,7 +240,7 @@ func normalizeEnum(spec CodecSpec, value []byte) ([]byte, error) {
 // Slot is always zero for continuous and geo keys, which never hash.
 type NamespaceKey struct {
 	Hash      uint64
-	Namespace common.Namespace
+	Namespace schema.Namespace
 	Slot      uint16
 }
 
@@ -253,7 +253,7 @@ func decodeOrderKey(key uint64) int64 { return int64(key ^ (1 << 63)) }
 
 // continuousKey builds the NamespaceKey for one int64 grid value. The result
 // always has Slot zero and Namespace t.
-func continuousKey(t common.Namespace, grid int64) NamespaceKey {
+func continuousKey(t schema.Namespace, grid int64) NamespaceKey {
 	return NamespaceKey{Hash: orderKey(grid), Namespace: t}
 }
 
@@ -264,7 +264,7 @@ func continuousKey(t common.Namespace, grid int64) NamespaceKey {
 // production code must never replace it.
 var hashCanonical = hashCanonicalValue
 
-func hashCanonicalValue(t common.Namespace, kind common.NamespaceKind, canonical []byte) NamespaceKey {
+func hashCanonicalValue(t schema.Namespace, kind schema.NamespaceKind, canonical []byte) NamespaceKey {
 	var header [8]byte
 	binary.LittleEndian.PutUint16(header[0:2], uint16(t))
 	header[2] = bitmapKindCode(kind)
@@ -290,7 +290,7 @@ func hashCanonicalValue(t common.Namespace, kind common.NamespaceKind, canonical
 // borrow caller memory through preparation and are copied under the writer
 // lock only for genuinely new dictionary values.
 type Value struct {
-	Kind  common.NamespaceKind
+	Kind  schema.NamespaceKind
 	Bytes []byte
 	Int   int64
 	Bool  bool
@@ -299,30 +299,30 @@ type Value struct {
 // EnumStringValue returns an enum value. The string is copied to a fresh byte
 // slice; the caller retains its string.
 func EnumStringValue(value string) Value {
-	return Value{Kind: common.KindBitmapEnum, Bytes: []byte(value)}
+	return Value{Kind: schema.KindBitmapEnum, Bytes: []byte(value)}
 }
 
 // EnumBytesValue returns an enum value borrowing value. The slice is borrowed
 // through preparation and copied under the writer lock only if the value
 // is new to the dictionary; callers must not mutate it until the write
 // returns.
-func EnumBytesValue(value []byte) Value { return Value{Kind: common.KindBitmapEnum, Bytes: value} }
+func EnumBytesValue(value []byte) Value { return Value{Kind: schema.KindBitmapEnum, Bytes: value} }
 
 // BoolValue returns an explicit boolean value. False is distinct from
 // absent: an image with no bool membership is neither true nor false.
-func BoolValue(value bool) Value { return Value{Kind: common.KindBitmapBool, Bool: value} }
+func BoolValue(value bool) Value { return Value{Kind: schema.KindBitmapBool, Bool: value} }
 
 // IntValue returns a continuous value already converted into the namespace's
 // int64 grid domain. No quantizer runs at write time.
-func IntValue(value int64) Value { return Value{Kind: common.KindBitmapContinuous, Int: value} }
+func IntValue(value int64) Value { return Value{Kind: schema.KindBitmapContinuous, Int: value} }
 
 // Uint16Value returns a 16-bit BSI value. It is only valid for a BSI namespace
 // whose width is BSIWidth16; the writer rejects it against any other width.
-func Uint16Value(value uint16) Value { return Value{Kind: common.KindBitmapBSI, Int: int64(value)} }
+func Uint16Value(value uint16) Value { return Value{Kind: schema.KindBitmapBSI, Int: int64(value)} }
 
 // Uint32Value returns a 32-bit BSI value. It is only valid for a BSI namespace
 // whose width is BSIWidth32; the writer rejects it against any other width.
-func Uint32Value(value uint32) Value { return Value{Kind: common.KindBitmapBSI, Int: int64(value)} }
+func Uint32Value(value uint32) Value { return Value{Kind: schema.KindBitmapBSI, Int: int64(value)} }
 
 // BSIMove is one logical BSI value transition for a ValueID. The presence
 // flags are literal preconditions:
@@ -333,9 +333,9 @@ func Uint32Value(value uint32) Value { return Value{Kind: common.KindBitmapBSI, 
 //   - neither: a no-op.
 //
 // A no-op move is dropped. Values must fit the namespace width; they are never
-// truncated. All IDs are common.ValueID: a BSI namespace is entity-agnostic.
+// truncated. All IDs are schema.ValueID: a BSI namespace is entity-agnostic.
 type BSIMove struct {
-	ID      common.ValueID
+	ID      schema.ValueID
 	From    uint32
 	To      uint32
 	HasFrom bool
@@ -345,7 +345,7 @@ type BSIMove struct {
 // Entry is one ImageID to value membership change. ImageID zero is
 // reserved and rejected with ErrInvalidImageID.
 type Entry struct {
-	ImageID common.ImageID
+	ImageID schema.ImageID
 	Value   Value
 }
 
@@ -361,7 +361,7 @@ type namespaceMutation struct {
 // inserts, To == 0 removes, and both nonzero values move. Both zero is a no-op.
 // A continuous value of zero must use Batch.Add or Batch.Remove instead.
 type Move struct {
-	ImageID common.ImageID
+	ImageID schema.ImageID
 	From    int64
 	To      int64
 }
@@ -370,21 +370,21 @@ type Move struct {
 // Callers supply the old and new source strings so the index can diff
 // analyzer token sets without keeping a reverse index.
 type TextReplacement struct {
-	ImageID common.ImageID
+	ImageID schema.ImageID
 	Before  []string
 	After   []string
 }
 
-// NamespaceDef converts the spec into a common.Schema definition, encoding
+// NamespaceDef converts the spec into a schema.Definitions definition, encoding
 // the codecs into Config with the persisted namespace layout.
-func (s NamespaceSpec) NamespaceDef(name string) (common.NamespaceDef, error) {
+func (s NamespaceSpec) NamespaceDef(name string) (schema.NamespaceDef, error) {
 	if name == "" {
-		return common.NamespaceDef{}, common.ErrNamespaceName
+		return schema.NamespaceDef{}, schema.ErrNamespaceName
 	}
 	if err := validateNamespace(s); err != nil {
-		return common.NamespaceDef{}, err
+		return schema.NamespaceDef{}, err
 	}
-	return common.NamespaceDef{
+	return schema.NamespaceDef{
 		Namespace: s.Namespace,
 		Name:      name,
 		Kind:      s.Kind,
@@ -394,7 +394,7 @@ func (s NamespaceSpec) NamespaceDef(name string) (common.NamespaceDef, error) {
 
 // NamespaceSpecFromSchemaDef is the inverse of NamespaceDef. It rejects
 // definitions that do not describe a bitmap namespace with ErrNamespaceMismatch.
-func NamespaceSpecFromSchemaDef(def common.NamespaceDef) (NamespaceSpec, error) {
+func NamespaceSpecFromSchemaDef(def schema.NamespaceDef) (NamespaceSpec, error) {
 	if !def.Kind.IsBitmap() {
 		return NamespaceSpec{}, ErrNamespaceMismatch
 	}
@@ -412,13 +412,13 @@ func NamespaceSpecFromSchemaDef(def common.NamespaceDef) (NamespaceSpec, error) 
 // namespace numbers. NewStore uses it to keep store definitions unique
 // without requiring schema names, which are not persisted.
 func validateNamespaceSpecs(specs []NamespaceSpec) error {
-	seen := make(map[common.Namespace]struct{}, len(specs))
+	seen := make(map[schema.Namespace]struct{}, len(specs))
 	for _, spec := range specs {
 		if err := validateNamespace(spec); err != nil {
 			return err
 		}
 		if _, ok := seen[spec.Namespace]; ok {
-			return fmt.Errorf("%w: %d", common.ErrNamespaceDuplicate, spec.Namespace)
+			return fmt.Errorf("%w: %d", schema.ErrNamespaceDuplicate, spec.Namespace)
 		}
 		seen[spec.Namespace] = struct{}{}
 	}

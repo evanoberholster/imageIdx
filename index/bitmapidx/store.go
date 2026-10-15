@@ -10,7 +10,7 @@ import (
 	"slices"
 	"sync"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -30,10 +30,10 @@ const namespaceManifestMagic uint32 = 0x424d464d
 // budgets.
 type Store struct {
 	dir        string
-	namespaces map[common.Namespace]*Index // immutable after construction
+	namespaces map[schema.Namespace]*Index // immutable after construction
 	order      []*Index
 	config     NamespaceConfig
-	durability common.Durability
+	durability schema.Durability
 	storeID    [16]byte // binds manifest, snapshots, and WAL to one store
 	writeMu    sync.Mutex
 	closed     bool
@@ -60,7 +60,7 @@ func newStoreID() ([16]byte, error) {
 // validated, persisted in the first checkpoint, and immutable after;
 // config is runtime-only policy. Handles become store-owned on success
 // and must be closed via the store.
-func NewStore(dir string, namespaces []NamespaceSpec, config NamespaceConfig, durability common.Durability) (*Store, error) {
+func NewStore(dir string, namespaces []NamespaceSpec, config NamespaceConfig, durability schema.Durability) (*Store, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -81,7 +81,7 @@ func NewStore(dir string, namespaces []NamespaceSpec, config NamespaceConfig, du
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, namespaces: make(map[common.Namespace]*Index)}
+	s := &Store{dir: dir, config: config, durability: durability, lock: lock, storeID: storeID, namespaces: make(map[schema.Namespace]*Index)}
 	for _, spec := range specs {
 		index, err := NewMemory(spec, config)
 		if err != nil {
@@ -105,7 +105,7 @@ func NewStore(dir string, namespaces []NamespaceSpec, config NamespaceConfig, du
 // only an incomplete terminal frame before making namespace handles
 // available. Generation, namespace count, segment checksums, and WAL offsets
 // all validate; any other corruption fails the open for external recovery.
-func OpenStore(dir string, config NamespaceConfig, durability common.Durability) (*Store, error) {
+func OpenStore(dir string, config NamespaceConfig, durability schema.Durability) (*Store, error) {
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, err
@@ -146,7 +146,7 @@ func OpenStore(dir string, config NamespaceConfig, durability common.Durability)
 	if uint64(len(s.order)) != binary.LittleEndian.Uint64(data[16:24]) {
 		return nil, ErrCorruptManifest
 	}
-	s.namespaces = make(map[common.Namespace]*Index, len(s.order))
+	s.namespaces = make(map[schema.Namespace]*Index, len(s.order))
 	for _, index := range s.order {
 		s.namespaces[index.spec().Namespace] = index
 	}
@@ -174,7 +174,7 @@ func OpenStore(dir string, config NamespaceConfig, durability common.Durability)
 
 // Lookup returns the store-owned namespace for t. All mutations append to the
 // store WAL. The handle must not be closed directly.
-func (s *Store) Lookup(t common.Namespace) (*Index, bool) {
+func (s *Store) Lookup(t schema.Namespace) (*Index, bool) {
 	index, ok := s.namespaces[t]
 	return index, ok
 }

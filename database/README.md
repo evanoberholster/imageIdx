@@ -1,9 +1,43 @@
 # database: authoritative records and derived indexes (alpha)
 
-`database.DB` owns one Pebble-backed `store.Store` for canonical bytes and one
-unified `index.Store` for derived associations. The index schema is created
-separately with `index.Create`; `database.Open(dataDir, indexDir, decoder,
-options)` reopens it and checks health and the durable source watermark. The
+`database.DB` coordinates `schema.dat` (entity IDs and all logical namespace
+definitions), Pebble (canonical bytes, journal, operational generations), and
+the unified index (physical engines and recovery metadata). The initial index
+may be created with standalone `index.Create`; database startup validates and
+retires its old `schema.bin` after establishing schema.dat. Subsequent index
+opens consume central definitions. Allocation-file format v1 returns
+`schema.ErrVersion`; no namespace-scoped counter migration is attempted.
+
+`database.Open` takes an exclusive database lock. On new databases it validates
+the index and writes schema.dat before creating Pebble; Pebble never receives
+a serialized schema registry. Existing databases validate old Pebble and index
+copies during their one-time migration, preserve namespace IDs and allocator
+reservations, remove those copies, then durably mark retirement in schema.dat.
+Later opens do not read old Pebble schema keys. Losing schema.dat after migration
+fails closed, without scanning records to invent IDs.
+
+Additions supplied through `Options.Definitions` are allowed only at startup.
+Existing definitions must remain an identical prefix; removal, renaming,
+reassignment, or changing configuration fails. schema.dat publishes the full
+target as PREPARED before physical index work; the previous superblock remains
+ACTIVE. The index is rebuilt into a verified staging directory from canonical
+projections and activated with the index recovery marker. Once every namespace
+is healthy and durable, schema.dat publishes ACTIVE. A crash can repeat staging
+or finish a verified activation; recovery loads the durable target from
+schema.dat without requiring the caller's original options. An index that
+cannot be rebuilt from canonical projections fails closed. A KV-only addition
+reuses the healthy index unchanged: the coordinator still publishes PREPARED
+and ACTIVE, but no index rebuild or backfill runs. Canonical namespaces
+come from persisted `entity-<kind>` definitions and need not match EntityKind
+ordinals; `Options.CanonicalNamespaces` never renumbers existing databases.
+
+`NextID` issues unique IDs from the entity allocator. Explicit IDs in `Commit`
+use caller-owned, last-writer-wins canonical record semantics. `EnsureMinimum`
+protects future allocations, **not** IDs already issued to another goroutine.
+A bulk import must finish and reconcile its maximum before concurrent `NextID`
+for that entity using `PrepareImport(entity, maximum)`; callers must coordinate
+this phase themselves. Runtime
+external-ID insertion cannot promise uniqueness against outstanding issued IDs.
 database directory is exclusively owned by this package: its fixed `entity-*`
 collections contain canonical records, namespace 65533 holds ordered journal
 entries, and 65534 holds generation metadata. Do not mutate these namespaces
@@ -24,11 +58,10 @@ exposes `RecoveryStatus()` for per-namespace `RecoveryHealthy`,
 generations. No ordinary database reader or writer receives a DB while its
 startup rebuild is in progress.
 
-When first opening a healthy store, the integration persists an immutable copy
-of the index schema in Pebble metadata. This lets it reconstruct even a missing
-index directory without inventing namespace definitions. An older database
-that never recorded this copy and has also lost its index schema requires
-manual schema restoration; recovery must not guess.
+An existing schema.dat supplies index definitions for rebuild, even if the
+entire index directory or old `schema.bin` is missing. A pre-schema.dat legacy
+database without either copy cannot recover definitions and fails closed. After
+the retirement marker, the old Pebble backup is never consulted.
 
 The current physical rebuild reconstructs **all declared namespaces**, not
 just the damaged logical namespace. Bitmap namespaces share one segment and
@@ -37,8 +70,8 @@ activation is not implemented. The original directory remains untouched until
 a replacement has been completely scanned, durably assigned the canonical
 generation, structurally verified, closed, and reopened. The replacement lives
 at `<indexDir>.rebuild`; a checksummed `<indexDir>.activation` records BUILDING
-or VERIFIED, the source generation, and a fingerprint of the authoritative
-Pebble schema. Reopen validates this fingerprint before any rename. Only a
+or VERIFIED, the source generation, and a fingerprint of the index definitions
+from schema.dat. Reopen validates this fingerprint before any rename. Only a
 VERIFIED replacement may replace `<indexDir>`; the previous generation is
 temporarily moved to `<indexDir>.previous`. Every rename is followed by parent
 directory sync. On restart the activation record finishes or restarts the
@@ -80,7 +113,7 @@ if err != nil { return err }
 defer db.Close()
 
 generation, err := db.Commit(database.Mutation{
-    Entity: common.EntityImage, ValueID: imageID,
+    Entity: schema.EntityImage, ValueID: imageID,
     Record: imageMetadata, Projection: encodedIndexEntry,
 })
 if err != nil { return err } // canonical commit + journal are already durable
@@ -90,7 +123,7 @@ engine, err := search.New(db.Index())
 if err != nil { return err }
 clause, err := engine.Values(101, bitmapidx.EnumBytesValue([]byte("favorite")))
 if err != nil { return err }
-plan, err := engine.Compile(common.EntityImage, clause)
+plan, err := engine.Compile(schema.EntityImage, clause)
 if err != nil { return err }
 ids, err := plan.AppendIDs(ctx, nil, search.NewWorkspace(128))
 _ = ids
@@ -179,3 +212,13 @@ One measured startup-rebuild iteration reconstructed **10,000** enum records
 in **179 ms** (~56k records/s) and **100,000** in **397 ms** (~252k records/s),
 excluding fixture ingestion. These single observations are not a base-branch
 `benchstat` comparison and do not validate other index families.
+## ID allocation
+
+`DB.NextID(entity)` uses the standalone `schema` package's single-file
+`schema.dat` allocator, keyed by the entity's canonical namespace. Other
+namespaces for that entity reference the same ID; they do not allocate it.
+On first open, the database transfers the former Pebble allocator's durable
+high-water marks (if present) and reconciles canonical records and tombstones
+before publishing a synced migration marker. Later opens use only the schema
+file and never scan canonical records to reconstruct issued IDs. A clean close
+preserves the last issued ID; an unclean close skips unused reservations.

@@ -3,7 +3,7 @@ package bitmapidx
 import (
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/roar"
 )
 
@@ -41,7 +41,7 @@ type bitmapDelta struct {
 // newBitmapDelta canonicalizes additions minus removals into an immutable
 // correction. It returns nil when the correction is empty, so callers can
 // keep delta maps sparse.
-func newBitmapDelta(additions, removals []common.ImageID) *bitmapDelta {
+func newBitmapDelta(additions, removals []schema.ImageID) *bitmapDelta {
 	if len(additions) == 0 && len(removals) == 0 {
 		return nil
 	}
@@ -85,7 +85,7 @@ func (d *namespaceDelta) delta(key NamespaceKey) (*bitmapDelta, bool) {
 // state reports the layer's correction for (key, id), if any. Additions
 // win within the layer because newBitmapDelta canonicalizes remove-wins
 // before storage.
-func (d *namespaceDelta) state(key NamespaceKey, id common.ImageID) (present, touched bool) {
+func (d *namespaceDelta) state(key NamespaceKey, id schema.ImageID) (present, touched bool) {
 	if d == nil {
 		return false, false
 	}
@@ -140,7 +140,7 @@ func (v *namespaceView) allKeys() []NamespaceKey {
 	return slices.Compact(keys)
 }
 
-func (v *namespaceView) contains(key NamespaceKey, id common.ImageID) bool {
+func (v *namespaceView) contains(key NamespaceKey, id schema.ImageID) bool {
 	if v.active == nil && v.frozen == nil {
 		if p, ok := v.base.get(key); ok {
 			return p.contains(id)
@@ -159,7 +159,7 @@ func (v *namespaceView) contains(key NamespaceKey, id common.ImageID) bool {
 	return false
 }
 
-func (v *namespaceView) containsWithoutActive(key NamespaceKey, id common.ImageID) bool {
+func (v *namespaceView) containsWithoutActive(key NamespaceKey, id schema.ImageID) bool {
 	if present, ok := v.frozen.state(key, id); ok {
 		return present
 	}
@@ -311,6 +311,6 @@ type stagedChange struct {
 	// chain. An int avoids conversions on 64-bit platforms for a
 	// prepare-only structure.
 	next   int
-	add    []common.ImageID
-	remove []common.ImageID
+	add    []schema.ImageID
+	remove []schema.ImageID
 }

@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestConfigNamespaceValidation(t *testing.T) {
@@ -21,7 +21,7 @@ func TestConfigNamespaceValidation(t *testing.T) {
 
 func TestConfigNamespaceDef(t *testing.T) {
 	def := testConfigFloat512().NamespaceDef()
-	if def.Namespace != testNamespace || def.Kind != common.KindVector || def.Name != "" {
+	if def.Namespace != testNamespace || def.Kind != schema.KindVector || def.Name != "" {
 		t.Fatalf("NamespaceDef() = %+v", def)
 	}
 }
@@ -43,7 +43,7 @@ func TestDimensionsValidation(t *testing.T) {
 // the NodeID -> ValueID widening in results.
 func TestNamespaceAndResultAcrossReopen(t *testing.T) {
 	path := tempPath(t)
-	namespace := common.Namespace(5)
+	namespace := schema.Namespace(5)
 	idx, err := NewStore(path, Config{Namespace: namespace, Dimensions: Dim512, ElementType: ElementFloat32}, DurabilitySync)
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +73,7 @@ func TestNamespaceAndResultAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].ValueID != common.ValueID(id) || results[0].Score != 0 {
+	if len(results) != 1 || results[0].ValueID != schema.ValueID(id) || results[0].Score != 0 {
 		t.Fatalf("result = %+v, want ValueID %d Score 0", results, id)
 	}
 }

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestCompiledQueryParity(t *testing.T) {
@@ -39,7 +39,7 @@ func TestCompiledQueryParity(t *testing.T) {
 	if gotCount != directCount {
 		t.Fatalf("compiled Count = %d, want %d", gotCount, directCount)
 	}
-	candidates := []common.ImageID{1, 2, 3, 4, 5, 999_999}
+	candidates := []schema.ImageID{1, 2, 3, 4, 5, 999_999}
 	directFiltered, err := index.FilterValues(nil, candidates, names...)
 	if err != nil {
 		t.Fatalf("FilterValues: %v", err)
@@ -54,7 +54,7 @@ func TestCompiledQueryParity(t *testing.T) {
 }
 
 func TestCompiledQuerySeesLaterWrites(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, index, func(b *Batch) error {
 		return b.Add(Entry{ImageID: 1, Value: EnumStringValue("a")})
 	})
@@ -77,7 +77,7 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
-	if !slices.Equal(got.AppendTo(nil), []common.ImageID{2}) {
+	if !slices.Equal(got.AppendTo(nil), []schema.ImageID{2}) {
 		t.Fatalf("compiled Match = %v, want [2]", got.AppendTo(nil))
 	}
 
@@ -96,7 +96,7 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
-	if !slices.Equal(got.AppendTo(nil), []common.ImageID{3}) {
+	if !slices.Equal(got.AppendTo(nil), []schema.ImageID{3}) {
 		t.Fatalf("compiled Match = %v, want [3]", got.AppendTo(nil))
 	}
 	count, err := both.Count()
@@ -124,7 +124,7 @@ func TestCompiledQuerySeesLaterWrites(t *testing.T) {
 }
 
 func TestCompiledQueryValidation(t *testing.T) {
-	index := mustNamespace(t, enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index := mustNamespace(t, enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 
 	empty, err := index.Compile()
 	if err != nil {
@@ -142,7 +142,7 @@ func TestCompiledQueryValidation(t *testing.T) {
 		t.Fatalf("CompileText on enum error = %v", err)
 	}
 
-	text := mustNamespace(t, textNamespace(common.NamespaceTag), NamespaceConfig{})
+	text := mustNamespace(t, textNamespace(schema.NamespaceTag), NamespaceConfig{})
 	commit(t, text, func(b *Batch) error {
 		return b.ReplaceText(TextReplacement{ImageID: 1, After: []string{"alpha beta"}})
 	})
@@ -162,7 +162,7 @@ func TestCompiledQueryValidation(t *testing.T) {
 		t.Fatal("compiled text differs from MatchText")
 	}
 
-	closed, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	closed, err := NewMemory(enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestZeroQueryMatchesNothing(t *testing.T) {
 	if count, err := q.Count(); err != nil || count != 0 {
 		t.Fatalf("zero Query Count = %d, %v; want 0, nil", count, err)
 	}
-	if got, err := q.Filter([]common.ImageID{9}, []common.ImageID{1}); err != nil || !slices.Equal(got, []common.ImageID{9}) {
+	if got, err := q.Filter([]schema.ImageID{9}, []schema.ImageID{1}); err != nil || !slices.Equal(got, []schema.ImageID{9}) {
 		t.Fatalf("zero Query Filter = %v, %v; want [9], nil", got, err)
 	}
 }
@@ -254,7 +254,7 @@ func TestCompiledQueryConcurrent(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if _, err := compiled.Filter(nil, []common.ImageID{1, 2, 3}); err != nil {
+				if _, err := compiled.Filter(nil, []schema.ImageID{1, 2, 3}); err != nil {
 					t.Error(err)
 					return
 				}

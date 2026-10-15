@@ -3,19 +3,19 @@ package index
 import (
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 )
 
-func benchSchema(tb testing.TB) *common.Schema {
+func benchSchema(tb testing.TB) *schematypes.Definitions {
 	tb.Helper()
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{
-		Namespace: 1, Name: "time", Kind: common.KindTimestamp, Entity: common.EntityImage,
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{
+		Namespace: 1, Name: "time", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage,
 	}); err != nil {
 		tb.Fatal(err)
 	}
-	tags, err := BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: common.KindBitmapEnum}, "tags", common.EntityImage)
+	tags, err := BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: schematypes.KindBitmapEnum}, "tags", schematypes.EntityImage)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func BenchmarkStoreApply(b *testing.B) {
 					b.Fatal(err)
 				}
 				for n := 0; n < size; n++ {
-					if err := batch.Add(Entry{ValueID: common.ValueID(n + 1), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i + n)}}}); err != nil {
+					if err := batch.Add(Entry{ValueID: schematypes.ValueID(n + 1), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i + n)}}}); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -103,7 +103,7 @@ func BenchmarkStoreDelete(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := db.Delete(common.EntityImage, 1); err != nil {
+		if err := db.Delete(schematypes.EntityImage, 1); err != nil {
 			b.Fatal(err)
 		}
 		if err := db.Add(entry); err != nil {
@@ -119,7 +119,7 @@ func BenchmarkStoreApplyUpdate(b *testing.B) {
 		b.Run(benchName(size), func(b *testing.B) {
 			db := benchStore(b)
 			for n := 1; n <= size; n++ {
-				if err := db.Add(Entry{ValueID: common.ValueID(n), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(n)}}}); err != nil {
+				if err := db.Add(Entry{ValueID: schematypes.ValueID(n), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(n)}}}); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -132,8 +132,8 @@ func BenchmarkStoreApplyUpdate(b *testing.B) {
 				}
 				for n := 1; n <= size; n++ {
 					if err := batch.Update(Change{
-						Before: Entry{ValueID: common.ValueID(n), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i)}}},
-						After:  Entry{ValueID: common.ValueID(n), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i + 1)}}},
+						Before: Entry{ValueID: schematypes.ValueID(n), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i)}}},
+						After:  Entry{ValueID: schematypes.ValueID(n), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i + 1)}}},
 					}); err != nil {
 						b.Fatal(err)
 					}
@@ -165,7 +165,7 @@ func BenchmarkStoreApplyWithGeneration(b *testing.B) {
 					b.Fatal(err)
 				}
 				for n := 0; n < size; n++ {
-					if err := batch.Add(Entry{ValueID: common.ValueID(n + 1), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i*size + n + 1)}}}); err != nil {
+					if err := batch.Add(Entry{ValueID: schematypes.ValueID(n + 1), Times: []TimeValue{{Namespace: 1, Timestamp: uint64(i*size + n + 1)}}}); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -186,7 +186,7 @@ func BenchmarkRegistryLookup(b *testing.B) {
 	b.ResetTimer()
 	var found bool
 	for i := 0; i < b.N; i++ {
-		_, found = db.reg.lookup(common.Namespace(i%8 + 1))
+		_, found = db.reg.lookup(schematypes.Namespace(i%8 + 1))
 	}
 	_ = found
 }

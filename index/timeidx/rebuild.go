@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -15,12 +15,12 @@ import (
 // exclude active index owners; no database logic or automatic rebuilding occurs.
 // Cross-filesystem rename is not supported. A directory-sync failure after
 // rename is uncertain: inspect/reopen the final file rather than recreating it.
-func PublishRebuild(dir, stagedDir string, ns common.Namespace) error {
+func PublishRebuild(dir, stagedDir string, ns schema.Namespace) error {
 	return publishRebuild(dir, stagedDir, ns, nil)
 }
 
 // Per-call test seam: no global hook and no effect on other namespace owners.
-func publishRebuild(dir, stagedDir string, ns common.Namespace, fault func(string) error) error {
+func publishRebuild(dir, stagedDir string, ns schema.Namespace, fault func(string) error) error {
 	check := func(stage string) error {
 		if fault != nil {
 			return fault(stage)

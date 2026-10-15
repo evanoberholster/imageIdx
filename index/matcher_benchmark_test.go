@@ -3,7 +3,7 @@ package index_test
 import (
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
@@ -68,7 +68,7 @@ func newMatcherBench(b *testing.B, n int) *matcherBench {
 				}
 			}
 			entry := index.Entry{
-				ValueID: common.ValueID(i + 1),
+				ValueID: schema.ValueID(i + 1),
 				Hashes: []index.HashValue{
 					{Namespace: 4, Hash: mb.sha[i]},
 					{Namespace: 5, Hash: mb.blake[i]},
@@ -401,7 +401,7 @@ func BenchmarkMatcherDuplicateHeavyWorkspace64(b *testing.B) {
 	shared := radixhash.Hash{0x55}
 	batch := db.NewBatch(64)
 	for i := 0; i < 64; i++ {
-		if err := batch.Add(index.Entry{ValueID: common.ValueID(i + 1), Hashes: []index.HashValue{{Namespace: 4, Hash: shared}}}); err != nil {
+		if err := batch.Add(index.Entry{ValueID: schema.ValueID(i + 1), Hashes: []index.HashValue{{Namespace: 4, Hash: shared}}}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -466,7 +466,7 @@ func BenchmarkMatcherDuplicateHeavyBatch64(b *testing.B) {
 	shared := radixhash.Hash{0x55}
 	batch := db.NewBatch(64)
 	for i := 0; i < 64; i++ {
-		if err := batch.Add(index.Entry{ValueID: common.ValueID(i + 1), Hashes: []index.HashValue{{Namespace: 4, Hash: shared}}}); err != nil {
+		if err := batch.Add(index.Entry{ValueID: schema.ValueID(i + 1), Hashes: []index.HashValue{{Namespace: 4, Hash: shared}}}); err != nil {
 			b.Fatal(err)
 		}
 	}

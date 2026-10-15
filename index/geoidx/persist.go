@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
@@ -218,7 +218,7 @@ func decodeDirEntry(arena, entry []byte) (*shard, error) {
 	if err != nil {
 		return nil, err
 	}
-	ids, err := storage.View[common.ImageID](arena, offset+uint64(count)*8, uint64(count), ErrCorrupt, ErrCorrupt)
+	ids, err := storage.View[schema.ImageID](arena, offset+uint64(count)*8, uint64(count), ErrCorrupt, ErrCorrupt)
 	if err != nil {
 		return nil, err
 	}
@@ -227,8 +227,8 @@ func decodeDirEntry(arena, entry []byte) (*shard, error) {
 		ids:    ids,
 		offset: offset,
 		length: uint32(length),
-		minID:  common.ImageID(minID),
-		maxID:  common.ImageID(maxID),
+		minID:  schema.ImageID(minID),
+		maxID:  schema.ImageID(maxID),
 	}
 	if checksumKeys(s) != keyCRC || checksumIDs(s) != idCRC {
 		return nil, ErrCorrupt
@@ -574,7 +574,7 @@ func liveBytes(shards []*shard) uint64 {
 type shardPlan struct {
 	keep *shard
 	keys []S2Key
-	ids  []common.ImageID
+	ids  []schema.ImageID
 }
 
 func planBytes(p shardPlan) int64 {
@@ -584,7 +584,7 @@ func planBytes(p shardPlan) int64 {
 	return int64(len(p.keys)) * shardBytesPerRecord
 }
 
-func planArrays(p shardPlan) ([]S2Key, []common.ImageID) {
+func planArrays(p shardPlan) ([]S2Key, []schema.ImageID) {
 	if p.keep != nil {
 		return p.keep.keys, p.keep.ids
 	}
@@ -643,7 +643,7 @@ func (i *Index) prepareShards(current []*shard, frozen []mutation) ([]shardPlan,
 			continue
 		}
 		keys := make([]S2Key, count)
-		ids := make([]common.ImageID, count)
+		ids := make([]schema.ImageID, count)
 		written := mergeInto(keys, ids, s.keys, s.ids, shadow, shardAdds)
 		if bounds := splitBounds(written, targetRecords); bounds == nil {
 			plans = append(plans, shardPlan{keys: keys[:written], ids: ids[:written]})
@@ -658,9 +658,9 @@ func (i *Index) prepareShards(current []*shard, frozen []mutation) ([]shardPlan,
 
 // deltaIDRange returns the min and max ImageID named by the delta. An empty
 // delta yields a range that never prunes.
-func deltaIDRange(frozen []mutation) (common.ImageID, common.ImageID) {
+func deltaIDRange(frozen []mutation) (schema.ImageID, schema.ImageID) {
 	if len(frozen) == 0 {
-		return common.ImageID(^uint64(0)), 0
+		return schema.ImageID(^uint64(0)), 0
 	}
 	minID, maxID := frozen[0].id, frozen[0].id
 	for _, m := range frozen[1:] {
@@ -681,7 +681,7 @@ func shardsFromAdds(adds []mutation, cfg Config) []shardPlan {
 		return nil
 	}
 	keys := make([]S2Key, len(adds))
-	ids := make([]common.ImageID, len(adds))
+	ids := make([]schema.ImageID, len(adds))
 	for n, m := range adds {
 		keys[n] = m.key
 		ids[n] = m.id
@@ -722,7 +722,7 @@ func concatPlans(a, b shardPlan) shardPlan {
 	keys := make([]S2Key, 0, len(ak)+len(bk))
 	keys = append(keys, ak...)
 	keys = append(keys, bk...)
-	ids := make([]common.ImageID, 0, len(ai)+len(bi))
+	ids := make([]schema.ImageID, 0, len(ai)+len(bi))
 	ids = append(ids, ai...)
 	ids = append(ids, bi...)
 	return shardPlan{keys: keys, ids: ids}
@@ -762,7 +762,7 @@ func (i *Index) materialize(plans []shardPlan, gen uint64) ([]*shard, []extentRe
 			i.rollback(append(allocated, extentRef{ref, capacity}))
 			return nil, nil, err
 		}
-		ids, err := storage.View[common.ImageID](data, offset+uint64(len(p.keys))*8, uint64(len(p.keys)), ErrCorrupt, ErrCorrupt)
+		ids, err := storage.View[schema.ImageID](data, offset+uint64(len(p.keys))*8, uint64(len(p.keys)), ErrCorrupt, ErrCorrupt)
 		if err != nil {
 			i.rollback(append(allocated, extentRef{ref, capacity}))
 			return nil, nil, err
@@ -1153,8 +1153,8 @@ func sortedByKey(muts []mutation) []mutation {
 }
 
 // maxOfIDs returns the largest ImageID in ids, or 0 when empty.
-func maxOfIDs(ids []common.ImageID) common.ImageID {
-	var best common.ImageID
+func maxOfIDs(ids []schema.ImageID) schema.ImageID {
+	var best schema.ImageID
 	for _, id := range ids {
 		if id > best {
 			best = id
@@ -1164,7 +1164,7 @@ func maxOfIDs(ids []common.ImageID) common.ImageID {
 }
 
 // minOfIDs returns the smallest ImageID in ids, or 0 when empty.
-func minOfIDs(ids []common.ImageID) common.ImageID {
+func minOfIDs(ids []schema.ImageID) schema.ImageID {
 	if len(ids) == 0 {
 		return 0
 	}
@@ -1179,7 +1179,7 @@ func minOfIDs(ids []common.ImageID) common.ImageID {
 
 // validateBase reports whether a shard's records are well-formed and its
 // recorded maximum ImageID matches.
-func validateBase(keys []S2Key, ids []common.ImageID, maxID common.ImageID) error {
+func validateBase(keys []S2Key, ids []schema.ImageID, maxID schema.ImageID) error {
 	if !validateShardOrder(keys, ids) {
 		return ErrCorrupt
 	}
@@ -1191,7 +1191,7 @@ func validateBase(keys []S2Key, ids []common.ImageID, maxID common.ImageID) erro
 
 // exactCount returns the number of live (key, imageID) pairs after applying the
 // delta. It mirrors mergeInto's traversal exactly.
-func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) uint64 {
+func exactCount(baseKeys []S2Key, baseIDs []schema.ImageID, shadow mutationSet, adds []mutation) uint64 {
 	count := uint64(0)
 	baseIndex, addIndex := 0, 0
 	for baseIndex < len(baseKeys) || addIndex < len(adds) {
@@ -1228,7 +1228,7 @@ func exactCount(baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, 
 
 // mergeInto writes the retained base entries and additions into keys and ids in
 // (key, id) order, skipping base entries shadowed by the delta.
-func mergeInto(keys []S2Key, ids []common.ImageID, baseKeys []S2Key, baseIDs []common.ImageID, shadow mutationSet, adds []mutation) int {
+func mergeInto(keys []S2Key, ids []schema.ImageID, baseKeys []S2Key, baseIDs []schema.ImageID, shadow mutationSet, adds []mutation) int {
 	baseIndex, addIndex, out := 0, 0, 0
 	for baseIndex < len(baseKeys) || addIndex < len(adds) {
 		for baseIndex < len(baseKeys) && shadow.touched(baseIDs[baseIndex]) {

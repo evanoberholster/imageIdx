@@ -1,5 +1,5 @@
 // Package bitmapidx implements immutable, copy-on-write namespace indexes over
-// database-wide image identifiers (common.ImageID).
+// database-wide image identifiers (schema.ImageID).
 //
 // An Index owns all postings for one typed namespace. Values are
 // canonicalized according to the persisted namespace definition and may be

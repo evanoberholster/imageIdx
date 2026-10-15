@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/bench"
 )
 
@@ -22,7 +22,7 @@ func TestTimeSearchNoAlloc(t *testing.T) {
 	timestamps := bench.Timestamps(7, n, bench.TimeUniform)
 	entries := make([]Entry, n)
 	for i, timestamp := range timestamps {
-		entries[i] = Entry{Timestamp: timestamp, ImageID: common.ValueID(i + 1)}
+		entries[i] = Entry{Timestamp: timestamp, ImageID: schema.ValueID(i + 1)}
 	}
 	index, err := NewMemory(Spec{Entries: entries}, Config{DeltaCapacity: 4_096, BlockSize: 4_096})
 	if err != nil {
@@ -34,7 +34,7 @@ func TestTimeSearchNoAlloc(t *testing.T) {
 	if len(full) != n {
 		t.Fatalf("full-range search = %d candidates, want %d", len(full), n)
 	}
-	dst := make([]common.ValueID, 0, len(full))
+	dst := make([]schema.ValueID, 0, len(full))
 	if allocs := testing.AllocsPerRun(100, func() {
 		dst = index.Search(dst[:0], 0, math.MaxUint64)
 	}); allocs != 0 {

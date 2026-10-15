@@ -6,19 +6,19 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 )
 
 func TestUnifiedBSIRange(t *testing.T) {
-	schema := common.NewSchema()
-	quality, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 40, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16}, "quality", common.EntityImage)
+	schema := schematypes.NewDefinitions()
+	quality, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 40, Kind: schematypes.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16}, "quality", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 41, Kind: common.KindBitmapEnum}, "tags", common.EntityImage)
+	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 41, Kind: schematypes.KindBitmapEnum}, "tags", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestUnifiedBSIRange(t *testing.T) {
 	}
 	defer db.Close()
 	for _, entry := range []struct {
-		id    common.ValueID
+		id    schematypes.ValueID
 		value uint16
 	}{{1, 0}, {2, 12}, {3, 85}, {4, 85}} {
 		if err := db.Add(index.Entry{ValueID: entry.id, Bitmaps: []index.BitmapValue{
@@ -49,7 +49,7 @@ func TestUnifiedBSIRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := eng.Compile(common.EntityImage, clause)
+	plan, err := eng.Compile(schematypes.EntityImage, clause)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestUnifiedBSIRange(t *testing.T) {
 	if got, err := plan.AppendPage(ctx, nil, ws, Page{Limit: 2}); err != nil || !slices.Equal(got, []ImageID{2, 3}) {
 		t.Fatalf("AppendPage = %v, %v", got, err)
 	}
-	if err := db.Delete(common.EntityImage, 3); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 3); err != nil {
 		t.Fatal(err)
 	}
 	refreshed, err := plan.Refresh(ctx)
@@ -87,7 +87,7 @@ func TestUnifiedBSIRange(t *testing.T) {
 	}
 }
 
-func mustBitmap(t *testing.T, db *index.Store, ns common.Namespace) *bitmapidx.Index {
+func mustBitmap(t *testing.T, db *index.Store, ns schematypes.Namespace) *bitmapidx.Index {
 	t.Helper()
 	idx, ok := db.Bitmap(ns)
 	if !ok {
@@ -97,8 +97,8 @@ func mustBitmap(t *testing.T, db *index.Store, ns common.Namespace) *bitmapidx.I
 }
 
 func TestEngineRejectsNilIndexesAndNonImageACL(t *testing.T) {
-	schema := common.NewSchema()
-	def, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 42, Kind: common.KindBitmapEnum}, "tags", common.EntityFace)
+	schema := schematypes.NewDefinitions()
+	def, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 42, Kind: schematypes.KindBitmapEnum}, "tags", schematypes.EntityFace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,24 +112,24 @@ func TestEngineRejectsNilIndexesAndNonImageACL(t *testing.T) {
 	defer db.Close()
 	eng, _ := New(db)
 	for _, clause := range []Clause{AllValues(nil, bitmapidx.EnumStringValue("x")), During(nil, 0, 1), InCells(nil, 1)} {
-		if _, err := eng.Compile(common.EntityFace, clause); !errors.Is(err, ErrInvalidClause) {
+		if _, err := eng.Compile(schematypes.EntityFace, clause); !errors.Is(err, ErrInvalidClause) {
 			t.Fatalf("nil index: %v", err)
 		}
 	}
-	if _, err := eng.Compile(common.EntityFace, WithACL(1)); !errors.Is(err, ErrIncompatibleEntity) {
+	if _, err := eng.Compile(schematypes.EntityFace, WithACL(1)); !errors.Is(err, ErrIncompatibleEntity) {
 		t.Fatalf("face ACL: %v", err)
 	}
 }
 
 func BenchmarkBSIPlan(b *testing.B) {
 	idx, err := bitmapidx.NewMemory(bitmapidx.NamespaceSpec{
-		Namespace: 40, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+		Namespace: 40, Kind: schematypes.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
 	}, bitmapidx.NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer idx.Close()
-	for id := common.ValueID(1); id <= 1024; id++ {
+	for id := schematypes.ValueID(1); id <= 1024; id++ {
 		if err := idx.Set(id, uint64(id%100)); err != nil {
 			b.Fatal(err)
 		}
@@ -161,8 +161,8 @@ func BenchmarkBSIPlan(b *testing.B) {
 }
 
 func TestUnifiedExactHash(t *testing.T) {
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: 50, Name: "digest", Kind: common.KindHashExact, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 50, Name: "digest", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := index.Create(t.TempDir(), index.Spec{Schema: schema})
@@ -179,7 +179,7 @@ func TestUnifiedExactHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := eng.Compile(common.EntityImage, clause)
+	plan, err := eng.Compile(schematypes.EntityImage, clause)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,10 +198,10 @@ func TestUnifiedExactHash(t *testing.T) {
 		t.Fatalf("hash namespace missing from %+v", stages)
 	}
 	idx, _ := db.Hash(50)
-	if _, err := eng.Compile(common.EntityImage, ExactHash(idx, HashSHA256, digest)); !errors.Is(err, ErrInvalidClause) {
+	if _, err := eng.Compile(schematypes.EntityImage, ExactHash(idx, HashSHA256, digest)); !errors.Is(err, ErrInvalidClause) {
 		t.Fatalf("unbound hash clause = %v", err)
 	}
-	if err := db.Delete(common.EntityImage, 10); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 10); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := plan.AppendIDs(context.Background(), nil, nil); err != nil || len(got) != 0 {

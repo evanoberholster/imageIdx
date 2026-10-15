@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -72,15 +72,15 @@ func TestSearchRejectsCrossEntityCompilation(t *testing.T) {
 	}
 
 	// Same-entity intersections compile.
-	if _, err := eng.Compile(common.EntityImage, imageTime, imageTag); err != nil {
+	if _, err := eng.Compile(schematypes.EntityImage, imageTime, imageTag); err != nil {
 		t.Fatalf("image/image compile failed: %v", err)
 	}
 	// Image + face is rejected.
-	if _, err := eng.Compile(common.EntityImage, imageTime, faceTime); !errors.Is(err, search.ErrIncompatibleEntity) {
+	if _, err := eng.Compile(schematypes.EntityImage, imageTime, faceTime); !errors.Is(err, search.ErrIncompatibleEntity) {
 		t.Fatalf("image/face compile err = %v, want ErrIncompatibleEntity", err)
 	}
 	// An image bitmap clause under the face entity is rejected.
-	if _, err := eng.Compile(common.EntityFace, imageTag); !errors.Is(err, search.ErrIncompatibleEntity) {
+	if _, err := eng.Compile(schematypes.EntityFace, imageTag); !errors.Is(err, search.ErrIncompatibleEntity) {
 		t.Fatalf("face/imageTag compile err = %v, want ErrIncompatibleEntity", err)
 	}
 	// A clause referencing another Store's engine is rejected.
@@ -93,7 +93,7 @@ func TestSearchRejectsCrossEntityCompilation(t *testing.T) {
 	if !ok {
 		t.Fatal("foreign tag missing")
 	}
-	if _, err := eng.Compile(common.EntityImage, search.AllValues(foreignTag, bitmapidx.EnumStringValue("cat"))); !errors.Is(err, search.ErrIncompatibleEntity) {
+	if _, err := eng.Compile(schematypes.EntityImage, search.AllValues(foreignTag, bitmapidx.EnumStringValue("cat"))); !errors.Is(err, search.ErrIncompatibleEntity) {
 		t.Fatalf("foreign store clause err = %v, want ErrIncompatibleEntity", err)
 	}
 }
@@ -115,7 +115,7 @@ func TestSearchEntityIsolationOverlappingIDs(t *testing.T) {
 	face, _ := eng.During(7, 0, 10)
 	ctx := context.Background()
 	ws := search.NewWorkspace(16)
-	imgPlan, err := eng.Compile(common.EntityImage, img)
+	imgPlan, err := eng.Compile(schematypes.EntityImage, img)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestSearchEntityIsolationOverlappingIDs(t *testing.T) {
 	if !slices.Equal(imgIDs, []uint64{100}) {
 		t.Fatalf("image plan = %v", imgIDs)
 	}
-	facePlan, err := eng.Compile(common.EntityFace, face)
+	facePlan, err := eng.Compile(schematypes.EntityFace, face)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,8 +283,8 @@ func assertStoresEqual(t *testing.T, a, b *index.Store) {
 	if got, want := av.AppendTo(nil), bv.AppendTo(nil); !slices.Equal(got, want) {
 		t.Fatalf("tag mismatch: batch=%v sequential=%v", got, want)
 	}
-	al, av2, _ := a.Liveness(common.EntityImage)
-	bl, bv2, _ := b.Liveness(common.EntityImage)
+	al, av2, _ := a.Liveness(schematypes.EntityImage)
+	bl, bv2, _ := b.Liveness(schematypes.EntityImage)
 	am, _ := al.MatchValues(av2)
 	bm, _ := bl.MatchValues(bv2)
 	if got, want := am.AppendTo(nil), bm.AppendTo(nil); !slices.Equal(got, want) {
@@ -325,7 +325,7 @@ func TestBatchMatchesSequential(t *testing.T) {
 		})
 	}
 	for id := uint64(7); id <= 63; id += 7 {
-		dels = append(dels, index.DeleteOp{Entity: common.EntityImage, ID: id})
+		dels = append(dels, index.DeleteOp{Entity: schematypes.EntityImage, ID: id})
 	}
 
 	// The documented batch contract applies deletes, then changes, then adds.
@@ -372,7 +372,7 @@ func TestSchemaImmutable(t *testing.T) {
 	defer db.Close()
 
 	// Mutating the caller schema after Create must not affect the Store.
-	if err := schema.Register(common.NamespaceDef{Namespace: 20, Name: "late", Kind: common.KindTimestamp, Entity: common.EntityImage}); err != nil {
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 20, Name: "late", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := db.Time(20); ok {
@@ -392,7 +392,7 @@ func TestSchemaImmutable(t *testing.T) {
 
 	// Schema() is a defensive copy.
 	clone := db.Schema()
-	if err := clone.Register(common.NamespaceDef{Namespace: 21, Name: "clone", Kind: common.KindTimestamp, Entity: common.EntityImage}); err != nil {
+	if err := clone.Register(schematypes.NamespaceDef{Namespace: 21, Name: "clone", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := db.NamespaceDef(21); ok {
@@ -430,7 +430,7 @@ func TestLifecycleConcurrentWithMutations(t *testing.T) {
 			t.Fatal(err)
 		}
 		if i%10 == 0 {
-			if err := db.Delete(common.EntityImage, id); err != nil {
+			if err := db.Delete(schematypes.EntityImage, id); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -501,7 +501,7 @@ func TestVectorAddUpdateDeleteReopen(t *testing.T) {
 	if len(got) != 1 || got[0].ValueID != 1 {
 		t.Fatalf("after update = %v", got)
 	}
-	if err := db.Delete(common.EntityImage, 1); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 1); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = v.SearchFloat32(vec2, nil, 1)

@@ -1,7 +1,7 @@
 // Package radixhash implements a persistent, mmap-oriented exact hash index
 // for fixed-width 256-bit hashes such as BLAKE3 and SHA-256.
 //
-// The index maps a 256-bit hash to one or more common.ImageID values and allows
+// The index maps a 256-bit hash to one or more schema.ImageID values and allows
 // duplicate hashes, because exact-content duplicates are a normal part of an
 // image library. The design prioritizes SIMD-friendly lookup, lock-free
 // readers, batched writes, copy-on-write updates, lazy allocation, and low
@@ -78,7 +78,7 @@ package radixhash
 import (
 	"errors"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 const (
@@ -102,7 +102,7 @@ const (
 type Hash [32]byte
 
 // ImageID is the database-wide image identity returned by lookups.
-type ImageID = common.ImageID
+type ImageID = schema.ImageID
 
 // Entry is one logical (hash, image) pair.
 type Entry struct {

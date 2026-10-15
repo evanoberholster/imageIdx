@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -553,7 +553,7 @@ func (st *Store) Close() error {
 
 // Get returns the canonical record for id, validated by the block sequence. It
 // returns false for a closed store or an id beyond the committed mark.
-func (st *Store) Get(id common.ImageID) (Record, bool) {
+func (st *Store) Get(id schema.ImageID) (Record, bool) {
 	if st.closed.Load() {
 		return Record{}, false
 	}

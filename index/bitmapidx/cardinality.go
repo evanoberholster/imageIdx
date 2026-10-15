@@ -1,6 +1,6 @@
 package bitmapidx
 
-import common "github.com/evanoberholster/imageIdx/common"
+import schema "github.com/evanoberholster/imageIdx/schema"
 
 // Cardinality returns the number of distinct values with at least one live
 // ImageID in this namespace. It counts a value once regardless of its posting size,
@@ -16,7 +16,7 @@ func (i *Index) Cardinality() uint64 {
 	}
 	// A BSI "value" is the number of ValueIDs holding a value: the existence
 	// bitmap cardinality, not the count of slice postings.
-	if view.namespace.Kind == common.KindBitmapBSI {
+	if view.namespace.Kind == schema.KindBitmapBSI {
 		if exists, ok := view.bsiExists(view.namespace.Namespace); ok {
 			return exists.Cardinality()
 		}
@@ -72,9 +72,9 @@ func (i *Index) Cardinality() uint64 {
 }
 
 // Cardinality returns the distinct live-value count for one registered
-// common.Namespace. ok is false when the type is not registered; a registered but
+// schema.Namespace. ok is false when the type is not registered; a registered but
 // empty or closed namespace reports (0, true).
-func (s *Store) Cardinality(t common.Namespace) (count uint64, ok bool) {
+func (s *Store) Cardinality(t schema.Namespace) (count uint64, ok bool) {
 	namespace, ok := s.Lookup(t)
 	if !ok {
 		return 0, false
@@ -83,10 +83,10 @@ func (s *Store) Cardinality(t common.Namespace) (count uint64, ok bool) {
 }
 
 // Cardinalities returns the distinct live-value count for every registered
-// common.Namespace, including empty namespaces. Each namespace is sampled independently;
+// schema.Namespace, including empty namespaces. Each namespace is sampled independently;
 // concurrent cross-namespace writes do not produce a store-wide snapshot.
-func (s *Store) Cardinalities() map[common.Namespace]uint64 {
-	counts := make(map[common.Namespace]uint64, len(s.order))
+func (s *Store) Cardinalities() map[schema.Namespace]uint64 {
+	counts := make(map[schema.Namespace]uint64, len(s.order))
 	for _, namespace := range s.order {
 		counts[namespace.spec().Namespace] = namespace.Cardinality()
 	}

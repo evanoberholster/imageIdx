@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestCrashChild(t *testing.T) {
@@ -26,7 +26,7 @@ func TestCrashChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gen, err := db.Commit(Mutation{Entity: common.EntityImage, ValueID: 1, Record: []byte("canonical"), Projection: projection(1, 'x')})
+	gen, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Record: []byte("canonical"), Projection: projection(1, 'x')})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestCrashBoundaries(t *testing.T) {
 				}
 				return
 			}
-			if got, err := db.Get(common.EntityImage, 1); err != nil || string(got) != "canonical" {
+			if got, err := db.Get(schema.EntityImage, 1); err != nil || string(got) != "canonical" {
 				t.Fatalf("canonical record = %q: %v", got, err)
 			}
 			wait(t, db, 1)

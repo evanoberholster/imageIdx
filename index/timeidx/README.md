@@ -1,6 +1,6 @@
 # timeidx — exact timestamp index
 
-`timeidx` maps **one exact timestamp per `common.ValueID` per namespace** and
+`timeidx` maps **one exact timestamp per `schema.ValueID` per namespace** and
 answers half-open `[start, end)` range queries in `(TimeKey, ValueID)` order.
 
 It is a namespace-aware, copy-on-write, mmap-backed index with lock-free readers
@@ -43,8 +43,8 @@ survive only as deprecated source-compatibility constants; none affects indexing
 ```go
 // In-memory or one persistent namespace file.
 index, err := timeidx.NewMemory(spec, config)
-index, err := timeidx.NewStore(dir, spec, config, common.DurabilityOS) // create
-index, err := timeidx.OpenStore(dir, config, common.DurabilityOS)     // reopen
+index, err := timeidx.NewStore(dir, spec, config, schema.DurabilityOS) // create
+index, err := timeidx.OpenStore(dir, config, schema.DurabilityOS)     // reopen
 
 batch := timeidx.NewBatch(64)
 batch.Append(timeidx.Insert(id, timestamp))       // upsert by ID
@@ -60,8 +60,8 @@ count := index.EstimateRange(start, end)
 
 - `Spec{Namespace, Name, Flags, Entries}` carries the identity. `Entries` seed the
   initial shards; duplicate IDs are rejected with `ErrDuplicateImageID`.
-  `Spec.NamespaceDef()` produces the `common.NamespaceDef` to register in a
-  `common.Schema`.
+  `Spec.NamespaceDef()` produces the `schema.NamespaceDef` to register in a
+  `schema.Definitions`.
 - `Metadata()` returns namespace, flags, generation, compatibility offset,
   logical count and shard count. `SourceGeneration()` returns the completeness
   watermark.
@@ -271,7 +271,7 @@ passed to `SearchExact` must not synchronously write or close the pinned index.
 
 ## Invariants
 
-- Each `common.ValueID` has at most one timestamp per namespace.
+- Each `schema.ValueID` has at most one timestamp per namespace.
 - Parallel `Times`/`ValueIDs` columns always have equal lengths and are strictly
   increasing by `(TimeKey, ValueID)`.
 - A published snapshot is immutable; readers never observe partial batches.

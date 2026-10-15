@@ -8,29 +8,29 @@ import (
 	"slices"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/simhash"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
-func testSchema(t testing.TB) *common.Schema {
+func testSchema(t testing.TB) *schematypes.Definitions {
 	t.Helper()
-	schema := common.NewSchema()
-	defs := []common.NamespaceDef{
-		{Namespace: 1, Name: "time", Kind: common.KindTimestamp, Entity: common.EntityImage},
-		{Namespace: 2, Name: "geo", Kind: common.KindGeo, Entity: common.EntityImage},
-		{Namespace: 3, Name: "sim", Kind: common.KindHashPerceptual, Entity: common.EntityImage},
-		{Namespace: 4, Name: "sha256", Kind: common.KindHashExact, Entity: common.EntityImage},
-		{Namespace: 7, Name: "face-time", Kind: common.KindTimestamp, Entity: common.EntityFace},
+	schema := schematypes.NewDefinitions()
+	defs := []schematypes.NamespaceDef{
+		{Namespace: 1, Name: "time", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+		{Namespace: 2, Name: "geo", Kind: schematypes.KindGeo, Entity: schematypes.EntityImage},
+		{Namespace: 3, Name: "sim", Kind: schematypes.KindHashPerceptual, Entity: schematypes.EntityImage},
+		{Namespace: 4, Name: "sha256", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage},
+		{Namespace: 7, Name: "face-time", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityFace},
 	}
 	if err := schema.RegisterAll(defs...); err != nil {
 		t.Fatal(err)
 	}
-	tagsDef, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: common.KindBitmapEnum}, "tags", common.EntityImage)
+	tagsDef, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: schematypes.KindBitmapEnum}, "tags", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func testSchema(t testing.TB) *common.Schema {
 		Namespace:   5,
 		Dimensions:  vectoridx.Dim512,
 		ElementType: vectoridx.ElementFloat32,
-	}, "embedding", common.EntityImage)
+	}, "embedding", schematypes.EntityImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,9 +51,87 @@ func testSchema(t testing.TB) *common.Schema {
 	return schema
 }
 
+func TestDatabaseManagedIndexUsesSuppliedDefinitions(t *testing.T) {
+	defs := schematypes.NewDefinitions()
+	if err := defs.RegisterAll(
+		schematypes.NamespaceDef{Namespace: 20, Name: "records", Kind: schematypes.KindKV, Entity: schematypes.EntityImage},
+		schematypes.NamespaceDef{Namespace: 101, Name: "created", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+	); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	idx, err := index.CreateWithDefinitions(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "schema.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("index persisted logical schema: %v", err)
+	}
+	idx, err = index.OpenWithDefinitions(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrong := schematypes.NewDefinitions()
+	if err := wrong.RegisterAll(
+		schematypes.NamespaceDef{Namespace: 20, Name: "records", Kind: schematypes.KindKV, Entity: schematypes.EntityImage},
+		schematypes.NamespaceDef{Namespace: 102, Name: "different", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := index.OpenWithDefinitions(dir, wrong); err == nil {
+		_ = opened.Close()
+		t.Fatal("accepted manifest with mismatched namespace IDs")
+	}
+}
+
+func TestLegacyIndexSchemaRequiresMatchingAuthority(t *testing.T) {
+	defs := testSchema(t)
+	dir := t.TempDir()
+	idx, err := index.Create(dir, index.Spec{Schema: defs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	full := schematypes.NewDefinitions()
+	if err := full.Register(schematypes.NamespaceDef{Namespace: 20, Name: "records", Kind: schematypes.KindKV, Entity: schematypes.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	if err := full.RegisterAll(defs.Defs()...); err != nil {
+		t.Fatal(err)
+	}
+	idx, err = index.OpenWithDefinitions(dir, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.RetireLegacySchema(); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "schema.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy schema not retired: %v", err)
+	}
+	idx, err = index.OpenWithDefinitions(dir, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateAddSearchReopen(t *testing.T) {
 	dir := t.TempDir()
-	db, err := index.Create(dir, index.Spec{Schema: testSchema(t)}, index.WithDurability(common.DurabilityOS))
+	db, err := index.Create(dir, index.Spec{Schema: testSchema(t)}, index.WithDurability(schematypes.DurabilityOS))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +167,7 @@ func TestCreateAddSearchReopen(t *testing.T) {
 	}
 
 	timeIdx, _ := db.Time(1)
-	if got := timeIdx.Search(nil, 999, 1_001); !slices.Equal(got, []common.ValueID{100}) {
+	if got := timeIdx.Search(nil, 999, 1_001); !slices.Equal(got, []schematypes.ValueID{100}) {
 		t.Fatalf("time search = %v", got)
 	}
 	tags, _ := db.Bitmap(6)
@@ -112,10 +190,10 @@ func TestCreateAddSearchReopen(t *testing.T) {
 	}
 
 	// Entity isolation: Image 100 is live, Face 100 is not (no face values).
-	if err := db.Delete(common.EntityImage, 100); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 100); err != nil {
 		t.Fatal(err)
 	}
-	liveImg, liveVal, _ := db.Liveness(common.EntityImage)
+	liveImg, liveVal, _ := db.Liveness(schematypes.EntityImage)
 	imgBitmap, _ := liveImg.MatchValues(liveVal)
 	if imgBitmap.Contains(100) {
 		t.Fatal("image 100 still live after delete")
@@ -128,7 +206,7 @@ func TestCreateAddSearchReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := index.Open(dir, index.WithDurability(common.DurabilityOS))
+	reopened, err := index.Open(dir, index.WithDurability(schematypes.DurabilityOS))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +219,7 @@ func TestCreateAddSearchReopen(t *testing.T) {
 	if err != nil || !cat2.Contains(100) {
 		t.Fatalf("reopened tag = %v, %v", cat2, err)
 	}
-	liveImg2, liveVal2, _ := reopened.Liveness(common.EntityImage)
+	liveImg2, liveVal2, _ := reopened.Liveness(schematypes.EntityImage)
 	img2, _ := liveImg2.MatchValues(liveVal2)
 	if img2.Contains(100) {
 		t.Fatal("image 100 live again after reopen")
@@ -164,19 +242,19 @@ func TestEntityIsolationSameNumericID(t *testing.T) {
 		t.Fatal(err)
 	}
 	faceTime, _ := db.Time(7)
-	if got := faceTime.Search(nil, 8, 10); !slices.Equal(got, []common.ValueID{100}) {
+	if got := faceTime.Search(nil, 8, 10); !slices.Equal(got, []schematypes.ValueID{100}) {
 		t.Fatalf("face time = %v", got)
 	}
 	// Deleting the image must not affect the face.
-	if err := db.Delete(common.EntityImage, 100); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 100); err != nil {
 		t.Fatal(err)
 	}
-	faceLive, faceVal, _ := db.Liveness(common.EntityFace)
+	faceLive, faceVal, _ := db.Liveness(schematypes.EntityFace)
 	fb, _ := faceLive.MatchValues(faceVal)
 	if !fb.Contains(100) {
 		t.Fatal("face 100 should remain live")
 	}
-	if got := faceTime.Search(nil, 8, 10); !slices.Equal(got, []common.ValueID{100}) {
+	if got := faceTime.Search(nil, 8, 10); !slices.Equal(got, []schematypes.ValueID{100}) {
 		t.Fatalf("face time after image delete = %v", got)
 	}
 }
@@ -204,7 +282,7 @@ func TestPartialUpdateKeepsUnrelatedNamespaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	timeIdx, _ := db.Time(1)
-	if got := timeIdx.Search(nil, 19, 21); !slices.Equal(got, []common.ValueID{1}) {
+	if got := timeIdx.Search(nil, 19, 21); !slices.Equal(got, []schematypes.ValueID{1}) {
 		t.Fatalf("updated time = %v", got)
 	}
 	tags, _ := db.Bitmap(6)
@@ -224,7 +302,7 @@ func TestPartialUpdateKeepsUnrelatedNamespaces(t *testing.T) {
 		t.Fatal("explicit tag removal failed")
 	}
 	// Timestamp is untouched by the tag-only change.
-	if got := timeIdx.Search(nil, 19, 21); !slices.Equal(got, []common.ValueID{1}) {
+	if got := timeIdx.Search(nil, 19, 21); !slices.Equal(got, []schematypes.ValueID{1}) {
 		t.Fatalf("time changed by tag update = %v", got)
 	}
 }
@@ -269,7 +347,7 @@ func TestSearchEngineExcludesDeleted(t *testing.T) {
 	}
 	ctx := context.Background()
 	ws := search.NewWorkspace(64)
-	plan, err := eng.Compile(common.EntityImage, tag)
+	plan, err := eng.Compile(schematypes.EntityImage, tag)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,10 +358,10 @@ func TestSearchEngineExcludesDeleted(t *testing.T) {
 	if !slices.Contains(got, uint64(100)) {
 		t.Fatalf("live entity missing: %v", got)
 	}
-	if err := db.Delete(common.EntityImage, 100); err != nil {
+	if err := db.Delete(schematypes.EntityImage, 100); err != nil {
 		t.Fatal(err)
 	}
-	plan2, err := eng.Compile(common.EntityImage, tag)
+	plan2, err := eng.Compile(schematypes.EntityImage, tag)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,14 +381,14 @@ func TestOpenMissingStore(t *testing.T) {
 }
 
 func TestDuplicateNamespaceRejected(t *testing.T) {
-	schema := common.NewSchema()
-	if err := schema.Register(common.NamespaceDef{Namespace: 1, Name: "a", Kind: common.KindTimestamp, Entity: common.EntityImage}); err != nil {
+	schema := schematypes.NewDefinitions()
+	if err := schema.Register(schematypes.NamespaceDef{Namespace: 1, Name: "a", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
-	// common.Schema rejects duplicates at registration; the unified layer also
+	// schematypes.Definitions rejects duplicates at registration; the unified layer also
 	// rejects namespaces without an entity.
-	schema2 := common.NewSchema()
-	if err := schema2.Register(common.NamespaceDef{Namespace: 1, Name: "a", Kind: common.KindTimestamp}); err != nil {
+	schema2 := schematypes.NewDefinitions()
+	if err := schema2.Register(schematypes.NamespaceDef{Namespace: 1, Name: "a", Kind: schematypes.KindTimestamp}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := index.Create(t.TempDir(), index.Spec{Schema: schema2}); !errors.Is(err, index.ErrEntityRequired) {

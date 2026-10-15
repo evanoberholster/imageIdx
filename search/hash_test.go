@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/zeebo/blake3"
@@ -123,7 +123,7 @@ func TestExactHashIntersectsNamespace(t *testing.T) {
 		{Hash: radixhash.Hash(digest), ImageID: 2},
 		{Hash: radixhash.Hash(digest), ImageID: 3},
 	})
-	tags := enumNamespaceForSearch(t, common.NamespaceTag, "favorite", []uint64{2, 3})
+	tags := enumNamespaceForSearch(t, schema.NamespaceTag, "favorite", []uint64{2, 3})
 
 	plan, err := Compile(
 		ExactHash(blake, HashBLAKE3, digest),

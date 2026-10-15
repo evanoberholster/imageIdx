@@ -6,7 +6,7 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 type mutationKind uint8
@@ -18,23 +18,23 @@ const (
 )
 
 type Mutation struct {
-	imageID  common.ValueID
+	imageID  schema.ValueID
 	from, to uint64
 	kind     mutationKind
 }
 
 // Insert is an ID-authoritative upsert. One ID has at most one time per namespace.
-func Insert(id common.ValueID, timestamp uint64) Mutation {
+func Insert(id schema.ValueID, timestamp uint64) Mutation {
 	return Mutation{imageID: id, to: timestamp, kind: mutationInsert}
 }
 
 // Delete removes by ID; timestamp is advisory for compatibility with old callers.
-func Delete(id common.ValueID, timestamp uint64) Mutation {
+func Delete(id schema.ValueID, timestamp uint64) Mutation {
 	return Mutation{imageID: id, from: timestamp, kind: mutationDelete}
 }
 
 // Move atomically replaces an ID's time; from is advisory, even if stale.
-func Move(id common.ValueID, from, to uint64) Mutation {
+func Move(id schema.ValueID, from, to uint64) Mutation {
 	return Mutation{imageID: id, from: from, to: to, kind: mutationMove}
 }
 

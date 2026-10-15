@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
@@ -18,15 +18,15 @@ import (
 const quantum = uint64(1) << timeidx.TimestampShift
 
 func main() {
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
-	}, "tags", common.EntityImage)
+		Namespace: schematypes.NamespaceTag, Kind: schematypes.KindBitmapEnum,
+	}, "tags", schematypes.EntityImage)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err := schema.RegisterAll(tags,
-		common.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: common.KindTimestamp, Entity: common.EntityImage},
+		schematypes.NamespaceDef{Namespace: 100, Name: "timestamp", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -41,12 +41,12 @@ func main() {
 	}
 	defer db.Close()
 	for _, row := range []struct {
-		id    common.ValueID
+		id    schematypes.ValueID
 		stamp uint64
 	}{{100, quantum}, {200, 2 * quantum}, {300, 3 * quantum}} {
 		if err := db.Add(index.Entry{ValueID: row.id,
 			Times:   []index.TimeValue{{Namespace: 100, Timestamp: row.stamp}},
-			Bitmaps: []index.BitmapValue{{Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}},
+			Bitmaps: []index.BitmapValue{{Namespace: schematypes.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")}},
 		}); err != nil {
 			log.Fatal(err)
 		}
@@ -55,7 +55,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	favorites, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+	favorites, err := engine.Values(schematypes.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	plan, err := engine.Compile(common.EntityImage, favorites, during)
+	plan, err := engine.Compile(schematypes.EntityImage, favorites, during)
 	if err != nil {
 		log.Fatal(err)
 	}

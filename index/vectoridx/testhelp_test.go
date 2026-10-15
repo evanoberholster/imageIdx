@@ -4,10 +4,10 @@ import (
 	"math/rand"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
-const testNamespace common.Namespace = 1
+const testNamespace schema.Namespace = 1
 
 func testConfigFloat512() Config {
 	return Config{Namespace: testNamespace, Dimensions: Dim512, ElementType: ElementFloat32}
@@ -36,15 +36,15 @@ func mustAddFloat(t *testing.T, idx *VectorIdx, id NodeID, vec []float32) {
 	}
 }
 
-func resultIDs(results []Result) []common.ValueID {
-	ids := make([]common.ValueID, len(results))
+func resultIDs(results []Result) []schema.ValueID {
+	ids := make([]schema.ValueID, len(results))
 	for i, r := range results {
 		ids[i] = r.ValueID
 	}
 	return ids
 }
 
-func containsResult(results []Result, id common.ValueID) bool {
+func containsResult(results []Result, id schema.ValueID) bool {
 	for _, r := range results {
 		if r.ValueID == id {
 			return true

@@ -1,26 +1,28 @@
-package common
+package schema
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
+	"unicode/utf8"
 )
 
 var (
 	// ErrNamespaceInvalid reports the reserved zero namespace.
-	ErrNamespaceInvalid = errors.New("common: namespace zero is reserved")
+	ErrNamespaceInvalid = errors.New("schema: namespace zero is reserved")
 	// ErrNamespaceDuplicate reports a namespace number already registered.
-	ErrNamespaceDuplicate = errors.New("common: duplicate namespace")
+	ErrNamespaceDuplicate = errors.New("schema: duplicate namespace")
 	// ErrNamespaceName reports an empty or duplicate namespace name.
-	ErrNamespaceName = errors.New("common: namespace name must be non-empty and unique")
+	ErrNamespaceName = errors.New("schema: namespace name must be non-empty and unique")
 	// ErrNamespaceKind reports an unrecognized namespace kind.
-	ErrNamespaceKind = errors.New("common: invalid namespace kind")
+	ErrNamespaceKind = errors.New("schema: invalid namespace kind")
 	// ErrNamespaceEntity reports an unrecognized (non-zero) entity kind.
-	ErrNamespaceEntity = errors.New("common: invalid namespace entity kind")
+	ErrNamespaceEntity = errors.New("schema: invalid namespace entity kind")
 	// ErrCorruptSchema reports a schema blob that fails magic, version,
 	// length, or checksum validation.
-	ErrCorruptSchema = errors.New("common: corrupt schema")
+	ErrCorruptSchema = errors.New("schema: corrupt definitions")
 )
 
 // NamespaceDef is one schema entry: its unique number, unique name, owning
@@ -39,44 +41,43 @@ type NamespaceDef struct {
 	Config    []byte
 }
 
-// Schema is an ordered set of unique namespace definitions. The zero value
+// Definitions is an ordered set of unique namespace definitions. The zero value
 // is a valid empty schema. It is not safe for concurrent mutation: register
-// namespaces during setup before sharing the schema. Definitions are copied
-// on Register and on UnmarshalBinary, and returned slices share their Config
-// bytes, which callers must treat as read-only.
-type Schema struct {
+// namespaces during setup before sharing the schema. Config is copied both
+// when registered and when returned, so callers cannot mutate its contents.
+type Definitions struct {
 	defs   []NamespaceDef
 	byID   map[Namespace]int
 	byName map[string]int
 }
 
-// NewSchema returns an empty schema.
-func NewSchema() *Schema { return &Schema{} }
+// NewDefinitions returns an empty set of namespace definitions.
+func NewDefinitions() *Definitions { return &Definitions{} }
 
 // Register adds one namespace definition. It rejects the zero namespace,
 // empty or duplicate names, unknown kinds, and duplicate namespace numbers.
-func (s *Schema) Register(def NamespaceDef) error {
+func (s *Definitions) Register(def NamespaceDef) error {
 	if !def.Namespace.Valid() {
 		return ErrNamespaceInvalid
 	}
-	if def.Name == "" {
-		return ErrNamespaceName
+	if def.Name == "" || !utf8.ValidString(def.Name) || len(def.Name) > math.MaxUint16 {
+		return fmt.Errorf("%w: namespace %d name %q", ErrNamespaceName, def.Namespace, def.Name)
 	}
 	if !def.Kind.Valid() {
-		return ErrNamespaceKind
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceKind, def.Namespace)
 	}
 	if def.Entity != EntityInvalid && !def.Entity.Valid() {
-		return ErrNamespaceEntity
+		return fmt.Errorf("%w: namespace %d", ErrNamespaceEntity, def.Namespace)
 	}
 	if s.byID == nil {
 		s.byID = make(map[Namespace]int)
 		s.byName = make(map[string]int)
 	}
 	if _, ok := s.byID[def.Namespace]; ok {
-		return fmt.Errorf("%w: %d", ErrNamespaceDuplicate, def.Namespace)
+		return fmt.Errorf("%w: namespace %d name %q", ErrNamespaceDuplicate, def.Namespace, def.Name)
 	}
-	if _, ok := s.byName[def.Name]; ok {
-		return fmt.Errorf("%w: %q", ErrNamespaceName, def.Name)
+	if prior, ok := s.byName[def.Name]; ok {
+		return fmt.Errorf("%w: namespace %d name %q already used by namespace %d", ErrNamespaceName, def.Namespace, def.Name, s.defs[prior].Namespace)
 	}
 	def.Config = append([]byte(nil), def.Config...)
 	s.byID[def.Namespace] = len(s.defs)
@@ -88,7 +89,7 @@ func (s *Schema) Register(def NamespaceDef) error {
 // RegisterAll registers defs in order, stopping at the first failure. A
 // partial registration is left in place; callers building a fresh schema can
 // discard it on error.
-func (s *Schema) RegisterAll(defs ...NamespaceDef) error {
+func (s *Definitions) RegisterAll(defs ...NamespaceDef) error {
 	for _, def := range defs {
 		if err := s.Register(def); err != nil {
 			return err
@@ -98,7 +99,7 @@ func (s *Schema) RegisterAll(defs ...NamespaceDef) error {
 }
 
 // Lookup returns the definition for a namespace number.
-func (s *Schema) Lookup(ns Namespace) (NamespaceDef, bool) {
+func (s *Definitions) Lookup(ns Namespace) (NamespaceDef, bool) {
 	if s.byID == nil {
 		return NamespaceDef{}, false
 	}
@@ -106,11 +107,23 @@ func (s *Schema) Lookup(ns Namespace) (NamespaceDef, bool) {
 	if !ok {
 		return NamespaceDef{}, false
 	}
-	return s.defs[index], true
+	return cloneDef(s.defs[index]), true
+}
+
+// LookupIdentity returns only immutable scalar metadata, without copying
+// Config. Use Lookup when kind-specific configuration is needed.
+func (s *Definitions) LookupIdentity(ns Namespace) (NamespaceDef, bool) {
+	index, ok := s.byID[ns]
+	if !ok {
+		return NamespaceDef{}, false
+	}
+	def := s.defs[index]
+	def.Config = nil
+	return def, true
 }
 
 // LookupName returns the definition for a namespace name.
-func (s *Schema) LookupName(name string) (NamespaceDef, bool) {
+func (s *Definitions) LookupName(name string) (NamespaceDef, bool) {
 	if s.byName == nil {
 		return NamespaceDef{}, false
 	}
@@ -118,24 +131,33 @@ func (s *Schema) LookupName(name string) (NamespaceDef, bool) {
 	if !ok {
 		return NamespaceDef{}, false
 	}
-	return s.defs[index], true
+	return cloneDef(s.defs[index]), true
+}
+
+func cloneDef(def NamespaceDef) NamespaceDef {
+	def.Config = append([]byte(nil), def.Config...)
+	return def
 }
 
 // Len returns the number of registered namespaces.
-func (s *Schema) Len() int { return len(s.defs) }
+func (s *Definitions) Len() int { return len(s.defs) }
 
 // Defs returns a copy of the registered definitions in registration order.
-func (s *Schema) Defs() []NamespaceDef {
-	return append([]NamespaceDef(nil), s.defs...)
+func (s *Definitions) Defs() []NamespaceDef {
+	out := make([]NamespaceDef, len(s.defs))
+	for i, def := range s.defs {
+		out[i] = cloneDef(def)
+	}
+	return out
 }
 
 // DefsOfKind returns a copy of the definitions with the given kind, in
 // registration order.
-func (s *Schema) DefsOfKind(kind NamespaceKind) []NamespaceDef {
+func (s *Definitions) DefsOfKind(kind NamespaceKind) []NamespaceDef {
 	var out []NamespaceDef
 	for _, def := range s.defs {
 		if def.Kind == kind {
-			out = append(out, def)
+			out = append(out, cloneDef(def))
 		}
 	}
 	return out
@@ -143,11 +165,11 @@ func (s *Schema) DefsOfKind(kind NamespaceKind) []NamespaceDef {
 
 // DefsOfEntity returns a copy of the definitions with the given entity kind,
 // in registration order.
-func (s *Schema) DefsOfEntity(entity EntityKind) []NamespaceDef {
+func (s *Definitions) DefsOfEntity(entity EntityKind) []NamespaceDef {
 	var out []NamespaceDef
 	for _, def := range s.defs {
 		if def.Entity == entity {
-			out = append(out, def)
+			out = append(out, cloneDef(def))
 		}
 	}
 	return out
@@ -165,9 +187,16 @@ const (
 // bytes. The per-definition layout is unchanged from version 1 — the byte that
 // was reserved padding now carries EntityKind — so the encoding stays a fixed
 // 10-byte header plus name and config bytes either way.
-func (s *Schema) MarshalBinary() ([]byte, error) {
+func (s *Definitions) MarshalBinary() ([]byte, error) {
 	size := 4 + 2 + 4 + 4 // magic, version, count, crc
+	if uint64(len(s.defs)) > math.MaxUint32 {
+		return nil, ErrCorruptSchema
+	}
 	for _, def := range s.defs {
+		if len(def.Name) > math.MaxUint16 || uint64(len(def.Config)) > math.MaxUint32 ||
+			len(def.Name) > math.MaxInt-size-10 || len(def.Config) > math.MaxInt-size-10-len(def.Name) {
+			return nil, ErrCorruptSchema
+		}
 		size += 2 + 1 + 1 + 2 + 4 + len(def.Name) + len(def.Config)
 	}
 	out := make([]byte, 0, size)
@@ -188,7 +217,7 @@ func (s *Schema) MarshalBinary() ([]byte, error) {
 // UnmarshalBinary replaces the schema from MarshalBinary output. It rejects
 // trailing bytes, unknown versions, invalid definitions, and duplicates, and
 // leaves the receiver unchanged on failure.
-func (s *Schema) UnmarshalBinary(data []byte) error {
+func (s *Definitions) UnmarshalBinary(data []byte) error {
 	if len(data) < 14 {
 		return ErrCorruptSchema
 	}
@@ -204,10 +233,10 @@ func (s *Schema) UnmarshalBinary(data []byte) error {
 		return ErrCorruptSchema
 	}
 	count := binary.LittleEndian.Uint32(body[6:10])
-	if uint64(count) > uint64(len(body)) {
+	if uint64(count) > uint64(len(body)-10)/10 {
 		return ErrCorruptSchema
 	}
-	next := &Schema{}
+	next := &Definitions{}
 	offset := 10
 	for range count {
 		if offset+10 > len(body) {
@@ -222,11 +251,13 @@ func (s *Schema) UnmarshalBinary(data []byte) error {
 		// never a silently fabricated entity.
 		if version >= schemaVersion {
 			def.Entity = EntityKind(body[offset+3])
+		} else if body[offset+3] != 0 {
+			return ErrCorruptSchema
 		}
 		nameLen := int(binary.LittleEndian.Uint16(body[offset+4 : offset+6]))
 		configLen := int(binary.LittleEndian.Uint32(body[offset+6 : offset+10]))
 		offset += 10
-		if offset+nameLen+configLen > len(body) {
+		if nameLen > len(body)-offset || configLen > len(body)-offset-nameLen {
 			return ErrCorruptSchema
 		}
 		def.Name = string(body[offset : offset+nameLen])

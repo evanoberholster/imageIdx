@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // seedStore builds a persistent store with values distinct enum values,
@@ -12,11 +12,11 @@ import (
 // memberships stay in the WAL until the caller checkpoints.
 func seedStore(b *testing.B, dir string, values, perValue int) *Store {
 	b.Helper()
-	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(common.NamespaceTag)}, NamespaceConfig{}, common.DurabilitySync)
+	s, err := NewStore(dir, []NamespaceSpec{enumNamespace(schema.NamespaceTag)}, NamespaceConfig{}, schema.DurabilitySync)
 	if err != nil {
 		b.Fatal(err)
 	}
-	index, _ := s.Lookup(common.NamespaceTag)
+	index, _ := s.Lookup(schema.NamespaceTag)
 	entries := make([]Entry, 0, 1024)
 	flush := func() {
 		if len(entries) == 0 {
@@ -28,7 +28,7 @@ func seedStore(b *testing.B, dir string, values, perValue int) *Store {
 	for value := 0; value < values; value++ {
 		name := EnumStringValue(fmt.Sprintf("value-%d", value))
 		for n := 0; n < perValue; n++ {
-			entries = append(entries, Entry{ImageID: common.ImageID(value*perValue + n + 1), Value: name})
+			entries = append(entries, Entry{ImageID: schema.ImageID(value*perValue + n + 1), Value: name})
 			if len(entries) == cap(entries) {
 				flush()
 			}
@@ -40,14 +40,14 @@ func seedStore(b *testing.B, dir string, values, perValue int) *Store {
 
 // addTail appends updates memberships spread over distinct values, split
 // into MaxNamespaceBatchUpdates-sized write batches.
-func addTail(index *Index, baseImage common.ImageID, updates, distinct int) error {
+func addTail(index *Index, baseImage schema.ImageID, updates, distinct int) error {
 	if updates <= 0 {
 		return nil
 	}
 	batch := make([]Entry, 0, updates)
 	for n := 0; n < updates; n++ {
 		batch = append(batch, Entry{
-			ImageID: baseImage + common.ImageID(n),
+			ImageID: baseImage + schema.ImageID(n),
 			Value:   EnumStringValue(fmt.Sprintf("tail-%d", n%distinct)),
 		})
 	}
@@ -99,7 +99,7 @@ func BenchmarkNamespaceReopen(b *testing.B) {
 			if err := s.Checkpoint(); err != nil {
 				b.Fatal(err)
 			}
-			index, _ := s.Lookup(common.NamespaceTag)
+			index, _ := s.Lookup(schema.NamespaceTag)
 			if err := addTail(index, 1_000_000, updates, distinct); err != nil {
 				b.Fatal(err)
 			}
@@ -108,7 +108,7 @@ func BenchmarkNamespaceReopen(b *testing.B) {
 			}
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
-				opened, err := OpenStore(dir, NamespaceConfig{}, common.DurabilityOS)
+				opened, err := OpenStore(dir, NamespaceConfig{}, schema.DurabilityOS)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -122,7 +122,7 @@ func BenchmarkNamespaceReopen(b *testing.B) {
 
 func benchmarkMaxCardinalityIndex(b *testing.B) *Index {
 	b.Helper()
-	index, err := NewMemory(enumNamespace(common.NamespaceTag), NamespaceConfig{})
+	index, err := NewMemory(enumNamespace(schema.NamespaceTag), NamespaceConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func benchmarkMaxCardinalityIndex(b *testing.B) *Index {
 	value := EnumStringValue("shared")
 	entries := make([]Entry, 0, 4096)
 	for n := 1; n <= ids; n++ {
-		entries = append(entries, Entry{ImageID: common.ImageID(n), Value: value})
+		entries = append(entries, Entry{ImageID: schema.ImageID(n), Value: value})
 		if len(entries) == cap(entries) {
 			commit(b, index, func(bt *Batch) error { return bt.Add(entries...) })
 			entries = entries[:0]
@@ -167,7 +167,7 @@ func BenchmarkNamespaceMaxCardinalityMatchPersistent(b *testing.B) {
 	if err := s.Checkpoint(); err != nil {
 		b.Fatal(err)
 	}
-	index, _ := s.Lookup(common.NamespaceTag)
+	index, _ := s.Lookup(schema.NamespaceTag)
 	value := EnumStringValue("value-0")
 	b.ResetTimer()
 	b.ReportAllocs()

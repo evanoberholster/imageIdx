@@ -7,18 +7,18 @@ import (
 	"sync/atomic"
 	"testing"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
-func geoTestSchema(t testing.TB) *common.Schema {
+func geoTestSchema(t testing.TB) *schematypes.Definitions {
 	t.Helper()
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	if err := schema.RegisterAll(
-		common.NamespaceDef{Namespace: 2, Name: "geo2", Kind: common.KindGeo, Entity: common.EntityImage},
-		common.NamespaceDef{Namespace: 3, Name: "geo3", Kind: common.KindGeo, Entity: common.EntityImage},
+		schematypes.NamespaceDef{Namespace: 2, Name: "geo2", Kind: schematypes.KindGeo, Entity: schematypes.EntityImage},
+		schematypes.NamespaceDef{Namespace: 3, Name: "geo3", Kind: schematypes.KindGeo, Entity: schematypes.EntityImage},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -244,13 +244,13 @@ func TestGeoUpdateUnifiedSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	query := func(cell uint64) []common.ValueID {
+	query := func(cell uint64) []schematypes.ValueID {
 		t.Helper()
 		clause, err := eng.InCells(2, cell)
 		if err != nil {
 			t.Fatal(err)
 		}
-		plan, err := eng.Compile(common.EntityImage, clause)
+		plan, err := eng.Compile(schematypes.EntityImage, clause)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -359,7 +359,7 @@ func BenchmarkStoreGeoUnchanged(b *testing.B) {
 // alternating a location on one ImageID.
 func BenchmarkGeoEngineDirectReplacement(b *testing.B) {
 	_, idx, a, c, _ := geoDB(b)
-	if err := idx.Insert(a, common.ValueID(1)); err != nil {
+	if err := idx.Insert(a, schematypes.ValueID(1)); err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
@@ -369,7 +369,7 @@ func BenchmarkGeoEngineDirectReplacement(b *testing.B) {
 		if i%2 == 1 {
 			key = c
 		}
-		if err := idx.Insert(key, common.ValueID(1)); err != nil {
+		if err := idx.Insert(key, schematypes.ValueID(1)); err != nil {
 			b.Fatal(err)
 		}
 	}

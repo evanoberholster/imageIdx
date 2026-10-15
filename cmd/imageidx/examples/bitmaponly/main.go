@@ -10,23 +10,23 @@ import (
 	"log"
 	"os"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
 func main() {
-	schema := common.NewSchema()
+	schema := schematypes.NewDefinitions()
 	tags, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-		Namespace: common.NamespaceTag, Kind: common.KindBitmapEnum,
-	}, "tags", common.EntityImage)
+		Namespace: schematypes.NamespaceTag, Kind: schematypes.KindBitmapEnum,
+	}, "tags", schematypes.EntityImage)
 	if err != nil {
 		log.Fatal(err)
 	}
 	quality, err := index.BitmapDef(bitmapidx.NamespaceSpec{
-		Namespace: 40, Kind: common.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
-	}, "quality", common.EntityImage)
+		Namespace: 40, Kind: schematypes.KindBitmapBSI, BSIWidth: bitmapidx.BSIWidth16,
+	}, "quality", schematypes.EntityImage)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -45,11 +45,11 @@ func main() {
 	defer db.Close()
 
 	for _, entry := range []struct {
-		id      common.ValueID
+		id      schematypes.ValueID
 		quality uint16
 	}{{1, 5}, {2, 40}, {3, 85}, {4, 100}} {
 		if err := db.Add(index.Entry{ValueID: entry.id, Bitmaps: []index.BitmapValue{
-			{Namespace: common.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")},
+			{Namespace: schematypes.NamespaceTag, Value: bitmapidx.EnumStringValue("favorite")},
 			{Namespace: 40, Value: bitmapidx.Uint16Value(entry.quality)},
 		}}); err != nil {
 			log.Fatal(err)
@@ -59,7 +59,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	favorites, err := engine.Values(common.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+	favorites, err := engine.Values(schematypes.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	plan, err := engine.Compile(common.EntityImage, favorites, rangeClause)
+	plan, err := engine.Compile(schematypes.EntityImage, favorites, rangeClause)
 	if err != nil {
 		log.Fatal(err)
 	}

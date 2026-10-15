@@ -5,15 +5,15 @@ import (
 	"hash/crc32"
 	"math"
 
-	"github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Journal payload v1: [version:1][op:1][entity:1][id:8][beforeLen:4]
 // [afterLen:4][before][after][crc32:4]. The ordered sequence is in the
 // store.Key (namespace 65533, big-endian uint64 ID, flags 0), not the value.
 type journalEntry struct {
-	entity        common.EntityKind
-	id            common.ValueID
+	entity        schema.EntityKind
+	id            schema.ValueID
 	deleted       bool
 	before, after []byte
 }
@@ -47,7 +47,7 @@ func decodeMutation(b []byte) (journalEntry, error) {
 		binary.BigEndian.Uint32(b[len(b)-4:]) != crc32.ChecksumIEEE(b[:len(b)-4]) {
 		return journalEntry{}, ErrCorruptJournal
 	}
-	entity := common.EntityKind(b[2])
+	entity := schema.EntityKind(b[2])
 	id := binary.BigEndian.Uint64(b[3:11])
 	before, after := uint64(binary.BigEndian.Uint32(b[11:15])), uint64(binary.BigEndian.Uint32(b[15:19]))
 	if !entity.Valid() || id == 0 || before+after != uint64(len(b)-journalHeader-4) || (b[1] == 1 && after != 0) || (b[1] == 0 && after == 0) {

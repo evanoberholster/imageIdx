@@ -9,7 +9,7 @@ package vectoridx
 import (
 	"errors"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
@@ -87,7 +87,7 @@ const (
 // zero. Dynamic-ef is disabled unless DynamicEfFactor != 0; FlatSearchCutoff
 // and FlatThreshold default when zero, negative FlatSearchCutoff forces ANN.
 type Config struct {
-	Namespace      common.Namespace
+	Namespace      schema.Namespace
 	Dimensions     Dimensions
 	ElementType    ElementType
 	Metric         uint8
@@ -128,11 +128,11 @@ type Config struct {
 	AutoVacuumFragmentation float64
 }
 
-// NamespaceDef returns the common.Schema definition for this config's
+// NamespaceDef returns the schema.Definitions definition for this config's
 // namespace. The schema name lives at the schema layer, so Name is empty and
 // should be filled in by the caller.
-func (c Config) NamespaceDef() common.NamespaceDef {
-	return common.NamespaceDef{Namespace: c.Namespace, Kind: common.KindVector}
+func (c Config) NamespaceDef() schema.NamespaceDef {
+	return schema.NamespaceDef{Namespace: c.Namespace, Kind: schema.KindVector}
 }
 
 func (c Config) withDefaults() (Config, error) {
@@ -245,12 +245,12 @@ func (c Config) VectorBytes() int { return int(c.Dimensions) * c.ElementSize() }
 // squared L2; for cosine it tracks (1-cos)*2^30; for dot it tracks
 // querySelfDot-dot (zero for self). See EncodeScore for the saturation rule.
 type Result struct {
-	ValueID common.ValueID
+	ValueID schema.ValueID
 	Score   uint32
 }
 
 // widenedID converts a stored NodeID to the database-wide identifier type.
-func widenedID(id NodeID) common.ValueID { return common.ValueID(id) }
+func widenedID(id NodeID) schema.ValueID { return schema.ValueID(id) }
 
 // CandidateFilter restricts which live nodes may be returned. A nil filter
 // accepts every live, non-tombstoned node. Filtering is applied after ANN
@@ -259,7 +259,7 @@ func widenedID(id NodeID) common.ValueID { return common.ValueID(id) }
 // Adapt a bitmap index with a closure:
 //
 //	filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
-//	    imageID, ok := imageForValue(common.ValueID(id))
+//	    imageID, ok := imageForValue(schema.ValueID(id))
 //	    return ok && bitmap.Contains(imageID)
 //	})
 type CandidateFilter func(NodeID) bool
@@ -268,11 +268,11 @@ type CandidateFilter func(NodeID) bool
 // once the frame is visible to the OS; DurabilitySync fsyncs before
 // returning. It is a runtime policy passed to Create/Open, not part of the
 // persisted format.
-type Durability = common.Durability
+type Durability = schema.Durability
 
 const (
-	DurabilityOS   = common.DurabilityOS
-	DurabilitySync = common.DurabilitySync
+	DurabilityOS   = schema.DurabilityOS
+	DurabilitySync = schema.DurabilitySync
 )
 
 var (

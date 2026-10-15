@@ -4,16 +4,16 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	common "github.com/evanoberholster/imageIdx/common"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
 // livenessNamespace is the reserved bitmap namespace that stores entity
 // liveness. Its enum values are the EntityKind names, so the same numeric
 // ValueID can be live for one entity kind and dead for another without a
 // per-record entity byte.
-const livenessNamespace common.Namespace = 0xFFF0
+const livenessNamespace schematypes.Namespace = 0xFFF0
 
 // livenessName is the display name of the reserved liveness namespace.
 const livenessName = "__liveness__"
@@ -21,15 +21,15 @@ const livenessName = "__liveness__"
 // VectorDef builds a namespace definition for a vectorix namespace, encoding
 // the persisted dimensions, element type, and metric into Config. Name and
 // entity are supplied here; the namespace number comes from cfg.
-func VectorDef(cfg vectoridx.Config, name string, entity common.EntityKind) (common.NamespaceDef, error) {
+func VectorDef(cfg vectoridx.Config, name string, entity schematypes.EntityKind) (schematypes.NamespaceDef, error) {
 	if !cfg.Namespace.Valid() || !cfg.Dimensions.Valid() {
-		return common.NamespaceDef{}, ErrInvalidSchema
+		return schematypes.NamespaceDef{}, ErrInvalidSchema
 	}
 	if !entity.Valid() {
-		return common.NamespaceDef{}, ErrEntityRequired
+		return schematypes.NamespaceDef{}, ErrEntityRequired
 	}
 	if cfg.ElementType < vectoridx.ElementInt8 || cfg.ElementType > vectoridx.ElementFloat32 {
-		return common.NamespaceDef{}, ErrInvalidSchema
+		return schematypes.NamespaceDef{}, ErrInvalidSchema
 	}
 	metric := cfg.Metric
 	if metric == 0 {
@@ -39,10 +39,10 @@ func VectorDef(cfg vectoridx.Config, name string, entity common.EntityKind) (com
 	binary.LittleEndian.PutUint16(config[0:2], uint16(cfg.Dimensions))
 	config[2] = byte(cfg.ElementType)
 	config[3] = metric
-	return common.NamespaceDef{
+	return schematypes.NamespaceDef{
 		Namespace: cfg.Namespace,
 		Name:      name,
-		Kind:      common.KindVector,
+		Kind:      schematypes.KindVector,
 		Entity:    entity,
 		Config:    config,
 	}, nil
@@ -50,13 +50,13 @@ func VectorDef(cfg vectoridx.Config, name string, entity common.EntityKind) (com
 
 // BitmapDef builds a namespace definition for a bitmapix namespace from its
 // spec, attaching the entity kind.
-func BitmapDef(spec bitmapidx.NamespaceSpec, name string, entity common.EntityKind) (common.NamespaceDef, error) {
+func BitmapDef(spec bitmapidx.NamespaceSpec, name string, entity schematypes.EntityKind) (schematypes.NamespaceDef, error) {
 	if !entity.Valid() {
-		return common.NamespaceDef{}, ErrEntityRequired
+		return schematypes.NamespaceDef{}, ErrEntityRequired
 	}
 	def, err := spec.NamespaceDef(name)
 	if err != nil {
-		return common.NamespaceDef{}, err
+		return schematypes.NamespaceDef{}, err
 	}
 	def.Entity = entity
 	return def, nil
@@ -91,19 +91,19 @@ const (
 	familyVector
 )
 
-func familyOf(kind common.NamespaceKind) engineFamily {
+func familyOf(kind schematypes.NamespaceKind) engineFamily {
 	switch {
 	case kind.IsBitmap():
 		return familyBitmap
-	case kind == common.KindTimestamp:
+	case kind == schematypes.KindTimestamp:
 		return familyTime
-	case kind == common.KindGeo:
+	case kind == schematypes.KindGeo:
 		return familyGeo
-	case kind == common.KindHashPerceptual:
+	case kind == schematypes.KindHashPerceptual:
 		return familySim
-	case kind == common.KindHashExact:
+	case kind == schematypes.KindHashExact:
 		return familyRadix
-	case kind == common.KindVector:
+	case kind == schematypes.KindVector:
 		return familyVector
 	default:
 		return familyNone
@@ -113,7 +113,7 @@ func familyOf(kind common.NamespaceKind) engineFamily {
 // validateSchema checks the user schema and returns its definitions sorted by
 // namespace number. It rejects unsupported kinds, missing entities, and the
 // reserved liveness namespace.
-func validateSchema(schema *common.Schema) ([]common.NamespaceDef, error) {
+func validateSchema(schema *schematypes.Definitions) ([]schematypes.NamespaceDef, error) {
 	if schema == nil {
 		return nil, ErrSchemaRequired
 	}
@@ -121,9 +121,6 @@ func validateSchema(schema *common.Schema) ([]common.NamespaceDef, error) {
 		return nil, fmt.Errorf("%w: no namespaces", ErrInvalidSchema)
 	}
 	defs := schema.Defs()
-	for i := range defs {
-		defs[i].Config = append([]byte(nil), defs[i].Config...)
-	}
 	for _, def := range defs {
 		if def.Namespace == livenessNamespace {
 			return nil, fmt.Errorf("%w: namespace %d is reserved for liveness", ErrInvalidSchema, livenessNamespace)
@@ -134,7 +131,7 @@ func validateSchema(schema *common.Schema) ([]common.NamespaceDef, error) {
 		if familyOf(def.Kind) == familyNone {
 			return nil, fmt.Errorf("%w: namespace %d kind %s", ErrInvalidSchema, def.Namespace, def.Kind)
 		}
-		if def.Kind == common.KindVector {
+		if def.Kind == schematypes.KindVector {
 			if _, err := decodeVectorConfig(def.Config); err != nil {
 				return nil, fmt.Errorf("%w: namespace %d vector config", ErrInvalidSchema, def.Namespace)
 			}
@@ -150,12 +147,12 @@ func validateSchema(schema *common.Schema) ([]common.NamespaceDef, error) {
 
 // cloneSchema returns an independent copy so a Store never shares mutable
 // schema state with its caller.
-func cloneSchema(src *common.Schema) (*common.Schema, error) {
+func cloneSchema(src *schematypes.Definitions) (*schematypes.Definitions, error) {
 	data, err := src.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
-	clone := common.NewSchema()
+	clone := schematypes.NewDefinitions()
 	if err := clone.UnmarshalBinary(data); err != nil {
 		return nil, err
 	}
@@ -164,12 +161,12 @@ func cloneSchema(src *common.Schema) (*common.Schema, error) {
 
 // livenessValues caches one enum value per entity kind. Indexing is direct and
 // allocation-free; index 0 is unused.
-var livenessValues = func() [common.EntityKindCount + 1]bitmapidx.Value {
-	var values [common.EntityKindCount + 1]bitmapidx.Value
-	for e := common.EntityImage; e.Valid(); e++ {
+var livenessValues = func() [schematypes.EntityKindCount + 1]bitmapidx.Value {
+	var values [schematypes.EntityKindCount + 1]bitmapidx.Value
+	for e := schematypes.EntityImage; e.Valid(); e++ {
 		values[e] = bitmapidx.EnumStringValue(e.String())
 	}
 	return values
 }()
 
-func livenessValue(entity common.EntityKind) bitmapidx.Value { return livenessValues[entity] }
+func livenessValue(entity schematypes.EntityKind) bitmapidx.Value { return livenessValues[entity] }

@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	common "github.com/evanoberholster/imageIdx/common"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	hashkernel "github.com/evanoberholster/imageIdx/index/simhash/internal/hashkernel"
 )
 
@@ -296,7 +296,7 @@ func (st *Store) SearchPDQBulk(dst []Result, query *PDQHash, maxDistance uint8) 
 }
 
 // Quality returns the PDQ quality byte for id, validated by the block sequence.
-func (st *Store) Quality(id common.ImageID) (uint8, bool) {
+func (st *Store) Quality(id schema.ImageID) (uint8, bool) {
 	if st.closed.Load() {
 		return 0, false
 	}
