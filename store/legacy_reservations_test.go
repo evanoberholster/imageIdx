@@ -10,7 +10,7 @@ import (
 )
 
 func TestLegacyReservationsAndSchemaMigration(t *testing.T) {
-	s, err := Open(t.TempDir(), Spec{Namespace: 1, Name: "image"})
+	s, err := OpenLegacy(t.TempDir(), Spec{Namespace: 1, Name: "image"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestLegacyReservationsAndSchemaMigration(t *testing.T) {
 }
 
 func TestLegacyVersionOneReservations(t *testing.T) {
-	s, err := Open(t.TempDir(), Spec{Namespace: 1, Name: "image"})
+	s, err := OpenLegacy(t.TempDir(), Spec{Namespace: 1, Name: "image"})
 	if err != nil {
 		t.Fatal(err)
 	}

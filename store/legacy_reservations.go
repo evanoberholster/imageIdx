@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
-	"path/filepath"
 
 	"github.com/cockroachdb/pebble/v2"
 	schema "github.com/evanoberholster/imageIdx/schema"
@@ -20,24 +19,34 @@ var legacyPrefix = [...]byte{0, 0, 'i', 'd', 'a', 'l', 'l', 'o', 'c', '/'}
 var legacyWitness = EncodeKey(Key{Namespace: 0, ID: 1})
 var schemaMigrationKey = EncodeKey(Key{Namespace: 0, ID: 2})
 
-// InspectSchemaMigration opens an existing Pebble database without validating
+// InspectDatabase opens an existing Pebble database without validating
 // or extending its namespace compatibility schema. It is used before a
 // database startup may call OpenWithExtension. A missing database has no
 // migration marker; an existing malformed database fails rather than being
 // treated as fresh.
-func InspectSchemaMigration(dir string) (bool, error) {
-	if _, err := os.Stat(filepath.Join(dir, "CURRENT")); errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	} else if err != nil {
-		return false, err
+func InspectDatabase(dir string) (exists, complete bool, err error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if len(entries) == 0 {
+		return false, false, nil
 	}
 	db, err := pebble.Open(dir, &pebble.Options{ReadOnly: true})
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	s := &Store{db: db}
 	complete, readErr := s.SchemaMigrationComplete()
-	return complete, errors.Join(readErr, db.Close())
+	return true, complete, errors.Join(readErr, db.Close())
+}
+
+func InspectSchemaMigration(dir string) (bool, error) {
+	_, complete, err := InspectDatabase(dir)
+	return complete, err
 }
 
 func legacyKey(kind schema.EntityKind) [11]byte {

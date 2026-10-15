@@ -29,7 +29,10 @@ type Options struct {
 	Backend     Backend
 	Definitions *Definitions
 	Entities    []EntityConfig
-	fault       func(string) error // deterministic crash/failure injection in package tests
+	// Prepare publishes additive definitions without activating them. The
+	// caller must verify dependent resources and call Activate before use.
+	Prepare bool
+	fault   func(string) error // deterministic crash/failure injection in package tests
 }
 
 type entityAllocator struct {
@@ -46,21 +49,28 @@ type entityAllocator struct {
 // Schema owns immutable namespace definitions and entity-scoped allocation.
 // The backing file is locked for its entire lifetime.
 type Schema struct {
-	f               *os.File
-	lock            *os.File
-	mapped          *storage.MappedFile
-	backend         Backend
-	entries         []*entityAllocator
-	owners          [EntityKindCount + 1]*entityAllocator
-	definitions     *Definitions
-	definitionsData []byte
-	state           atomic.Uint64 // closing bit | admitted operations
-	poisoned        atomic.Bool
-	closeMu         sync.Mutex
-	closeCond       *sync.Cond
-	closeOnce       sync.Once
-	closeErr        error
-	fault           func(string) error
+	f                 *os.File
+	lock              *os.File
+	mapped            *storage.MappedFile
+	backend           Backend
+	entries           []*entityAllocator
+	owners            [EntityKindCount + 1]*entityAllocator
+	definitions       *Definitions
+	definitionsData   []byte
+	activeDefinitions *Definitions // non-nil while a prepared target is pending
+	prepared          bool
+	legacyRetired     bool
+	generation        uint64
+	directoryOffset   uint64
+	directoryEnd      uint64
+	directory         []byte
+	state             atomic.Uint64 // closing bit | admitted operations
+	poisoned          atomic.Bool
+	closeMu           sync.Mutex
+	closeCond         *sync.Cond
+	closeOnce         sync.Once
+	closeErr          error
+	fault             func(string) error
 }
 
 const closing uint64 = 1 << 63
@@ -120,6 +130,9 @@ func configs(opts Options) ([]directoryEntry, *Definitions, []byte, error) {
 // definitions must match their stored prefix; new namespaces and reservation
 // sizes publish a new checksummed directory before returning to callers.
 func Open(path string, opts Options) (_ *Schema, err error) {
+	if opts.Prepare && opts.Definitions == nil {
+		return nil, ErrNamespace
+	}
 	defs, definitions, definitionsData, err := configs(opts)
 	if err != nil {
 		return nil, err
@@ -149,12 +162,12 @@ func Open(path string, opts Options) (_ *Schema, err error) {
 	}()
 	var f *os.File
 	var openErr error
-	if definitions == nil {
+	if definitions == nil || opts.Prepare {
 		f, openErr = os.OpenFile(path, os.O_RDWR, 0)
 	} else {
 		f, openErr = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	}
-	created := definitions != nil && openErr == nil
+	created := definitions != nil && !opts.Prepare && openErr == nil
 	if definitions != nil && errors.Is(openErr, os.ErrExist) {
 		f, openErr = os.OpenFile(path, os.O_RDWR, 0)
 	}
@@ -165,7 +178,7 @@ func Open(path string, opts Options) (_ *Schema, err error) {
 	if created {
 		err = s.create(defs)
 	} else {
-		err = s.recover(defs)
+		err = s.recover(defs, opts.Prepare)
 	}
 	if err != nil {
 		return nil, err
@@ -192,14 +205,100 @@ func (s *Schema) entry(entity EntityKind) *entityAllocator {
 
 // Lookup returns a persisted namespace definition and its owning entity.
 func (s *Schema) Lookup(ns Namespace) (NamespaceDef, bool) {
+	if s.prepared {
+		return s.activeDefinitions.Lookup(ns)
+	}
 	return s.definitions.Lookup(ns)
 }
 
 // Definitions returns an independent copy of the persisted namespace model.
 func (s *Schema) Definitions() *Definitions {
 	d := NewDefinitions()
+	source := s.definitions
+	if s.prepared {
+		source = s.activeDefinitions
+	}
+	_ = d.RegisterAll(source.Defs()...)
+	return d
+}
+
+// PreparedDefinitions returns the durable target during startup migration.
+// It is nil for an active schema. The returned definitions are independent.
+func (s *Schema) PreparedDefinitions() *Definitions {
+	if !s.prepared {
+		return nil
+	}
+	d := NewDefinitions()
 	_ = d.RegisterAll(s.definitions.Defs()...)
 	return d
+}
+
+// Generation is the active logical schema generation (not an ID watermark).
+func (s *Schema) Generation() uint64 {
+	if s.prepared {
+		return s.generation - 1
+	}
+	return s.generation
+}
+
+// ReservationSize reports an entity's durable reservation-block setting for
+// startup schema evolution; zero means the entity is not yet defined.
+func (s *Schema) ReservationSize(entity EntityKind) uint64 {
+	if a := s.entry(entity); a != nil {
+		return a.block
+	}
+	return 0
+}
+
+// LegacyRetired reports whether the old Pebble and index logical schema copies
+// were durably retired. An active database with this marker skips legacy reads.
+func (s *Schema) LegacyRetired() bool { return s.legacyRetired }
+
+// MarkLegacyRetired publishes a synced marker only after migration-only code
+// has checked and removed every old schema copy. Repeating it is harmless.
+func (s *Schema) MarkLegacyRetired() error {
+	if s.state.Load()&closing != 0 {
+		return ErrClosed
+	}
+	if s.prepared || s.f == nil || s.poisoned.Load() {
+		return ErrNamespace
+	}
+	if s.legacyRetired {
+		return nil
+	}
+	if s.generation == ^uint64(0) {
+		return ErrExhausted
+	}
+	if err := s.commitDirectory(int(s.generation%2), s.generation+1, s.directoryOffset, s.directory, s.definitionsData, s.directoryEnd, false, true); err != nil {
+		s.poisoned.Store(true)
+		return err
+	}
+	s.generation++
+	s.legacyRetired = true
+	return nil
+}
+
+// Activate publishes the prepared definitions after the coordinator has
+// verified dependent resources. It is only valid during startup on a
+// ReadAt/WriteAt opener; mmap readers may reopen after activation. A failed
+// publication must be resolved by reopening before the database is exposed.
+func (s *Schema) Activate() error {
+	if s.state.Load()&closing != 0 {
+		return ErrClosed
+	}
+	if !s.prepared || s.f == nil || s.poisoned.Load() {
+		return ErrNamespace
+	}
+	if s.generation == ^uint64(0) {
+		return ErrExhausted
+	}
+	if err := s.commitDirectory(int(s.generation%2), s.generation+1, s.directoryOffset, s.directory, s.definitionsData, s.directoryEnd, false, s.legacyRetired); err != nil {
+		s.poisoned.Store(true)
+		return err
+	}
+	s.generation++
+	s.prepared, s.activeDefinitions = false, nil
+	return nil
 }
 
 func (s *Schema) admit() error {

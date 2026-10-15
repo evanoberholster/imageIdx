@@ -42,19 +42,28 @@ func (db *DB) openIDs(dir string) error {
 		}
 	}
 	observed := schema.NewDefinitions()
-	for _, spec := range canonicalSpecsFor(db.canonical) {
-		if spec.Entity.Valid() {
-			if err := observed.Register(spec.NamespaceDef()); err != nil {
-				return err
+	if db.ids != nil {
+		observed = db.ids.Definitions()
+		if err := validateIndexDefinitions(observed, db.indexes.Schema()); err != nil {
+			return err
+		}
+	} else {
+		// Only the one-time legacy bootstrap may reconstruct definitions from
+		// historical index metadata. Normal startup loads schema.dat first.
+		for _, spec := range canonicalSpecsFor(db.canonical) {
+			if spec.Entity.Valid() {
+				if err := observed.Register(spec.NamespaceDef()); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	for _, def := range db.indexes.Schema().Defs() {
-		if def.Namespace == journalNS || def.Namespace == metadataNS || def.Namespace == 0xFFF0 {
-			return fmt.Errorf("database: reserved namespace %d: %w", def.Namespace, schema.ErrNamespace)
-		}
-		if err := observed.Register(def); err != nil {
-			return fmt.Errorf("database: global namespace ownership: %w", err)
+		for _, def := range db.indexes.Schema().Defs() {
+			if def.Namespace == journalNS || def.Namespace == metadataNS || def.Namespace == 0xFFF0 {
+				return fmt.Errorf("database: reserved namespace %d: %w", def.Namespace, schema.ErrNamespace)
+			}
+			if err := observed.Register(def); err != nil {
+				return fmt.Errorf("database: global namespace ownership: %w", err)
+			}
 		}
 	}
 	entities := make([]schema.EntityConfig, 0, schema.EntityKindCount)
@@ -144,6 +153,29 @@ func validateIndexDefinitions(authoritative, indexes *schema.Definitions) error 
 		want, ok := authoritative.Lookup(def.Namespace)
 		if !ok || want.Kind != def.Kind || want.Name != def.Name || want.Entity != def.Entity || !bytes.Equal(want.Config, def.Config) {
 			return fmt.Errorf("database: index namespace %d differs from central schema: %w", def.Namespace, schema.ErrNamespace)
+		}
+	}
+	return nil
+}
+
+// validateLegacyIndexCopy permits a strictly additive target while an old
+// Pebble backup awaits retirement. It never treats the backup as authority.
+func validateLegacyIndexCopy(authoritative, legacy *schema.Definitions) error {
+	active := schema.NewDefinitions()
+	for _, def := range authoritative.Defs() {
+		if def.Kind != schema.KindKV {
+			if err := active.Register(def); err != nil {
+				return err
+			}
+		}
+	}
+	if legacy.Len() > active.Len() {
+		return schema.ErrNamespace
+	}
+	for i, def := range legacy.Defs() {
+		want := active.Defs()[i]
+		if def.Namespace != want.Namespace || def.Name != want.Name || def.Kind != want.Kind || def.Entity != want.Entity || !bytes.Equal(def.Config, want.Config) {
+			return schema.ErrNamespace
 		}
 	}
 	return nil

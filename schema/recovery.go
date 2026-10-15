@@ -65,16 +65,26 @@ func (s *Schema) create(defs []directoryEntry) error {
 			return err
 		}
 	}
-	return s.sync()
+	if err := s.sync(); err != nil {
+		return err
+	}
+	s.generation, s.directoryOffset, s.directoryEnd, s.directory = 1, dirOff, end, dir
+	return nil
 }
 
-func (s *Schema) commitDirectory(slot int, generation, off uint64, dir, definitions []byte, end uint64) error {
+func (s *Schema) commitDirectory(slot int, generation, off uint64, dir, definitions []byte, end uint64, prepared, retired bool) error {
 	if s.fault != nil {
 		if err := s.fault("before superblock"); err != nil {
 			return err
 		}
 	}
 	p := superPayload(off, dir, definitions, end)
+	if prepared {
+		p[52] = 1
+	}
+	if retired {
+		p[53] = 1
+	}
 	var sb [superBytes]byte
 	if err := storage.EncodeSuperblock(sb[:], storage.SuperblockHeader{Magic: superMagic, Version: SchemaVersion, Generation: generation}, p[:]); err != nil {
 		return err
@@ -124,7 +134,7 @@ func (s *Schema) loadRecord(e directoryEntry) (allocationRecord, error) {
 	}
 }
 
-func (s *Schema) recover(defs []directoryEntry) error {
+func (s *Schema) recover(defs []directoryEntry, prepare bool) error {
 	info, err := s.f.Stat()
 	if err != nil {
 		return err
@@ -181,7 +191,8 @@ func (s *Schema) recover(defs []directoryEntry) error {
 	if err := s.read(dir, c.off); err != nil {
 		return errors.Join(ErrCorrupt, err)
 	}
-	_, payload, valid := storage.DecodeSuperblock(slots[best][:], superMagic, SchemaVersion)
+	version := binary.LittleEndian.Uint16(slots[best][4:6])
+	_, payload, valid := storage.DecodeSuperblock(slots[best][:], superMagic, version)
 	if !valid {
 		return ErrCorrupt
 	}
@@ -198,6 +209,50 @@ func (s *Schema) recover(defs []directoryEntry) error {
 	if err := stored.UnmarshalBinary(storedDefinitions); err != nil {
 		return errors.Join(ErrCorrupt, err)
 	}
+	s.generation, s.directoryOffset, s.directoryEnd, s.directory = c.gen, c.off, c.end, dir
+	s.legacyRetired = payload[53] == 1
+	if payload[52] == 1 {
+		previous := found[1-best]
+		if previous.gen+1 != c.gen {
+			return ErrCorrupt
+		}
+		_, priorPayload, valid := storage.DecodeSuperblock(slots[1-best][:], superMagic, binary.LittleEndian.Uint16(slots[1-best][4:6]))
+		if !valid || priorPayload[52] != 0 {
+			return ErrCorrupt
+		}
+		if priorPayload[53] != payload[53] {
+			return ErrCorrupt
+		}
+		priorDir := make([]byte, previous.length)
+		if err := s.read(priorDir, previous.off); err != nil {
+			return errors.Join(ErrCorrupt, err)
+		}
+		priorOffset := binary.LittleEndian.Uint64(priorPayload[32:40])
+		priorLength := binary.LittleEndian.Uint64(priorPayload[40:48])
+		priorData := make([]byte, priorLength)
+		if err := s.read(priorData, priorOffset); err != nil {
+			return errors.Join(ErrCorrupt, err)
+		}
+		if checkSuperDirectory(priorPayload, priorDir, priorData) != nil {
+			return ErrCorrupt
+		}
+		active := NewDefinitions()
+		if err := active.UnmarshalBinary(priorData); err != nil {
+			return errors.Join(ErrCorrupt, err)
+		}
+		priorDefs := active.Defs()
+		targetDefs := stored.Defs()
+		if len(priorDefs) >= len(targetDefs) {
+			return ErrCorrupt
+		}
+		for i, p := range priorDefs {
+			d := targetDefs[i]
+			if p.Namespace != d.Namespace || p.Name != d.Name || p.Kind != d.Kind || p.Entity != d.Entity || !bytes.Equal(p.Config, d.Config) {
+				return ErrCorrupt
+			}
+		}
+		s.activeDefinitions, s.prepared = active, true
+	}
 	if s.definitions == nil {
 		s.definitions, s.definitionsData = stored, storedDefinitions
 	} else {
@@ -211,6 +266,9 @@ func (s *Schema) recover(defs []directoryEntry) error {
 				return ErrNamespace
 			}
 		}
+	}
+	if prepare && !s.prepared && bytes.Equal(storedDefinitions, s.definitionsData) {
+		return ErrNamespace // a new generation requires at least one added namespace
 	}
 	entries, err := parseDirectory(dir, c.end)
 	if err != nil {
@@ -291,6 +349,9 @@ func (s *Schema) recover(defs []directoryEntry) error {
 	if !changed {
 		return nil
 	}
+	if s.prepared {
+		return ErrNamespace
+	}
 	if c.gen == math.MaxUint64 {
 		return ErrExhausted
 	}
@@ -361,8 +422,12 @@ func (s *Schema) recover(defs []directoryEntry) error {
 			return err
 		}
 	}
-	if err := s.commitDirectory(1-best, c.gen+1, dirOff, newDir, s.definitionsData, end); err != nil {
+	if err := s.commitDirectory(1-best, c.gen+1, dirOff, newDir, s.definitionsData, end, prepare, s.legacyRetired); err != nil {
 		return err
+	}
+	s.generation, s.directoryOffset, s.directoryEnd, s.directory = c.gen+1, dirOff, end, newDir
+	if prepare {
+		s.activeDefinitions, s.prepared = stored, true
 	}
 	oldEntries := s.entries
 	s.entries = nil

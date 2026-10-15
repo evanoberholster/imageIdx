@@ -9,7 +9,7 @@ import (
 )
 
 func TestAtomicBatchScanAndRangeCleanup(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "kv"), Spec{Namespace: 44, Name: "entries"})
+	db, err := OpenLegacy(filepath.Join(t.TempDir(), "kv"), Spec{Namespace: 44, Name: "entries"})
 	if err != nil {
 		t.Fatal(err)
 	}

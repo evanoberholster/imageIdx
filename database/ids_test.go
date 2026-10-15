@@ -1,7 +1,6 @@
 package database
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -158,7 +157,7 @@ func TestPersistedCentralSchemaRejectsDifferentIndexCopy(t *testing.T) {
 
 func TestBootstrapDoesNotPublishSchemaWithConflictingBackup(t *testing.T) {
 	data, idxPath := paths(t)
-	kv, err := store.Open(data, canonicalSpecs()...)
+	kv, err := store.OpenLegacy(data, canonicalSpecs()...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,13 +232,11 @@ func TestMissingAllocatorPreflightDoesNotExtendPebbleSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := store.EncodeKey(store.Key{})
-	value, closer, err := pdb.Get(key[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	before := append([]byte(nil), value...)
-	if err := closer.Close(); err != nil {
-		t.Fatal(err)
+	if value, closer, err := pdb.Get(key[:]); !errors.Is(err, pebble.ErrNotFound) {
+		if closer != nil {
+			_ = closer.Close()
+		}
+		t.Fatalf("new database retained Pebble schema: %x %v", value, err)
 	}
 	if err := pdb.Close(); err != nil {
 		t.Fatal(err)
@@ -276,15 +273,11 @@ func TestMissingAllocatorPreflightDoesNotExtendPebbleSchema(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		value, closer, err = pdb.Get(key[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(value, before) {
-			t.Fatal("preflight changed Pebble namespace metadata")
-		}
-		if err := closer.Close(); err != nil {
-			t.Fatal(err)
+		if value, closer, err := pdb.Get(key[:]); !errors.Is(err, pebble.ErrNotFound) {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			t.Fatalf("preflight wrote Pebble schema: %x %v", value, err)
 		}
 		if err := pdb.Close(); err != nil {
 			t.Fatal(err)
@@ -304,15 +297,11 @@ func TestMissingAllocatorPreflightDoesNotExtendPebbleSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, closer, err = pdb.Get(key[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(value, before) {
-		t.Fatal("corrupt file preflight changed Pebble namespace metadata")
-	}
-	if err := closer.Close(); err != nil {
-		t.Fatal(err)
+	if value, closer, err := pdb.Get(key[:]); !errors.Is(err, pebble.ErrNotFound) {
+		if closer != nil {
+			_ = closer.Close()
+		}
+		t.Fatalf("corrupt-file preflight wrote Pebble schema: %x %v", value, err)
 	}
 	if err := pdb.Close(); err != nil {
 		t.Fatal(err)
@@ -365,9 +354,190 @@ func TestExplicitIDCommitOverlapsAllocation(t *testing.T) {
 	}
 }
 
+func TestPreparedSchemaRecoversDuringDatabaseOpen(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(data, "schema.dat")
+	active, err := schema.Open(path, schema.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := active.Definitions()
+	if err := active.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.Register(schema.NamespaceDef{Namespace: 600, Name: "new-index", Kind: schema.KindTimestamp, Entity: schema.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := schema.Open(path, schema.Options{Definitions: target, Prepare: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		opened, err := Open(data, idx, decodeTest, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opened.ids.PreparedDefinitions() != nil || opened.ids.Definitions().Len() != target.Len() {
+			t.Fatal("prepared target not activated")
+		}
+		if _, ok := opened.Index().Schema().Lookup(600); !ok {
+			t.Fatal("new index namespace missing")
+		}
+		if err := opened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepared, err = schema.Open(path, schema.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.PreparedDefinitions() != nil || prepared.Definitions().Len() != target.Len() {
+		t.Fatal("recovered startup did not preserve active schema")
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStartupAddsKVAndIndexNamespaces(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	g, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Record: []byte("original"), Projection: projection(1, 'x')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, g)
+	target := db.ids.Definitions()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, def := range []schema.NamespaceDef{
+		{Namespace: 501, Name: "extra-a", Kind: schema.KindKV, Entity: schema.EntityImage},
+		{Namespace: 502, Name: "extra-b", Kind: schema.KindKV, Entity: schema.EntityImage},
+		{Namespace: 503, Name: "new-time", Kind: schema.KindTimestamp, Entity: schema.EntityImage},
+		{Namespace: 504, Name: "new-geo", Kind: schema.KindGeo, Entity: schema.EntityImage},
+	} {
+		if err := target.Register(def); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err = Open(data, idx, decodeTest, Options{Definitions: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.ids.PreparedDefinitions() != nil || db.ids.Definitions().Len() != target.Len() {
+		t.Fatal("namespace additions not active")
+	}
+	if got, err := db.Get(schema.EntityImage, 1); err != nil || string(got) != "original" {
+		t.Fatalf("canonical: %q %v", got, err)
+	}
+	contains(t, db, 1, 'x', true)
+	if id, err := db.NextID(schema.EntityImage); id != 2 || err != nil {
+		t.Fatalf("counter changed: %d %v", id, err)
+	}
+	if err := db.values.Set(store.Key{Namespace: 501, ID: 1}, []byte("extra")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pdb, err := pebble.Open(data, &pebble.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.EncodeKey(store.Key{})
+	if value, closer, err := pdb.Get(key[:]); !errors.Is(err, pebble.ErrNotFound) {
+		if closer != nil {
+			_ = closer.Close()
+		}
+		t.Fatalf("legacy Pebble schema remains: %x %v", value, err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openTest(t, data, idx)
+	defer db.Close()
+	if got, err := db.values.Get(store.Key{Namespace: 501, ID: 1}); err != nil || string(got) != "extra" {
+		t.Fatalf("new KV: %q %v", got, err)
+	}
+	if id, err := db.NextID(schema.EntityImage); id != 3 || err != nil {
+		t.Fatalf("reopened counter: %d %v", id, err)
+	}
+	if _, err := os.Stat(filepath.Join(idx, "schema.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete index schema: %v", err)
+	}
+}
+
+func TestStartupRejectsNonAdditiveSchemaChanges(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	active := db.ids.Definitions()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		makeTarget func() *schema.Definitions
+	}{
+		{"removal", func() *schema.Definitions {
+			d := schema.NewDefinitions()
+			defs := active.Defs()
+			_ = d.RegisterAll(defs[:len(defs)-1]...)
+			return d
+		}},
+		{"rename", func() *schema.Definitions {
+			d := schema.NewDefinitions()
+			defs := active.Defs()
+			defs[0].Name = "renamed"
+			_ = d.RegisterAll(defs...)
+			return d
+		}},
+		{"owner", func() *schema.Definitions {
+			d := schema.NewDefinitions()
+			defs := active.Defs()
+			defs[0].Entity = schema.EntityFace
+			_ = d.RegisterAll(defs...)
+			return d
+		}},
+		{"kind", func() *schema.Definitions {
+			d := schema.NewDefinitions()
+			defs := active.Defs()
+			defs[0].Kind = schema.KindTimestamp
+			_ = d.RegisterAll(defs...)
+			return d
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if opened, err := Open(data, idx, decodeTest, Options{Definitions: tc.makeTarget()}); opened != nil || !errors.Is(err, schema.ErrNamespace) {
+				if opened != nil {
+					_ = opened.Close()
+				}
+				t.Fatalf("accepted non-additive schema: %v", err)
+			}
+			s, err := schema.Open(filepath.Join(data, "schema.dat"), schema.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.PreparedDefinitions() != nil || s.Definitions().Len() != active.Len() {
+				t.Fatal("failed validation published intent")
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestLegacyMigrationIncludesTombstones(t *testing.T) {
 	data, idx := paths(t)
-	values, err := store.Open(data, canonicalSpecs()...)
+	values, err := store.OpenLegacy(data, canonicalSpecs()...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +623,7 @@ func TestLegacyCanonicalSchemaExtendsForNewKinds(t *testing.T) {
 	for i := range legacy {
 		legacy[i].Entity = schema.EntityInvalid // pre-entity KV schema
 	}
-	values, err := store.Open(data, legacy...)
+	values, err := store.OpenLegacy(data, legacy...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +649,7 @@ func TestLegacyCanonicalSchemaExtendsForNewKinds(t *testing.T) {
 
 func TestMigratesLegacyDurableHighWater(t *testing.T) {
 	data, idx := paths(t)
-	values, err := store.Open(data, canonicalSpecs()...)
+	values, err := store.OpenLegacy(data, canonicalSpecs()...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,11 +707,17 @@ func TestMigratesLegacyDurableHighWater(t *testing.T) {
 	}
 	// Losing the authoritative single-file state must never reset from the
 	// (now removed) legacy metadata or surviving canonical records.
+	if complete, err := db.values.SchemaMigrationComplete(); err != nil || !complete {
+		t.Fatalf("migration marker before close: %v %v", complete, err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(data, "schema.dat")); err != nil {
 		t.Fatal(err)
+	}
+	if complete, err := store.InspectSchemaMigration(data); err != nil || !complete {
+		t.Fatalf("preflight marker lost: %v %v", complete, err)
 	}
 	if reopened, err := Open(data, idx, decodeTest, Options{}); !errors.Is(err, schema.ErrCorrupt) {
 		if reopened != nil {

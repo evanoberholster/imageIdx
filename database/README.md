@@ -1,30 +1,33 @@
 # database: authoritative records and derived indexes (alpha)
 
-`database.DB` owns one Pebble-backed `store.Store` for canonical bytes and one
-unified `index.Store` for derived associations. The index schema is created
-separately with `index.Create`; `database.Open(dataDir, indexDir, decoder,
-options)` reopens it and checks health and the durable source watermark. The
-database also opens `schema.Schema` as the authoritative entity-ID allocator
-and namespace ownership snapshot. Schema owns identity and definitions;
-`store` owns values, index packages own secondary indexes, and `database`
-coordinates their lifecycle. Canonical and index namespaces must have unique
-numbers and names; conflicting preexisting layouts fail to open rather than
-silently renumbering persisted identifiers. Allocation-file format v1 is not
-automatically converted; it returns `schema.ErrVersion` rather than risking
-reuse of IDs allocated under namespace-scoped semantics.
+`database.DB` coordinates `schema.dat` (entity IDs and all logical namespace
+definitions), Pebble (canonical bytes, journal, operational generations), and
+the unified index (physical engines and recovery metadata). The initial index
+may be created with standalone `index.Create`; database startup validates and
+retires its old `schema.bin` after establishing schema.dat. Subsequent index
+opens consume central definitions. Allocation-file format v1 returns
+`schema.ErrVersion`; no namespace-scoped counter migration is attempted.
 
-On reopen, the central schema file is read first. The database resolves each
-entity's canonical namespace from its persisted `entity-<kind>` KV definition
-and validates the existing Pebble and index copies against it. New databases
-may supply `Options.Definitions` as the complete authoritative model and
-`Options.CanonicalNamespaces[entity]` to select a different KV namespace;
-zero uses the historical assignment on first creation. Reopens without
-overrides use the persisted relationship. Index and Pebble schema copies remain
-compatibility metadata; mismatches fail closed. There is no general
-cross-package namespace-addition API yet: do not manually extend one copy and
-expect the database to publish it as a new schema generation. Legacy first-open
-Pebble high-water reconciliation remains idempotent and completes before the
-migration marker is synced.
+`database.Open` takes an exclusive database lock. On new databases it validates
+the index and writes schema.dat before creating Pebble; Pebble never receives
+a serialized schema registry. Existing databases validate old Pebble and index
+copies during their one-time migration, preserve namespace IDs and allocator
+reservations, remove those copies, then durably mark retirement in schema.dat.
+Later opens do not read old Pebble schema keys. Losing schema.dat after migration
+fails closed, without scanning records to invent IDs.
+
+Additions supplied through `Options.Definitions` are allowed only at startup.
+Existing definitions must remain an identical prefix; removal, renaming,
+reassignment, or changing configuration fails. schema.dat publishes the full
+target as PREPARED before physical index work; the previous superblock remains
+ACTIVE. The index is rebuilt into a verified staging directory from canonical
+projections and activated with the index recovery marker. Once every namespace
+is healthy and durable, schema.dat publishes ACTIVE. A crash can repeat staging
+or finish a verified activation; recovery loads the durable target from
+schema.dat without requiring the caller's original options. An index that
+cannot be rebuilt from canonical projections fails closed. Canonical namespaces
+come from persisted `entity-<kind>` definitions and need not match EntityKind
+ordinals; `Options.CanonicalNamespaces` never renumbers existing databases.
 
 `NextID` issues unique IDs from the entity allocator. Explicit IDs in `Commit`
 use caller-owned, last-writer-wins canonical record semantics. `EnsureMinimum`
@@ -53,11 +56,10 @@ exposes `RecoveryStatus()` for per-namespace `RecoveryHealthy`,
 generations. No ordinary database reader or writer receives a DB while its
 startup rebuild is in progress.
 
-When first opening a healthy store, the integration persists an immutable copy
-of the index schema in Pebble metadata. This lets it reconstruct even a missing
-index directory without inventing namespace definitions. An older database
-that never recorded this copy and has also lost its index schema requires
-manual schema restoration; recovery must not guess.
+An existing schema.dat supplies index definitions for rebuild, even if the
+entire index directory or old `schema.bin` is missing. A pre-schema.dat legacy
+database without either copy cannot recover definitions and fails closed. After
+the retirement marker, the old Pebble backup is never consulted.
 
 The current physical rebuild reconstructs **all declared namespaces**, not
 just the damaged logical namespace. Bitmap namespaces share one segment and
@@ -66,8 +68,8 @@ activation is not implemented. The original directory remains untouched until
 a replacement has been completely scanned, durably assigned the canonical
 generation, structurally verified, closed, and reopened. The replacement lives
 at `<indexDir>.rebuild`; a checksummed `<indexDir>.activation` records BUILDING
-or VERIFIED, the source generation, and a fingerprint of the authoritative
-Pebble schema. Reopen validates this fingerprint before any rename. Only a
+or VERIFIED, the source generation, and a fingerprint of the index definitions
+from schema.dat. Reopen validates this fingerprint before any rename. Only a
 VERIFIED replacement may replace `<indexDir>`; the previous generation is
 temporarily moved to `<indexDir>.previous`. Every rename is followed by parent
 directory sync. On restart the activation record finishes or restarts the

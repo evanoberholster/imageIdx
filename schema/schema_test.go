@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
 func testOptions(backend Backend) Options {
@@ -94,6 +96,251 @@ func TestAllocationAndCleanReopen(t *testing.T) {
 		defer s.Close()
 		if id, err := s.NextID(EntityPerson); id != 50002 || err != nil {
 			t.Fatalf("second clean: %d %v", id, err)
+		}
+	})
+}
+
+func TestPreparedDefinitionsRecoverAndActivate(t *testing.T) {
+	forBackends(t, func(t *testing.T, backend Backend) {
+		path := filepath.Join(t.TempDir(), "schema.dat")
+		initial := testOptions(backend)
+		s, err := Open(path, initial)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.NextID(EntityImage); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		target := testOptions(BackendReadWrite)
+		if err := target.Definitions.Register(NamespaceDef{Namespace: 400, Name: "secondary", Kind: KindKV, Entity: EntityImage}); err != nil {
+			t.Fatal(err)
+		}
+		target.Prepare = true
+		s, err = Open(path, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Generation() != 1 || s.PreparedDefinitions() == nil || s.Definitions().Len() != initial.Definitions.Len() {
+			t.Fatal("prepared schema replaced active definitions")
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Recovery needs no caller-provided target; it is already in schema.dat.
+		s, err = Open(path, Options{Backend: backend})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.PreparedDefinitions() == nil || s.PreparedDefinitions().Len() != target.Definitions.Len() {
+			t.Fatal("lost durable prepared target")
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s, err = Open(path, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Activate(); err != nil {
+			t.Fatal(err)
+		}
+		if s.PreparedDefinitions() != nil || s.Generation() != 3 || s.Definitions().Len() != target.Definitions.Len() {
+			t.Fatal("activation not durable")
+		}
+		if id, err := s.NextID(EntityImage); id != 2 || err != nil {
+			t.Fatalf("allocator regressed: %d %v", id, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s, err = Open(path, Options{Backend: backend})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if s.PreparedDefinitions() != nil || s.Generation() != 3 || s.Definitions().Len() != target.Definitions.Len() {
+			t.Fatal("reopened wrong active generation")
+		}
+		if id, err := s.NextID(EntityImage); id != 3 || err != nil {
+			t.Fatalf("reopen allocator: %d %v", id, err)
+		}
+	})
+}
+
+func TestOpenPreviousActiveSchemaFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.dat")
+	s, err := Open(path, testOptions(BackendReadWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := 0; slot < 2; slot++ {
+		var raw [superBytes]byte
+		if _, err := f.ReadAt(raw[:], int64(slot*superBytes)); err != nil {
+			t.Fatal(err)
+		}
+		h, payload, ok := storage.DecodeSuperblock(raw[:], superMagic, SchemaVersion)
+		if !ok {
+			t.Fatal("invalid newly created superblock")
+		}
+		h.Version = previousVersion
+		if err := storage.EncodeSuperblock(raw[:], h, payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteAt(raw[:], int64(slot*superBytes)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path, Options{})
+	if err != nil {
+		t.Fatalf("previous supported format: %v", err)
+	}
+	defer s.Close()
+	if s.PreparedDefinitions() != nil || s.Generation() != 1 {
+		t.Fatal("v2 must reopen ACTIVE")
+	}
+}
+
+func TestPreparedPublicationCrashRecovery(t *testing.T) {
+	for _, point := range []string{"after directory sync", "after superblock sync"} {
+		t.Run(point, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "schema.dat")
+			s, err := Open(path, testOptions(BackendReadWrite))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			opts := testOptions(BackendReadWrite)
+			if err := opts.Definitions.Register(NamespaceDef{Namespace: 400, Name: "extra", Kind: KindKV, Entity: EntityImage}); err != nil {
+				t.Fatal(err)
+			}
+			opts.Prepare = true
+			opts.fault = func(stage string) error {
+				if stage == point {
+					return ErrCorrupt
+				}
+				return nil
+			}
+			if opened, err := Open(path, opts); err == nil {
+				_ = opened.Close()
+				t.Fatal("injection did not fire")
+			}
+			s, err = Open(path, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.Definitions().Len() != 2 {
+				t.Fatal("old active definitions lost")
+			}
+			if point == "after directory sync" && s.PreparedDefinitions() != nil {
+				t.Fatal("unpublished target became prepared")
+			}
+			if point == "after superblock sync" && s.PreparedDefinitions() == nil {
+				t.Fatal("durable target lost")
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestActivationPublicationCrashRecovery(t *testing.T) {
+	for _, point := range []string{"before superblock", "after superblock sync"} {
+		t.Run(point, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "schema.dat")
+			s, err := Open(path, testOptions(BackendReadWrite))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			opts := testOptions(BackendReadWrite)
+			if err := opts.Definitions.Register(NamespaceDef{Namespace: 400, Name: "extra", Kind: KindKV, Entity: EntityImage}); err != nil {
+				t.Fatal(err)
+			}
+			opts.Prepare = true
+			s, err = Open(path, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = Open(path, Options{fault: func(stage string) error {
+				if stage == point {
+					return ErrCorrupt
+				}
+				return nil
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Activate(); err == nil {
+				t.Fatal("injection did not fire")
+			}
+			_ = s.Close()
+			s, err = Open(path, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if point == "before superblock" && s.PreparedDefinitions() == nil {
+				t.Fatal("prepared target disappeared")
+			}
+			if point == "after superblock sync" && (s.PreparedDefinitions() != nil || s.Definitions().Len() != 3) {
+				t.Fatal("durable activation disappeared")
+			}
+		})
+	}
+}
+
+func TestLegacyRetirementMarkerIsDurable(t *testing.T) {
+	forBackends(t, func(t *testing.T, backend Backend) {
+		path := filepath.Join(t.TempDir(), "schema.dat")
+		s, err := Open(path, testOptions(BackendReadWrite))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.LegacyRetired() {
+			t.Fatal("new file marked migrated before cleanup")
+		}
+		if err := s.MarkLegacyRetired(); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s, err = Open(path, Options{Backend: backend})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !s.LegacyRetired() || s.Definitions().Len() != 2 {
+			t.Fatal("lost retirement marker or definitions")
+		}
+		if id, err := s.NextID(EntityImage); id != 1 || err != nil {
+			t.Fatalf("allocator: %d %v", id, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
 		}
 	})
 }

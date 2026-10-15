@@ -1,6 +1,7 @@
 package index
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -35,11 +36,12 @@ type Store struct {
 	dir  string
 	opts Options
 
-	schema   *schematypes.Definitions
-	defs     []schematypes.NamespaceDef
-	reg      registry
-	health   []NamespaceHealth // dense by namespace number
-	healthOK bool
+	schema     *schematypes.Definitions
+	defs       []schematypes.NamespaceDef
+	standalone bool // legacy/standalone indexes retain schema.bin for independent Open
+	reg        registry
+	health     []NamespaceHealth // dense by namespace number
+	healthOK   bool
 
 	bitmapStore *bitmapidx.Store
 	timeStore   *timeidx.Store
@@ -131,11 +133,26 @@ type simCursor struct {
 // Create builds a new unified Store at dir, creating every configured
 // namespace. It fails if a unified store already exists there.
 func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
-	defs, err := validateSchema(spec.Schema)
+	return create(dir, spec.Schema, true, opts...)
+}
+
+// CreateWithDefinitions creates a database-managed index using the schema's
+// authoritative definitions. It writes only physical index metadata, not a
+// second logical schema file. Standalone callers may continue using Create.
+func CreateWithDefinitions(dir string, definitions *schematypes.Definitions, opts ...Option) (*Store, error) {
+	indexes, err := indexDefinitions(definitions)
 	if err != nil {
 		return nil, err
 	}
-	storedSchema, err := cloneSchema(spec.Schema)
+	return create(dir, indexes, false, opts...)
+}
+
+func create(dir string, definitions *schematypes.Definitions, standalone bool, opts ...Option) (*Store, error) {
+	defs, err := validateSchema(definitions)
+	if err != nil {
+		return nil, err
+	}
+	storedSchema, err := cloneSchema(definitions)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +163,7 @@ func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 	if _, err := os.Stat(filepath.Join(dir, storeBinName)); err == nil {
 		return nil, fmt.Errorf("%w: %s already exists", ErrInvalidSchema, storeBinName)
 	}
-	s := &Store{dir: dir, opts: options, schema: storedSchema, defs: defs}
+	s := &Store{dir: dir, opts: options, schema: storedSchema, defs: defs, standalone: standalone}
 	// bitmapidx.NewStore requires an empty directory (its exclusive lock checks
 	// for foreign files), so every engine is created before the unified
 	// manifest and lock exist.
@@ -176,8 +193,50 @@ func Create(dir string, spec Spec, opts ...Option) (*Store, error) {
 // failures are reported through Health and do not prevent healthy namespaces
 // from opening; a query that needs an unavailable namespace fails explicitly.
 func Open(dir string, opts ...Option) (*Store, error) {
+	return open(dir, nil, opts...)
+}
+
+// OpenWithDefinitions opens a database-managed index from the authoritative
+// schema. An old schema.bin is checked for compatibility if present, but it is
+// not required and never becomes the runtime namespace registry.
+func OpenWithDefinitions(dir string, definitions *schematypes.Definitions, opts ...Option) (*Store, error) {
+	indexes, err := indexDefinitions(definitions)
+	if err != nil {
+		return nil, err
+	}
+	return open(dir, indexes, opts...)
+}
+
+func indexDefinitions(definitions *schematypes.Definitions) (*schematypes.Definitions, error) {
+	if definitions == nil {
+		return nil, ErrSchemaRequired
+	}
+	indexes := schematypes.NewDefinitions()
+	for _, def := range definitions.Defs() {
+		if def.Kind == schematypes.KindKV {
+			continue
+		}
+		if err := indexes.Register(def); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := validateSchema(indexes); err != nil {
+		return nil, err
+	}
+	return indexes, nil
+}
+
+// ValidateDefinitions checks all index namespaces of an authoritative schema
+// without creating physical engine files. It is used before publishing a
+// prepared schema generation.
+func ValidateDefinitions(definitions *schematypes.Definitions) error {
+	_, err := indexDefinitions(definitions)
+	return err
+}
+
+func open(dir string, supplied *schematypes.Definitions, opts ...Option) (*Store, error) {
 	options := applyOptions(opts)
-	schema, safe, flags, gens, err := readSchema(dir)
+	schema, safe, flags, gens, err := readSchema(dir, supplied)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +248,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock}
+	s := &Store{dir: dir, opts: options, schema: schema, defs: defs, lock: lock, standalone: supplied == nil}
 	// The flag is written before the first removal commits, so its absence
 	// proves no removal was ever durable and the fast path is safe.
 	s.liveRemovals.Store(flags&1 != 0)
@@ -291,14 +350,44 @@ func applyOptions(opts []Option) Options {
 }
 
 func (s *Store) writeSchema() error {
-	schemaBytes, err := s.schema.MarshalBinary()
+	if s.standalone {
+		schemaBytes, err := s.schema.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		if err := writeFileAtomic(s.dir, schemaBinName, schemaBytes); err != nil {
+			return err
+		}
+	}
+	return s.writeManifest()
+}
+
+// RetireLegacySchema removes the old logical schema copy after schema.dat has
+// been made authoritative. This is only valid for a database-managed opener;
+// standalone Open still needs schema.bin to discover its definitions.
+func (s *Store) RetireLegacySchema() error {
+	if s.standalone || s.closed.Load() {
+		return ErrInvalidSchema
+	}
+	path := filepath.Join(s.dir, schemaBinName)
+	legacy, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(s.dir, schemaBinName, schemaBytes); err != nil {
+	expected, err := s.schema.MarshalBinary()
+	if err != nil {
 		return err
 	}
-	return s.writeManifest()
+	if !bytes.Equal(legacy, expected) {
+		return errors.Join(schematypes.ErrNamespace, ErrInvalidSchema)
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return storage.SyncDir(s.dir)
 }
 
 // writeManifest persists the unified manifest: magic, version, namespace
@@ -330,7 +419,7 @@ func (s *Store) writeManifest() error {
 // readSchema loads and validates the unified manifest and schema. It returns
 // the schema, the recorded safe watermark, the header flags, and a dense
 // per-namespace generation slice indexed by namespace number.
-func readSchema(dir string) (*schematypes.Definitions, uint64, uint16, []uint64, error) {
+func readSchema(dir string, supplied *schematypes.Definitions) (*schematypes.Definitions, uint64, uint16, []uint64, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, storeBinName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -358,13 +447,30 @@ func readSchema(dir string) (*schematypes.Definitions, uint64, uint16, []uint64,
 	if len(body) != count*10 {
 		return nil, 0, 0, nil, ErrCorrupt
 	}
-	schemaBytes, err := os.ReadFile(filepath.Join(dir, schemaBinName))
-	if err != nil {
+	legacy, err := os.ReadFile(filepath.Join(dir, schemaBinName))
+	if err != nil && (supplied == nil || !errors.Is(err, os.ErrNotExist)) {
 		return nil, 0, 0, nil, err
 	}
-	schema := schematypes.NewDefinitions()
-	if err := schema.UnmarshalBinary(schemaBytes); err != nil {
-		return nil, 0, 0, nil, errors.Join(ErrCorrupt, err)
+	var schema *schematypes.Definitions
+	if supplied != nil {
+		schema, err = cloneSchema(supplied)
+		if err != nil {
+			return nil, 0, 0, nil, err
+		}
+		if legacy != nil {
+			current, err := schema.MarshalBinary()
+			if err != nil {
+				return nil, 0, 0, nil, err
+			}
+			if !bytes.Equal(legacy, current) {
+				return nil, 0, 0, nil, errors.Join(schematypes.ErrNamespace, ErrInvalidSchema)
+			}
+		}
+	} else {
+		schema = schematypes.NewDefinitions()
+		if err := schema.UnmarshalBinary(legacy); err != nil {
+			return nil, 0, 0, nil, errors.Join(ErrCorrupt, err)
+		}
 	}
 	defs := schema.Defs()
 	// The generation table must describe exactly the schema's namespaces: no

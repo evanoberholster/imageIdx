@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/evanoberholster/imageIdx/index"
+	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
@@ -62,6 +63,7 @@ type Options struct {
 }
 
 type DB struct {
+	owner     *os.File   // serializes schema startup, including close/reopen transitions
 	mu        sync.Mutex // serializes sequence allocation with the Pebble commit
 	values    *store.Store
 	ids       *schema.Schema
@@ -87,6 +89,9 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if decode == nil {
 		return nil, ErrInvalidMutation
 	}
+	if dir == "" {
+		return nil, store.ErrInvalidDir
+	}
 	if indexDir == "" || filepath.Clean(indexDir) == string(filepath.Separator) || filepath.Base(filepath.Clean(indexDir)) == "." {
 		return nil, fmt.Errorf("%w: unsafe index directory", ErrInvalidMutation)
 	}
@@ -96,17 +101,29 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if options.BatchSize > 64 {
 		return nil, fmt.Errorf("%w: batch size > 64", ErrInvalidMutation)
 	}
+	owner, err := storage.AcquireLock(filepath.Dir(dir), "."+filepath.Base(filepath.Clean(dir))+".database.lock", false)
+	if err != nil {
+		return nil, err
+	}
+	owned := true
+	defer func() {
+		if owned {
+			_ = storage.ReleaseLock(owner)
+		}
+	}()
 	var existing *schema.Schema
+	var fresh bool
 	path := filepath.Join(dir, "schema.dat")
 	_, statErr := os.Stat(path)
 	if errors.Is(statErr, os.ErrNotExist) {
-		complete, err := store.InspectSchemaMigration(dir)
+		present, complete, err := store.InspectDatabase(dir)
 		if err != nil {
 			return nil, err
 		}
 		if complete {
 			return nil, errors.Join(schema.ErrCorrupt, fmt.Errorf("database: missing authoritative schema.dat"))
 		}
+		fresh = !present
 	} else if statErr != nil {
 		return nil, statErr
 	}
@@ -115,6 +132,22 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		existing, openErr = schema.Open(path, schema.Options{})
 		if openErr != nil {
 			return nil, openErr
+		}
+		if existing.PreparedDefinitions() != nil {
+			if err := recoverPreparedSchema(existing, dir, indexDir, decode, options); err != nil {
+				_ = existing.Close()
+				return nil, err
+			}
+		}
+	}
+	if existing != nil && options.Definitions != nil && validateDefinitions(existing.Definitions(), options.Definitions) != nil {
+		var err error
+		existing, err = prepareSchemaAddition(existing, path, dir, indexDir, options.Definitions, decode, options)
+		if err != nil {
+			if existing != nil {
+				_ = existing.Close()
+			}
+			return nil, err
 		}
 	}
 	canonical, err := canonicalNamespaces(options.CanonicalNamespaces)
@@ -130,27 +163,82 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		}
 		return nil, err
 	}
-	var values *store.Store
-	if existing != nil {
-		kv := schema.NewDefinitions()
+	if fresh {
+		// Validate the independently created index before creating schema.dat.
+		// New Pebble directories are opened only after the central file is
+		// durable; the fresh path never writes a Pebble schema registry.
+		idx, err := index.Open(indexDir)
+		if err != nil {
+			return nil, err
+		}
+		defs := schema.NewDefinitions()
 		for _, spec := range canonicalSpecsFor(canonical) {
-			def := spec.NamespaceDef()
 			if spec.Entity.Valid() {
-				var ok bool
-				def, ok = existing.Lookup(spec.Namespace)
-				if !ok || def.Kind != schema.KindKV || def.Name != spec.Name || def.Entity != spec.Entity {
-					_ = existing.Close()
-					return nil, schema.ErrNamespace
+				if err = defs.Register(spec.NamespaceDef()); err != nil {
+					break
 				}
 			}
-			if err := kv.Register(def); err != nil {
+		}
+		if err == nil {
+			for _, def := range idx.Schema().Defs() {
+				if def.Namespace == journalNS || def.Namespace == metadataNS || def.Namespace == 0xFFF0 {
+					err = schema.ErrNamespace
+					break
+				}
+				if err = defs.Register(def); err != nil {
+					break
+				}
+			}
+		}
+		if err == nil && options.Definitions != nil {
+			err = validateDefinitions(options.Definitions, defs)
+		}
+		closeErr := idx.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+		entities := make([]schema.EntityConfig, 0, schema.EntityKindCount)
+		for e := schema.EntityImage; e.Valid(); e++ {
+			entities = append(entities, schema.EntityConfig{Entity: e, ReserveSize: 1000})
+		}
+		existing, err = schema.Open(path, schema.Options{Definitions: defs, Entities: entities})
+		if err != nil {
+			return nil, err
+		}
+	}
+	var values *store.Store
+	if existing != nil {
+		if !fresh {
+			present, _, err := store.InspectDatabase(dir)
+			if err != nil {
 				_ = existing.Close()
 				return nil, err
 			}
+			if !present {
+				_ = existing.Close()
+				return nil, schema.ErrCorrupt
+			}
 		}
-		values, err = store.OpenDefinitions(dir, kv)
+		kv, err := kvDefinitions(existing.Definitions())
+		if err != nil {
+			_ = existing.Close()
+			return nil, err
+		}
+		values, err = store.Open(dir, kv)
+		if err == nil && !existing.LegacyRetired() {
+			err = values.ValidateLegacyDefinitions(kv)
+			if err != nil {
+				_ = values.Close()
+			}
+		}
 	} else {
-		values, err = store.OpenWithExtension(dir, canonicalSpecsFor(canonical)...)
+		values, err = store.OpenLegacyWithExtension(dir, canonicalSpecsFor(canonical)...)
 	}
 	if err != nil {
 		if existing != nil {
@@ -158,7 +246,12 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		}
 		return nil, err
 	}
-	return openWithValues(values, dir, indexDir, decode, options, existing, canonical)
+	db, err := openWithValues(values, dir, indexDir, decode, options, existing, canonical)
+	if err != nil {
+		return nil, err
+	}
+	db.owner, owned = owner, false
+	return db, nil
 }
 
 func canonicalSpecs() []store.Spec {
@@ -221,12 +314,12 @@ func canonicalSpecsFor(canonical [schema.EntityKindCount + 1]schema.Namespace) [
 }
 
 func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, options Options, existing *schema.Schema, canonical [schema.EntityKindCount + 1]schema.Namespace) (*DB, error) {
-	if existing != nil {
+	if existing != nil && !existing.LegacyRetired() {
 		stored, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
 		if err == nil {
 			backup := schema.NewDefinitions()
 			if err = backup.UnmarshalBinary(stored); err == nil {
-				err = validateIndexDefinitions(existing.Definitions(), backup)
+				err = validateLegacyIndexCopy(existing.Definitions(), backup)
 			}
 		} else if errors.Is(err, store.ErrNotFound) {
 			err = nil
@@ -249,7 +342,13 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 		_ = values.Close()
 		return nil, err
 	}
-	idx, err := index.Open(indexDir)
+	var idx *index.Store
+	var err error
+	if authoritative != nil {
+		idx, err = index.OpenWithDefinitions(indexDir, authoritative)
+	} else {
+		idx, err = index.Open(indexDir) // one-time legacy bootstrap
+	}
 	openErr := err
 	if err != nil && options.Recovery != RecoveryAutomatic {
 		if existing != nil {
@@ -300,11 +399,6 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 	if err := db.openIDs(dir); err != nil {
 		return nil, err
 	}
-	if hadSchema {
-		if err := db.persistSchema(); err != nil {
-			return nil, err
-		}
-	}
 	idx = db.indexes
 	safe := idx.SourceGeneration()
 	if db.indexed > db.committed || safe < db.indexed || len(idx.RecoveryNamespaces()) != 0 || len(idx.DegradedNamespaces()) != 0 {
@@ -333,6 +427,49 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 	if db.indexed != 0 {
 		if err = db.cleanup(0, db.indexed); err != nil {
 			return nil, err
+		}
+	}
+	// The central allocator and logical schema are now durable, and the
+	// database and index have passed consistency checks. Retire legacy copies
+	// one at a time; an interrupted cleanup is safe to repeat on the next Open.
+	if hadSchema == false {
+		if err := db.indexes.Close(); err != nil {
+			return nil, err
+		}
+		db.indexes = nil
+		db.indexes, err = index.OpenWithDefinitions(indexDir, db.ids.Definitions())
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !db.ids.LegacyRetired() {
+		if err := values.RemoveLegacyDefinitions(); err != nil {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy Pebble schema cleanup")
+		}
+		if _, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID}); err == nil {
+			if err := values.Delete(store.Key{Namespace: metadataNS, ID: schemaKeyID}); err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy index backup cleanup")
+		}
+		if err := db.indexes.RetireLegacySchema(); err != nil {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy index schema cleanup")
+		}
+		if err := db.ids.MarkLegacyRetired(); err != nil {
+			return nil, err
+		}
+		if options.boundary != nil {
+			options.boundary("after legacy retirement sync")
 		}
 	}
 	go db.run()
@@ -612,5 +749,5 @@ func (db *DB) Close() error {
 	db.mu.Unlock()
 	idsErr := db.ids.Close()
 	<-db.done
-	return errors.Join(idsErr, db.indexes.Close(), db.values.Close())
+	return errors.Join(idsErr, db.indexes.Close(), db.values.Close(), storage.ReleaseLock(db.owner))
 }

@@ -10,18 +10,21 @@ import (
 	"github.com/evanoberholster/imageIdx/internal/storage"
 )
 
-// Format version 2: two 512-byte superblocks, followed by append-only
+// Format version 3: two 512-byte superblocks, followed by append-only
 // checksummed directories and 64-byte metadata slots. Integers are LE.
 // A directory entry is id:u16, nameLen:u16, block:u64, slotsOffset:u64,
 // name:nameLen. A directory starts with count:u16 and ends in CRC32C:u32.
 // Superblock payload: directory offset:u64, length:u64, CRC32C:u32,
 // entity count:u16, reserved:u16, end of committed file:u64,
-// definitions offset:u64, length:u64, CRC32C:u32, reserved:12 bytes.
+// definitions offset:u64, length:u64, CRC32C:u32, state:u8 (0 ACTIVE,
+// 1 PREPARED), legacy copies retired:u8, reserved:10 bytes. Version 2 has 12 zero reserved bytes and
+// is read as ACTIVE. A PREPARED slot's predecessor remains the active schema.
 // Directory keys are persisted EntityKind ordinals, not namespace IDs.
 // Metadata slot: generation:u64, reserved:u64, lastIssued:u64, clean:u8,
 // 35 zero bytes, CRC32C:u32 over the first 60 bytes.
 const (
-	SchemaVersion     uint16 = 2
+	SchemaVersion     uint16 = 3
+	previousVersion   uint16 = 2
 	superMagic        uint32 = 0x49445343 // IDSC
 	superBytes               = storage.SuperblockSlotBytes
 	metadataBytes            = 64
@@ -169,10 +172,11 @@ func parseSuper(src []byte, size uint64) (uint64, uint64, uint64, uint64, error)
 	if len(src) != superBytes {
 		return 0, 0, 0, 0, ErrCorrupt
 	}
-	if binary.LittleEndian.Uint32(src[:4]) == superMagic && binary.LittleEndian.Uint16(src[4:6]) != SchemaVersion {
+	version := binary.LittleEndian.Uint16(src[4:6])
+	if binary.LittleEndian.Uint32(src[:4]) == superMagic && version != SchemaVersion && version != previousVersion {
 		return 0, 0, 0, 0, ErrVersion
 	}
-	h, p, ok := storage.DecodeSuperblock(src, superMagic, SchemaVersion)
+	h, p, ok := storage.DecodeSuperblock(src, superMagic, version)
 	if !ok || h.Generation == 0 || len(p) != 64 || p[22] != 0 || p[23] != 0 {
 		return 0, 0, 0, 0, ErrCorrupt
 	}
@@ -184,7 +188,10 @@ func parseSuper(src []byte, size uint64) (uint64, uint64, uint64, uint64, error)
 	if defsOff != off+length || defsLen < 14 || defsLen > maxDirectory || defsOff > end || defsLen != end-defsOff {
 		return 0, 0, 0, 0, ErrCorrupt
 	}
-	for _, b := range p[52:] {
+	if version == previousVersion && (p[52] != 0 || p[53] != 0) || version == SchemaVersion && (p[52] > 1 || p[53] > 1) {
+		return 0, 0, 0, 0, ErrCorrupt
+	}
+	for _, b := range p[54:] {
 		if b != 0 {
 			return 0, 0, 0, 0, ErrCorrupt
 		}

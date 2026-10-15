@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -210,26 +211,72 @@ func TestMissingIndexSchemaRequiresExplicitRecovery(t *testing.T) {
 	}
 }
 
-func TestCanonicalSchemaMismatchStopsActivation(t *testing.T) {
+func TestCentralSchemaRebuildsWithoutLegacyIndexOrPebbleSchemaCopies(t *testing.T) {
+	data, dir := paths(t)
+	db := openTest(t, data, dir)
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection(1, 'x'), Record: []byte("kept")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, g)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "schema.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database-managed index retained schema.bin: %v", err)
+	}
+	pdb, err := pebble.Open(data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.EncodeKey(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+	if err := pdb.Delete(key[:], pebble.Sync); err != nil {
+		_ = pdb.Close()
+		t.Fatal(err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got, err := db.Get(schematypes.EntityImage, 1); err != nil || string(got) != "kept" {
+		t.Fatalf("canonical: %q %v", got, err)
+	}
+	contains(t, db, 1, 'x', true)
+	if _, err := os.Stat(filepath.Join(dir, "schema.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rebuild recreated schema.bin: %v", err)
+	}
+}
+
+func TestRetiredPebbleBackupCannotOverrideCentralSchema(t *testing.T) {
 	data, dir := paths(t)
 	db := openTest(t, data, dir)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	kvSpecs := canonicalSpecs()
-	kv, err := store.Open(data, kvSpecs...)
+	kv, err := pebble.Open(data, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := kv.Set(store.Key{Namespace: metadataNS, ID: schemaKeyID}, []byte("broken")); err != nil {
+	key := store.EncodeKey(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+	if err := kv.Set(key[:], []byte("broken"), pebble.Sync); err != nil {
 		t.Fatal(err)
 	}
 	if err := kv.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
-	if !errors.Is(err, ErrRecoveryRequired) {
-		t.Fatalf("invalid schema: %v", err)
+	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	if err != nil {
+		t.Fatalf("retired backup was consulted: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

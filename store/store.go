@@ -42,28 +42,12 @@ type Store struct {
 	namespaces map[schematypes.Namespace]struct{}
 }
 
-var schemaKey = EncodeKey(Key{}) // namespace zero is reserved for metadata
+var schemaKey = EncodeKey(Key{}) // obsolete registry, migration-only
 
-// Open creates or reopens a database. The registered namespace definitions
-// are persisted on creation and must match on every subsequent open.
-// Writes are synchronized before they return.
-func Open(dir string, specs ...Spec) (*Store, error) {
-	return open(dir, false, specs...)
-}
-
-// OpenWithExtension explicitly allows an additive append-only namespace
-// upgrade. Existing namespace definitions must match byte-for-byte and the
-// replacement schema is synced before returning. Only call while the database
-// is closed; Pebble's writer lock excludes competing processes.
-func OpenWithExtension(dir string, specs ...Spec) (*Store, error) {
-	return open(dir, true, specs...)
-}
-
-// OpenDefinitions consumes the caller's authoritative KV definitions without
-// rebuilding namespace names or ownership from store-specific specs. The
-// existing persisted copy must match; callers may use OpenWithExtension for
-// explicit legacy upgrades before adopting this path.
-func OpenDefinitions(dir string, definitions *schematypes.Definitions) (*Store, error) {
+// Open consumes the caller's authoritative KV definitions. It
+// never reads or writes a serialized schema in Pebble. Migration-only callers
+// must validate any legacy Pebble schema separately before using it.
+func Open(dir string, definitions *schematypes.Definitions) (*Store, error) {
 	if definitions == nil || definitions.Len() == 0 {
 		return nil, ErrEmptySpecs
 	}
@@ -74,11 +58,17 @@ func OpenDefinitions(dir string, definitions *schematypes.Definitions) (*Store, 
 		}
 		namespaces[def.Namespace] = struct{}{}
 	}
-	data, err := definitions.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	return openPrepared(dir, data, namespaces, false)
+	return openPrepared(dir, nil, namespaces, false)
+}
+
+// OpenLegacy exists only for reading or constructing pre-schema.dat fixtures.
+// It writes the historical Pebble schema key; never use it with schema.dat.
+func OpenLegacy(dir string, specs ...Spec) (*Store, error) { return open(dir, false, specs...) }
+
+// OpenLegacyWithExtension is the one-time append-only compatibility upgrade
+// for old stores before schema.dat has been durably published.
+func OpenLegacyWithExtension(dir string, specs ...Spec) (*Store, error) {
+	return open(dir, true, specs...)
 }
 
 func open(dir string, extend bool, specs ...Spec) (*Store, error) {
@@ -111,11 +101,68 @@ func openPrepared(dir string, schemaBytes []byte, namespaces map[schematypes.Nam
 	if err != nil {
 		return nil, err
 	}
-	if err := verifySchema(db, schemaBytes, extend); err != nil {
-		_ = db.Close()
-		return nil, err
+	if schemaBytes != nil {
+		if err := verifySchema(db, schemaBytes, extend); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	return &Store{db: db, namespaces: namespaces}, nil
+}
+
+// ValidateLegacyDefinitions is only for migrating a persisted Pebble schema
+// copy. It never writes, and a missing copy is already migrated.
+func (s *Store) ValidateLegacyDefinitions(expected *schematypes.Definitions) error {
+	data, err := expected.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	value, closer, err := s.db.Get(schemaKey[:])
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	matches := bytes.Equal(value, data)
+	if !matches {
+		var old, desired schematypes.Definitions
+		if old.UnmarshalBinary(value) == nil && desired.UnmarshalBinary(data) == nil {
+			before, after := old.Defs(), desired.Defs()
+			matches = len(before) <= len(after)
+			for i := 0; matches && i < len(before); i++ {
+				a, b := before[i], after[i]
+				ownerUpgrade := a.Entity == schematypes.EntityInvalid && b.Entity.Valid() &&
+					b.Entity == schematypes.EntityKind(b.Namespace) && b.Name == "entity-"+b.Entity.String()
+				matches = a.Namespace == b.Namespace && a.Name == b.Name && a.Kind == b.Kind &&
+					(a.Entity == b.Entity || ownerUpgrade) && bytes.Equal(a.Config, b.Config)
+			}
+		}
+	}
+	if err := closer.Close(); err != nil {
+		return err
+	}
+	if !matches {
+		return ErrSchemaMismatch
+	}
+	return nil
+}
+
+// RemoveLegacyDefinitions retires the old registry only after the caller has
+// durably installed schema.dat and validated the old copy. Repeating deletion
+// after an interrupted cleanup is safe.
+func (s *Store) RemoveLegacyDefinitions() error {
+	_, closer, err := s.db.Get(schemaKey[:])
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := closer.Close(); err != nil {
+		return err
+	}
+	return s.db.Delete(schemaKey[:], pebble.Sync)
 }
 
 func verifySchema(db *pebble.DB, expected []byte, extend bool) error {

@@ -8,12 +8,12 @@ import (
 	"slices"
 	"testing"
 
-	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/simhash"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/search"
 )
 
@@ -49,6 +49,84 @@ func testSchema(t testing.TB) *schematypes.Definitions {
 		t.Fatal(err)
 	}
 	return schema
+}
+
+func TestDatabaseManagedIndexUsesSuppliedDefinitions(t *testing.T) {
+	defs := schematypes.NewDefinitions()
+	if err := defs.RegisterAll(
+		schematypes.NamespaceDef{Namespace: 20, Name: "records", Kind: schematypes.KindKV, Entity: schematypes.EntityImage},
+		schematypes.NamespaceDef{Namespace: 101, Name: "created", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+	); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	idx, err := index.CreateWithDefinitions(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "schema.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("index persisted logical schema: %v", err)
+	}
+	idx, err = index.OpenWithDefinitions(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrong := schematypes.NewDefinitions()
+	if err := wrong.RegisterAll(
+		schematypes.NamespaceDef{Namespace: 20, Name: "records", Kind: schematypes.KindKV, Entity: schematypes.EntityImage},
+		schematypes.NamespaceDef{Namespace: 102, Name: "different", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := index.OpenWithDefinitions(dir, wrong); err == nil {
+		_ = opened.Close()
+		t.Fatal("accepted manifest with mismatched namespace IDs")
+	}
+}
+
+func TestLegacyIndexSchemaRequiresMatchingAuthority(t *testing.T) {
+	defs := testSchema(t)
+	dir := t.TempDir()
+	idx, err := index.Create(dir, index.Spec{Schema: defs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	full := schematypes.NewDefinitions()
+	if err := full.Register(schematypes.NamespaceDef{Namespace: 20, Name: "records", Kind: schematypes.KindKV, Entity: schematypes.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	if err := full.RegisterAll(defs.Defs()...); err != nil {
+		t.Fatal(err)
+	}
+	idx, err = index.OpenWithDefinitions(dir, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.RetireLegacySchema(); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "schema.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy schema not retired: %v", err)
+	}
+	idx, err = index.OpenWithDefinitions(dir, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCreateAddSearchReopen(t *testing.T) {

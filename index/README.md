@@ -12,9 +12,12 @@ imageIdx index families in one root directory.
 | `KindVector` | `vectoridx` | `vector-<hex>.idx` (+ `.manifest`/`.wal`/`.delta`) |
 | `KindBitmap*` | `bitmapidx` | `manifest`, `namespaces-*.idx`/`.wal` (one Store, many namespaces) |
 
-The unified manifest is `store.bin` (magic `UIDX`, version 2) and the persisted
-schema is `schema.bin`. No per-family or per-namespace subdirectories are
-created.
+The unified manifest is `store.bin` (magic `UIDX`, version 2). No per-family or
+per-namespace subdirectories are created. `index.Create`/`Open` remain
+standalone entry points and persist `schema.bin` for independent use.
+Database-managed operation uses `CreateWithDefinitions`/`OpenWithDefinitions`,
+which consume `schema.dat`'s definitions and never create `schema.bin`; an old
+`schema.bin` is validated once and retired.
 
 ## Entity model
 
@@ -30,10 +33,12 @@ entity, and deleting `ImageID 100` never affects `FaceID 100`.
 
 ## Schema
 
-Namespaces are registered in a `schema.Definitions` before `Create`/`Open` and never
-at runtime. The schema is persisted (`schema.bin`) and validated on reopen.
-`schema.Definitions` uses version 2, which stores the entity kind; version-1 blobs
-load as `EntityInvalid` and are rejected.
+Namespaces are registered in a `schema.Definitions` before `Create`/`Open` and
+never at runtime. Standalone stores persist `schema.bin`; database-managed
+stores receive definitions from `schema.dat`. `schema.Definitions` uses
+version 2, which stores the entity kind; version-1 blobs load as `EntityInvalid`
+and are rejected. `validateSchema` accepts only index kinds, so KV definitions
+never enter an engine routing table.
 
 Helpers encode engine configuration into `NamespaceDef.Config`:
 
