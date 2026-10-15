@@ -238,7 +238,11 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 		}
 	}
 	// A prior activation must be completed before reading the active index.
-	if err := resumeActivation(indexDir, values, options.boundary); err != nil {
+	var authoritative *schema.Definitions
+	if existing != nil {
+		authoritative = existing.Definitions()
+	}
+	if err := resumeActivation(indexDir, values, authoritative, options.boundary); err != nil {
 		if existing != nil {
 			_ = existing.Close()
 		}

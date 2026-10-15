@@ -216,7 +216,11 @@ func (db *DB) rebuildOnOpen(dir string) error {
 		}
 		db.indexes = nil
 	}
-	if err := resumeActivation(dir, db.values, db.options.boundary); err != nil {
+	var authoritative *schematypes.Definitions
+	if db.ids != nil {
+		authoritative = db.ids.Definitions()
+	}
+	if err := resumeActivation(dir, db.values, authoritative, db.options.boundary); err != nil {
 		return err
 	}
 	db.indexes, err = index.Open(dir)
@@ -437,7 +441,7 @@ func verifyReplacement(path string, generation uint64, schemaCRC uint32) error {
 // resumeActivation is called only during Open, before publishing any index
 // pointers. The verified marker is the atomic *authorization* to publish;
 // directory renames are retried until indexDir names the verified generation.
-func resumeActivation(dir string, values *store.Store, boundary func(string)) error {
+func resumeActivation(dir string, values *store.Store, authoritative *schematypes.Definitions, boundary func(string)) error {
 	if _, err := os.Stat(activationPath(dir)); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
@@ -447,7 +451,21 @@ func resumeActivation(dir string, values *store.Store, boundary func(string)) er
 	if err != nil {
 		return err
 	}
-	canonicalSchema, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+	var canonicalSchema []byte
+	if authoritative != nil {
+		indexDefs := schematypes.NewDefinitions()
+		for _, def := range authoritative.Defs() {
+			if def.Kind != schematypes.KindKV {
+				if err := indexDefs.Register(def); err != nil {
+					return errors.Join(ErrRecoveryRequired, err)
+				}
+			}
+		}
+		canonicalSchema, err = indexDefs.MarshalBinary()
+	} else {
+		// Only the one-time legacy bootstrap may use Pebble's schema copy.
+		canonicalSchema, err = values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+	}
 	if err != nil || crc32.ChecksumIEEE(canonicalSchema) != a.schemaCRC {
 		return ErrRecoveryRequired
 	}
