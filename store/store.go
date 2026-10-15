@@ -59,6 +59,28 @@ func OpenWithExtension(dir string, specs ...Spec) (*Store, error) {
 	return open(dir, true, specs...)
 }
 
+// OpenDefinitions consumes the caller's authoritative KV definitions without
+// rebuilding namespace names or ownership from store-specific specs. The
+// existing persisted copy must match; callers may use OpenWithExtension for
+// explicit legacy upgrades before adopting this path.
+func OpenDefinitions(dir string, definitions *schematypes.Definitions) (*Store, error) {
+	if definitions == nil || definitions.Len() == 0 {
+		return nil, ErrEmptySpecs
+	}
+	namespaces := make(map[schematypes.Namespace]struct{}, definitions.Len())
+	for _, def := range definitions.Defs() {
+		if def.Kind != schematypes.KindKV {
+			return nil, fmt.Errorf("store: namespace %d is not KV: %w", def.Namespace, ErrSchemaMismatch)
+		}
+		namespaces[def.Namespace] = struct{}{}
+	}
+	data, err := definitions.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return openPrepared(dir, data, namespaces, false)
+}
+
 func open(dir string, extend bool, specs ...Spec) (*Store, error) {
 	if dir == "" {
 		return nil, ErrInvalidDir
@@ -77,6 +99,13 @@ func open(dir string, extend bool, specs ...Spec) (*Store, error) {
 	schemaBytes, err := schema.MarshalBinary()
 	if err != nil {
 		return nil, err
+	}
+	return openPrepared(dir, schemaBytes, namespaces, extend)
+}
+
+func openPrepared(dir string, schemaBytes []byte, namespaces map[schematypes.Namespace]struct{}, extend bool) (*Store, error) {
+	if dir == "" {
+		return nil, ErrInvalidDir
 	}
 	db, err := pebble.Open(dir, nil)
 	if err != nil {

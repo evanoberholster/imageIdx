@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
+	"unicode/utf8"
 )
 
 var (
@@ -41,9 +43,8 @@ type NamespaceDef struct {
 
 // Definitions is an ordered set of unique namespace definitions. The zero value
 // is a valid empty schema. It is not safe for concurrent mutation: register
-// namespaces during setup before sharing the schema. Definitions are copied
-// on Register and on UnmarshalBinary, and returned slices share their Config
-// bytes, which callers must treat as read-only.
+// namespaces during setup before sharing the schema. Config is copied both
+// when registered and when returned, so callers cannot mutate its contents.
 type Definitions struct {
 	defs   []NamespaceDef
 	byID   map[Namespace]int
@@ -59,7 +60,7 @@ func (s *Definitions) Register(def NamespaceDef) error {
 	if !def.Namespace.Valid() {
 		return ErrNamespaceInvalid
 	}
-	if def.Name == "" {
+	if def.Name == "" || !utf8.ValidString(def.Name) || len(def.Name) > math.MaxUint16 {
 		return ErrNamespaceName
 	}
 	if !def.Kind.Valid() {
@@ -106,7 +107,19 @@ func (s *Definitions) Lookup(ns Namespace) (NamespaceDef, bool) {
 	if !ok {
 		return NamespaceDef{}, false
 	}
-	return s.defs[index], true
+	return cloneDef(s.defs[index]), true
+}
+
+// LookupIdentity returns only immutable scalar metadata, without copying
+// Config. Use Lookup when kind-specific configuration is needed.
+func (s *Definitions) LookupIdentity(ns Namespace) (NamespaceDef, bool) {
+	index, ok := s.byID[ns]
+	if !ok {
+		return NamespaceDef{}, false
+	}
+	def := s.defs[index]
+	def.Config = nil
+	return def, true
 }
 
 // LookupName returns the definition for a namespace name.
@@ -118,7 +131,12 @@ func (s *Definitions) LookupName(name string) (NamespaceDef, bool) {
 	if !ok {
 		return NamespaceDef{}, false
 	}
-	return s.defs[index], true
+	return cloneDef(s.defs[index]), true
+}
+
+func cloneDef(def NamespaceDef) NamespaceDef {
+	def.Config = append([]byte(nil), def.Config...)
+	return def
 }
 
 // Len returns the number of registered namespaces.
@@ -126,7 +144,11 @@ func (s *Definitions) Len() int { return len(s.defs) }
 
 // Defs returns a copy of the registered definitions in registration order.
 func (s *Definitions) Defs() []NamespaceDef {
-	return append([]NamespaceDef(nil), s.defs...)
+	out := make([]NamespaceDef, len(s.defs))
+	for i, def := range s.defs {
+		out[i] = cloneDef(def)
+	}
+	return out
 }
 
 // DefsOfKind returns a copy of the definitions with the given kind, in
@@ -135,7 +157,7 @@ func (s *Definitions) DefsOfKind(kind NamespaceKind) []NamespaceDef {
 	var out []NamespaceDef
 	for _, def := range s.defs {
 		if def.Kind == kind {
-			out = append(out, def)
+			out = append(out, cloneDef(def))
 		}
 	}
 	return out
@@ -147,7 +169,7 @@ func (s *Definitions) DefsOfEntity(entity EntityKind) []NamespaceDef {
 	var out []NamespaceDef
 	for _, def := range s.defs {
 		if def.Entity == entity {
-			out = append(out, def)
+			out = append(out, cloneDef(def))
 		}
 	}
 	return out
@@ -167,7 +189,14 @@ const (
 // 10-byte header plus name and config bytes either way.
 func (s *Definitions) MarshalBinary() ([]byte, error) {
 	size := 4 + 2 + 4 + 4 // magic, version, count, crc
+	if uint64(len(s.defs)) > math.MaxUint32 {
+		return nil, ErrCorruptSchema
+	}
 	for _, def := range s.defs {
+		if len(def.Name) > math.MaxUint16 || uint64(len(def.Config)) > math.MaxUint32 ||
+			len(def.Name) > math.MaxInt-size-10 || len(def.Config) > math.MaxInt-size-10-len(def.Name) {
+			return nil, ErrCorruptSchema
+		}
 		size += 2 + 1 + 1 + 2 + 4 + len(def.Name) + len(def.Config)
 	}
 	out := make([]byte, 0, size)
@@ -204,7 +233,7 @@ func (s *Definitions) UnmarshalBinary(data []byte) error {
 		return ErrCorruptSchema
 	}
 	count := binary.LittleEndian.Uint32(body[6:10])
-	if uint64(count) > uint64(len(body)) {
+	if uint64(count) > uint64(len(body)-10)/10 {
 		return ErrCorruptSchema
 	}
 	next := &Definitions{}
@@ -222,11 +251,13 @@ func (s *Definitions) UnmarshalBinary(data []byte) error {
 		// never a silently fabricated entity.
 		if version >= schemaVersion {
 			def.Entity = EntityKind(body[offset+3])
+		} else if body[offset+3] != 0 {
+			return ErrCorruptSchema
 		}
 		nameLen := int(binary.LittleEndian.Uint16(body[offset+4 : offset+6]))
 		configLen := int(binary.LittleEndian.Uint32(body[offset+6 : offset+10]))
 		offset += 10
-		if offset+nameLen+configLen > len(body) {
+		if nameLen > len(body)-offset || configLen > len(body)-offset-nameLen {
 			return ErrCorruptSchema
 		}
 		def.Name = string(body[offset : offset+nameLen])

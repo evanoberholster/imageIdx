@@ -121,19 +121,27 @@ func (db *DB) persistSchema() error {
 // single-directory format, so every declared namespace is reconstructed.
 func (db *DB) rebuildOnOpen(dir string) error {
 	schema, err := db.persistedSchema()
-	if errors.Is(err, store.ErrNotFound) && db.indexes != nil {
+	missingBackup := errors.Is(err, store.ErrNotFound)
+	if missingBackup && db.indexes != nil {
 		schema = db.indexes.Schema()
-		data, e := schema.MarshalBinary()
-		if e != nil {
-			return e
-		}
-		if e = db.values.Set(store.Key{Namespace: metadataNS, ID: schemaKeyID}, data); e != nil {
-			return e
-		}
 		err = nil
 	}
 	if err != nil {
 		return fmt.Errorf("%w: no authoritative schema: %v", ErrRecoveryRequired, err)
+	}
+	if db.ids != nil {
+		if err := validateIndexDefinitions(db.ids.Definitions(), schema); err != nil {
+			return err
+		}
+	}
+	if missingBackup {
+		data, err := schema.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		if err := db.values.Set(store.Key{Namespace: metadataNS, ID: schemaKeyID}, data); err != nil {
+			return err
+		}
 	}
 	marker := activationPath(dir)
 	if _, err := os.Stat(marker); err == nil {
@@ -246,7 +254,7 @@ func (db *DB) scanRebuild(stage *index.Store, schema *schematypes.Definitions, b
 		used = 0
 		return nil
 	}
-	err := db.values.ScanFrom(schematypes.Namespace(entity), 0, func(key store.Key, raw []byte) (bool, error) {
+	err := db.values.ScanFrom(db.canonical[entity], 0, func(key store.Key, raw []byte) (bool, error) {
 		if db.options.boundary != nil {
 			db.options.boundary("during rebuild scan")
 		}

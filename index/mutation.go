@@ -7,13 +7,13 @@ import (
 	"math"
 	"sync/atomic"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // DeleteOp removes one entity of a kind. Deletion is logical: liveness for the
@@ -280,7 +280,7 @@ func (s *Store) batchMayPartiallyPersist() bool {
 				continue
 			}
 			units++
-			if def, ok := s.schema.Lookup(schema.Namespace(w*64 + bit)); ok && crashDurableDuringApply(def.Kind) {
+			if def, ok := s.schema.LookupIdentity(schema.Namespace(w*64 + bit)); ok && crashDurableDuringApply(def.Kind) {
 				anyDurable = true
 			}
 		}
@@ -360,7 +360,7 @@ func (s *Store) advanceTouchedCompleteness(gen uint64) (bool, error) {
 				s.nsSource[ns] = gen
 				advanced = true
 			}
-			if def, ok := s.schema.Lookup(ns); ok && def.Kind == schema.KindTimestamp {
+			if def, ok := s.schema.LookupIdentity(ns); ok && def.Kind == schema.KindTimestamp {
 				if idx, ok := s.reg.timeIndex(ns); ok {
 					if err := applyTimeGeneration(idx, gen); err != nil {
 						return advanced, err
@@ -427,7 +427,7 @@ func (s *Store) advanceAllCompleteness(gen uint64) error {
 // Apply already left crash-recoverable state, so re-checkpointing them would be
 // redundant write amplification.
 func (s *Store) syncNamespace(ns schema.Namespace) error {
-	def, ok := s.schema.Lookup(ns)
+	def, ok := s.schema.LookupIdentity(ns)
 	if !ok || !s.health[ns].Available || s.isDegraded(ns) {
 		return nil
 	}
@@ -756,7 +756,7 @@ func (s *Store) prevalidateEntry(e Entry) error {
 }
 
 func (s *Store) pvKind(ns schema.Namespace, want schema.NamespaceKind) error {
-	def, ok := s.schema.Lookup(ns)
+	def, ok := s.schema.LookupIdentity(ns)
 	if !ok || def.Kind != want {
 		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, ns)
 	}
@@ -768,7 +768,7 @@ func (s *Store) pvKind(ns schema.Namespace, want schema.NamespaceKind) error {
 }
 
 func (s *Store) pvBitmap(v BitmapValue) error {
-	def, ok := s.schema.Lookup(v.Namespace)
+	def, ok := s.schema.LookupIdentity(v.Namespace)
 	if !ok || !def.Kind.IsBitmap() || def.Kind != v.Value.Kind {
 		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, v.Namespace)
 	}
@@ -780,7 +780,7 @@ func (s *Store) pvBitmap(v BitmapValue) error {
 }
 
 func (s *Store) pvSim(ns schema.Namespace, id schema.ValueID) error {
-	def, ok := s.schema.Lookup(ns)
+	def, ok := s.schema.LookupIdentity(ns)
 	if !ok || def.Kind != schema.KindHashPerceptual {
 		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, ns)
 	}
@@ -823,7 +823,7 @@ func (s *Store) pvSim(ns schema.Namespace, id schema.ValueID) error {
 }
 
 func (s *Store) pvVector(v VectorValue, id schema.ValueID) error {
-	def, ok := s.schema.Lookup(v.Namespace)
+	def, ok := s.schema.LookupIdentity(v.Namespace)
 	if !ok || def.Kind != schema.KindVector {
 		return fmt.Errorf("%w: namespace %d", ErrWrongEngine, v.Namespace)
 	}

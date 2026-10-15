@@ -10,9 +10,9 @@ key-value collection, **not** a namespace routed by `index.Store`.
 
 | Import suffix | Role | Unified namespace kind |
 |---|---|---|
-| `schema` | entity IDs, namespace definitions, persistent schema and ID allocation, durability | — |
+| `schema` | entity/canonical namespace relationships, authoritative namespace definitions, schema versions, persistent ValueID allocation, durability | — |
 | `index` | unified persistent store, typed routing, mutations, liveness, recovery, import matcher | owns the six families below |
-| `database` | authoritative Pebble records, atomic mutation journal, durable indexing coordinator and generation waits | owns a separate canonical `store.Store` and `index.Store` |
+| `database` | lifecycle coordination, canonical commits, mutation journal, reconciliation and generation waits | owns a separate canonical `store.Store`, `schema.Schema`, and `index.Store` |
 | `index/bitmapidx` | enum, bool, analyzed text, signed continuous grid, unsigned 16/32-bit bit-sliced index (BSI) | `KindBitmapEnum`, `KindBitmapBool`, `KindBitmapString`, `KindBitmapContinuous`, `KindBitmapBSI` |
 | `index/timeidx` | timestamp range index | `KindTimestamp` |
 | `index/geoidx` | level-19 S2 geographic index | `KindGeo` |
@@ -21,7 +21,7 @@ key-value collection, **not** a namespace routed by `index.Store`.
 | `index/vectoridx` | HNSW vector search and exact reference search | `KindVector` |
 | `search`, `search/ranking` | AND query planning/execution, ranking and fusion | — |
 | `roar` | immutable, serialized bitmap sets | — |
-| `store` | persisted canonical values and independent Pebble collections | `KindKV`; database validates these against the central schema |
+| `store` | Pebble lifecycle, persisted canonical values and KV batches | `KindKV`; database validates compatibility metadata against the central schema |
 
 All imports start with `github.com/evanoberholster/imageIdx/`. A
 `schema.Namespace` is a nonzero `uint16`; its number and name must be unique

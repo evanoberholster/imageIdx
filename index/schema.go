@@ -4,9 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
 // livenessNamespace is the reserved bitmap namespace that stores entity
@@ -121,9 +121,6 @@ func validateSchema(schema *schematypes.Definitions) ([]schematypes.NamespaceDef
 		return nil, fmt.Errorf("%w: no namespaces", ErrInvalidSchema)
 	}
 	defs := schema.Defs()
-	for i := range defs {
-		defs[i].Config = append([]byte(nil), defs[i].Config...)
-	}
 	for _, def := range defs {
 		if def.Namespace == livenessNamespace {
 			return nil, fmt.Errorf("%w: namespace %d is reserved for liveness", ErrInvalidSchema, livenessNamespace)

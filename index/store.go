@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
@@ -18,6 +17,7 @@ import (
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
 const (
@@ -206,7 +206,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		// namespaces incomplete; they must not silently become healthy.
 		s.pendingSet = rec
 		for _, ns := range namespacesOfBitSet(rec) {
-			if _, ok := s.schema.Lookup(ns); ok {
+			if _, ok := s.schema.LookupIdentity(ns); ok {
 				s.markDegraded(ns, ErrRecoveryRequired)
 				s.health[ns].NeedsRebuild = true
 			}
@@ -643,7 +643,7 @@ func (s *Store) openTime(create bool) error {
 	}
 	s.timeStore = store
 	for _, res := range results {
-		def, _ := s.schema.Lookup(res.Namespace)
+		def, _ := s.schema.LookupIdentity(res.Namespace)
 		h := &s.health[res.Namespace]
 		h.Kind, h.Entity = def.Kind, def.Entity
 		if res.Err != nil {
@@ -830,7 +830,6 @@ func (s *Store) NamespaceDef(ns schematypes.Namespace) (schematypes.NamespaceDef
 	if !ok {
 		return schematypes.NamespaceDef{}, false
 	}
-	def.Config = append([]byte(nil), def.Config...)
 	return def, true
 }
 
@@ -864,7 +863,7 @@ func (s *Store) HealthOf(ns schematypes.Namespace) (NamespaceHealth, bool) {
 func (s *Store) NamespaceSourceGeneration(ns schematypes.Namespace) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.schema.Lookup(ns); !ok {
+	if _, ok := s.schema.LookupIdentity(ns); !ok {
 		return 0, false
 	}
 	return s.nsSource[ns], true

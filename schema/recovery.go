@@ -198,19 +198,35 @@ func (s *Schema) recover(defs []directoryEntry) error {
 	if err := stored.UnmarshalBinary(storedDefinitions); err != nil {
 		return errors.Join(ErrCorrupt, err)
 	}
-	prior, desired := stored.Defs(), s.definitions.Defs()
-	if len(prior) > len(desired) {
-		return ErrNamespace
-	}
-	for i, p := range prior {
-		d := desired[i]
-		if p.Namespace != d.Namespace || p.Name != d.Name || p.Kind != d.Kind || p.Entity != d.Entity || !bytes.Equal(p.Config, d.Config) {
+	if s.definitions == nil {
+		s.definitions, s.definitionsData = stored, storedDefinitions
+	} else {
+		prior, desired := stored.Defs(), s.definitions.Defs()
+		if len(prior) > len(desired) {
 			return ErrNamespace
+		}
+		for i, p := range prior {
+			d := desired[i]
+			if p.Namespace != d.Namespace || p.Name != d.Name || p.Kind != d.Kind || p.Entity != d.Entity || !bytes.Equal(p.Config, d.Config) {
+				return ErrNamespace
+			}
 		}
 	}
 	entries, err := parseDirectory(dir, c.end)
 	if err != nil {
 		return err
+	}
+	if defs == nil {
+		expected, _, _, err := configs(Options{Definitions: stored})
+		if err != nil || len(expected) != len(entries) {
+			return ErrCorrupt
+		}
+		for i := range expected {
+			if expected[i].id != entries[i].id || expected[i].name != entries[i].name {
+				return ErrCorrupt
+			}
+		}
+		defs = entries
 	}
 	for _, e := range entries {
 		if e.offset < c.end && c.off < e.offset+metadataPairBytes {

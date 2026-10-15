@@ -41,6 +41,62 @@ func TestNextIDAbandonedAndReopen(t *testing.T) {
 	}
 }
 
+func TestCanonicalNamespaceIndependentOfEntityKind(t *testing.T) {
+	data, idx := paths(t)
+	var options Options
+	options.CanonicalNamespaces[schema.EntityImage] = 100
+	options.CanonicalNamespaces[schema.EntityFace] = 200
+	db, err := Open(data, idx, decodeTest, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []schema.EntityKind{schema.EntityImage, schema.EntityFace} {
+		if id, err := db.NextID(e); id != 1 || err != nil {
+			t.Fatalf("%v: %d %v", e, id, err)
+		}
+	}
+	if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Record: []byte("image"), Projection: projection(1, 'x')}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.values.Get(store.Key{Namespace: 100, ID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(data, idx, decodeTest, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Get(schema.EntityImage, 1); err != nil || string(got) != "image" {
+		t.Fatalf("reopen record: %q %v", got, err)
+	}
+	if def, ok := db.ids.Lookup(100); !ok || def.Entity != schema.EntityImage {
+		t.Fatalf("canonical owner: %+v %v", def, ok)
+	}
+	if def, ok := db.ids.Lookup(101); !ok || def.Entity != schema.EntityImage {
+		t.Fatalf("index owner: %+v %v", def, ok)
+	}
+	if id, err := db.NextID(schema.EntityImage); id != 2 || err != nil {
+		t.Fatalf("reopen image: %d %v", id, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(data, idx, decodeTest, Options{})
+	if err != nil {
+		t.Fatalf("persisted canonical assignment not loaded: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var wrong Options
+	wrong.CanonicalNamespaces[schema.EntityImage] = 1
+	if _, err := Open(data, idx, decodeTest, wrong); err == nil {
+		t.Fatal("accepted reassigned canonical namespace")
+	}
+}
+
 func TestOpenRejectsCollidingCanonicalAndIndexNamespaces(t *testing.T) {
 	root := t.TempDir()
 	data, idxPath := filepath.Join(root, "data"), filepath.Join(root, "index")
@@ -62,6 +118,106 @@ func TestOpenRejectsCollidingCanonicalAndIndexNamespaces(t *testing.T) {
 	}
 	if !errors.Is(err, schema.ErrNamespaceDuplicate) {
 		t.Fatalf("collision error: %v", err)
+	}
+}
+
+func TestPersistedCentralSchemaRejectsDifferentIndexCopy(t *testing.T) {
+	data, idxPath := paths(t)
+	db := openTest(t, data, idxPath)
+	if _, err := db.NextID(schema.EntityImage); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(t.TempDir(), "different-index")
+	defs := schema.NewDefinitions()
+	if err := defs.Register(schema.NamespaceDef{Namespace: 101, Name: "different", Kind: schema.KindTimestamp, Entity: schema.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := index.Create(otherPath, index.Spec{Schema: defs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if db, err := Open(data, otherPath, decodeTest, Options{}); db != nil || !errors.Is(err, schema.ErrNamespace) {
+		if db != nil {
+			_ = db.Close()
+		}
+		t.Fatalf("accepted conflicting index schema: %v", err)
+	}
+	db = openTest(t, data, idxPath)
+	defer db.Close()
+	if id, err := db.NextID(schema.EntityImage); err != nil || id != 2 {
+		t.Fatalf("original identity lost: %d %v", id, err)
+	}
+}
+
+func TestBootstrapDoesNotPublishSchemaWithConflictingBackup(t *testing.T) {
+	data, idxPath := paths(t)
+	kv, err := store.Open(data, canonicalSpecs()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Set(store.Key{Namespace: metadataNS, ID: schemaKeyID}, []byte("broken")); err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if db, err := Open(data, idxPath, decodeTest, Options{}); db != nil || !errors.Is(err, ErrRecoveryRequired) {
+		if db != nil {
+			_ = db.Close()
+		}
+		t.Fatalf("accepted invalid backup: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(data, "schema.dat")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("published central schema before validating backup: %v", err)
+	}
+}
+
+func TestExplicitAuthoritativeDefinitionsOnCreation(t *testing.T) {
+	data, idxPath := paths(t)
+	idx, err := index.Open(idxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defs := schema.NewDefinitions()
+	for _, spec := range canonicalSpecs() {
+		if spec.Entity.Valid() {
+			if err := defs.Register(spec.NamespaceDef()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, def := range idx.Schema().Defs() {
+		if err := defs.Register(def); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(data, idxPath, decodeTest, Options{Definitions: defs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openTest(t, data, idxPath)
+	if _, ok := db.ids.Lookup(tagNS); !ok {
+		t.Fatal("lost authoritative index namespace")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrong := schema.NewDefinitions()
+	_ = wrong.Register(schema.NamespaceDef{Namespace: 100, Name: "wrong", Kind: schema.KindKV, Entity: schema.EntityImage})
+	if _, err := Open(data, idxPath, decodeTest, Options{Definitions: wrong}); !errors.Is(err, schema.ErrNamespace) {
+		t.Fatalf("accepted different authoritative definitions: %v", err)
 	}
 }
 
@@ -102,6 +258,48 @@ func TestCommitReconcilesExternalID(t *testing.T) {
 	defer db.Close()
 	if id, err := db.NextID(schema.EntityImage); id != 5202 || err != nil {
 		t.Fatalf("reopen issued old ID: %d, %v", id, err)
+	}
+}
+
+func TestExplicitIDCannotRevokePreviouslyIssuedID(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	defer db.Close()
+	issued := make(chan schema.ValueID, 1)
+	go func() { id, _ := db.NextID(schema.EntityImage); issued <- id }()
+	id := <-issued
+	if id != 1 {
+		t.Fatalf("first issued ID: %d", id)
+	}
+	// This is legal last-writer-wins record creation, but proves EnsureMinimum
+	// cannot promise to prevent collision with an outstanding issued ID.
+	if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: id, Projection: projection(id, 'e')}); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := db.NextID(schema.EntityImage); err != nil || next != id+1 {
+		t.Fatalf("future ID: %d %v", next, err)
+	}
+}
+
+func TestPrepareImportBeforeAllocation(t *testing.T) {
+	data, idx := paths(t)
+	db := openTest(t, data, idx)
+	if err := db.PrepareImport(schema.EntityImage, 5000); err != nil {
+		t.Fatal(err)
+	}
+	if image, err := db.NextID(schema.EntityImage); err != nil || image != 5001 {
+		t.Fatalf("import floor: %d %v", image, err)
+	}
+	if person, err := db.NextID(schema.EntityPerson); err != nil || person != 1 {
+		t.Fatalf("independent entity: %d %v", person, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openTest(t, data, idx)
+	defer db.Close()
+	if image, err := db.NextID(schema.EntityImage); err != nil || image != 5002 {
+		t.Fatalf("reopen import floor: %d %v", image, err)
 	}
 }
 

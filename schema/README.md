@@ -9,6 +9,9 @@ the same ValueID sequence. Different entities may use the same numeric ID.
 the definitions and locks the file until `Close`. Registration-order binary
 encoding (`NSPC` v2) is unchanged; v1 definitions still decode with an invalid
 entity, which must be assigned before allocating IDs.
+`Open(path, Options{})` opens only an existing file and loads its persisted
+definitions under the exclusive lock. Lookup returns owned Config bytes;
+`LookupIdentity` omits Config and allocates nothing.
 
 The single file has two alternating checksummed 512-byte superblocks, two
 checksummed 64-byte reservation slots per entity, and append-only directories.
@@ -21,6 +24,9 @@ An allocator file from v1 is rejected with `ErrVersion`: reinterpreting its
 namespace counters as entity counters would permit ID reuse. No automatic v1
 allocator-file conversion is attempted. Existing KV/index definition blobs use
 their original serialization and are compared to the central snapshot on open.
+Format v1 appeared on the unmerged PR branch and no repository releases
+contain it; use outside that branch cannot be ruled out, so any deployment
+that used it requires a separate offline migration before adopting v2.
 
 `BackendReadWrite` (default) uses `ReadAt`/`WriteAt`/`Sync`;
 `BackendMmap` uses the same format through `internal/storage.MappedFile`.
@@ -36,3 +42,7 @@ Durability assumes the storage device honors acknowledged syncs.
 canonical values; index packages own secondary indexes. A database with
 duplicate numeric namespaces across KV and index definitions fails explicitly
 instead of silently renumbering durable identifiers.
+The canonical KV namespace is an explicit entity-to-namespace relationship;
+its number need not equal the entity ordinal. Historical assignments retain
+their original numbers. Database namespace additions require a coordinated
+startup migration; mismatched compatibility copies currently fail closed.

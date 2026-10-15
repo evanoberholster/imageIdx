@@ -12,6 +12,27 @@ numbers and names; conflicting preexisting layouts fail to open rather than
 silently renumbering persisted identifiers. Allocation-file format v1 is not
 automatically converted; it returns `schema.ErrVersion` rather than risking
 reuse of IDs allocated under namespace-scoped semantics.
+
+On reopen, the central schema file is read first. The database resolves each
+entity's canonical namespace from its persisted `entity-<kind>` KV definition
+and validates the existing Pebble and index copies against it. New databases
+may supply `Options.Definitions` as the complete authoritative model and
+`Options.CanonicalNamespaces[entity]` to select a different KV namespace;
+zero uses the historical assignment on first creation. Reopens without
+overrides use the persisted relationship. Index and Pebble schema copies remain
+compatibility metadata; mismatches fail closed. There is no general
+cross-package namespace-addition API yet: do not manually extend one copy and
+expect the database to publish it as a new schema generation. Legacy first-open
+Pebble high-water reconciliation remains idempotent and completes before the
+migration marker is synced.
+
+`NextID` issues unique IDs from the entity allocator. Explicit IDs in `Commit`
+use caller-owned, last-writer-wins canonical record semantics. `EnsureMinimum`
+protects future allocations, **not** IDs already issued to another goroutine.
+A bulk import must finish and reconcile its maximum before concurrent `NextID`
+for that entity using `PrepareImport(entity, maximum)`; callers must coordinate
+this phase themselves. Runtime
+external-ID insertion cannot promise uniqueness against outstanding issued IDs.
 database directory is exclusively owned by this package: its fixed `entity-*`
 collections contain canonical records, namespace 65533 holds ordered journal
 entries, and 65534 holds generation metadata. Do not mutate these namespaces

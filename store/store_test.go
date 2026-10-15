@@ -34,6 +34,44 @@ func TestKeyEncoding(t *testing.T) {
 	}
 }
 
+func TestOpenDefinitionsUsesAuthoritativeKVModel(t *testing.T) {
+	dir := t.TempDir()
+	defs := schema.NewDefinitions()
+	if err := defs.Register(schema.NamespaceDef{Namespace: 100, Name: "image-metadata", Kind: schema.KindKV, Entity: schema.EntityImage}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenDefinitions(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(Key{Namespace: 100, ID: 1}, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenDefinitions(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, err := s.Get(Key{Namespace: 100, ID: 1}); err != nil || string(value) != "value" {
+		t.Fatalf("reopen: %q %v", value, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	other := schema.NewDefinitions()
+	_ = other.Register(schema.NamespaceDef{Namespace: 100, Name: "different", Kind: schema.KindKV, Entity: schema.EntityImage})
+	if _, err := OpenDefinitions(dir, other); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("accepted conflicting name: %v", err)
+	}
+	invalid := schema.NewDefinitions()
+	_ = invalid.Register(schema.NamespaceDef{Namespace: 100, Name: "index", Kind: schema.KindTimestamp, Entity: schema.EntityImage})
+	if _, err := OpenDefinitions(dir, invalid); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("accepted index kind: %v", err)
+	}
+}
+
 func TestStorePersistenceAndNamespaceScan(t *testing.T) {
 	dir := t.TempDir()
 	specs := []Spec{{Namespace: 1, Name: "photos"}, {Namespace: schema.Namespace(math.MaxUint16), Name: "last"}}

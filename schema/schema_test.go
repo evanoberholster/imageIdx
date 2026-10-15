@@ -209,6 +209,40 @@ func TestSharedEntityNamespacesAndPersistedOwnership(t *testing.T) {
 	})
 }
 
+func TestOpenFromPersistedDefinitions(t *testing.T) {
+	forBackends(t, func(t *testing.T, backend Backend) {
+		path := filepath.Join(t.TempDir(), "schema.dat")
+		s, err := Open(path, testOptions(backend))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id, err := s.NextID(EntityImage); err != nil || id != 1 {
+			t.Fatalf("initial ID: %d %v", id, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s, err = Open(path, Options{Backend: backend})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defs := s.Definitions()
+		def, ok := defs.Lookup(NamespaceTag)
+		if !ok || def.Entity != EntityImage {
+			t.Fatalf("persisted owner: %+v %v", def, ok)
+		}
+		if id, err := s.NextID(EntityImage); err != nil || id != 2 {
+			t.Fatalf("reopen ID: %d %v", id, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, err := Open(filepath.Join(t.TempDir(), "missing"), Options{}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing persisted schema created: %v", err)
+	}
+}
+
 func TestAllocatorVersionOneRejectedWithoutModification(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "schema.dat")
 	opts := testOptions(BackendReadWrite)

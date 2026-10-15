@@ -69,7 +69,13 @@ func configs(opts Options) ([]directoryEntry, *Definitions, []byte, error) {
 	if opts.Backend != BackendReadWrite && opts.Backend != BackendMmap {
 		return nil, nil, nil, fmt.Errorf("schema: invalid backend %d", opts.Backend)
 	}
-	if opts.Definitions == nil || opts.Definitions.Len() == 0 {
+	if opts.Definitions == nil {
+		if len(opts.Entities) != 0 {
+			return nil, nil, nil, ErrNamespaceEntity
+		}
+		return nil, nil, nil, nil // recover definitions from an existing file
+	}
+	if opts.Definitions.Len() == 0 {
 		return nil, nil, nil, ErrNamespace
 	}
 	data, err := opts.Definitions.MarshalBinary()
@@ -141,9 +147,15 @@ func Open(path string, opts Options) (_ *Schema, err error) {
 			_ = storage.ReleaseLock(lock)
 		}
 	}()
-	f, openErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	created := openErr == nil
-	if errors.Is(openErr, os.ErrExist) {
+	var f *os.File
+	var openErr error
+	if definitions == nil {
+		f, openErr = os.OpenFile(path, os.O_RDWR, 0)
+	} else {
+		f, openErr = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	}
+	created := definitions != nil && openErr == nil
+	if definitions != nil && errors.Is(openErr, os.ErrExist) {
 		f, openErr = os.OpenFile(path, os.O_RDWR, 0)
 	}
 	if openErr != nil {
@@ -181,6 +193,13 @@ func (s *Schema) entry(entity EntityKind) *entityAllocator {
 // Lookup returns a persisted namespace definition and its owning entity.
 func (s *Schema) Lookup(ns Namespace) (NamespaceDef, bool) {
 	return s.definitions.Lookup(ns)
+}
+
+// Definitions returns an independent copy of the persisted namespace model.
+func (s *Schema) Definitions() *Definitions {
+	d := NewDefinitions()
+	_ = d.RegisterAll(s.definitions.Defs()...)
+	return d
 }
 
 func (s *Schema) admit() error {

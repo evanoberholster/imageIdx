@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -49,13 +50,22 @@ type Options struct {
 	BatchSize  int    // defaults to 64; one publisher processes batches in order
 	MaxPending uint64 // maximum unacknowledged mutations; zero means no limit
 	Recovery   RecoveryPolicy
-	boundary   func(string) // deterministic process-crash injection in package tests
+	// Definitions, if provided, is the authoritative complete namespace model.
+	// Existing KV and index metadata must agree with it. When omitted on an
+	// existing database, the persisted schema file is authoritative.
+	Definitions *schema.Definitions
+	// CanonicalNamespaces overrides the historical canonical KV namespace for
+	// an entity. Zero retains its original assignment. Supply the same values
+	// on every reopen; persisted definitions reject any reassignment.
+	CanonicalNamespaces [schema.EntityKindCount + 1]schema.Namespace
+	boundary            func(string) // deterministic process-crash injection in package tests
 }
 
 type DB struct {
 	mu        sync.Mutex // serializes sequence allocation with the Pebble commit
 	values    *store.Store
 	ids       *schema.Schema
+	canonical [schema.EntityKindCount + 1]schema.Namespace
 	idsClosed atomic.Bool
 	indexes   *index.Store
 	decode    Decoder
@@ -86,40 +96,155 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if options.BatchSize > 64 {
 		return nil, fmt.Errorf("%w: batch size > 64", ErrInvalidMutation)
 	}
-	values, err := store.OpenWithExtension(dir, canonicalSpecs()...)
+	var existing *schema.Schema
+	path := filepath.Join(dir, "schema.dat")
+	if _, statErr := os.Stat(path); statErr == nil {
+		var openErr error
+		existing, openErr = schema.Open(path, schema.Options{})
+		if openErr != nil {
+			return nil, openErr
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, statErr
+	}
+	canonical, err := canonicalNamespaces(options.CanonicalNamespaces)
+	if existing != nil {
+		canonical, err = persistedCanonical(existing.Definitions(), options.CanonicalNamespaces)
+		if err == nil && options.Definitions != nil {
+			err = validateDefinitions(existing.Definitions(), options.Definitions)
+		}
+	}
 	if err != nil {
+		if existing != nil {
+			_ = existing.Close()
+		}
 		return nil, err
 	}
-	return openWithValues(values, dir, indexDir, decode, options)
+	var values *store.Store
+	if existing != nil {
+		kv := schema.NewDefinitions()
+		for _, spec := range canonicalSpecsFor(canonical) {
+			def := spec.NamespaceDef()
+			if spec.Entity.Valid() {
+				var ok bool
+				def, ok = existing.Lookup(spec.Namespace)
+				if !ok || def.Kind != schema.KindKV || def.Name != spec.Name || def.Entity != spec.Entity {
+					_ = existing.Close()
+					return nil, schema.ErrNamespace
+				}
+			}
+			if err := kv.Register(def); err != nil {
+				_ = existing.Close()
+				return nil, err
+			}
+		}
+		values, err = store.OpenDefinitions(dir, kv)
+	} else {
+		values, err = store.OpenWithExtension(dir, canonicalSpecsFor(canonical)...)
+	}
+	if err != nil {
+		if existing != nil {
+			_ = existing.Close()
+		}
+		return nil, err
+	}
+	return openWithValues(values, dir, indexDir, decode, options, existing, canonical)
 }
 
 func canonicalSpecs() []store.Spec {
+	canonical, _ := canonicalNamespaces([schema.EntityKindCount + 1]schema.Namespace{})
+	return canonicalSpecsFor(canonical)
+}
+
+func canonicalNamespaces(overrides [schema.EntityKindCount + 1]schema.Namespace) ([schema.EntityKindCount + 1]schema.Namespace, error) {
+	var canonical [schema.EntityKindCount + 1]schema.Namespace
+	var seen [1 << 16]bool
+	for e := schema.EntityImage; e.Valid(); e++ {
+		ns := overrides[e]
+		if ns == 0 {
+			ns = schema.Namespace(e)
+		} // historical persisted assignment
+		if ns == journalNS || ns == metadataNS || ns == 0xFFF0 || seen[ns] {
+			return canonical, fmt.Errorf("%w: invalid or duplicate canonical namespace %d", ErrInvalidMutation, ns)
+		}
+		seen[ns] = true
+		canonical[e] = ns
+	}
+	return canonical, nil
+}
+
+func persistedCanonical(defs *schema.Definitions, overrides [schema.EntityKindCount + 1]schema.Namespace) ([schema.EntityKindCount + 1]schema.Namespace, error) {
+	var canonical [schema.EntityKindCount + 1]schema.Namespace
+	var seen [1 << 16]bool
+	for _, def := range defs.DefsOfKind(schema.KindKV) {
+		for e := schema.EntityImage; e.Valid(); e++ {
+			if def.Name != "entity-"+e.String() {
+				continue
+			}
+			if canonical[e] != 0 || seen[def.Namespace] || def.Entity != e {
+				return canonical, schema.ErrNamespace
+			}
+			canonical[e], seen[def.Namespace] = def.Namespace, true
+		}
+	}
+	for e := schema.EntityImage; e.Valid(); e++ {
+		if canonical[e] == 0 || (overrides[e] != 0 && overrides[e] != canonical[e]) ||
+			canonical[e] == journalNS || canonical[e] == metadataNS || canonical[e] == 0xFFF0 {
+			return canonical, schema.ErrNamespace
+		}
+	}
+	return canonical, nil
+}
+
+func canonicalSpecsFor(canonical [schema.EntityKindCount + 1]schema.Namespace) []store.Spec {
 	specs := make([]store.Spec, 0, schema.EntityKindCount+2)
 	for e := schema.EntityImage; e <= schema.EntityStack; e++ {
-		specs = append(specs, store.Spec{Namespace: schema.Namespace(e), Name: "entity-" + e.String(), Entity: e})
+		specs = append(specs, store.Spec{Namespace: canonical[e], Name: "entity-" + e.String(), Entity: e})
 	}
 	specs = append(specs, store.Spec{Namespace: journalNS, Name: "mutation-journal"}, store.Spec{Namespace: metadataNS, Name: "database-generations"})
 	// Append new entity namespaces after the historical schema entries: the
 	// explicit additive schema upgrade checks their stable original prefix.
 	for e := schema.EntityUser; e.Valid(); e++ {
-		specs = append(specs, store.Spec{Namespace: schema.Namespace(e), Name: "entity-" + e.String(), Entity: e})
+		specs = append(specs, store.Spec{Namespace: canonical[e], Name: "entity-" + e.String(), Entity: e})
 	}
 	return specs
 }
 
-func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, options Options) (*DB, error) {
+func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, options Options, existing *schema.Schema, canonical [schema.EntityKindCount + 1]schema.Namespace) (*DB, error) {
+	if existing != nil {
+		stored, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
+		if err == nil {
+			backup := schema.NewDefinitions()
+			if err = backup.UnmarshalBinary(stored); err == nil {
+				err = validateIndexDefinitions(existing.Definitions(), backup)
+			}
+		} else if errors.Is(err, store.ErrNotFound) {
+			err = nil
+		}
+		if err != nil {
+			_ = existing.Close()
+			_ = values.Close()
+			return nil, errors.Join(ErrRecoveryRequired, err)
+		}
+	}
 	// A prior activation must be completed before reading the active index.
 	if err := resumeActivation(indexDir, values, options.boundary); err != nil {
+		if existing != nil {
+			_ = existing.Close()
+		}
 		_ = values.Close()
 		return nil, err
 	}
 	idx, err := index.Open(indexDir)
 	openErr := err
 	if err != nil && options.Recovery != RecoveryAutomatic {
+		if existing != nil {
+			_ = existing.Close()
+		}
 		_ = values.Close()
 		return nil, errors.Join(ErrRecoveryRequired, err)
 	}
-	db := &DB{values: values, indexes: idx, decode: decode, options: options,
+	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, options: options,
 		wake: make(chan struct{}, 1), changed: make(chan struct{}), done: make(chan struct{})}
 	ready := false
 	defer func() {
@@ -150,11 +275,21 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 	if db.indexes == nil {
 		return nil, fmt.Errorf("%w: index cannot open: %v", ErrRecoveryRequired, openErr)
 	}
-	if err := db.persistSchema(); err != nil {
-		return nil, err
+	// On the bootstrap path, reject a conflicting legacy index backup before
+	// creating the central file or publishing the allocator migration marker.
+	hadSchema := db.ids != nil
+	if !hadSchema {
+		if err := db.persistSchema(); err != nil {
+			return nil, err
+		}
 	}
 	if err := db.openIDs(dir); err != nil {
 		return nil, err
+	}
+	if hadSchema {
+		if err := db.persistSchema(); err != nil {
+			return nil, err
+		}
 	}
 	idx = db.indexes
 	safe := idx.SourceGeneration()
@@ -236,6 +371,11 @@ type Mutation struct {
 
 // Commit atomically writes canonical records, ordered journal entries, and the
 // next sequence in one synced Pebble batch. Returns the last generation.
+// Explicit ValueIDs are caller-owned: an existing ID updates that record, and
+// a new ID creates it. EnsureMinimum prevents future allocator reuse but cannot
+// prevent collision with IDs already issued to concurrent callers. Bulk import
+// must be serialized by the caller before allowing NextID on that entity;
+// runtime explicit inserts use last-writer-wins canonical record semantics.
 // A failed commit does not consume a sequence. Search is eventually consistent;
 // pass the returned generation to WaitIndexed before requiring fresh results.
 func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
@@ -272,7 +412,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 				return 0, err
 			}
 		}
-		key := store.Key{Namespace: schema.Namespace(m.Entity), ID: m.ValueID}
+		key := store.Key{Namespace: db.canonical[m.Entity], ID: m.ValueID}
 		prior, err := db.values.Get(key)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return 0, err
@@ -319,9 +459,9 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			return 0, err
 		}
 	}
-	// Legacy callers may provide IDs instead of obtaining them via NextID.
-	// Reconcile them before publishing canonical records, including deletions,
-	// so neither reopening nor future reservations can hand them out again.
+	// Reconcile explicit IDs before publishing canonical records, including
+	// deletions. This protects *future* reservations only, not IDs already
+	// issued to a concurrent caller (see Commit's conflict policy).
 	for _, m := range mutations {
 		if err := db.ids.EnsureMinimum(m.Entity, m.ValueID); err != nil {
 			return 0, err
@@ -360,7 +500,7 @@ func (db *DB) Get(entity schema.EntityKind, id schema.ValueID) ([]byte, error) {
 	if db.closed {
 		return nil, ErrClosed
 	}
-	v, err := db.values.Get(store.Key{Namespace: schema.Namespace(entity), ID: id})
+	v, err := db.values.Get(store.Key{Namespace: db.canonical[entity], ID: id})
 	if err != nil {
 		return nil, err
 	}
@@ -392,6 +532,22 @@ func (db *DB) NextID(entity schema.EntityKind) (schema.ValueID, error) {
 		return 0, schema.ErrClosed
 	}
 	return db.ids.NextID(entity)
+}
+
+// PrepareImport establishes the maximum ID of a completed bulk import before
+// concurrent allocation begins. Callers must exclude NextID/Commit for this
+// entity while reconciling; this method does not revoke already issued IDs.
+// It is safe to repeat after a crash, and never reduces the durable watermark.
+func (db *DB) PrepareImport(entity schema.EntityKind, maximum schema.ValueID) error {
+	if !entity.Valid() {
+		return ErrInvalidMutation
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrClosed
+	}
+	return db.ids.EnsureMinimum(entity, maximum)
 }
 
 // WaitIndexed waits without polling or per-waiter goroutines. Permanent
