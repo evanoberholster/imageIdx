@@ -6,10 +6,9 @@ import (
 	"errors"
 	"slices"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
-	"github.com/evanoberholster/imageIdx/index/radixhash"
+	schema "github.com/evanoberholster/imageIdx/schema"
 
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 )
@@ -21,7 +20,6 @@ const (
 	StageTimestamp
 	StageGeo
 	StageACL
-	StageHash
 )
 
 func (kind StageKind) String() string {
@@ -34,8 +32,6 @@ func (kind StageKind) String() string {
 		return "geo"
 	case StageACL:
 		return "acl"
-	case StageHash:
-		return "hash"
 	default:
 		return "unknown"
 	}
@@ -45,14 +41,12 @@ func (kind StageKind) String() string {
 type Stage struct {
 	Kind     StageKind
 	Estimate uint64
-	// Namespace is zero for timestamp, ACL, and standalone hash stages.
+	// Namespace is zero for timestamp and ACL stages.
 	Namespace        schema.Namespace
 	Predicate        string
 	CanProbe         bool
 	OrderedSource    bool
 	BufferedFallback bool
-	// Algorithm is set for StageHash and names the 256-bit digest family.
-	Algorithm HashAlgorithm
 }
 
 // stage is the unified compiled unit. Estimates are cached at Compile time
@@ -77,17 +71,12 @@ type stage struct {
 	geoRanges []geoidx.Range
 
 	aclQueries []bitmapidx.Query
-
-	hashIndex     *radixhash.Index
-	hashAlgorithm HashAlgorithm
-	hashValue     radixhash.Hash
-	hashNamespace schema.Namespace
 }
 
 func (s *stage) metadata() Stage {
 	meta := Stage{Kind: s.kind, Estimate: s.estimate, CanProbe: s.canFilter(),
 		OrderedSource:    s.kind != StageTimestamp,
-		BufferedFallback: (s.kind == StageTimestamp && s.tsExact == nil) || s.kind == StageHash}
+		BufferedFallback: s.kind == StageTimestamp && s.tsExact == nil}
 	switch s.kind {
 	case StageNamespace:
 		meta.Namespace = s.namespaceIndex.Spec().Namespace
@@ -108,10 +97,6 @@ func (s *stage) metadata() Stage {
 		meta.Predicate = "timestamp-range"
 	case StageACL:
 		meta.Predicate = "any-principal"
-	case StageHash:
-		meta.Namespace = s.hashNamespace
-		meta.Predicate = "exact-hash"
-		meta.Algorithm = s.hashAlgorithm
 	}
 	return meta
 }
@@ -131,10 +116,6 @@ func (s *stage) canFilter() bool {
 		return false
 	case StageACL:
 		return true
-	case StageHash:
-		// A hash clause cannot test one candidate without materializing the
-		// digest's (small) ID set, so it runs as a buffered filter.
-		return false
 	default:
 		return false
 	}
@@ -175,8 +156,6 @@ func (s *stage) collect(dst []ImageID) ([]ImageID, error) {
 			return dst, err
 		}
 		return match.AppendTo(dst), nil
-	case StageHash:
-		return s.hashIndex.Lookup(dst, s.hashValue), nil
 	default:
 		return dst, ErrInvalidClause
 	}
@@ -210,15 +189,6 @@ func (s *stage) filter(dst, candidates, scratch []ImageID, ws *Workspace) ([]Ima
 		return dst, ErrInvalidClause
 	case StageACL:
 		return s.filterACL(dst, candidates, ws)
-	case StageHash:
-		// Membership test against the digest's ID set (buffered in scratch).
-		match := s.hashIndex.Lookup(scratch[:0], s.hashValue)
-		for _, id := range candidates {
-			if _, ok := slices.BinarySearch(match, id); ok {
-				dst = append(dst, id)
-			}
-		}
-		return dst, nil
 	default:
 		return dst, ErrInvalidClause
 	}
@@ -414,21 +384,6 @@ func compile(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 				},
 				order: clauseIndex,
 			})
-		case hashClause:
-			if value.index == nil || !value.algorithm.Valid() {
-				return Plan{}, ErrInvalidClause
-			}
-			ordered = append(ordered, orderedStage{
-				s: stage{
-					kind:          StageHash,
-					estimate:      value.index.Count(value.hash),
-					hashIndex:     value.index,
-					hashAlgorithm: value.algorithm,
-					hashValue:     value.hash,
-					hashNamespace: value.namespace,
-				},
-				order: clauseIndex,
-			})
 		default:
 			return Plan{}, ErrInvalidClause
 		}
@@ -493,8 +448,6 @@ func (plan Plan) Refresh(ctx context.Context) (Plan, error) {
 			st.estimate = st.tsIndex.EstimateRange(st.tsStart, st.tsEnd)
 		case StageACL:
 			st.estimate = aclEstimate(st.aclQueries)
-		case StageHash:
-			st.estimate = st.hashIndex.Count(st.hashValue)
 		}
 		if err != nil {
 			return Plan{}, err

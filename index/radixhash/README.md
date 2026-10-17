@@ -191,18 +191,13 @@ The streaming batch defaults to 16K entries: `BenchmarkCompactBatch` shows 16K
 captures most of the 64K throughput with a quarter of the temporary memory.
 This is a maintenance workload, independent of the small ingestion batch.
 
-### Combined search
+### Exact-content presence checks
 
-`search` can use a radixhash index directly. The digest is exact, so a
-one-bit difference is a miss.
-
-```go
-plan, err := search.Compile(
-    search.ExactHash(index, search.HashBLAKE3, digest),
-    search.AllValues(tags, bitmapidx.EnumStringValue("favorite")),
-)
-ids, err := plan.Search(ctx, nil, &ws)
-```
+Radixhash is an exact-content index used by `index.Matcher` during import to
+find existing live images for an incoming digest. It is deliberately not a
+`search.Plan` source or filter: general Search collects candidates from bitmap,
+time, geo, and ACL indexes. The unified matcher applies image liveness and
+reports exact duplicate hits; see [`index/README.md`](../README.md#import-matching).
 
 ## Config
 

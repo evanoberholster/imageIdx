@@ -3,12 +3,11 @@ package search
 import (
 	"errors"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
-	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // ErrIncompatibleEntity reports a query whose entity kind has no liveness
@@ -48,9 +47,6 @@ func (e *Engine) Geo(ns schema.Namespace) (*geoidx.Index, bool) { return e.db.Ge
 // Bitmap returns the bitmap engine for a namespace, or false if unavailable.
 func (e *Engine) Bitmap(ns schema.Namespace) (*bitmapidx.Index, bool) { return e.db.Bitmap(ns) }
 
-// Hash returns an exact-hash engine for a namespace, or false if unavailable.
-func (e *Engine) Hash(ns schema.Namespace) (*radixhash.Index, bool) { return e.db.Hash(ns) }
-
 // During builds a timestamp clause for a namespace.
 func (e *Engine) During(ns schema.Namespace, start, end uint64, options ...TimestampOption) (Clause, error) {
 	idx, ok := e.db.Time(ns)
@@ -87,16 +83,6 @@ func (e *Engine) BSIRange(ns schema.Namespace, bounds bitmapidx.ValueRange) (Cla
 	return NamespaceBSIRange(idx, bounds), nil
 }
 
-// ExactHash binds a digest clause to an exact-hash namespace in this Store.
-// The algorithm is caller-supplied metadata; radixhash does not persist it.
-func (e *Engine) ExactHash(ns schema.Namespace, algorithm HashAlgorithm, digest [32]byte) (Clause, error) {
-	idx, ok := e.db.Hash(ns)
-	if !ok {
-		return nil, ErrNamespaceUnavailable
-	}
-	return hashClause{index: idx, namespace: ns, algorithm: algorithm, hash: radixhash.Hash(digest)}, nil
-}
-
 // Compile compiles clauses and prepends the entity liveness restriction.
 //
 // Every entity-scoped clause must reference a namespace owned by the bound
@@ -108,8 +94,6 @@ func (e *Engine) ExactHash(ns schema.Namespace, algorithm HashAlgorithm, digest 
 //
 // WithACL clauses use image-ID grants and are only accepted for EntityImage;
 // when present the plan uses the Store's dedicated bitmap ACL namespaces.
-// ExactHash clauses must be created through Engine.ExactHash so their owning
-// namespace can be validated.
 func (e *Engine) Compile(entity schema.EntityKind, clauses ...Clause) (Plan, error) {
 	live, value, ok := e.db.Liveness(entity)
 	if !ok {
@@ -185,20 +169,6 @@ func (e *Engine) validateClauses(entity schema.EntityKind, clauses []Clause) err
 			// ACL postings contain image IDs; other entity kinds can reuse the
 			// same numeric IDs and must never inherit image grants.
 			if entity != schema.EntityImage {
-				return ErrIncompatibleEntity
-			}
-		case hashClause:
-			if cl.index == nil || cl.namespace == 0 {
-				return ErrInvalidClause
-			}
-			idx, ok := e.db.Hash(cl.namespace)
-			if !ok {
-				return ErrNamespaceUnavailable
-			}
-			if idx != cl.index {
-				return ErrIncompatibleEntity
-			}
-			if ent, ok := e.db.EntityOf(cl.namespace); !ok || ent != entity {
 				return ErrIncompatibleEntity
 			}
 		default:

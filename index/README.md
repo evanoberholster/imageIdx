@@ -184,11 +184,12 @@ ids, err := plan.AppendIDs(ctx, nil, ws)
 entities are excluded automatically, and resolves engines by namespace number
 from the immutable registry — no maps, no reflection, no string lookups.
 
-`search.Compile` supports standalone `ExactHash` over `radixhash`, and
-`Engine.ExactHash(ns, algorithm, digest)` binds an exact-hash namespace for
-`Engine.Compile`, which includes entity liveness. The algorithm is caller
-metadata (the radix index does not store it). The unified import matcher
-serves radixhash and simhash with liveness filtering.
+Exact-content `radixhash` checks are for import-time duplicate/presence
+detection, not Search candidate collection or plan stages. Use the unified
+import matcher to find existing live images for an incoming digest; it filters
+deleted images through entity liveness. The algorithm-to-namespace association
+is defined by `MatcherSpec` (the radix index itself stores digest bytes only).
+Perceptual `simhash` matching uses the same matcher path.
 Vector ANN results can be filtered through `search.Plan.FilterRanked`.
 
 ## Import matching
