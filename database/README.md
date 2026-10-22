@@ -249,6 +249,20 @@ order. The old experimental `sparse.bin`/`*.sparse` format is rejected with an
 explicit rebuild error. Once the segmented sparse overlay is used, dense
 `AppendBatch`/`UpsertBatch` calls are rejected to avoid two sources of truth.
 
+## Recovery units
+
+The current unified-index layout shares one bitmap namespace segment/WAL across
+all bitmap namespaces and one time store across timestamp namespaces. There is
+no safe namespace-granular replacement boundary for those families. As a result,
+this release intentionally supports only the **full unified-index rebuild** as
+the recovery fallback: staging index, canonical rescan, verification and
+PREPARED/ACTIVATE-style replacement. `RecoveryManual` reports the unhealthy
+namespaces and requires an explicit `RecoveryAutomatic` reopen; automatic recovery
+never serves an incomplete namespace.
+
+Family-granular recovery requires isolating bitmap/time physical directories and
+adding a staged family replacement protocol. It is not claimed by this release.
+
 ## Projection versions
 
 Each `schema.NamespaceDef` now carries `ProjectionVersion` in the definitions
