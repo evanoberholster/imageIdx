@@ -1,5 +1,8 @@
 # Implement the `ranking` Package
 
+> **Design note.** Current implementation: `search/ranking`. Verify APIs against
+> the package documentation and tests before relying on this document.
+
 Implement a small, high-performance ranking package for `imageIdx`.
 
 Before writing code, inspect the repository and existing conventions for `ImageID`, package layout, SIMD kernels, zero-allocation APIs, benchmarks, and tests. Reuse existing types and conventions rather than creating parallel abstractions.

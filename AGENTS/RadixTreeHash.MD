@@ -1,5 +1,8 @@
 # Radix Tree Hash Index
 
+> **Design note.** Current implementation: `index/radixhash`. Verify APIs and
+> formats against the package documentation and tests.
+
 ## Goal
 
 Build a persistent, mmap-oriented exact hash index for fixed-width **256-bit

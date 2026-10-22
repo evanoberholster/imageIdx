@@ -1,0 +1,96 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/evanoberholster/imageIdx/store
+cpu: Apple M4 Pro
+BenchmarkKVNamespaceLookupMap/namespaces=8-12         	39709824	         5.625 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKVNamespaceLookupMap/namespaces=64-12        	43873680	         5.459 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKVNamespaceLookupMap/namespaces=256-12       	45236425	         5.441 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKVNamespaceLookupBitmap/namespaces=8-12      	940208607	         0.2566 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKVNamespaceLookupBitmap/namespaces=64-12     	913433175	         0.2603 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKVNamespaceLookupBitmap/namespaces=256-12    	919097126	         0.2604 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/evanoberholster/imageIdx/store	2.098s
+goos: darwin
+goarch: arm64
+pkg: github.com/evanoberholster/imageIdx/schema
+cpu: Apple M4 Pro
+BenchmarkLookupIdentity/namespaces=8-12         	13882489	        16.17 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookupIdentity/namespaces=64-12        	22458854	        10.11 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLookupIdentity/namespaces=256-12       	21774712	        10.12 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/evanoberholster/imageIdx/schema	1.257s
+2026/10/22 10:17:22 Found 0 WALs
+goos: darwin
+goarch: arm64
+pkg: github.com/evanoberholster/imageIdx/database
+cpu: Apple M4 Pro
+BenchmarkCommitAndIndex/batch-1-12     	2026/10/22 10:17:22 Found 0 WALs
+      12	  18236840 ns/op	        54.83 images/s	   14571 B/op	      97 allocs/op
+2026/10/22 10:17:23 Found 0 WALs
+BenchmarkCommitAndIndex/batch-16-12    	2026/10/22 10:17:23 Found 0 WALs
+      12	  20083111 ns/op	       796.7 images/s	   40243 B/op	     229 allocs/op
+2026/10/22 10:17:23 Found 0 WALs
+BenchmarkCommitAndIndex/batch-32-12    	2026/10/22 10:17:23 Found 0 WALs
+      12	  19993753 ns/op	      1600 images/s	   61851 B/op	     345 allocs/op
+2026/10/22 10:17:24 Found 0 WALs
+BenchmarkCommitAndIndex/batch-64-12    	2026/10/22 10:17:24 Found 0 WALs
+      10	  20464008 ns/op	      3127 images/s	  112244 B/op	     570 allocs/op
+BenchmarkProjectionDiffReference/n=1/changed=-1-12         	 3559140	        66.37 ns/op	     128 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=1/changed=1-12          	 3623995	        66.26 ns/op	     128 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=1/changed=0-12          	 3610118	        67.75 ns/op	     128 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=4/changed=-1-12         	 1000000	       252.4 ns/op	     448 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=4/changed=1-12          	  967758	       256.4 ns/op	     448 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=4/changed=0-12          	  903656	       256.3 ns/op	     448 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=8/changed=-1-12         	  421221	       527.2 ns/op	     896 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=8/changed=1-12          	  446396	       525.3 ns/op	     896 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=8/changed=0-12          	  452996	       523.2 ns/op	     896 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=16/changed=-1-12        	  160710	      1530 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=16/changed=1-12         	  155532	      1497 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=16/changed=0-12         	  156136	      1513 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=64/changed=-1-12        	   14260	     17003 ns/op	    8192 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=64/changed=1-12         	   14265	     16839 ns/op	    8192 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=64/changed=0-12         	   14100	     17012 ns/op	    8192 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=256/changed=-1-12       	     993	    239824 ns/op	   32809 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=256/changed=1-12        	     998	    239544 ns/op	   32809 B/op	       2 allocs/op
+BenchmarkProjectionDiffReference/n=256/changed=0-12        	     996	    240895 ns/op	   32817 B/op	       3 allocs/op
+BenchmarkProjectionDiffSortMerge/n=1/changed=-1-12         	 1998352	       120.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=1/changed=1-12          	 1932956	       120.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=1/changed=0-12          	 1987648	       121.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=4/changed=-1-12         	 1000000	       216.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=4/changed=1-12          	 1000000	       216.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=4/changed=0-12          	 1000000	       216.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=8/changed=-1-12         	  703940	       342.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=8/changed=1-12          	  694519	       343.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=8/changed=0-12          	  683338	       344.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=16/changed=-1-12        	  374558	       633.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=16/changed=1-12         	  376458	       633.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=16/changed=0-12         	  381501	       633.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=64/changed=-1-12        	   38995	      6184 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=64/changed=1-12         	   38684	      6223 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=64/changed=0-12         	   38454	      6219 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=256/changed=-1-12       	    7545	     31566 ns/op	       4 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=256/changed=1-12        	    7686	     31679 ns/op	       4 B/op	       0 allocs/op
+BenchmarkProjectionDiffSortMerge/n=256/changed=0-12        	    7100	     32134 ns/op	       4 B/op	       0 allocs/op
+PASS
+ok  	github.com/evanoberholster/imageIdx/database	12.516s
+goos: darwin
+goarch: arm64
+pkg: github.com/evanoberholster/imageIdx/index
+cpu: Apple M4 Pro
+BenchmarkStoreApply/Entities=1-12       	      28	   7712062 ns/op	    3616 B/op	      35 allocs/op
+BenchmarkStoreApply/Entities=16-12      	      28	   7181467 ns/op	    9399 B/op	      62 allocs/op
+BenchmarkStoreApply/Entities=32-12      	      33	   7331559 ns/op	   15402 B/op	      80 allocs/op
+BenchmarkStoreApply/Entities=64-12      	      33	   7152073 ns/op	   27309 B/op	     114 allocs/op
+BenchmarkStoreUpdate-12                 	     100	   7024624 ns/op	    3324 B/op	      33 allocs/op
+BenchmarkStoreDelete-12                 	      14	  16703196 ns/op	    6325 B/op	      61 allocs/op
+BenchmarkStoreApplyUpdate/Entities=1-12 	     100	   7997112 ns/op	    3359 B/op	      35 allocs/op
+BenchmarkStoreApplyUpdate/Entities=16-12         	      30	   7964569 ns/op	    9577 B/op	      77 allocs/op
+BenchmarkStoreApplyUpdate/Entities=32-12         	      27	   8242596 ns/op	   16317 B/op	     111 allocs/op
+BenchmarkStoreApplyUpdate/Entities=64-12         	      30	   8164986 ns/op	   29085 B/op	     177 allocs/op
+BenchmarkStoreApplyWithGeneration/Entities=1-12  	      24	  13085049 ns/op	    5014 B/op	      49 allocs/op
+BenchmarkStoreApplyWithGeneration/Entities=16-12 	      18	  13325840 ns/op	   11054 B/op	      76 allocs/op
+BenchmarkStoreApplyWithGeneration/Entities=32-12 	      21	  12514962 ns/op	   17239 B/op	      94 allocs/op
+BenchmarkStoreApplyWithGeneration/Entities=64-12 	      19	  12364787 ns/op	   29775 B/op	     129 allocs/op
+BenchmarkRegistryLookup-12                       	912416137	         0.2497 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/evanoberholster/imageIdx/index	9.152s

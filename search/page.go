@@ -8,8 +8,8 @@ import (
 var ErrInvalidOptions = errors.New("search: invalid execution options")
 
 // Page selects up to Limit sorted IDs strictly greater than AfterID. Limit
-// must be positive; AppendIDs is the unlimited operation. Pages use live
-// views, so writes between calls can change later pages; this is not a snapshot.
+// must be positive; AppendIDs is the unlimited operation. Each page execution
+// pins its own snapshot, so writes between calls can change later pages.
 type Page struct {
 	AfterID ImageID
 	Limit   int

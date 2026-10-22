@@ -1,5 +1,8 @@
 # Roar Format Implementation
 
+> **Format note.** Current authoritative format documentation: `roar/FORMAT.md`.
+> Verify byte-layout claims against that document and tests.
+
 The `roar` package is a standalone immutable, zero-copy bitmap implementation.
 Its serialized bytes are its read representation. Logical indexes use `roar`
 bitmaps directly for bases, deltas, and dense geo cells.

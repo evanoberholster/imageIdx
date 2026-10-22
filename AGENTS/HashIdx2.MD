@@ -1,5 +1,8 @@
 # HashIdx Implementation Proposal
 
+> **Historical proposal.** Retained for design context only. Use
+> `index/radixhash` and `index/simhash`; see their package documentation.
+
 ## Purpose
 
 `hashidx` is a persistent, mmap-backed perceptual-hash index for image similarity and duplicate detection.

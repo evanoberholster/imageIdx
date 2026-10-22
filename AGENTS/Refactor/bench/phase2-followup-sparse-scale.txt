@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/evanoberholster/imageIdx/index/simhash
+cpu: Apple M4 Pro
+BenchmarkSparseScaleSearch/10000-12         	     859	     14536 ns/op	    500204 disk-B	         3.000 segments	      16 B/op	       1 allocs/op
+BenchmarkSparseScaleSearch/100000-12        	      72	    148372 ns/op	   5000168 disk-B	         2.000 segments	      16 B/op	       1 allocs/op
+BenchmarkSparseScaleSearch/1000000-12       	       7	   1507250 ns/op	  50000132 disk-B	         1.000 segments	      16 B/op	       1 allocs/op
+BenchmarkSparseScaleHotApply/10000-12       	      40	    467318 ns/op	         1.000 segments	  120506 B/op	      37 allocs/op
+BenchmarkSparseScaleHotApply/100000-12      	      28	   3482327 ns/op	         2.000 segments	  938347 B/op	      39 allocs/op
+BenchmarkSparseScaleHotApply/1000000-12     	      10	 117571333 ns/op	         4.000 segments	 6421346 B/op	      37 allocs/op
+PASS
+ok  	github.com/evanoberholster/imageIdx/index/simhash	939.261s

@@ -1,11 +1,15 @@
 # SimHash Index
 
+> **Design note.** Current implementation: `index/simhash`. Sparse external-ID
+> support is documented in `index/simhash/README.md`; this design note may lag
+> the implementation.
+
 ## Goal
 
 Build a persistent, mmap-oriented **exact similarity store for the canonical
 image tuple `pHash64 + PDQ256 + PDQQuality`**. It is deliberately not a generic
 column store: the only supported shape is this tuple, indexed directly by
-`common.ImageID`.
+`schema.ImageID`.
 
 The design priorities, in order:
 
@@ -17,7 +21,7 @@ The design priorities, in order:
 
 It reuses `internal/storage` (mmap, dual-slot CRC32C superblock, atomic file
 publication, WAL transport, directory sync, reader epochs) and
-`common.Namespace`/`Schema` for identity. It does not add a parallel
+`schema.Namespace`/`Schema` for identity. It does not add a parallel
 persistence framework.
 
 ## Non-goals
@@ -242,7 +246,7 @@ Both take a caller-owned destination slice and a single result type:
 
 ```go
 type Result struct {
-    ImageID  common.ImageID
+    ImageID  schema.ImageID
     Distance uint8
 }
 ```

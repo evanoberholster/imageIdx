@@ -1,10 +1,11 @@
 # Bitmap namespaces
 
 `index/bitmapidx` owns typed posting namespaces and BSI (bit-sliced) numeric
-values. Define each namespace in `common.Schema` with `index.BitmapDef` before
-creating a unified `index.Store`. `KindBitmapEnum`, `KindBitmapBool`, and
-`KindBitmapString` support value/token queries; `KindBitmapContinuous` supports
-signed grid ranges. Geography uses the separate `index/geoidx` engine.
+values. Define each namespace in `schema.Definitions` with `index.BitmapDef`
+before creating a unified `index.Store` or database. `KindBitmapEnum`,
+`KindBitmapBool`, and `KindBitmapString` support value/token queries;
+`KindBitmapContinuous` supports signed grid ranges. Geography uses the separate
+`index/geoidx` engine.
 
 `KindBitmapBSI` stores one unsigned `uint16` or `uint32` per ID, including zero.
 Use `bitmapidx.Uint16Value`/`Uint32Value` with unified `index.Entry.Bitmaps`,
@@ -13,7 +14,9 @@ or the typed index's `Set`/`BSIMove`. Use `bitmapidx.ValuesBetween` (inclusive),
 `BSICountRange`, and `BSIFilterRange` are the native collect, count, and
 candidate-filter paths. Bounds outside the namespace width return an error.
 `search.NamespaceBSIRange` and `search.Engine.BSIRange` combine these with
-other clauses while preserving entity liveness.
+other clauses while preserving entity liveness. Search plans compiled through
+`search.Engine` execute against one pinned snapshot; direct plans read live
+views.
 
 Readers use immutable views; writes serialize per engine. Reuse search plans,
 workspace buffers, and candidate filters rather than materializing every

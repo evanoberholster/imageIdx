@@ -1,5 +1,8 @@
 # Timestamp Index (`timeidx`)
 
+> **Design note.** Current implementation: `index/timeidx`. Verify APIs and
+> format details against `index/timeidx/README.md` and tests.
+
 This document describes the implemented `timeidx` package. It is a summary; the
 package [`index/timeidx/README.md`](../index/timeidx/README.md) is authoritative
 for the format and lifecycle, and
@@ -8,7 +11,7 @@ evidence.
 
 ## Purpose
 
-`timeidx` maps **one exact timestamp per `common.ValueID` per namespace** and
+`timeidx` maps **one exact timestamp per `schema.ValueID` per namespace** and
 answers half-open `[start, end)` range queries in `(TimeKey, ValueID)` order. It
 is namespace-aware, copy-on-write, and mmap-backed, with lock-free readers and
 one serialized writer per namespace.
@@ -33,8 +36,8 @@ encoding.
 
 ```go
 index, err := timeidx.NewMemory(spec, config)                       // in memory
-index, err := timeidx.NewStore(dir, spec, config, common.DurabilityOS) // create file
-index, err := timeidx.OpenStore(dir, config, common.DurabilityOS)      // reopen
+index, err := timeidx.NewStore(dir, spec, config, schema.DurabilityOS) // create file
+index, err := timeidx.OpenStore(dir, config, schema.DurabilityOS)      // reopen
 
 batch := timeidx.NewBatch(64)
 batch.Append(timeidx.Insert(id, timestamp))
@@ -48,8 +51,8 @@ count := index.EstimateRange(start, end)
 ```
 
 - `Spec{Namespace, Name, Flags, Entries}` carries the stable identity;
-  `Spec.NamespaceDef()` yields the `common.NamespaceDef` to register in a
-  `common.Schema`. Initial entries are sorted by `(time, ID)`; duplicate IDs are
+  `Spec.NamespaceDef()` yields the `schema.NamespaceDef` to register in a
+  `schema.Schema`. Initial entries are sorted by `(time, ID)`; duplicate IDs are
   rejected with `ErrDuplicateImageID`.
 - `Metadata()` returns namespace, flags, generation, compatibility offset,
   logical count and shard count. `SourceGeneration()` returns the completeness
@@ -155,7 +158,7 @@ loading the snapshot, then release it in reverse order, so a reader either sees
 and counter accessors read only heap snapshot state. `SearchExact` callbacks must
 not synchronously write or close the pinned index.
 
-- One exact timestamp per `common.ValueID` per namespace.
+- One exact timestamp per `schema.ValueID` per namespace.
 - Parallel time/ID columns stay equal-length and strictly increasing by
   `(TimeKey, ValueID)`.
 - A batch is accepted atomically or rejected without partial mutation.

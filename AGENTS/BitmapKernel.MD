@@ -1,5 +1,8 @@
 # Bitmap Kernel SIMD Implementation
 
+> **Design note.** Current implementation: `roar/internal/bitmapkernel`. Kernel
+> changes require scalar-equivalence, race, and benchmark evidence.
+
 Implement dense bitmap kernels behind a small internal abstraction. Do not change the serialized Roar format, container layout, public APIs, sparse-array algorithms, mmap behavior, or reader/writer model.
 
 ## Goal

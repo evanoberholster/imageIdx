@@ -1,7 +1,14 @@
 # index — unified index Store
 
-`index` is the single public entry point that owns and coordinates the six
-imageIdx index families in one root directory.
+`index` is the advanced unified store that owns and coordinates the six imageIdx
+index families in one root directory. Applications using the stable database
+lifecycle should normally use [`database.DB`](../database/README.md); `index`
+remains public for standalone use, import/matcher workflows, and advanced
+services.
+
+> **Experimental family:** `KindVector` and `index/vectoridx` are functional but
+> experimental in V1. Vector APIs, performance, and on-disk formats are not part
+> of the stable V1 compatibility promise.
 
 | Namespace kind | Engine | Files |
 |---|---|---|
@@ -9,7 +16,7 @@ imageIdx index families in one root directory.
 | `KindGeo` | `geoidx` | `geo-<hex>.idx` per namespace |
 | `KindHashPerceptual` | `simhash` | `sim-<hex>.manifest`, `sim-<hex>-shard-*.bin`, `sim-<hex>.wal` |
 | `KindHashExact` | `radixhash` | `radix-<hex>.idx` per namespace |
-| `KindVector` | `vectoridx` | `vector-<hex>.idx` (+ `.manifest`/`.wal`/`.delta`) |
+| `KindVector` | `vectoridx` (experimental) | `vector-<hex>.idx` (+ `.manifest`/`.wal`/`.delta`) |
 | `KindBitmap*` | `bitmapidx` | `manifest`, `namespaces-*.idx`/`.wal` (one Store, many namespaces) |
 
 The unified manifest is `store.bin` (magic `UIDX`, version 2). No per-family or
@@ -127,7 +134,7 @@ complete durable watermark is reported as recovery-required in manual mode.
 Automatic database startup recovery may reconstruct a full replacement before
 publishing any index pointer; it does not hot-swap live namespaces.
 
-A `Store` is **not** an atomic multi-engine transaction. A batch is prevalidated
+A `Store` is **not** an atomic multi-engine write transaction. A batch is prevalidated
 (routing, family, entity, ValueID, vector dimensions, simhash id model) before
 any engine is mutated, so a malformed batch cannot partially apply. If an engine
 fails during application, every namespace the batch intended is marked **stale**
@@ -135,6 +142,11 @@ fails during application, every namespace the batch intended is marked **stale**
 reopen or rebuild; unrelated namespaces stay usable. Value mutations publish
 before liveness on additions and after it on deletions, so an incomplete entity
 is never searchable.
+
+Queries through `search.Engine` capture one reader-pinned snapshot for all
+participating engines, so one plan execution sees a coherent published
+generation while writers continue. Direct engine access and direct
+`search.Compile` plans read live views.
 
 `ApplyWithGeneration` records a per-namespace completeness generation in
 `store.bin`. Before the manifest records a generation, every touched namespace is
@@ -230,16 +242,18 @@ paths. Benchmarks live in `benchmark_test.go`, `matcher_benchmark_test.go`, and
 
 ## Known limitations
 
-- **Cross-engine atomicity.** No multi-engine snapshot or transaction; a
-  mid-batch failure degrades the intended namespaces with no rollback.
+- **Cross-engine writes are not atomic.** A mid-batch failure degrades the
+  intended namespaces with no rollback. Queries through `search.Engine` still
+  capture one coherent reader-pinned snapshot; direct engine access is live.
 - **Hash updates need `Before`.** Invalidation of a stale `(hash, id)` uses the
   previous hash in `Change.Before`.
-- **simhash IDs are dense.** A simhash value must use the next dense `ValueID`;
-  otherwise `ErrNamespaceIDModel`. Prevalidation enforces this for the batch.
-- **Search clauses.** Exact hash supports a namespace-bound search clause;
-  perceptual matching is served by the matcher. `Engine.Compile` rejects
-  clause/entity mismatches and foreign-Store clauses; vector ANN stays outside
-  the plan.
+- **SimHash has a dense fast path and a sparse overlay.** Contiguous append IDs
+  use the dense pages; arbitrary nonzero external IDs use `ApplyUpdates` and the
+  durable sparse segments. Dense append APIs are rejected after the sparse
+  overlay is used to preserve one source of truth.
+- **Search clauses.** Exact and perceptual hashes are import/matching APIs, not
+  general plan predicates. `Engine.Compile` rejects clause/entity mismatches and
+  foreign-Store clauses; vector ANN stays outside the plan and is experimental.
 - **Generation advancement cost.** `ApplyWithGeneration` is dominated by the
   unified-manifest directory sync (~13 ms vs ~7.8 ms ordinary Apply per 64-entity
   batch); ordinary `Apply` pays it only for risky batches.

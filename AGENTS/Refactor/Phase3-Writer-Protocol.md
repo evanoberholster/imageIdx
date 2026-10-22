@@ -1,6 +1,6 @@
 # Phase 3 Writer Protocol Decision
 
-**Baseline:** `c466464` (Phase 3.0 merged)  
+**Baseline:** `c466464` (Phase 3.0 merged)
 **Status:** alternative gate invoked for Phase 3.1; lock-free query snapshots
 implemented for 3.3
 

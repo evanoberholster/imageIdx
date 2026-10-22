@@ -1,5 +1,9 @@
 # VectorIdx Design
 
+> **Design note / experimental.** Vector APIs, performance, and file formats are
+> experimental in V1. Current implementation docs:
+> `index/vectoridx/README.md`. Do not treat this proposal as a V1 API contract.
+
 ## 1. Purpose
 
 `VectorIdx` is a persistent, mmap-oriented approximate-nearest-neighbor vector index for the image database. It is designed for Go, HNSW graph search, fixed-width vectors, direct application NodeIDs, predictable memory use, pooled search state, and SIMD-accelerated Euclidean/L2 distance calculations.

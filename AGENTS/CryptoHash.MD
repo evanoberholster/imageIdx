@@ -1,5 +1,9 @@
 # CryptoHash Index Proposal
 
+> **Historical proposal.** This document is retained for design context only.
+> It does not describe the current implementation. Use `index/radixhash` for
+> exact hashes and `database/FORMAT.md` for V1 persistence.
+
 ## 1. Purpose
 
 `cryptohash` is a persistent, mmap-oriented exact-content hash index for `imageIdx`.

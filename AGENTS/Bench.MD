@@ -1,5 +1,9 @@
 # imageIdx Benchmarking Implementation Instructions
 
+> **Current benchmark methodology.** Some engine names and proposals in this
+> document are historical. Use `internal/bench`, package benchmarks, and
+> `AGENTS/Refactor/Phase3-Baseline-Report.md` for the current harness and results.
+
 Implement a shared benchmarking and performance-testing framework for imageIdx, inspired by the methodology used by kvbench/tamnd.
 
 The goal is not to copy kvbench code. Copy the important benchmarking concepts and adapt them to imageIdx's specialized indexes.
