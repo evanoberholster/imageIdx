@@ -23,13 +23,16 @@ import (
 // Each association is family:u8 | namespace:u16 | family payload. The before
 // list is the set removed by this mutation; the after list is the set added.
 // An insert is flagged explicitly so an empty final projection is not confused
-// with a no-op update. Delete entries carry no association payload.
+// with a no-op update. A reinsert over a tombstone carries both lists and is
+// flagged separately so replay restores liveness and removes stale values.
+// Delete entries carry no association payload.
 const (
 	journalVersion = 2
 	journalHeader  = 23
 
-	journalFlagDeleted = 1 << 0
-	journalFlagInsert  = 1 << 1
+	journalFlagDeleted  = 1 << 0
+	journalFlagInsert   = 1 << 1
+	journalFlagReinsert = 1 << 2
 )
 
 const (
@@ -42,14 +45,15 @@ const (
 )
 
 type journalEntry struct {
-	entity  schema.EntityKind
-	id      schema.ValueID
-	deleted bool
-	insert  bool
-	before  []byte
-	after   []byte
-	beforeN uint16
-	afterN  uint16
+	entity   schema.EntityKind
+	id       schema.ValueID
+	deleted  bool
+	insert   bool
+	reinsert bool
+	before   []byte
+	after    []byte
+	beforeN  uint16
+	afterN   uint16
 }
 
 // encodeMutation encodes typed before/after deltas. before is the set removed
@@ -107,7 +111,13 @@ func appendMutation(dst []byte, m Mutation, insert bool, before, after index.Ent
 		b[1] |= journalFlagDeleted
 	}
 	if insert {
-		b[1] |= journalFlagInsert
+		if beforeN == 0 && beforeLen == 0 {
+			b[1] |= journalFlagInsert
+		} else {
+			// A tombstone retains the old projection. Mark the transition as a
+			// reinsert so replay can restore liveness and remove stale values.
+			b[1] |= journalFlagReinsert
+		}
 	}
 	b[2] = byte(m.Entity)
 	binary.BigEndian.PutUint64(b[3:11], m.ValueID)
@@ -157,7 +167,7 @@ func decodeMutation(b []byte) (journalEntry, error) {
 		return journalEntry{}, ErrCorruptJournal
 	}
 	flags := b[1]
-	if flags&^(journalFlagDeleted|journalFlagInsert) != 0 {
+	if flags&^(journalFlagDeleted|journalFlagInsert|journalFlagReinsert) != 0 {
 		return journalEntry{}, ErrCorruptJournal
 	}
 	entity := schema.EntityKind(b[2])
@@ -173,23 +183,28 @@ func decodeMutation(b []byte) (journalEntry, error) {
 	}
 	deleted := flags&journalFlagDeleted != 0
 	insert := flags&journalFlagInsert != 0
+	reinsert := flags&journalFlagReinsert != 0
 	if deleted && (afterLen != 0 || afterN != 0) {
 		return journalEntry{}, ErrCorruptJournal
 	}
-	if insert && (beforeLen != 0 || beforeN != 0 || deleted) {
+	if insert && (beforeLen != 0 || beforeN != 0 || deleted || reinsert) {
+		return journalEntry{}, ErrCorruptJournal
+	}
+	if reinsert && (deleted || beforeLen == 0 && beforeN == 0) {
 		return journalEntry{}, ErrCorruptJournal
 	}
 	beforeStart := journalHeader
 	afterStart := beforeStart + int(beforeLen)
 	return journalEntry{
-		entity:  entity,
-		id:      id,
-		deleted: deleted,
-		insert:  insert,
-		before:  b[beforeStart:afterStart],
-		after:   b[afterStart : len(b)-4],
-		beforeN: beforeN,
-		afterN:  afterN,
+		entity:   entity,
+		id:       id,
+		deleted:  deleted,
+		insert:   insert,
+		reinsert: reinsert,
+		before:   b[beforeStart:afterStart],
+		after:    b[afterStart : len(b)-4],
+		beforeN:  beforeN,
+		afterN:   afterN,
 	}, nil
 }
 

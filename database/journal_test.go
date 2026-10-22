@@ -80,6 +80,26 @@ func TestJournalV2Golden(t *testing.T) {
 	}
 }
 
+func TestJournalV2ReinsertCarriesTombstoneDelta(t *testing.T) {
+	before := fullJournalEntry()
+	after := fullJournalEntry()
+	after.Bitmaps[0].Value = bitmapidx.EnumStringValue("next")
+	raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 42}, true, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := decodeMutation(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.insert || !entry.reinsert || entry.deleted {
+		t.Fatalf("flags insert=%t reinsert=%t deleted=%t", entry.insert, entry.reinsert, entry.deleted)
+	}
+	if entry.beforeN != 6 || entry.afterN != 6 {
+		t.Fatalf("association counts = %d/%d", entry.beforeN, entry.afterN)
+	}
+}
+
 func TestJournalV2RejectsMalformed(t *testing.T) {
 	raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 42}, true, index.Entry{}, fullJournalEntry())
 	if err != nil {
@@ -93,6 +113,7 @@ func TestJournalV2RejectsMalformed(t *testing.T) {
 		{name: "truncated", raw: raw[:len(raw)-1]},
 		{name: "future-version", raw: mutateByte(raw, 0, 3)},
 		{name: "bad-flags", raw: mutateByte(raw, 1, 0x80)},
+		{name: "both-insert-and-reinsert", raw: mutateByte(raw, 1, journalFlagInsert|journalFlagReinsert)},
 		{name: "zero-id", raw: mutateByte(raw, 10, 0)},
 		{name: "trailing", raw: append(append([]byte(nil), raw...), 0)},
 		{name: "bad-crc", raw: mutateByte(raw, len(raw)-1, raw[len(raw)-1]^1)},

@@ -39,6 +39,7 @@ type queuedMutation struct {
 	afterN   uint16
 	deleted  bool
 	insert   bool
+	reinsert bool
 }
 
 type decodedEvent struct {
@@ -160,6 +161,7 @@ func (w *coordinatorWorkspace) appendMutation(sequence uint64, raw []byte, entry
 		afterN:   entry.afterN,
 		deleted:  entry.deleted,
 		insert:   entry.insert,
+		reinsert: entry.reinsert,
 	}
 	if beforeLen != 0 {
 		m.before = dataRef{slot: slot, offset: offset, length: uint32(beforeLen), epoch: w.epoch, valid: true}

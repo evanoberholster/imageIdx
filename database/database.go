@@ -131,8 +131,11 @@ type DB struct {
 }
 
 // Open opens the canonical Pebble directory and its derived index directory.
-// The index must have been created with index.Create before the first Open.
-// A reconciliation failure closes both stores and leaves the journal intact.
+// On a fresh database, the index directory must first be created with
+// index.Create or index.CreateWithDefinitions. Later opens reuse schema.dat and
+// the existing index. A reconciliation failure closes both stores and leaves
+// the journal intact; ownership and recovery semantics are documented in
+// database/README.md and database/FORMAT.md.
 func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if decode == nil && options.DecodeInto == nil {
 		return nil, ErrInvalidMutation
@@ -663,6 +666,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			return 0, err
 		}
 		priorExists := err == nil
+		priorTombstone := false
 		var before []byte
 		var beforeRecord []byte
 		if priorExists {
@@ -670,18 +674,23 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			if err != nil {
 				return 0, err
 			}
+			priorTombstone = value.tombstone
 			before, err = db.projectionForValue(value)
 			if err != nil {
 				return 0, err
 			}
 			beforeRecord = value.record
 		}
-		insert := !priorExists
+		// A value written over a tombstone is semantically a reinsertion even
+		// though the prior value still carries the old projection. It must add
+		// liveness and remove associations that are absent from the new
+		// projection.
+		insert := !priorExists || priorTombstone
 		if m.Delete {
 			insert = false
 		}
 		var beforeEntry index.Entry
-		if !insert {
+		if priorExists && !m.Delete {
 			var err error
 			beforeEntry, err = db.decodeEntry(before, m.Entity, m.ValueID)
 			if err != nil {
@@ -809,9 +818,17 @@ func (db *DB) Get(entity schema.EntityKind, id schema.ValueID) ([]byte, error) {
 	return append([]byte(nil), value.record...), nil
 }
 
+// DatabaseGeneration returns the latest committed canonical/journal sequence.
 func (db *DB) DatabaseGeneration() uint64 { db.mu.Lock(); defer db.mu.Unlock(); return db.committed }
-func (db *DB) IndexedGeneration() uint64  { db.mu.Lock(); defer db.mu.Unlock(); return db.indexed }
-func (db *DB) Index() *index.Store        { return db.indexes }
+
+// IndexedGeneration returns the last sequence durably acknowledged as indexed.
+// It never exceeds DatabaseGeneration.
+func (db *DB) IndexedGeneration() uint64 { db.mu.Lock(); defer db.mu.Unlock(); return db.indexed }
+
+// Index returns the live derived index store. It is an advanced read accessor:
+// do not write to or close the returned store while the database coordinator is
+// running. Search plans bind with search.New(db.Index()).
+func (db *DB) Index() *index.Store { return db.indexes }
 
 // NextID reserves a unique entity ID before its canonical record is committed.
 // Abandoned IDs are never recycled. Close rejects new calls and drains those
@@ -895,6 +912,10 @@ func (db *DB) Checkpoint() error {
 	return db.indexes.Checkpoint()
 }
 
+// Close stops new operations, drains the indexing coordinator, closes the
+// derived index and canonical Pebble store, and releases database locks. Active
+// search snapshots may delay index closure; drain long-running queries before
+// calling Close. Close is idempotent.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	if db.closed {
