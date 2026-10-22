@@ -150,9 +150,10 @@ ordinary block capacity, and keeps at most one bounded oversized buffer.
 bytes in one batch; a single oversized mutation is still processed alone.
 `Options.OversizedRetentionBytes` (default 4 MiB) bounds the one reused oversized
 buffer. The index copies any bytes it needs to retain; callers must not retain
-views into coordinator storage. `DB.Stats()` exposes cumulative logical and
-physical writer counters for benchmarks and diagnostics; it is not a
-transactional snapshot.
+views into coordinator storage. `DB.Stats()` exposes cumulative application-level
+operation counters and logical byte estimates for benchmarks and diagnostics; it
+is not a transactional snapshot and does not measure device writes or `fsync`
+syscalls.
 
 ## Journal, ordering and replay
 

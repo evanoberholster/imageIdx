@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"unsafe"
@@ -107,5 +108,75 @@ func BenchmarkKVNamespaceLookupBitmap(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestOpenBitmapMembership(t *testing.T) {
+	dir := t.TempDir()
+	defs := schematypes.NewDefinitions()
+	namespaces := []schematypes.Namespace{1, 63, 64, 0xFFF0, 0xFFFE, 0xFFFF}
+	for _, ns := range namespaces {
+		if err := defs.Register(schematypes.NamespaceDef{
+			Namespace: ns,
+			Name:      fmt.Sprintf("kv-%d", ns),
+			Kind:      schematypes.KindKV,
+			Entity:    schematypes.EntityImage,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := Open(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ns := range namespaces {
+		if err := s.Set(Key{Namespace: ns, ID: 1}, []byte{byte(ns)}); err != nil {
+			t.Fatalf("namespace %d set: %v", ns, err)
+		}
+		if got, err := s.Get(Key{Namespace: ns, ID: 1}); err != nil || len(got) != 1 {
+			t.Fatalf("namespace %d get: %v %v", ns, got, err)
+		}
+	}
+	if err := s.Set(Key{Namespace: 2, ID: 1}, []byte("x")); !errors.Is(err, ErrNamespace) {
+		t.Fatalf("unknown namespace: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(dir, defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, ns := range namespaces {
+		if got, err := s.Get(Key{Namespace: ns, ID: 1}); err != nil || len(got) != 1 {
+			t.Fatalf("reopen namespace %d: %v %v", ns, got, err)
+		}
+	}
+}
+
+func TestOpenRejectsNonKVDefinition(t *testing.T) {
+	defs := schematypes.NewDefinitions()
+	if err := defs.Register(schematypes.NamespaceDef{
+		Namespace: 7, Name: "index", Kind: schematypes.KindTimestamp, Entity: schematypes.EntityImage,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(t.TempDir(), defs); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("non-KV definition: %v", err)
+	}
+}
+
+func TestOpenLegacyBitmapMembership(t *testing.T) {
+	s, err := OpenLegacy(t.TempDir(), Spec{Namespace: 1, Name: "one"}, Spec{Namespace: 0xFFFF, Name: "last"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Set(Key{Namespace: 0xFFFF, ID: 1}, []byte("last")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(Key{Namespace: 0, ID: 1}, []byte("zero")); !errors.Is(err, ErrNamespace) {
+		t.Fatalf("reserved zero namespace: %v", err)
 	}
 }

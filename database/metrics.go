@@ -7,9 +7,10 @@ import (
 	"github.com/evanoberholster/imageIdx/store"
 )
 
-// Stats is a cumulative, best-effort snapshot of coordinator and physical
-// writer activity. It is not a transactional snapshot across concurrent
-// writers; use it for benchmarks and diagnostics, not durability decisions.
+// Stats is a cumulative, best-effort snapshot of application-level coordinator
+// operations and logical byte estimates. It does not measure device writes or
+// fsync syscalls and is not a transactional snapshot across concurrent writers;
+// use it for benchmarks and diagnostics, not durability decisions.
 type Stats struct {
 	CanonicalCommits        uint64
 	JournalEntries          uint64

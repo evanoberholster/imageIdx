@@ -11,6 +11,7 @@ import (
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	schema "github.com/evanoberholster/imageIdx/schema"
+	"github.com/evanoberholster/imageIdx/store"
 	"github.com/golang/geo/s2"
 )
 
@@ -118,6 +119,9 @@ func TestCoalescingFallsBackForDeleteReinsert(t *testing.T) {
 	if !containsTag(t, idx, 1, 'b') {
 		t.Fatal("reinserted tag missing")
 	}
+	if !isLive(t, db, schema.EntityImage, 1) {
+		t.Fatal("reinserted entity is not live")
+	}
 }
 
 func TestCoalescedUpdateThenUpdate(t *testing.T) {
@@ -188,15 +192,29 @@ func TestBuildGroupsRejectsUnprovenEngineFamilies(t *testing.T) {
 	db := openTest(t, data, idxPath)
 	defer db.Close()
 
-	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
-	ws.reset()
-	ws.count = 2
-	ws.mutations[0] = queuedMutation{sequence: 1, entity: schema.EntityImage, id: 1}
-	ws.mutations[1] = queuedMutation{sequence: 2, entity: schema.EntityImage, id: 1}
-	ws.decoded[0].after.Sims = []index.SimValue{{Namespace: 200}}
-	ws.decoded[1].after.Sims = []index.SimValue{{Namespace: 200}}
-	if groups, safe := db.buildGroups(ws); safe || len(groups) != 1 {
-		t.Fatalf("groups=%d safe=%v, want one unsafe group", len(groups), safe)
+	for _, tc := range []struct {
+		name string
+		set  func(*decodedEvent)
+	}{
+		{name: "simhash", set: func(event *decodedEvent) {
+			event.after.Sims = []index.SimValue{{Namespace: 200}}
+		}},
+		{name: "vector", set: func(event *decodedEvent) {
+			event.after.Vectors = []index.VectorValue{{Namespace: 201, Element: 4, Float32: []float32{1}}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+			ws.reset()
+			ws.count = 2
+			ws.mutations[0] = queuedMutation{sequence: 1, entity: schema.EntityImage, id: 1}
+			ws.mutations[1] = queuedMutation{sequence: 2, entity: schema.EntityImage, id: 1}
+			tc.set(&ws.decoded[0])
+			tc.set(&ws.decoded[1])
+			if groups, safe := db.buildGroups(ws); safe || len(groups) != 1 {
+				t.Fatalf("groups=%d safe=%v, want one unsafe group", len(groups), safe)
+			}
+		})
 	}
 }
 
@@ -252,8 +270,8 @@ func loadWorkspace(t *testing.T, ws *coordinatorWorkspace, events []randomEvent)
 }
 
 func TestCoalescingMatchesSequentialRandomBitmap(t *testing.T) {
-	for seed := int64(0); seed < 12; seed++ {
-		events := randomBitmapEvents(seed, 20)
+	for seed := int64(0); seed < 8; seed++ {
+		events := randomBitmapEvents(seed, 64)
 		seqData, seqIdx := paths(t)
 		seqDB := openTest(t, seqData, seqIdx)
 		coalData, coalIdx := paths(t)
@@ -449,5 +467,297 @@ func appendFamilyJournal(t *testing.T, ws *coordinatorWorkspace, sequence uint64
 	}
 	if !ws.appendMutation(sequence, raw, entry) {
 		t.Fatal("appendMutation rejected")
+	}
+}
+
+func pairProjection(id uint64, camera, rating byte) []byte {
+	out := make([]byte, 10)
+	binary.BigEndian.PutUint64(out[:8], id)
+	out[8], out[9] = camera, rating
+	return out
+}
+
+func decodePair(p []byte) (index.Entry, error) {
+	if len(p) != 10 {
+		return index.Entry{}, ErrCorruptJournal
+	}
+	return index.Entry{
+		ValueID: binary.BigEndian.Uint64(p[:8]),
+		Bitmaps: []index.BitmapValue{
+			{Namespace: tagNS, Value: bitmapidx.EnumBytesValue(p[8:9])},
+			{Namespace: 102, Value: bitmapidx.EnumBytesValue(p[9:10])},
+		},
+	}, nil
+}
+
+func decodePairInto(p []byte, dst *index.Entry, scratch *DecodeScratch) error {
+	if len(p) != 10 {
+		return ErrCorruptJournal
+	}
+	dst.ValueID = binary.BigEndian.Uint64(p[:8])
+	dst.Bitmaps = append(dst.Bitmaps,
+		index.BitmapValue{Namespace: tagNS, Value: bitmapidx.EnumBytesValue(p[8:9])},
+		index.BitmapValue{Namespace: 102, Value: bitmapidx.EnumBytesValue(p[9:10])},
+	)
+	return nil
+}
+
+func writeCanonicalProjection(t *testing.T, db *DB, id uint64, projection []byte, record []byte, generation uint64) {
+	t.Helper()
+	b := db.values.NewBatch()
+	value := make([]byte, 5+len(projection)+len(record))
+	binary.BigEndian.PutUint32(value[1:5], uint32(len(projection)))
+	copy(value[5:], projection)
+	copy(value[5+len(projection):], record)
+	if err := b.Set(store.Key{Namespace: db.canonical[schema.EntityImage], ID: id}, value); err != nil {
+		_ = b.Close()
+		t.Fatal(err)
+	}
+	if err := putGeneration(b, 1, generation); err != nil {
+		_ = b.Close()
+		t.Fatal(err)
+	}
+	if err := b.Commit(); err != nil {
+		_ = b.Close()
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendCanonicalToBatch(t *testing.T, b *store.Batch, db *DB, id uint64, projection, record []byte) {
+	t.Helper()
+	value := make([]byte, 5+len(projection)+len(record))
+	binary.BigEndian.PutUint32(value[1:5], uint32(len(projection)))
+	copy(value[5:], projection)
+	copy(value[5+len(projection):], record)
+	if err := b.Set(store.Key{Namespace: db.canonical[schema.EntityImage], ID: id}, value); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeCoalescingFixture(t *testing.T, db *DB) {
+	t.Helper()
+	b := db.values.NewBatch()
+	defer b.Close()
+	appendCanonicalToBatch(t, b, db, 42, pairProjection(42, 'C', '4'), []byte("42-final"))
+	appendCanonicalToBatch(t, b, db, 99, pairProjection(99, 'N', '5'), []byte("99-final"))
+	appendJournal := func(sequence uint64, mutation Mutation, before []byte) {
+		t.Helper()
+		raw, err := encodeMutation(mutation, before)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Set(store.Key{Namespace: journalNS, ID: sequence}, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendJournal(1, Mutation{Entity: schema.EntityImage, ValueID: 42, Projection: pairProjection(42, 'C', '3')}, nil)
+	appendJournal(2, Mutation{Entity: schema.EntityImage, ValueID: 99, Projection: pairProjection(99, 'N', '5')}, nil)
+	appendJournal(3, Mutation{Entity: schema.EntityImage, ValueID: 42, Projection: pairProjection(42, 'C', '4')}, pairProjection(42, 'C', '3'))
+	if err := putGeneration(b, 1, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCoalescedInsertUpdatePairReopen(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		open func(string, string) *DB
+	}{
+		{
+			name: "Decoder",
+			open: func(data, idx string) *DB {
+				db, err := Open(data, idx, decodePair, Options{BatchSize: 64})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return db
+			},
+		},
+		{
+			name: "DecodeInto",
+			open: func(data, idx string) *DB {
+				db, err := Open(data, idx, nil, Options{BatchSize: 64, DecodeInto: decodePairInto})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return db
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, idxPath := paths(t)
+			db := tc.open(data, idxPath)
+			writeCoalescingFixture(t, db)
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			db = tc.open(data, idxPath)
+			if err := db.WaitIndexed(t.Context(), 3); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			assertPairState(t, db)
+			if got, err := db.Get(schema.EntityImage, 42); err != nil || string(got) != "42-final" {
+				db.Close()
+				t.Fatalf("canonical 42 = %q %v", got, err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			db = tc.open(data, idxPath)
+			defer db.Close()
+			assertPairState(t, db)
+		})
+	}
+}
+
+func assertPairState(t *testing.T, db *DB) {
+	t.Helper()
+	camera, ok := db.indexes.Bitmap(tagNS)
+	if !ok {
+		t.Fatal("camera index missing")
+	}
+	rating, ok := db.indexes.Bitmap(102)
+	if !ok {
+		t.Fatal("rating index missing")
+	}
+	if !containsTag(t, camera, 42, 'C') {
+		t.Fatal("camera Canon missing")
+	}
+	if !containsTag(t, rating, 42, '4') {
+		t.Fatal("rating 4 missing")
+	}
+	if containsTag(t, rating, 42, '3') {
+		t.Fatal("stale rating 3 present")
+	}
+	if !containsTag(t, camera, 99, 'N') || !containsTag(t, rating, 99, '5') {
+		t.Fatal("interleaved image state missing")
+	}
+	if !isLive(t, db, schema.EntityImage, 42) || !isLive(t, db, schema.EntityImage, 99) {
+		t.Fatal("entity liveness missing")
+	}
+	if got := db.IndexedGeneration(); got != 3 {
+		t.Fatalf("indexed generation = %d, want 3", got)
+	}
+}
+
+func TestCoalescingMutationSequences(t *testing.T) {
+	t.Run("add-delete", func(t *testing.T) {
+		data, idxPath := paths(t)
+		db := openTest(t, data, idxPath)
+		defer db.Close()
+		db.mu.Lock()
+		db.committed = 2
+		db.mu.Unlock()
+		ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+		ws.reset()
+		appendTestJournal(t, ws, 1, 1, nil, projection(1, 'a'), false)
+		appendTestJournal(t, ws, 2, 1, projection(1, 'a'), nil, true)
+		if err := db.applyWorkspace(ws, db.indexes.NewBatch(64)); err != nil {
+			t.Fatal(err)
+		}
+		if isLive(t, db, schema.EntityImage, 1) {
+			t.Fatal("entity live after add-delete")
+		}
+		if got := db.IndexedGeneration(); got != 2 {
+			t.Fatalf("generation = %d", got)
+		}
+	})
+	t.Run("update-delete", func(t *testing.T) {
+		data, idxPath := paths(t)
+		db := openTest(t, data, idxPath)
+		defer db.Close()
+		if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection(1, 'a')}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.WaitIndexed(t.Context(), 1); err != nil {
+			t.Fatal(err)
+		}
+		db.mu.Lock()
+		db.committed = 3
+		db.mu.Unlock()
+		ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+		ws.reset()
+		appendTestJournal(t, ws, 2, 1, projection(1, 'a'), projection(1, 'b'), false)
+		appendTestJournal(t, ws, 3, 1, projection(1, 'b'), nil, true)
+		if err := db.applyWorkspace(ws, db.indexes.NewBatch(64)); err != nil {
+			t.Fatal(err)
+		}
+		if isLive(t, db, schema.EntityImage, 1) {
+			t.Fatal("entity live after update-delete")
+		}
+		if got := db.IndexedGeneration(); got != 3 {
+			t.Fatalf("generation = %d", got)
+		}
+	})
+}
+
+func TestCoalescedNoOpUpdateAdvancesGeneration(t *testing.T) {
+	data, idxPath := paths(t)
+	db := openTest(t, data, idxPath)
+	defer db.Close()
+	if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection(1, 'a')}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitIndexed(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	db.mu.Lock()
+	db.committed = 2
+	db.mu.Unlock()
+
+	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+	ws.reset()
+	appendTestJournal(t, ws, 2, 1, projection(1, 'a'), projection(1, 'a'), false)
+	if err := db.applyWorkspace(ws, db.indexes.NewBatch(64)); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.IndexedGeneration(); got != 2 {
+		t.Fatalf("indexed generation = %d, want 2", got)
+	}
+	idx, _ := db.indexes.Bitmap(tagNS)
+	if !containsTag(t, idx, 1, 'a') {
+		t.Fatal("no-op update lost association")
+	}
+	if !isLive(t, db, schema.EntityImage, 1) {
+		t.Fatal("no-op update lost liveness")
+	}
+}
+
+func decodeEmptyProjection(p []byte) (index.Entry, error) {
+	if len(p) != 9 {
+		return index.Entry{}, ErrCorruptJournal
+	}
+	return index.Entry{ValueID: binary.BigEndian.Uint64(p[:8])}, nil
+}
+
+func TestEmptyProjectionAdvancesGeneration(t *testing.T) {
+	data, idxPath := paths(t)
+	db, err := Open(data, idxPath, decodeEmptyProjection, Options{BatchSize: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.mu.Lock()
+	db.committed = 2
+	db.mu.Unlock()
+
+	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+	ws.reset()
+	appendTestJournal(t, ws, 1, 1, nil, projection(1, 0), false)
+	appendTestJournal(t, ws, 2, 1, projection(1, 0), projection(1, 0), false)
+	if err := db.applyWorkspace(ws, db.indexes.NewBatch(64)); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.IndexedGeneration(); got != 2 {
+		t.Fatalf("indexed generation = %d, want 2", got)
 	}
 }

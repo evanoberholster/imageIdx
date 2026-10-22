@@ -43,6 +43,43 @@ func BenchmarkCommitAndIndex(b *testing.B) {
 	}
 }
 
+// BenchmarkCommitAndIndexWarm excludes the one-time coordinator workspace and
+// first projection-block allocation from the measured steady state.
+func BenchmarkCommitAndIndexWarm(b *testing.B) {
+	for _, size := range []int{1, 16, 32, 64} {
+		b.Run(fmt.Sprintf("batch-%d", size), func(b *testing.B) {
+			data, idxPath := paths(b)
+			db, err := Open(data, idxPath, decodeTest, Options{BatchSize: 64})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer db.Close()
+			mutations := make([]Mutation, size)
+			warm := func(base int) {
+				for j := range mutations {
+					id := uint64(base + j + 1)
+					mutations[j] = Mutation{Entity: 1, ValueID: id, Projection: projection(id, 'x')}
+				}
+				g, err := db.Commit(mutations...)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := db.WaitIndexed(context.Background(), g); err != nil {
+					b.Fatal(err)
+				}
+			}
+			warm(0)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				warm((i + 1) * size)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(b.N*size)/b.Elapsed().Seconds(), "images/s")
+		})
+	}
+}
+
 func BenchmarkStartupRebuild(b *testing.B) {
 	for _, total := range []int{10_000, 100_000} {
 		b.Run(fmt.Sprintf("records-%d", total), func(b *testing.B) {

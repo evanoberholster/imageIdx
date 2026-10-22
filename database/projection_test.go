@@ -65,6 +65,14 @@ func TestChangedProjectionDuplicatesUseSetSemantics(t *testing.T) {
 	if len(removed.Bitmaps) != 0 || len(added.Bitmaps) != 0 {
 		t.Fatalf("duplicate identical associations produced %d removals and %d additions", len(removed.Bitmaps), len(added.Bitmaps))
 	}
+	removed, added = changedProjection(before, index.Entry{ValueID: 1})
+	if len(removed.Bitmaps) != 1 || len(added.Bitmaps) != 0 {
+		t.Fatalf("removing duplicate associations produced %d removals and %d additions", len(removed.Bitmaps), len(added.Bitmaps))
+	}
+	removed, added = changedProjection(index.Entry{ValueID: 1}, index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{a, a}})
+	if len(removed.Bitmaps) != 0 || len(added.Bitmaps) != 1 {
+		t.Fatalf("adding duplicate associations produced %d removals and %d additions", len(removed.Bitmaps), len(added.Bitmaps))
+	}
 }
 
 func TestChangedProjectionVectorFloatSemantics(t *testing.T) {
@@ -89,7 +97,7 @@ func TestChangedProjectionVectorFloatSemantics(t *testing.T) {
 }
 
 func TestChangedProjectionMatchesReference(t *testing.T) {
-	for n := 0; n <= 24; n++ {
+	for _, n := range []int{0, 1, 4, 16, 64, 256} {
 		before := mixedProjection(n, 11)
 		after := before
 		after = mutateProjection(after, n, 7)
@@ -314,5 +322,47 @@ func BenchmarkProjectionDiffSortMerge(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+func TestChangedProjectionUnchangedOneAndAll(t *testing.T) {
+	before := mixedProjection(64, 5)
+	removed, added := changedProjection(before, before)
+	if len(removed.Bitmaps)+len(removed.Times)+len(removed.Geos)+len(removed.Hashes)+len(removed.Sims)+len(removed.Vectors) != 0 ||
+		len(added.Bitmaps)+len(added.Times)+len(added.Geos)+len(added.Hashes)+len(added.Sims)+len(added.Vectors) != 0 {
+		t.Fatal("identical projection produced changes")
+	}
+
+	one := before
+	one.Bitmaps = append([]index.BitmapValue(nil), before.Bitmaps...)
+	one.Bitmaps[0].Value = bitmapidx.EnumStringValue("one-change")
+	removed, added = changedProjection(before, one)
+	if len(removed.Bitmaps)+len(added.Bitmaps) != 2 {
+		t.Fatalf("one change produced %d removals/%d additions", len(removed.Bitmaps), len(added.Bitmaps))
+	}
+
+	all := before
+	all.Bitmaps = append([]index.BitmapValue(nil), before.Bitmaps...)
+	for i := range all.Bitmaps {
+		all.Bitmaps[i].Value = bitmapidx.EnumStringValue(fmt.Sprintf("all-%d", i))
+	}
+	removed, added = changedProjection(before, all)
+	if len(removed.Bitmaps) != len(before.Bitmaps) || len(added.Bitmaps) != len(before.Bitmaps) {
+		t.Fatalf("all change produced %d removals/%d additions", len(removed.Bitmaps), len(added.Bitmaps))
+	}
+}
+
+func TestChangedProjectionDoesNotSortInput(t *testing.T) {
+	a := index.BitmapValue{Namespace: 1, Value: bitmapidx.EnumStringValue("a")}
+	b := index.BitmapValue{Namespace: 1, Value: bitmapidx.EnumStringValue("b")}
+	c := index.BitmapValue{Namespace: 1, Value: bitmapidx.EnumStringValue("c")}
+	before := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{c, a, b}}
+	after := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{b, c, a}}
+	wantBefore := append([]index.BitmapValue(nil), before.Bitmaps...)
+	wantAfter := append([]index.BitmapValue(nil), after.Bitmaps...)
+	var scratch projectionScratch
+	changedProjectionScratch(before, after, &scratch)
+	if !slices.EqualFunc(before.Bitmaps, wantBefore, sameBitmap) || !slices.EqualFunc(after.Bitmaps, wantAfter, sameBitmap) {
+		t.Fatal("projection diff destructively sorted its input")
 	}
 }

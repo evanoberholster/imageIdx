@@ -2,6 +2,7 @@ package database
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	schema "github.com/evanoberholster/imageIdx/schema"
@@ -123,4 +124,75 @@ func TestCoordinatorWorkspaceStaleReferencePanics(t *testing.T) {
 		}
 	}()
 	_ = ws.refBytes(m.before)
+}
+
+func TestCoordinatorWorkspacePayloadBoundaries(t *testing.T) {
+	for _, size := range []int{0, 1, 65535, 65536, 65537} {
+		t.Run(fmt.Sprintf("bytes-%d", size), func(t *testing.T) {
+			ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+			ws.reset()
+			var after []byte
+			deleted := size == 0
+			if size != 0 {
+				after = bytes.Repeat([]byte{7}, size)
+			}
+			m := testWorkspaceMutation(t, ws, 1, nil, after, deleted)
+			if size == 0 {
+				if m.before.valid || m.after.valid {
+					t.Fatal("empty payload produced valid refs")
+				}
+				return
+			}
+			if !m.after.valid || len(ws.refBytes(m.after)) != size {
+				t.Fatalf("payload size %d missing", size)
+			}
+			block := ws.blocks[m.after.slot]
+			wantOrdinary := size <= projectionBlockSize
+			if block.ordinary != wantOrdinary {
+				t.Fatalf("size %d ordinary=%v, want %v", size, block.ordinary, wantOrdinary)
+			}
+		})
+	}
+}
+
+func TestCoordinatorWorkspaceRejectsMismatchedPayload(t *testing.T) {
+	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+	ws.reset()
+	raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: []byte("x")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := decodeMutation(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.before = []byte("unexpected")
+	if ws.appendMutation(1, raw, entry) {
+		t.Fatal("mismatched payload accepted")
+	}
+	if ws.count != 0 || ws.logicalBytes != 0 {
+		t.Fatal("rejected payload mutated workspace state")
+	}
+}
+
+func TestCoordinatorWorkspaceReusesOrdinaryAndOversizedSlots(t *testing.T) {
+	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, 1<<20)
+	ws.reset()
+	testWorkspaceMutation(t, ws, 1, nil, bytes.Repeat([]byte{1}, 32<<10), false)
+	ordinaryBlocks := len(ws.blocks)
+	ws.reset()
+	testWorkspaceMutation(t, ws, 2, nil, bytes.Repeat([]byte{2}, 32<<10), false)
+	if len(ws.blocks) != ordinaryBlocks {
+		t.Fatalf("ordinary block reuse grew from %d to %d", ordinaryBlocks, len(ws.blocks))
+	}
+	ws.reset()
+	testWorkspaceMutation(t, ws, 3, nil, bytes.Repeat([]byte{3}, 70<<10), false)
+	if len(ws.blocks) != 2 {
+		t.Fatalf("oversized allocation left %d blocks, want 2", len(ws.blocks))
+	}
+	ws.reset()
+	testWorkspaceMutation(t, ws, 4, nil, bytes.Repeat([]byte{4}, 70<<10), false)
+	if len(ws.blocks) != 2 {
+		t.Fatalf("oversized reuse left %d blocks, want 2", len(ws.blocks))
+	}
 }

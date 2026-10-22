@@ -86,7 +86,35 @@ func changedProjectionScratch(before, after index.Entry, s *projectionScratch) (
 	return outBefore, outAfter
 }
 
+const smallDiffLimit = 2
+
+func diffSmall[T any](before, after, removed, added []T, equal func(T, T) bool) ([]T, []T) {
+	for _, value := range before {
+		if !containsValue(after, value, equal) && !containsValue(removed, value, equal) {
+			removed = append(removed, value)
+		}
+	}
+	for _, value := range after {
+		if !containsValue(before, value, equal) && !containsValue(added, value, equal) {
+			added = append(added, value)
+		}
+	}
+	return removed, added
+}
+
+func containsValue[T any](values []T, target T, equal func(T, T) bool) bool {
+	for _, value := range values {
+		if equal(value, target) {
+			return true
+		}
+	}
+	return false
+}
+
 func diffTimes(before, after []index.TimeValue, s *projectionScratch) ([]index.TimeValue, []index.TimeValue) {
+	if len(before)+len(after) <= smallDiffLimit {
+		return diffSmall(before, after, s.timesRemoved[:0], s.timesAdded[:0], sameTime)
+	}
 	s.timesBefore = append(s.timesBefore[:0], before...)
 	s.timesAfter = append(s.timesAfter[:0], after...)
 	slices.SortFunc(s.timesBefore, compareTime)
@@ -97,6 +125,9 @@ func diffTimes(before, after []index.TimeValue, s *projectionScratch) ([]index.T
 }
 
 func diffGeos(before, after []index.GeoValue, s *projectionScratch) ([]index.GeoValue, []index.GeoValue) {
+	if len(before)+len(after) <= smallDiffLimit {
+		return diffSmall(before, after, s.geosRemoved[:0], s.geosAdded[:0], sameGeo)
+	}
 	s.geosBefore = append(s.geosBefore[:0], before...)
 	s.geosAfter = append(s.geosAfter[:0], after...)
 	slices.SortFunc(s.geosBefore, compareGeo)
@@ -107,6 +138,9 @@ func diffGeos(before, after []index.GeoValue, s *projectionScratch) ([]index.Geo
 }
 
 func diffSims(before, after []index.SimValue, s *projectionScratch) ([]index.SimValue, []index.SimValue) {
+	if len(before)+len(after) <= smallDiffLimit {
+		return diffSmall(before, after, s.simsRemoved[:0], s.simsAdded[:0], sameSim)
+	}
 	s.simsBefore = append(s.simsBefore[:0], before...)
 	s.simsAfter = append(s.simsAfter[:0], after...)
 	slices.SortFunc(s.simsBefore, compareSim)
@@ -117,6 +151,9 @@ func diffSims(before, after []index.SimValue, s *projectionScratch) ([]index.Sim
 }
 
 func diffHashes(before, after []index.HashValue, s *projectionScratch) ([]index.HashValue, []index.HashValue) {
+	if len(before)+len(after) <= smallDiffLimit {
+		return diffSmall(before, after, s.hashesRemoved[:0], s.hashesAdded[:0], sameHash)
+	}
 	s.hashesBefore = append(s.hashesBefore[:0], before...)
 	s.hashesAfter = append(s.hashesAfter[:0], after...)
 	slices.SortFunc(s.hashesBefore, compareHash)
@@ -127,6 +164,9 @@ func diffHashes(before, after []index.HashValue, s *projectionScratch) ([]index.
 }
 
 func diffVectors(before, after []index.VectorValue, s *projectionScratch) ([]index.VectorValue, []index.VectorValue) {
+	if len(before)+len(after) <= smallDiffLimit {
+		return diffSmall(before, after, s.vectorsRemoved[:0], s.vectorsAdded[:0], sameVector)
+	}
 	s.vectorsBefore = append(s.vectorsBefore[:0], before...)
 	s.vectorsAfter = append(s.vectorsAfter[:0], after...)
 	slices.SortFunc(s.vectorsBefore, compareVector)
@@ -137,6 +177,9 @@ func diffVectors(before, after []index.VectorValue, s *projectionScratch) ([]ind
 }
 
 func diffBitmaps(before, after []index.BitmapValue, s *projectionScratch) ([]index.BitmapValue, []index.BitmapValue) {
+	if len(before)+len(after) <= smallDiffLimit {
+		return diffSmall(before, after, s.bitmapsRemoved[:0], s.bitmapsAdded[:0], sameBitmap)
+	}
 	s.bitmapsBefore = append(s.bitmapsBefore[:0], before...)
 	s.bitmapsAfter = append(s.bitmapsAfter[:0], after...)
 	slices.SortFunc(s.bitmapsBefore, compareBitmap)
