@@ -19,6 +19,12 @@ type Page struct {
 // the returned slice has its original length; appended backing storage may
 // have changed. A workspace and adequately sized dst avoid scratch growth.
 func (plan Plan) AppendIDs(ctx context.Context, dst []ImageID, ws *Workspace) ([]ImageID, error) {
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return dst, pinErr
+	}
+	plan = pinned
+	defer release()
 	start := len(dst)
 	if err := ctx.Err(); err != nil {
 		return dst, err
@@ -39,6 +45,12 @@ func (plan Plan) AppendPage(ctx context.Context, dst []ImageID, ws *Workspace, p
 	if page.Limit <= 0 {
 		return dst, ErrInvalidOptions
 	}
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return dst, pinErr
+	}
+	plan = pinned
+	defer release()
 	start := len(dst)
 	err := plan.walk(ctx, ws, page.AfterID, min(page.Limit, executionBatch), func(ids []ImageID) bool {
 		remaining := page.Limit - (len(dst) - start)
@@ -53,12 +65,19 @@ func (plan Plan) AppendPage(ctx context.Context, dst []ImageID, ws *Workspace, p
 
 // Visit invokes yield for sorted, unique matches and stops when it returns
 // false. Cancellation is reported rather than disguised as exhaustion. The
-// workspace is exclusive until return; yield must not reuse it. Bitmap
-// sources use detached snapshots; no mmap reader is pinned across callbacks.
+// workspace is exclusive until return; yield must not reuse it. Plans bound to
+// an Engine execute against one pinned snapshot; a writer may publish newer
+// data while callbacks run without changing this result set.
 func (plan Plan) Visit(ctx context.Context, ws *Workspace, yield func(ImageID) bool) error {
 	if yield == nil {
 		return ErrInvalidOptions
 	}
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return pinErr
+	}
+	plan = pinned
+	defer release()
 	return plan.walk(ctx, ws, 0, executionBatch, func(ids []ImageID) bool {
 		for _, id := range ids {
 			if ctx.Err() != nil || !yield(id) {

@@ -76,6 +76,22 @@ func (i *Index) CompileText(query string) (Query, error) {
 	return i.Compile(values...)
 }
 
+// Snapshot returns a copy of q bound to a pinned namespace view. The caller
+// must call ReleaseSnapshot on the returned query.
+func (q Query) Snapshot() Query {
+	if q.index != nil {
+		q.index = q.index.Snapshot()
+	}
+	return q
+}
+
+// ReleaseSnapshot releases a pin acquired by Snapshot.
+func (q Query) ReleaseSnapshot() {
+	if q.index != nil {
+		q.index.ReleaseSnapshot()
+	}
+}
+
 // keysFor returns the execution keys for a view. Fully resolved queries
 // reuse their compiled keys while the dictionary generation is unchanged,
 // touching neither the heap nor the pool. Otherwise every value re-resolves

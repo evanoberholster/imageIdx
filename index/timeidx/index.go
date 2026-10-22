@@ -7,9 +7,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 type Index struct {
@@ -37,6 +37,13 @@ type Index struct {
 	crash     func(string)
 	lastStats CommitStats
 	scratch   writeScratch // serialized writer-owned temporary routing storage
+
+	// snapshotReaders is set on handles returned by Snapshot. It keeps the
+	// snapshot's reader token on the live index instead of the cloned handle's
+	// zero-value tracker.
+	snapshotReaders *storage.ReaderTracker
+	snapshotToken   uint32
+	snapshotOnce    sync.Once
 }
 
 type CommitStats struct {
@@ -48,6 +55,13 @@ type CommitStats struct {
 
 func (i *Index) isClosed() bool {
 	return i.closed.Load() || (i.ownerClosed != nil && i.ownerClosed.Load())
+}
+
+func (i *Index) readerTracker() *storage.ReaderTracker {
+	if i.snapshotReaders != nil {
+		return i.snapshotReaders
+	}
+	return &i.readers
 }
 
 func (i *Index) CommitStats() CommitStats { i.mu.Lock(); defer i.mu.Unlock(); return i.lastStats }
@@ -138,7 +152,7 @@ func (i *Index) Close() error {
 	if i.closed.Swap(true) {
 		return nil
 	}
-	i.readers.WaitForPriorReaders()
+	i.readerTracker().WaitForPriorReaders()
 	i.scratch = writeScratch{}
 	var err error
 	if i.file != nil {

@@ -261,3 +261,20 @@ func TestBatchOwnershipAndConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBatchAppendCollapsesDuplicateIDLastWriteWins(t *testing.T) {
+	i := mustNewIndex(t, nil, 0, Config{})
+	b := NewBatch(4)
+	if !b.Append(Insert(1, 10)) || !b.Append(Insert(1, 20)) {
+		t.Fatal("append rejected")
+	}
+	if b.Len() != 1 {
+		t.Fatalf("batch len = %d, want 1", b.Len())
+	}
+	if err := i.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	if got := i.Search(nil, 0, ^uint64(0)); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("search = %v", got)
+	}
+}
