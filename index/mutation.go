@@ -90,6 +90,9 @@ func (b *Batch) Reset() error {
 	if b.inFlight.Load() {
 		return ErrBatchClosed
 	}
+	clear(b.entries)
+	clear(b.changes)
+	clear(b.deletes)
 	b.entries = b.entries[:0]
 	b.changes = b.changes[:0]
 	b.deletes = b.deletes[:0]
@@ -168,6 +171,7 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit, all bool
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	s.stats.applies.Add(1)
 	if explicit {
 		if sourceGeneration < s.source {
 			return fmt.Errorf("%w: %d < %d", timeidx.ErrSourceGeneration, sourceGeneration, s.source)
@@ -431,17 +435,21 @@ func (s *Store) syncNamespace(ns schema.Namespace) error {
 	if !ok || !s.health[ns].Available || s.isDegraded(ns) {
 		return nil
 	}
+	s.stats.syncs.Add(1)
 	switch familyOf(def.Kind) {
 	case familyGeo:
 		if idx, ok := s.reg.geoIndex(ns); ok {
+			s.stats.checkpoints.Add(1)
 			return idx.Checkpoint()
 		}
 	case familyRadix:
 		if idx, ok := s.reg.radixIndex(ns); ok {
+			s.stats.checkpoints.Add(1)
 			return idx.Checkpoint()
 		}
 	case familySim:
 		if idx, ok := s.reg.simStore(ns); ok {
+			s.stats.checkpoints.Add(1)
 			return idx.Checkpoint()
 		}
 	}

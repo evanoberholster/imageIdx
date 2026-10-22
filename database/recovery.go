@@ -315,7 +315,7 @@ func (db *DB) scanRebuild(stage *index.Store, schema *schematypes.Definitions, b
 			return true, nil
 		}
 		projections[used] = append(projections[used][:0], raw[5:5+n]...)
-		entry, err := db.decode(projections[used])
+		entry, err := db.decodeProjection(projections[used])
 		if err != nil || entry.ValueID != key.ID {
 			return false, fmt.Errorf("%w: projection at entity %d id %d: %v", ErrCorruptJournal, entity, key.ID, err)
 		}

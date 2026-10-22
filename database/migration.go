@@ -156,7 +156,7 @@ func recoverPreparedSchema(ids *schema.Schema, dir, indexDir string, decode Deco
 	if err := resumeActivation(indexDir, values, target, options.boundary); err != nil {
 		return err
 	}
-	temp := &DB{values: values, ids: ids, canonical: canonical, decode: decode, options: options}
+	temp := &DB{values: values, ids: ids, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, options: options}
 	if temp.committed, err = temp.readGeneration(1); err != nil {
 		return err
 	}

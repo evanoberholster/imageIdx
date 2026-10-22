@@ -13,7 +13,7 @@ import (
 )
 
 func BenchmarkCommitAndIndex(b *testing.B) {
-	for _, size := range []int{1, 16, 64} {
+	for _, size := range []int{1, 16, 32, 64} {
 		b.Run(fmt.Sprintf("batch-%d", size), func(b *testing.B) {
 			data, idxPath := paths(b)
 			db, err := Open(data, idxPath, decodeTest, Options{BatchSize: 64})

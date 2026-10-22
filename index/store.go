@@ -48,6 +48,8 @@ type Store struct {
 
 	lock *os.File
 
+	stats indexStats
+
 	mu     sync.Mutex // serializes Apply/lifecycle
 	closed atomic.Bool
 	source uint64 // last requested watermark; guarded by mu
@@ -413,7 +415,11 @@ func (s *Store) writeManifest() error {
 		buf = binary.LittleEndian.AppendUint16(buf, uint16(def.Namespace))
 		buf = binary.LittleEndian.AppendUint64(buf, s.nsSource[def.Namespace])
 	}
-	return writeFileAtomic(s.dir, storeBinName, binary.LittleEndian.AppendUint32(buf, storage.Checksum(buf)))
+	err := writeFileAtomic(s.dir, storeBinName, binary.LittleEndian.AppendUint32(buf, storage.Checksum(buf)))
+	if err == nil {
+		s.stats.manifestWrites.Add(1)
+	}
+	return err
 }
 
 // readSchema loads and validates the unified manifest and schema. It returns
