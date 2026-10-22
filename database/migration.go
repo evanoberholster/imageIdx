@@ -31,16 +31,24 @@ func validateAddition(active, target *schema.Definitions, allowProjectionChange 
 	projectionChanged := false
 	for i, old := range before {
 		new := after[i]
-		switch {
-		case old.Namespace != new.Namespace:
+		// Check every immutable field independently. A switch would stop at the
+		// first difference and could hide a simultaneous config change.
+		if old.Namespace != new.Namespace {
 			return fmt.Errorf("%w: namespace %d requested as %d", schema.ErrNamespace, old.Namespace, new.Namespace)
-		case old.Name != new.Name:
+		}
+		if old.Name != new.Name {
 			return fmt.Errorf("%w: namespace %d renamed %q to %q", schema.ErrNamespace, old.Namespace, old.Name, new.Name)
-		case old.Kind != new.Kind:
+		}
+		if old.Kind != new.Kind {
 			return fmt.Errorf("%w: namespace %d kind changed %s to %s", schema.ErrNamespace, old.Namespace, old.Kind, new.Kind)
-		case old.Entity != new.Entity:
+		}
+		if old.Entity != new.Entity {
 			return fmt.Errorf("%w: namespace %d entity changed %s to %s", schema.ErrNamespace, old.Namespace, old.Entity, new.Entity)
-		case old.ProjectionVersion != new.ProjectionVersion:
+		}
+		if !bytes.Equal(old.Config, new.Config) {
+			return fmt.Errorf("%w: namespace %d configuration changed", schema.ErrNamespace, old.Namespace)
+		}
+		if old.ProjectionVersion != new.ProjectionVersion {
 			if new.ProjectionVersion < old.ProjectionVersion {
 				return fmt.Errorf("%w: namespace %d projection version downgrade %d to %d", schema.ErrNamespace, old.Namespace, old.ProjectionVersion, new.ProjectionVersion)
 			}
@@ -48,8 +56,6 @@ func validateAddition(active, target *schema.Definitions, allowProjectionChange 
 				return fmt.Errorf("%w: namespace %d projection version changed %d to %d", schema.ErrNamespace, old.Namespace, old.ProjectionVersion, new.ProjectionVersion)
 			}
 			projectionChanged = true
-		case !bytes.Equal(old.Config, new.Config):
-			return fmt.Errorf("%w: namespace %d configuration changed", schema.ErrNamespace, old.Namespace)
 		}
 	}
 	if len(after) == len(before) {
