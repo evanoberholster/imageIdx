@@ -30,8 +30,9 @@ func (s *stage) bitmap() (roar.Bitmap, error) {
 
 // walk emits fully verified, ascending batches. Bitmap sources seek by ID;
 // timestamp sources buffer/sort because timeidx has no ID-ordered cursor.
-// Probe stages observe live views per batch, not a transaction-wide snapshot.
-// The callback may not reuse ws or retain its borrowed batch.
+// Plans bound to an Engine execute against one pinned snapshot for the whole
+// walk; direct plans read the indexes' live views. The callback may not reuse
+// ws or retain its borrowed batch.
 func (plan Plan) walk(ctx context.Context, ws *Workspace, after ImageID, batchSize int, yield func([]ImageID) bool) error {
 	return plan.walkWithMetrics(ctx, ws, after, batchSize, yield, nil)
 }
@@ -138,6 +139,12 @@ func (plan Plan) walkWithMetrics(ctx context.Context, ws *Workspace, after Image
 // Exists reports whether at least one fully verified match exists. It does
 // not allocate an ID result set. Buffered timestamp fallbacks still apply.
 func (plan Plan) Exists(ctx context.Context, ws *Workspace) (bool, error) {
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return false, pinErr
+	}
+	plan = pinned
+	defer release()
 	found := false
 	err := plan.walk(ctx, ws, 0, 1, func([]ImageID) bool { found = true; return false })
 	if err != nil {

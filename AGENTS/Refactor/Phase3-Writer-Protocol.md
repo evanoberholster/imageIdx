@@ -1,7 +1,8 @@
 # Phase 3 Writer Protocol Decision
 
 **Baseline:** `c466464` (Phase 3.0 merged)  
-**Status:** alternative gate invoked for Phase 3.1
+**Status:** alternative gate invoked for Phase 3.1; lock-free query snapshots
+implemented for 3.3
 
 ## Required invariant
 
@@ -27,15 +28,10 @@ can be observed while another family still represents the previous interval.
    protect retirement, but it cannot retroactively make independently loaded
    engine views belong to one generation.
 5. Making per-family writers publish independently would expose mixed
-   generations to existing queries. Making them safe requires one of:
-   - new staged generation APIs for every engine, plus a composite root held by
-     every query for its full lifetime; or
-   - a global query gate that blocks readers while any family publishes, which
-     violates the Phase 3 reader/writer requirement and creates unacceptable
-     ingestion latency.
-
-The first option is a broad engine and query-API redesign. The second is not an
-acceptable implementation of the approved concurrency model.
+   generations to existing queries. The approved safe alternative is an
+   optimistic query snapshot: capture every stage's engine view between two
+   writer-sequence boundaries, retry if a writer overlaps the capture, and pin
+   the captured views with reader tokens for the query lifetime.
 
 ## Decision
 
@@ -47,8 +43,9 @@ Phase 3.1 invokes the documented alternative gate:
 - Do not claim a family-writer throughput win.
 - Preserve all current crash, replay, source-generation and recovery semantics.
 - Continue with write-amplification reductions that are safe within the
-  serialized coordinator, and with the planner/read-root/recovery phases after a
-  separate design for composite snapshots.
+  serialized coordinator.
+- Use the 3.3 optimistic snapshot protocol for lock-free query reads; do not
+  block writers for ordinary query execution.
 
 ## Why not a partial family-worker implementation
 
@@ -58,20 +55,29 @@ early while bitmap/time/geo/radix remain behind would expose mixed generations.
 A family worker therefore needs the same staged-generation infrastructure as
 the full design; a partial implementation would be unsound.
 
-## Required follow-up design for 3.3
+## 3.3 lock-free query snapshot protocol
 
-The composite root design must define:
+The implemented protocol is:
 
-- a root descriptor containing immutable engine snapshot references and one
-  source generation;
-- a query pin acquired before loading the root and held through all clause and
-  result assembly;
-- safe retirement of mmap regions, segments and lookup tables until all pins
-  from the prior root have drained;
-- bounded retention for long readers and documented backpressure;
-- a crash-safe durable prepare/manifest/activation path before the root swap.
+1. `Store.writeSeq` is even while no writer is publishing. A writer increments
+   it to an odd value before the first engine mutation and increments it again
+   after the last publication.
+2. `Plan.beginQuery` waits for an even sequence, captures a shallow plan copy,
+   and replaces every engine handle with a reader-pinned `Snapshot` of that
+   engine's current view.
+3. The sequence is re-read after all snapshots are captured. If it changed, all
+   pins are released and the capture is retried. Context cancellation is checked
+   between attempts.
+4. Query execution reads only the pinned handles. Writers can publish newer
+   engine views without waiting for the query; readers see exactly the captured
+   generation.
+5. Snapshot pins are released on every return path. Engine reader trackers keep
+   mmap regions and retired allocators alive until those pins drain.
 
-Until that design exists, the serialized writer remains authoritative.
+Engine reclamation may still wait for a pinned snapshot before unmapping old
+mmap regions. That is bounded backpressure on storage retirement, not a read
+lock, and does not change the query's visible generation. Deferred reclamation
+is the 3.5 follow-up.
 
 ## 3.1 scope after the gate
 

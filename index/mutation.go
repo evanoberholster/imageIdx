@@ -195,6 +195,8 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit, all bool
 		return ErrClosed
 	}
 	s.stats.applies.Add(1)
+	endWrite := s.beginWriteSequence()
+	defer endWrite()
 	if explicit {
 		if sourceGeneration < s.source {
 			return fmt.Errorf("%w: %d < %d", timeidx.ErrSourceGeneration, sourceGeneration, s.source)
@@ -511,6 +513,8 @@ func applyTimeGeneration(idx *timeidx.Index, gen uint64) error {
 
 // applyOne runs a single staged operation under the caller-held write lock.
 func (s *Store) applyOne(entry Entry, change *Change, del *DeleteOp) error {
+	endWrite := s.beginWriteSequence()
+	defer endWrite()
 	entries, changes, deletes := entrySlice(entry), changeSlice(change), deleteSlice(del)
 	if err := s.prevalidate(entries, changes, deletes, nil); err != nil {
 		return err

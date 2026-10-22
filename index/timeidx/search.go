@@ -50,8 +50,9 @@ func (i *Index) search(dst []schema.ValueID, start, end uint64, lookup ExactTime
 	if start >= end {
 		return dst
 	}
-	token := i.readers.Acquire()
-	defer i.readers.Release(token)
+	tracker := i.readerTracker()
+	token := tracker.Acquire()
+	defer tracker.Release(token)
 	if i.isClosed() {
 		return dst
 	}
@@ -78,8 +79,9 @@ func (i *Index) EstimateRange(start, end uint64) uint64 {
 	if start >= end {
 		return 0
 	}
-	token := i.readers.Acquire()
-	defer i.readers.Release(token)
+	tracker := i.readerTracker()
+	token := tracker.Acquire()
+	defer tracker.Release(token)
 	if i.isClosed() {
 		return 0
 	}

@@ -4,8 +4,10 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"runtime"
 	"slices"
 
+	unified "github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	schema "github.com/evanoberholster/imageIdx/schema"
@@ -234,15 +236,95 @@ func (s *stage) filter(dst, candidates, scratch []ImageID, ws *Workspace) ([]Ima
 	}
 }
 
-// Plan is a reusable, cardinality-ordered cross-index query. It holds raw
-// index pointers: querying after an index closes matches nothing from
-// that stage (closed indexes report empty), so keep the indexes open for
-// the plan's lifetime.
+// Plan is a reusable, cardinality-ordered cross-index query. Plans compiled by
+// an Engine capture pinned engine snapshots at the start of each execution, so
+// all stages observe one publication generation without blocking writers.
+// Directly compiled plans hold live index pointers and must keep their indexes
+// open for the plan's lifetime.
 type Plan struct {
 	stages []stage
+	// guard is set by Engine.Compile. It pins the unified store's family views
+	// for the full execution of a query so engine reads cannot mix generations.
+	guard *unified.Store
 	// empty marks a valid plan that matches nothing (e.g. intersected
 	// timestamp ranges with start >= end). Execution returns dst unchanged.
 	empty bool
+}
+
+// beginQuery captures one immutable set of engine snapshots at a quiescent
+// publication sequence and returns a plan that reads only those snapshots. The
+// returned release function must be called after execution. The capture is
+// optimistic: if a writer starts while the snapshots are being taken, all
+// snapshots are discarded and the capture is retried. Once captured, readers
+// execute without a writer lock and writers publish independently. Engine
+// reclamation may still wait for a pinned old mapping before unmapping it.
+func (plan Plan) beginQuery(ctx context.Context) (Plan, func(), error) {
+	if plan.guard == nil || plan.empty {
+		return plan, func() {}, nil
+	}
+	for {
+		seq, err := plan.guard.BeginQuerySnapshot(ctx)
+		if err != nil {
+			return Plan{}, nil, err
+		}
+		snapshot := plan
+		snapshot.stages = slices.Clone(plan.stages)
+		releases := make([]func(), 0, len(snapshot.stages))
+		for n := range snapshot.stages {
+			snapshot.stages[n].snapshot(&releases)
+		}
+		if plan.guard.QuerySnapshotValid(seq) {
+			return snapshot, releaseAll(releases), nil
+		}
+		releaseAll(releases)()
+		if err := ctx.Err(); err != nil {
+			return Plan{}, nil, err
+		}
+		runtime.Gosched()
+	}
+}
+
+func releaseAll(releases []func()) func() {
+	return func() {
+		for n := len(releases) - 1; n >= 0; n-- {
+			releases[n]()
+		}
+	}
+}
+
+// snapshot replaces every engine handle in the stage with a pinned handle.
+// The snapshot calls run only while the store's publication sequence is
+// quiescent; the caller validates the sequence before using the result.
+func (s *stage) snapshot(releases *[]func()) {
+	if s.namespaceIndex != nil {
+		s.namespaceIndex = s.namespaceIndex.Snapshot()
+		index := s.namespaceIndex
+		*releases = append(*releases, index.ReleaseSnapshot)
+	}
+	s.namespaceQuery = s.namespaceQuery.Snapshot()
+	query := s.namespaceQuery
+	*releases = append(*releases, query.ReleaseSnapshot)
+	if s.tsIndex != nil {
+		s.tsIndex = s.tsIndex.Snapshot()
+		index := s.tsIndex
+		*releases = append(*releases, index.ReleaseSnapshot)
+	}
+	if s.geoIndex != nil {
+		s.geoIndex = s.geoIndex.Snapshot()
+		index := s.geoIndex
+		*releases = append(*releases, index.ReleaseSnapshot)
+	}
+	if len(s.aclQueries) != 0 {
+		// Stage copies share the compiled ACL query slice. Clone it before
+		// replacing entries so concurrent queries never mutate the reusable
+		// plan or each other's snapshots.
+		s.aclQueries = slices.Clone(s.aclQueries)
+		for n := range s.aclQueries {
+			s.aclQueries[n] = s.aclQueries[n].Snapshot()
+			query := s.aclQueries[n]
+			*releases = append(*releases, query.ReleaseSnapshot)
+		}
+	}
 }
 
 // IsEmpty reports structural emptiness, not whether live indexes currently
@@ -505,5 +587,5 @@ func (plan Plan) Refresh(ctx context.Context) (Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return Plan{}, err
 	}
-	return Plan{stages: stages, empty: plan.empty}, nil
+	return Plan{stages: stages, empty: plan.empty, guard: plan.guard}, nil
 }

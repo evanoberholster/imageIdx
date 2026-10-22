@@ -23,6 +23,12 @@ func SearchOnce(ctx context.Context, dst []ImageID, clauses ...Clause) ([]ImageI
 
 // Count returns the number of sorted, unique matches without retaining them.
 func (plan Plan) Count(ctx context.Context, workspace *Workspace) (uint64, error) {
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return 0, pinErr
+	}
+	plan = pinned
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
