@@ -142,15 +142,6 @@ func (plan Plan) probe(ctx context.Context, candidates []ImageID, ws *Workspace,
 			candidates = out
 		case StageACL:
 			candidates, err = st.filterACL(candidates[:0], candidates, ws)
-		case StageHash:
-			out := candidates[:0]
-			fallback := ws.fallback[n]
-			for _, id := range candidates {
-				if _, ok := slices.BinarySearch(fallback, id); ok {
-					out = append(out, id)
-				}
-			}
-			candidates = out
 		case StageTimestamp:
 			out := candidates[:0]
 			for _, id := range candidates {

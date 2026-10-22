@@ -124,11 +124,10 @@ for _, stage := range metrics.Stages {
 token; `NamespaceRange` uses signed stored-grid bounds; `NamespaceBSIRange`
 uses unsigned 16/32-bit BSI bounds (`bitmapidx.ValuesBetween` is inclusive);
 `During` uses `[start,end)`
-with optional `ExactTimestamp` verification; `InCells` expands S2 cells;
-`ExactHash` matches a 256-bit digest in a `radixhash` index. Validation
-happens at `Compile`. There are no OR/NOT combinators, except `WithACL`,
-which unions user/group bitmaps and intersects the result. Bind it through
-the store and authenticate group membership yourself.
+with optional `ExactTimestamp` verification; `InCells` expands S2 cells.
+Validation happens at `Compile`. There are no OR/NOT combinators, except
+`WithACL`, which unions user/group bitmaps and intersects the result. Bind it
+through the store and authenticate group membership yourself.
 
 ```go
 plan, err := search.CompileWithStore(store,
@@ -151,43 +150,15 @@ database-wide snapshot. `AfterID` is an ID cursor, not a score cursor.
 Keep indexes open during execution and never reuse the active workspace
 inside callbacks.
 
-## Exact-hash search
+## Exact-hash presence checks
 
-`ExactHash` restricts results to a 256-bit digest held by an exact-content
-`radixhash` index (SHA-256 or BLAKE3-256). The digest is compared bit-exactly,
-duplicate content can map to several IDs, and the algorithm is a validation
-tag plus plan metadata, **not** a check against persisted index metadata;
-pass the index intended for that algorithm. For a unified store, use
-`engine.ExactHash(ns, algorithm, digest)` followed by
-`engine.Compile(entity, clause)` to bind the namespace, verify entity
-ownership, and include liveness. Bare `ExactHash(index, ...)` works only with
-standalone `Compile`; supply liveness explicitly if needed.
-
-```go
-import (
-    "crypto/sha256"
-
-    "github.com/evanoberholster/imageIdx/index/radixhash"
-    "github.com/evanoberholster/imageIdx/search"
-)
-
-digest := sha256.Sum256(content)
-plan, err := search.Compile(
-    search.ExactHash(shaIndex, search.HashSHA256, digest),
-    search.During(times, start, end), // any other conjuncts
-)
-if err != nil { return err }
-
-ids, err := plan.Search(ctx, nil, &ws)
-```
-
-Use `search.HashBLAKE3` with a BLAKE3-256 index. Hashing stays outside the
-index: compute the digest with `crypto/sha256` or a BLAKE3 implementation and
-pass the raw 32 bytes. A hash stage is a buffered filter: it materializes the
-digest's (usually tiny) ID set once and intersects it with the other stages,
-so it combines with namespaces, timestamps, geo, and ACLs like any other
-clause. Rows deleted at the application layer are not removed from the hash
-index — intersect a live or ACL clause when tombstones exist.
+Exact hashes are for import-time duplicate/presence checks, not candidate
+collection or Search-plan stages. Use `index.Matcher` to find live images with
+an incoming file's digest. Keep that check separate from general conjunctive
+queries over bitmap, timestamp, geo, and ACL indexes. The matcher applies image
+liveness, so deleted images are not reported as existing duplicates. See
+[`index/README.md`](../index/README.md#import-matching) for matcher setup and
+batch usage.
 
 ## Ranking usage
 

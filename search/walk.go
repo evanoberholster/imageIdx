@@ -11,9 +11,6 @@ import (
 // bitmap returns an owned/read-safe bitmap. No mmap lifetime escapes an index
 // call; a source cursor can safely survive concurrent checkpoint or close.
 func (s *stage) bitmap() (roar.Bitmap, error) {
-	if s.kind == StageHash {
-		return roar.FromSorted(s.hashIndex.Lookup(nil, s.hashValue))
-	}
 	if s.kind == StageACL {
 		return s.aclBitmap()
 	}

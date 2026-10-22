@@ -6,10 +6,9 @@ import (
 	"slices"
 	"testing"
 
-	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
-	"github.com/evanoberholster/imageIdx/index/radixhash"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
 func TestUnifiedBSIRange(t *testing.T) {
@@ -158,53 +157,4 @@ func BenchmarkBSIPlan(b *testing.B) {
 			}
 		}
 	})
-}
-
-func TestUnifiedExactHash(t *testing.T) {
-	schema := schematypes.NewDefinitions()
-	if err := schema.Register(schematypes.NamespaceDef{Namespace: 50, Name: "digest", Kind: schematypes.KindHashExact, Entity: schematypes.EntityImage}); err != nil {
-		t.Fatal(err)
-	}
-	db, err := index.Create(t.TempDir(), index.Spec{Schema: schema})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	digest := [32]byte{1, 2, 3}
-	if err := db.Add(index.Entry{ValueID: 10, Hashes: []index.HashValue{{Namespace: 50, Hash: radixhash.Hash(digest)}}}); err != nil {
-		t.Fatal(err)
-	}
-	eng, _ := New(db)
-	clause, err := eng.ExactHash(50, HashSHA256, digest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := eng.Compile(schematypes.EntityImage, clause)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, err := plan.AppendIDs(context.Background(), nil, nil); err != nil || !slices.Equal(got, []ImageID{10}) {
-		t.Fatalf("hash query = %v, %v", got, err)
-	}
-	stages := plan.Stages()
-	if len(stages) != 2 {
-		t.Fatalf("stages = %+v", stages)
-	}
-	var bound bool
-	for _, stage := range stages {
-		bound = bound || stage.Kind == StageHash && stage.Namespace == 50
-	}
-	if !bound {
-		t.Fatalf("hash namespace missing from %+v", stages)
-	}
-	idx, _ := db.Hash(50)
-	if _, err := eng.Compile(schematypes.EntityImage, ExactHash(idx, HashSHA256, digest)); !errors.Is(err, ErrInvalidClause) {
-		t.Fatalf("unbound hash clause = %v", err)
-	}
-	if err := db.Delete(schematypes.EntityImage, 10); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := plan.AppendIDs(context.Background(), nil, nil); err != nil || len(got) != 0 {
-		t.Fatalf("deleted hash query = %v, %v", got, err)
-	}
 }

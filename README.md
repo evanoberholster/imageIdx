@@ -214,14 +214,12 @@ postings; `search.SearchOnce(ctx, dst, clauses...)` is the single-use shortcut.
 | `BSIRange(ns, bitmapidx.ValuesBetween(lo, hi))` | `NamespaceBSIRange(idx, range)` | Unsigned BSI range, **inclusive** for `ValuesBetween`; `ValuesAtLeast`, `ValuesAtMost` or explicit `ValueRange` support open/exclusive bounds. Width mismatches error at compile. |
 | `During(ns, start, end, search.ExactTimestamp(lookup))` | `During(idx, start, end, options...)` | `[start,end)` timestamps; without an exact lookup coarse buckets can admit false positives. Empty ranges match nothing. |
 | `InCells(ns, cellIDs...)` | `InCells(idx, cellIDs...)` | Union S2 cells (level 19 or coarser; validated at compile). |
-| `ExactHash(ns, search.HashSHA256, digest)` | `ExactHash(idx, algorithm, digest)` | Bit-exact SHA-256/BLAKE3 digest; caller must match the label to the digest family: radixhash does **not** persist/verify the algorithm. Standalone clause is not bound to a unified namespace. |
 | — | `WithACL(userID, authenticatedGroupIDs...)` | One user OR authenticated groups, intersected with other clauses. `Engine.Compile` accepts ACL for `EntityImage` only. Configure `NamespaceUserACL`/`NamespaceGroupACL` as enum namespaces and authenticate group membership externally. |
 
-`engine.Hash(ns)` retrieves an exact-hash engine; `engine.Time/Geo/Bitmap`
-retrieve the other supported clause engines. Perceptual matching uses
-`index.Matcher`, not a search clause. Vector ANN is a separate ranked source,
-not a plan clause. `search.HashUnknown` is invalid; use `HashSHA256` or
-`HashBLAKE3`.
+Exact-content hash checks use `index.Matcher` during import to find existing
+live images for a digest; they are not Search clauses or candidate sources.
+Perceptual matching uses the same matcher path. Vector ANN is a separate ranked
+source, not a plan clause.
 
 ### Plan execution and buffers
 

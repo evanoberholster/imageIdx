@@ -11,7 +11,7 @@ unified store. For examples see `cmd/imageidx/examples/bitmaponly` and
 | `bitmapidx` | `AllValues`, `NamespaceText`, signed `NamespaceRange`, unsigned `NamespaceBSIRange` (`Engine.BSIRange`) |
 | `timeidx` | `During`; use `ExactTimestamp` to verify lossy candidates |
 | `geoidx` | `InCells` |
-| `radixhash` | `ExactHash` in standalone `Compile`; `Engine.ExactHash` binds a unified namespace and liveness |
+| `radixhash` | exact-content duplicate/presence checks through `index.Matcher`; not a Search clause |
 | `simhash` | import duplicate detection through `index.Matcher`, not a plan clause |
 | `vectoridx` | ANN outside the plan; `FilterRanked` filters candidate results |
 
