@@ -304,17 +304,18 @@ func (db *DB) scanRebuild(stage *index.Store, schema *schematypes.Definitions, b
 		if db.options.boundary != nil {
 			db.options.boundary("during rebuild scan")
 		}
-		if len(raw) < 5 || raw[0] > 1 {
-			return false, ErrCorruptJournal
+		value, err := decodeCanonicalValue(raw)
+		if err != nil {
+			return false, err
 		}
-		n := uint64(binary.BigEndian.Uint32(raw[1:5]))
-		if n > uint64(len(raw)-5) {
-			return false, ErrCorruptJournal
-		}
-		if raw[0] == 1 {
+		if value.tombstone {
 			return true, nil
 		}
-		projections[used] = append(projections[used][:0], raw[5:5+n]...)
+		projection, err := db.projectionForValue(value)
+		if err != nil {
+			return false, err
+		}
+		projections[used] = append(projections[used][:0], projection...)
 		entry, err := db.decodeProjection(projections[used])
 		if err != nil || entry.ValueID != key.ID {
 			return false, fmt.Errorf("%w: projection at entity %d id %d: %v", ErrCorruptJournal, entity, key.ID, err)

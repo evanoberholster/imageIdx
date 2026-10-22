@@ -88,7 +88,6 @@ type Store struct {
 	// Writer-owned scratch for batch prevalidation and staged, grouped
 	// application. All are only touched under mu and reused across batches.
 	pvSet       []uint64
-	pvCursors   []simCursor
 	pvVectorOps int
 	pvSimUpdate bool
 	stage       stageState
@@ -118,18 +117,9 @@ type flushScratch struct {
 	timeCap   int
 	geoIns    []geoidx.Entry
 	geoDel    []geoidx.Entry
-	simApp    []simhash.Record
 	simUpd    []simhash.Update
 	hashAdd   []radixhash.Entry
 	hashDel   []radixhash.Entry
-}
-
-// simCursor tracks the next dense simhash ValueID expected for one namespace
-// during prevalidation, so a batch of appends is validated without mutating an
-// engine.
-type simCursor struct {
-	ns   schematypes.Namespace
-	next uint64
 }
 
 // Create builds a new unified Store at dir, creating every configured

@@ -298,18 +298,15 @@ func (s *Store) flushSim() error {
 	return nil
 }
 
-// flushSimNamespace commits one namespace's staged records. simhash assigns
-// dense 1-based IDs: records beyond the committed high-water mark are appended
-// as a contiguous dense run (AppendBatch); records already committed are
-// updated (UpsertBatch). Prevalidation guarantees the dense ordering.
+// flushSimNamespace commits one namespace's staged records. SimHash now
+// accepts arbitrary external IDs; the engine keeps dense append fast paths for
+// dense IDs and a durable sparse overlay for gaps/out-of-order IDs.
 func (s *Store) flushSimNamespace(ops []stagedSim) error {
 	idx, _, err := s.simFor(ops[0].ns)
 	if err != nil {
 		return err
 	}
 	slices.SortStableFunc(ops, func(a, b stagedSim) int { return cmp.Compare(a.id, b.id) })
-	n := idx.Len()
-	// Collapse repeated ids, keeping the last write for each.
 	unique := ops[:0]
 	for _, op := range ops {
 		if len(unique) > 0 && unique[len(unique)-1].id == op.id {
@@ -318,30 +315,13 @@ func (s *Store) flushSimNamespace(ops []stagedSim) error {
 		}
 		unique = append(unique, op)
 	}
-	appends := s.flush.simApp[:0]
 	updates := s.flush.simUpd[:0]
-	expected := n + 1
 	for _, op := range unique {
-		switch {
-		case op.id <= n:
-			updates = append(updates, simhash.Update{ImageID: op.id, Record: op.rec})
-		case op.id == expected:
-			appends = append(appends, op.rec)
-			expected++
-		default:
-			return ErrNamespaceIDModel
-		}
+		updates = append(updates, simhash.Update{ImageID: op.id, Record: op.rec})
 	}
-	s.flush.simApp, s.flush.simUpd = appends, updates
-	if len(appends) != 0 {
-		if _, err := idx.AppendBatch(appends); err != nil {
-			return err
-		}
-	}
+	s.flush.simUpd = updates
 	if len(updates) != 0 {
-		if err := idx.UpsertBatch(updates); err != nil {
-			return err
-		}
+		return idx.ApplyUpdatesAt(updates, s.flushSourceGen)
 	}
 	return nil
 }

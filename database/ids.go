@@ -132,7 +132,7 @@ func validateDefinitions(authoritative, observed *schema.Definitions) error {
 	}
 	for _, def := range observed.Defs() {
 		want, ok := authoritative.Lookup(def.Namespace)
-		if !ok || want.Name != def.Name || want.Kind != def.Kind || want.Entity != def.Entity || !bytes.Equal(want.Config, def.Config) {
+		if !ok || want.Name != def.Name || want.Kind != def.Kind || want.Entity != def.Entity || want.ProjectionVersion != def.ProjectionVersion || !bytes.Equal(want.Config, def.Config) {
 			return fmt.Errorf("database: conflicting namespace %d: %w", def.Namespace, schema.ErrNamespace)
 		}
 	}
@@ -151,7 +151,7 @@ func validateIndexDefinitions(authoritative, indexes *schema.Definitions) error 
 	}
 	for _, def := range indexes.Defs() {
 		want, ok := authoritative.Lookup(def.Namespace)
-		if !ok || want.Kind != def.Kind || want.Name != def.Name || want.Entity != def.Entity || !bytes.Equal(want.Config, def.Config) {
+		if !ok || want.Kind != def.Kind || want.Name != def.Name || want.Entity != def.Entity || want.ProjectionVersion != def.ProjectionVersion || !bytes.Equal(want.Config, def.Config) {
 			return fmt.Errorf("database: index namespace %d differs from central schema: %w", def.Namespace, schema.ErrNamespace)
 		}
 	}
@@ -174,7 +174,7 @@ func validateLegacyIndexCopy(authoritative, legacy *schema.Definitions) error {
 	}
 	for i, def := range legacy.Defs() {
 		want := active.Defs()[i]
-		if def.Namespace != want.Namespace || def.Name != want.Name || def.Kind != want.Kind || def.Entity != want.Entity || !bytes.Equal(def.Config, want.Config) {
+		if def.Namespace != want.Namespace || def.Name != want.Name || def.Kind != want.Kind || def.Entity != want.Entity || def.ProjectionVersion != want.ProjectionVersion || !bytes.Equal(def.Config, want.Config) {
 			return schema.ErrNamespace
 		}
 	}

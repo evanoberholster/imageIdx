@@ -88,12 +88,16 @@ func TestSchemaLegacyVersionReadsEntityInvalid(t *testing.T) {
 	if err := schema.Register(NamespaceDef{Namespace: 3, Name: "cap", Kind: KindTimestamp}); err != nil {
 		t.Fatal(err)
 	}
-	data, err := schema.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := append([]byte(nil), data[:len(data)-4]...)
-	binary.LittleEndian.PutUint16(body[4:6], schemaVersionLegacy)
+	name := "cap"
+	body := make([]byte, 0, 10+len(name))
+	body = binary.LittleEndian.AppendUint32(body, schemaMagic)
+	body = binary.LittleEndian.AppendUint16(body, schemaVersionV1)
+	body = binary.LittleEndian.AppendUint32(body, 1)
+	body = binary.LittleEndian.AppendUint16(body, 3)
+	body = append(body, byte(KindTimestamp), 0)
+	body = binary.LittleEndian.AppendUint16(body, uint16(len(name)))
+	body = binary.LittleEndian.AppendUint32(body, 0)
+	body = append(body, name...)
 	legacy := binary.LittleEndian.AppendUint32(body, crc32.ChecksumIEEE(body))
 
 	var restored Definitions

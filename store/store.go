@@ -157,7 +157,7 @@ func (s *Store) ValidateLegacyDefinitions(expected *schematypes.Definitions) err
 				ownerUpgrade := a.Entity == schematypes.EntityInvalid && b.Entity.Valid() &&
 					b.Entity == schematypes.EntityKind(b.Namespace) && b.Name == "entity-"+b.Entity.String()
 				matches = a.Namespace == b.Namespace && a.Name == b.Name && a.Kind == b.Kind &&
-					(a.Entity == b.Entity || ownerUpgrade) && bytes.Equal(a.Config, b.Config)
+					(a.Entity == b.Entity || ownerUpgrade) && a.ProjectionVersion == b.ProjectionVersion && bytes.Equal(a.Config, b.Config)
 			}
 		}
 	}
@@ -194,6 +194,9 @@ func mismatchDetail(persisted, requested []byte) error {
 			b.Entity == schematypes.EntityKind(b.Namespace) && b.Name == "entity-"+b.Entity.String()
 		if a.Entity != b.Entity && !ownerUpgrade {
 			return fmt.Errorf("%w: namespace %d entity %s requested as %s", ErrSchemaMismatch, a.Namespace, a.Entity, b.Entity)
+		}
+		if a.ProjectionVersion != b.ProjectionVersion {
+			return fmt.Errorf("%w: namespace %d projection version %d requested as %d", ErrSchemaMismatch, a.Namespace, a.ProjectionVersion, b.ProjectionVersion)
 		}
 		if !bytes.Equal(a.Config, b.Config) {
 			return fmt.Errorf("%w: namespace %d configuration differs", ErrSchemaMismatch, a.Namespace)
@@ -239,7 +242,7 @@ func verifySchema(db *pebble.DB, expected []byte, extend bool) error {
 						changed = true
 					}
 					canExtend = a.Namespace == b.Namespace && a.Name == b.Name && a.Kind == b.Kind &&
-						(a.Entity == b.Entity || ownerUpgrade) && bytes.Equal(a.Config, b.Config)
+						(a.Entity == b.Entity || ownerUpgrade) && a.ProjectionVersion == b.ProjectionVersion && bytes.Equal(a.Config, b.Config)
 				}
 				canExtend = canExtend && changed
 			}

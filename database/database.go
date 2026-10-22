@@ -23,12 +23,17 @@ const journalNS schema.Namespace = 65533
 const metadataNS schema.Namespace = 65534
 
 var (
-	ErrRecoveryRequired = errors.New("database: index recovery required; journal retained")
-	ErrCorruptJournal   = errors.New("database: corrupt mutation journal")
-	ErrClosed           = errors.New("database: closed")
-	ErrJournalFull      = errors.New("database: pending journal limit reached")
-	ErrSequenceOverflow = errors.New("database: generation overflow")
-	ErrInvalidMutation  = errors.New("database: invalid mutation")
+	ErrRecoveryRequired            = errors.New("database: index recovery required; journal retained")
+	ErrCorruptJournal              = errors.New("database: corrupt mutation journal")
+	ErrClosed                      = errors.New("database: closed")
+	ErrJournalFull                 = errors.New("database: pending journal limit reached")
+	ErrSequenceOverflow            = errors.New("database: generation overflow")
+	ErrInvalidMutation             = errors.New("database: invalid mutation")
+	ErrProjectionUnavailable       = errors.New("database: canonical projection is unavailable")
+	ErrUnsupportedJournalVersion   = errors.New("database: unsupported journal version")
+	ErrUnsupportedCanonicalVersion = errors.New("database: unsupported canonical record version")
+	ErrCanonicalModeMismatch       = errors.New("database: canonical projection mode mismatch")
+	ErrCorruptDatabaseConfig       = errors.New("database: corrupt canonical projection config")
 )
 
 // Decoder reconstructs an index projection from durable, application-encoded
@@ -73,6 +78,20 @@ type Options struct {
 	// DecodeInto, when non-nil, replaces Decoder for projections. It is
 	// opt-in; existing callers can continue using Decoder.
 	DecodeInto DecodeIntoFunc
+	// CanonicalProjection selects inline (A) or external (B) canonical
+	// projection storage. External requires ProjectFromRecord or ProjectInto.
+	CanonicalProjection CanonicalProjectionMode
+	// ProjectFromRecord re-derives complete projection bytes from an
+	// application canonical record. It is required for external canonical
+	// projections and for projection-semantic rebuilds.
+	ProjectFromRecord func(record []byte) ([]byte, error)
+	// ProjectInto is the destination-buffer form of ProjectFromRecord. When set
+	// it is preferred over ProjectFromRecord for reprojection.
+	ProjectInto func(dst, record []byte) ([]byte, error)
+	// ProjectionMigration permits an explicit target schema to change
+	// per-namespace ProjectionVersion and rebuild indexes from canonical
+	// records using ProjectFromRecord or ProjectInto.
+	ProjectionMigration bool
 	// Definitions, if provided, is the authoritative complete namespace model.
 	// Existing KV and index metadata must agree with it. When omitted on an
 	// existing database, the persisted schema file is authoritative.
@@ -85,25 +104,29 @@ type Options struct {
 }
 
 type DB struct {
-	owner      *os.File   // serializes schema startup, including close/reopen transitions
-	mu         sync.Mutex // serializes sequence allocation with the Pebble commit
-	values     *store.Store
-	ids        *schema.Schema
-	canonical  [schema.EntityKindCount + 1]schema.Namespace
-	idsClosed  atomic.Bool
-	indexes    *index.Store
-	decode     Decoder
-	decodeInto DecodeIntoFunc
-	options    Options
-	stats      dbStats
-	committed  uint64
-	indexed    uint64
-	inflight   uint64
-	err        error
-	closed     bool
-	wake       chan struct{}
-	changed    chan struct{}
-	done       chan struct{}
+	owner             *os.File   // serializes schema startup, including close/reopen transitions
+	mu                sync.Mutex // serializes sequence allocation with the Pebble commit
+	values            *store.Store
+	ids               *schema.Schema
+	canonical         [schema.EntityKindCount + 1]schema.Namespace
+	idsClosed         atomic.Bool
+	indexes           *index.Store
+	decode            Decoder
+	decodeInto        DecodeIntoFunc
+	projectFromRecord func([]byte) ([]byte, error)
+	projectInto       func([]byte, []byte) ([]byte, error)
+	options           Options
+	stats             dbStats
+	commitScratch     projectionScratch
+	journalScratch    []byte
+	committed         uint64
+	indexed           uint64
+	inflight          uint64
+	err               error
+	closed            bool
+	wake              chan struct{}
+	changed           chan struct{}
+	done              chan struct{}
 }
 
 // Open opens the canonical Pebble directory and its derived index directory.
@@ -133,6 +156,15 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	}
 	if options.OversizedRetentionBytes == 0 {
 		options.OversizedRetentionBytes = defaultOversizedRetentionBytes
+	}
+	if !options.CanonicalProjection.valid() {
+		return nil, fmt.Errorf("%w: invalid canonical projection mode", ErrInvalidMutation)
+	}
+	if options.CanonicalProjection == CanonicalProjectionExternal && options.ProjectFromRecord == nil && options.ProjectInto == nil {
+		return nil, fmt.Errorf("%w: external canonical projection requires ProjectFromRecord or ProjectInto", ErrInvalidMutation)
+	}
+	if options.ProjectionMigration && options.ProjectFromRecord == nil && options.ProjectInto == nil {
+		return nil, fmt.Errorf("%w: projection migration requires ProjectFromRecord or ProjectInto", ErrInvalidMutation)
 	}
 	owner, err := storage.AcquireLock(filepath.Dir(dir), "."+filepath.Base(filepath.Clean(dir))+".database.lock", false)
 	if err != nil {
@@ -166,11 +198,22 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		if openErr != nil {
 			return nil, openErr
 		}
+		options, openErr = ensureCanonicalMode(existing, options)
+		if openErr != nil {
+			_ = existing.Close()
+			return nil, openErr
+		}
 		if existing.PreparedDefinitions() != nil {
 			if err := recoverPreparedSchema(existing, dir, indexDir, decode, options); err != nil {
 				_ = existing.Close()
 				return nil, err
 			}
+		}
+	}
+	if existing != nil && options.Definitions != nil && projectionVersionsDiffer(existing.Definitions(), options.Definitions) {
+		if options.CanonicalProjection != CanonicalProjectionExternal || (options.ProjectFromRecord == nil && options.ProjectInto == nil) {
+			_ = existing.Close()
+			return nil, fmt.Errorf("%w: projection version change requires external canonical mode and a projector callback", ErrInvalidMutation)
 		}
 	}
 	if existing != nil && options.Definitions != nil && validateDefinitions(existing.Definitions(), options.Definitions) != nil {
@@ -242,6 +285,11 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		}
 		existing, err = schema.Open(path, schema.Options{Definitions: defs, Entities: entities})
 		if err != nil {
+			return nil, err
+		}
+		options, err = ensureCanonicalMode(existing, options)
+		if err != nil {
+			_ = existing.Close()
 			return nil, err
 		}
 	}
@@ -347,6 +395,15 @@ func canonicalSpecsFor(canonical [schema.EntityKindCount + 1]schema.Namespace) [
 }
 
 func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, options Options, existing *schema.Schema, canonical [schema.EntityKindCount + 1]schema.Namespace) (*DB, error) {
+	if existing != nil {
+		var err error
+		options, err = ensureCanonicalMode(existing, options)
+		if err != nil {
+			_ = existing.Close()
+			_ = values.Close()
+			return nil, err
+		}
+	}
 	if existing != nil && !existing.LegacyRetired() {
 		stored, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
 		if err == nil {
@@ -390,7 +447,7 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 		_ = values.Close()
 		return nil, errors.Join(ErrRecoveryRequired, err)
 	}
-	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, options: options,
+	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, projectFromRecord: options.ProjectFromRecord, projectInto: options.ProjectInto, options: options,
 		wake: make(chan struct{}, 1), changed: make(chan struct{}), done: make(chan struct{})}
 	ready := false
 	defer func() {
@@ -591,8 +648,11 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 		if !m.Entity.Valid() || m.ValueID == 0 || (!m.Delete && len(m.Projection) == 0) {
 			return 0, ErrInvalidMutation
 		}
+		var afterEntry index.Entry
 		if !m.Delete {
-			if _, err := db.decodeEntry(m.Projection, m.Entity, m.ValueID); err != nil {
+			var err error
+			afterEntry, err = db.decodeEntry(m.Projection, m.Entity, m.ValueID)
+			if err != nil {
 				return 0, err
 			}
 		}
@@ -601,25 +661,48 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return 0, err
 		}
-		if err == nil && len(prior) < 5 {
-			return 0, ErrCorruptJournal
-		}
+		priorExists := err == nil
 		var before []byte
-		if err == nil {
-			n := binary.BigEndian.Uint32(prior[1:5])
-			if prior[0] > 1 || uint64(n) > uint64(len(prior)-5) {
-				return 0, ErrCorruptJournal
+		var beforeRecord []byte
+		if priorExists {
+			value, err := decodeCanonicalValue(prior)
+			if err != nil {
+				return 0, err
 			}
-			before = prior[5 : 5+n]
+			before, err = db.projectionForValue(value)
+			if err != nil {
+				return 0, err
+			}
+			beforeRecord = value.record
+		}
+		insert := !priorExists
+		if m.Delete {
+			insert = false
+		}
+		var beforeEntry index.Entry
+		if !insert {
+			var err error
+			beforeEntry, err = db.decodeEntry(before, m.Entity, m.ValueID)
+			if err != nil {
+				return 0, err
+			}
 		}
 		if m.Delete {
-			// Keep the old projection as a compact tombstone. A later insert
-			// of this ID must invalidate old non-ID-authoritative hash and
-			// bitmap associations before becoming live again.
-			tombstone := make([]byte, 5+len(before))
-			tombstone[0] = 1
-			binary.BigEndian.PutUint32(tombstone[1:], uint32(len(before)))
-			copy(tombstone[5:], before)
+			// Keep the old projection (inline) or old application record
+			// (external) as a compact tombstone for correct reinsertion.
+			tombstoneProjection, tombstoneRecord := before, beforeRecord
+			if db.options.CanonicalProjection == CanonicalProjectionExternal {
+				tombstoneProjection = nil
+			}
+			tombstone, err := encodeCanonicalValue(canonicalValue{
+				tombstone:  true,
+				version:    canonicalVersionForMode(db.options.CanonicalProjection),
+				projection: tombstoneProjection,
+				record:     tombstoneRecord,
+			})
+			if err != nil {
+				return 0, err
+			}
 			if err := b.Set(key, tombstone); err != nil {
 				return 0, err
 			}
@@ -627,15 +710,31 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			if len(m.Projection) > math.MaxUint32 {
 				return 0, ErrInvalidMutation
 			}
-			record := make([]byte, 5+len(m.Projection)+len(m.Record))
-			binary.BigEndian.PutUint32(record[1:], uint32(len(m.Projection)))
-			copy(record[5:], m.Projection)
-			copy(record[5+len(m.Projection):], m.Record)
+			projection := m.Projection
+			if db.options.CanonicalProjection == CanonicalProjectionExternal {
+				projection = nil
+			}
+			record, err := encodeCanonicalValue(canonicalValue{
+				version:    canonicalVersionForMode(db.options.CanonicalProjection),
+				projection: projection,
+				record:     m.Record,
+			})
+			if err != nil {
+				return 0, err
+			}
 			if err := b.Set(key, record); err != nil {
 				return 0, err
 			}
 		}
-		entry, err := encodeMutation(m, before)
+		deltaBefore, deltaAfter := beforeEntry, afterEntry
+		if m.Delete {
+			deltaBefore, deltaAfter = index.Entry{}, index.Entry{}
+		} else if !insert {
+			deltaBefore, deltaAfter = changedProjectionScratch(beforeEntry, afterEntry, &db.commitScratch)
+		}
+		entry, err := appendMutation(db.journalScratch[:0], m, insert, deltaBefore, deltaAfter)
+		db.journalScratch = entry
+		db.commitScratch.reset()
 		if err != nil {
 			return 0, err
 		}
@@ -691,17 +790,14 @@ func (db *DB) Get(entity schema.EntityKind, id schema.ValueID) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(v) < 5 || v[0] > 1 {
-		return nil, ErrCorruptJournal
+	value, err := decodeCanonicalValue(v)
+	if err != nil {
+		return nil, err
 	}
-	if v[0] == 1 {
+	if value.tombstone {
 		return nil, store.ErrNotFound
 	}
-	n := binary.BigEndian.Uint32(v[1:5])
-	if uint64(n) > uint64(len(v)-5) {
-		return nil, ErrCorruptJournal
-	}
-	return v[5+n:], nil
+	return append([]byte(nil), value.record...), nil
 }
 
 func (db *DB) DatabaseGeneration() uint64 { db.mu.Lock(); defer db.mu.Unlock(); return db.committed }

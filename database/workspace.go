@@ -35,7 +35,10 @@ type queuedMutation struct {
 	id       schema.ValueID
 	before   dataRef
 	after    dataRef
+	beforeN  uint16
+	afterN   uint16
 	deleted  bool
+	insert   bool
 }
 
 type decodedEvent struct {
@@ -153,7 +156,10 @@ func (w *coordinatorWorkspace) appendMutation(sequence uint64, raw []byte, entry
 		sequence: sequence,
 		entity:   entry.entity,
 		id:       entry.id,
+		beforeN:  entry.beforeN,
+		afterN:   entry.afterN,
 		deleted:  entry.deleted,
+		insert:   entry.insert,
 	}
 	if beforeLen != 0 {
 		m.before = dataRef{slot: slot, offset: offset, length: uint32(beforeLen), epoch: w.epoch, valid: true}

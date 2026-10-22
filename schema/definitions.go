@@ -34,11 +34,12 @@ var (
 // namespace has exactly one entity kind, so the same numeric ValueID under
 // different entities is independent.
 type NamespaceDef struct {
-	Namespace Namespace
-	Name      string
-	Kind      NamespaceKind
-	Entity    EntityKind
-	Config    []byte
+	Namespace         Namespace
+	Name              string
+	Kind              NamespaceKind
+	Entity            EntityKind
+	ProjectionVersion uint16
+	Config            []byte
 }
 
 // Definitions is an ordered set of unique namespace definitions. The zero value
@@ -57,6 +58,9 @@ func NewDefinitions() *Definitions { return &Definitions{} }
 // Register adds one namespace definition. It rejects the zero namespace,
 // empty or duplicate names, unknown kinds, and duplicate namespace numbers.
 func (s *Definitions) Register(def NamespaceDef) error {
+	if def.ProjectionVersion == 0 {
+		def.ProjectionVersion = 1
+	}
 	if !def.Namespace.Valid() {
 		return ErrNamespaceInvalid
 	}
@@ -177,16 +181,18 @@ func (s *Definitions) DefsOfEntity(entity EntityKind) []NamespaceDef {
 
 const (
 	schemaMagic         uint32 = 0x4e535043 // NSPC
-	schemaVersion       uint16 = 2          // current: per-definition EntityKind
-	schemaVersionLegacy uint16 = 1          // pre-entity: Entity is EntityInvalid
+	schemaVersionV1     uint16 = 1          // pre-entity: Entity is EntityInvalid
+	schemaVersionV2     uint16 = 2          // per-definition EntityKind
+	schemaVersionV3     uint16 = 3          // v3: per-namespace ProjectionVersion
+	schemaVersion              = schemaVersionV3
+	schemaVersionLegacy        = schemaVersionV1
 )
 
 // MarshalBinary encodes the schema deterministically in registration order:
-// magic, version, count, then per definition namespace, kind, entity kind, name
-// length, config length, name, config, and a trailing CRC32 over the preceding
-// bytes. The per-definition layout is unchanged from version 1 — the byte that
-// was reserved padding now carries EntityKind — so the encoding stays a fixed
-// 10-byte header plus name and config bytes either way.
+// magic, version, count, then per definition namespace, kind, entity kind,
+// projection version, name length, config length, name, config, and a trailing
+// CRC32 over the preceding bytes. Version 3 uses a 12-byte per-definition
+// header; versions 1 and 2 are read with ProjectionVersion=1.
 func (s *Definitions) MarshalBinary() ([]byte, error) {
 	size := 4 + 2 + 4 + 4 // magic, version, count, crc
 	if uint64(len(s.defs)) > math.MaxUint32 {
@@ -194,10 +200,10 @@ func (s *Definitions) MarshalBinary() ([]byte, error) {
 	}
 	for _, def := range s.defs {
 		if len(def.Name) > math.MaxUint16 || uint64(len(def.Config)) > math.MaxUint32 ||
-			len(def.Name) > math.MaxInt-size-10 || len(def.Config) > math.MaxInt-size-10-len(def.Name) {
+			len(def.Name) > math.MaxInt-size-12 || len(def.Config) > math.MaxInt-size-12-len(def.Name) {
 			return nil, ErrCorruptSchema
 		}
-		size += 2 + 1 + 1 + 2 + 4 + len(def.Name) + len(def.Config)
+		size += 2 + 1 + 1 + 2 + 2 + 4 + len(def.Name) + len(def.Config)
 	}
 	out := make([]byte, 0, size)
 	out = binary.LittleEndian.AppendUint32(out, schemaMagic)
@@ -206,6 +212,7 @@ func (s *Definitions) MarshalBinary() ([]byte, error) {
 	for _, def := range s.defs {
 		out = binary.LittleEndian.AppendUint16(out, uint16(def.Namespace))
 		out = append(out, byte(def.Kind), byte(def.Entity))
+		out = binary.LittleEndian.AppendUint16(out, def.ProjectionVersion)
 		out = binary.LittleEndian.AppendUint16(out, uint16(len(def.Name)))
 		out = binary.LittleEndian.AppendUint32(out, uint32(len(def.Config)))
 		out = append(out, def.Name...)
@@ -229,34 +236,44 @@ func (s *Definitions) UnmarshalBinary(data []byte) error {
 		return ErrCorruptSchema
 	}
 	version := binary.LittleEndian.Uint16(body[4:6])
-	if version != schemaVersion && version != schemaVersionLegacy {
+	if version != schemaVersion && version != schemaVersionV2 && version != schemaVersionV1 {
 		return ErrCorruptSchema
 	}
+	entryHeader := 10
+	if version >= schemaVersionV3 {
+		entryHeader = 12
+	}
 	count := binary.LittleEndian.Uint32(body[6:10])
-	if uint64(count) > uint64(len(body)-10)/10 {
+	if uint64(count) > uint64(len(body)-10)/uint64(entryHeader) {
 		return ErrCorruptSchema
 	}
 	next := &Definitions{}
 	offset := 10
 	for range count {
-		if offset+10 > len(body) {
+		if offset+entryHeader > len(body) {
 			return ErrCorruptSchema
 		}
 		def := NamespaceDef{
-			Namespace: Namespace(binary.LittleEndian.Uint16(body[offset : offset+2])),
-			Kind:      NamespaceKind(body[offset+2]),
+			Namespace:         Namespace(binary.LittleEndian.Uint16(body[offset : offset+2])),
+			Kind:              NamespaceKind(body[offset+2]),
+			ProjectionVersion: 1,
 		}
 		// Version 1 reserved this byte as zero padding; version 2 stores the
 		// entity kind there. Version-1 schemas therefore yield EntityInvalid,
 		// never a silently fabricated entity.
-		if version >= schemaVersion {
+		if version >= schemaVersionV2 {
 			def.Entity = EntityKind(body[offset+3])
 		} else if body[offset+3] != 0 {
 			return ErrCorruptSchema
 		}
-		nameLen := int(binary.LittleEndian.Uint16(body[offset+4 : offset+6]))
-		configLen := int(binary.LittleEndian.Uint32(body[offset+6 : offset+10]))
-		offset += 10
+		nameOffset, configOffset := 4, 6
+		if version >= schemaVersionV3 {
+			def.ProjectionVersion = binary.LittleEndian.Uint16(body[offset+4 : offset+6])
+			nameOffset, configOffset = 6, 8
+		}
+		nameLen := int(binary.LittleEndian.Uint16(body[offset+nameOffset : offset+nameOffset+2]))
+		configLen := int(binary.LittleEndian.Uint32(body[offset+configOffset : offset+configOffset+4]))
+		offset += entryHeader
 		if nameLen > len(body)-offset || configLen > len(body)-offset-nameLen {
 			return ErrCorruptSchema
 		}

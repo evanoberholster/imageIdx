@@ -13,11 +13,22 @@ import (
 // validateAddition permits only an append of completely new logical
 // namespaces. Both snapshots are owned by schema; existing identities and
 // configs are never rewritten to make a physical index open.
-func validateAddition(active, target *schema.Definitions) error {
+func projectionVersionsDiffer(active, target *schema.Definitions) bool {
 	before, after := active.Defs(), target.Defs()
-	if len(after) <= len(before) {
-		return fmt.Errorf("%w: requested %d namespaces, active %d (additions are required)", schema.ErrNamespace, len(after), len(before))
+	for i := 0; i < len(before) && i < len(after); i++ {
+		if before[i].ProjectionVersion != after[i].ProjectionVersion {
+			return true
+		}
 	}
+	return false
+}
+
+func validateAddition(active, target *schema.Definitions, allowProjectionChange bool) error {
+	before, after := active.Defs(), target.Defs()
+	if len(after) < len(before) {
+		return fmt.Errorf("%w: requested %d namespaces, active %d", schema.ErrNamespace, len(after), len(before))
+	}
+	projectionChanged := false
 	for i, old := range before {
 		new := after[i]
 		switch {
@@ -29,9 +40,23 @@ func validateAddition(active, target *schema.Definitions) error {
 			return fmt.Errorf("%w: namespace %d kind changed %s to %s", schema.ErrNamespace, old.Namespace, old.Kind, new.Kind)
 		case old.Entity != new.Entity:
 			return fmt.Errorf("%w: namespace %d entity changed %s to %s", schema.ErrNamespace, old.Namespace, old.Entity, new.Entity)
+		case old.ProjectionVersion != new.ProjectionVersion:
+			if new.ProjectionVersion < old.ProjectionVersion {
+				return fmt.Errorf("%w: namespace %d projection version downgrade %d to %d", schema.ErrNamespace, old.Namespace, old.ProjectionVersion, new.ProjectionVersion)
+			}
+			if !allowProjectionChange {
+				return fmt.Errorf("%w: namespace %d projection version changed %d to %d", schema.ErrNamespace, old.Namespace, old.ProjectionVersion, new.ProjectionVersion)
+			}
+			projectionChanged = true
 		case !bytes.Equal(old.Config, new.Config):
 			return fmt.Errorf("%w: namespace %d configuration changed", schema.ErrNamespace, old.Namespace)
 		}
+	}
+	if len(after) == len(before) {
+		if !projectionChanged {
+			return fmt.Errorf("%w: no schema additions or projection changes", schema.ErrNamespace)
+		}
+		return index.ValidateDefinitions(target)
 	}
 	for _, def := range after[len(before):] {
 		if def.Namespace == journalNS || def.Namespace == metadataNS || def.Namespace == 0xFFF0 {
@@ -128,7 +153,15 @@ func recoverPreparedSchema(ids *schema.Schema, dir, indexDir string, decode Deco
 		return nil
 	}
 	active := ids.Definitions()
-	if err := validateAddition(active, target); err != nil {
+	if projectionVersionsDiffer(active, target) {
+		if options.CanonicalProjection != CanonicalProjectionExternal {
+			return errors.Join(ErrRecoveryRequired, fmt.Errorf("%w: projection version change requires external canonical mode", ErrInvalidMutation))
+		}
+		if options.ProjectFromRecord == nil && options.ProjectInto == nil {
+			return errors.Join(ErrRecoveryRequired, ErrProjectionUnavailable)
+		}
+	}
+	if err := validateAddition(active, target, true); err != nil {
 		return errors.Join(ErrRecoveryRequired, err)
 	}
 	canonical, err := persistedCanonical(active, options.CanonicalNamespaces)
@@ -156,7 +189,8 @@ func recoverPreparedSchema(ids *schema.Schema, dir, indexDir string, decode Deco
 	if err := resumeActivation(indexDir, values, target, options.boundary); err != nil {
 		return err
 	}
-	temp := &DB{values: values, ids: ids, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, options: options}
+	projectionChange := projectionVersionsDiffer(active, target)
+	temp := &DB{values: values, ids: ids, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, projectFromRecord: options.ProjectFromRecord, projectInto: options.ProjectInto, options: options}
 	if temp.committed, err = temp.readGeneration(1); err != nil {
 		return err
 	}
@@ -186,6 +220,9 @@ func recoverPreparedSchema(ids *schema.Schema, dir, indexDir string, decode Deco
 		}
 	}
 	if openErr != nil {
+		if projectionChange && options.ProjectFromRecord == nil && options.ProjectInto == nil {
+			return errors.Join(ErrRecoveryRequired, ErrProjectionUnavailable)
+		}
 		// Rebuild under the prepared target. Existing healthy physical files are
 		// left untouched until a verified staged replacement is activated.
 		// rebuildWithDefinitions may publish temp.indexes before a later check
@@ -224,7 +261,7 @@ func recoverPreparedSchema(ids *schema.Schema, dir, indexDir string, decode Deco
 
 func prepareSchemaAddition(ids *schema.Schema, path, dir, indexDir string, target *schema.Definitions, decode Decoder, options Options) (*schema.Schema, error) {
 	active := ids.Definitions()
-	if err := validateAddition(active, target); err != nil {
+	if err := validateAddition(active, target, options.ProjectionMigration); err != nil {
 		return ids, err
 	}
 	if err := checkActiveSchema(dir, indexDir, active, ids.LegacyRetired()); err != nil {

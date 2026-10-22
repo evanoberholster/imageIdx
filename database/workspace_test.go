@@ -2,27 +2,36 @@ package database
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"testing"
 
 	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
+func testWorkspaceRaw(before, after []byte, deleted, insert bool) []byte {
+	raw := make([]byte, journalHeader+len(before)+len(after)+4)
+	raw[0] = journalVersion
+	if deleted {
+		raw[1] |= journalFlagDeleted
+	}
+	if insert {
+		raw[1] |= journalFlagInsert
+	}
+	raw[2] = byte(schema.EntityImage)
+	binary.BigEndian.PutUint32(raw[15:19], uint32(len(before)))
+	binary.BigEndian.PutUint32(raw[19:23], uint32(len(after)))
+	copy(raw[journalHeader:], before)
+	copy(raw[journalHeader+len(before):], after)
+	binary.BigEndian.PutUint32(raw[len(raw)-4:], crc32.ChecksumIEEE(raw[:len(raw)-4]))
+	return raw
+}
+
 func testWorkspaceMutation(t *testing.T, ws *coordinatorWorkspace, sequence uint64, before, after []byte, deleted bool) queuedMutation {
 	t.Helper()
-	raw, err := encodeMutation(Mutation{
-		Entity:     schema.EntityImage,
-		ValueID:    sequence,
-		Delete:     deleted,
-		Projection: after,
-	}, before)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry, err := decodeMutation(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := testWorkspaceRaw(before, after, deleted, !deleted && before == nil)
+	entry := journalEntry{entity: schema.EntityImage, id: sequence, deleted: deleted, insert: !deleted && before == nil, before: before, after: after}
 	if !ws.appendMutation(sequence, raw, entry) {
 		t.Fatal("appendMutation rejected")
 	}
@@ -70,14 +79,8 @@ func TestCoordinatorWorkspaceByteBudget(t *testing.T) {
 	ws := newCoordinatorWorkspace(10, defaultOversizedRetentionBytes)
 	ws.reset()
 	testWorkspaceMutation(t, ws, 1, bytes.Repeat([]byte{1}, 4), bytes.Repeat([]byte{2}, 4), false)
-	raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 2, Projection: bytes.Repeat([]byte{3}, 4)}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry, err := decodeMutation(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := testWorkspaceRaw(nil, bytes.Repeat([]byte{3}, 4), false, true)
+	entry := journalEntry{entity: schema.EntityImage, id: 2, insert: true, after: bytes.Repeat([]byte{3}, 4)}
 	if ws.appendMutation(2, raw, entry) {
 		t.Fatal("byte budget accepted an over-limit mutation")
 	}
@@ -158,14 +161,8 @@ func TestCoordinatorWorkspacePayloadBoundaries(t *testing.T) {
 func TestCoordinatorWorkspaceRejectsMismatchedPayload(t *testing.T) {
 	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
 	ws.reset()
-	raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: []byte("x")}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry, err := decodeMutation(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := testWorkspaceRaw(nil, []byte("x"), false, true)
+	entry := journalEntry{entity: schema.EntityImage, id: 1, insert: true, after: []byte("x")}
 	entry.before = []byte("unexpected")
 	if ws.appendMutation(1, raw, entry) {
 		t.Fatal("mismatched payload accepted")

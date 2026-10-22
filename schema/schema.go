@@ -26,7 +26,10 @@ type EntityConfig struct {
 }
 
 type Options struct {
-	Backend     Backend
+	Backend Backend
+	// Config is an opaque, schema-owned database configuration record. The
+	// database package uses it for durable canonical projection mode.
+	Config      [6]byte
 	Definitions *Definitions
 	Entities    []EntityConfig
 	// Prepare publishes additive definitions without activating them. The
@@ -57,6 +60,7 @@ type Schema struct {
 	owners            [EntityKindCount + 1]*entityAllocator
 	definitions       *Definitions
 	definitionsData   []byte
+	config            [6]byte
 	activeDefinitions *Definitions // non-nil while a prepared target is pending
 	prepared          bool
 	legacyRetired     bool
@@ -147,7 +151,7 @@ func Open(path string, opts Options) (_ *Schema, err error) {
 		}
 		return nil, err
 	}
-	s := &Schema{lock: lock, backend: opts.Backend, fault: opts.fault, definitions: definitions, definitionsData: definitionsData}
+	s := &Schema{lock: lock, backend: opts.Backend, fault: opts.fault, config: opts.Config, definitions: definitions, definitionsData: definitionsData}
 	s.closeCond = sync.NewCond(&s.closeMu)
 	defer func() {
 		if err != nil {
@@ -182,6 +186,9 @@ func Open(path string, opts Options) (_ *Schema, err error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if !created && opts.Config != ([6]byte{}) && opts.Config != s.config {
+		return nil, ErrConfigMismatch
 	}
 	if opts.Backend == BackendMmap {
 		s.mapped, err = storage.OpenMapped(path)
@@ -264,6 +271,39 @@ func (s *Schema) ReservationSize(entity EntityKind) uint64 {
 // LegacyRetired reports whether the old Pebble and index logical schema copies
 // were durably retired. An active database with this marker skips legacy reads.
 func (s *Schema) LegacyRetired() bool { return s.legacyRetired }
+
+// Config returns the opaque schema-owned database configuration record.
+func (s *Schema) Config() [6]byte { return s.config }
+
+// SetConfig durably publishes a new opaque database configuration record. It is
+// intended for startup-time creation/migration only; a prepared schema must be
+// activated or abandoned first.
+func (s *Schema) SetConfig(config [6]byte) error {
+	if s.state.Load()&closing != 0 {
+		return ErrClosed
+	}
+	if s.prepared || s.poisoned.Load() {
+		return ErrNamespace
+	}
+	if s.mapped != nil {
+		return fmt.Errorf("%w: config update requires read/write backend", ErrConfigMismatch)
+	}
+	if config == s.config {
+		return nil
+	}
+	if s.generation == ^uint64(0) {
+		return ErrExhausted
+	}
+	previous := s.config
+	s.config = config
+	if err := s.commitDirectory(int(s.generation%2), s.generation+1, s.directoryOffset, s.directory, s.definitionsData, s.directoryEnd, false, s.legacyRetired); err != nil {
+		s.config = previous
+		s.poisoned.Store(true)
+		return err
+	}
+	s.generation++
+	return nil
+}
 
 // MarkLegacyRetired publishes a synced marker only after migration-only code
 // has checked and removed every old schema copy. Repeating it is harmless.

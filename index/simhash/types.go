@@ -4,8 +4,8 @@ import (
 	"errors"
 	"unsafe"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	hashkernel "github.com/evanoberholster/imageIdx/index/simhash/internal/hashkernel"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 var (
@@ -23,6 +23,9 @@ var (
 	// ErrOverflow reports an arithmetic overflow that would wrap the committed
 	// high-water mark or generation.
 	ErrOverflow = errors.New("simhash: arithmetic overflow")
+	// ErrUnsupportedSparseFormat reports the retired experimental sparse file
+	// layout. The index must be rebuilt into the segmented sparse format.
+	ErrUnsupportedSparseFormat = errors.New("simhash: unsupported legacy sparse format")
 )
 
 // PDQHash is a 256-bit PDQ perceptual hash. The persistent representation is
