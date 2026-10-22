@@ -81,7 +81,11 @@ func BenchmarkCommitAndIndexWarm(b *testing.B) {
 }
 
 func BenchmarkStartupRebuild(b *testing.B) {
-	for _, total := range []int{10_000, 100_000} {
+	sizes := []int{10_000, 100_000, 1_000_000}
+	if os.Getenv("IMAGEIDX_BENCH_LARGE") != "" {
+		sizes = append(sizes, 10_000_000)
+	}
+	for _, total := range sizes {
 		b.Run(fmt.Sprintf("records-%d", total), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {

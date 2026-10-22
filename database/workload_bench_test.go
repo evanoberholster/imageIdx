@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
@@ -214,6 +215,96 @@ func BenchmarkPhotoMetadataWorkloads(b *testing.B) {
 				b.ReportMetric(float64(stats.JournalBytes-beforeStats.JournalBytes)/ops, "journal-B/op")
 				b.ReportMetric(float64(stats.Store.ValueBytes-beforeStats.Store.ValueBytes)/ops, "store-B/op")
 				b.ReportMetric(float64(b.N*size)/b.Elapsed().Seconds(), "images/s")
+			})
+		}
+	}
+}
+
+// BenchmarkPhotoMetadataLatency records commit→indexed lag and a small mixed
+// query latency distribution. It uses 1K live IDs by default so a routine
+// benchmark remains bounded; startup/rebuild benchmarks cover 10K/100K.
+func BenchmarkPhotoMetadataLatency(b *testing.B) {
+	workloads := []string{"rating", "tags", "gps", "ai", "unchanged"}
+	for _, workload := range workloads {
+		for _, size := range []int{1, 16, 32, 64} {
+			b.Run(fmt.Sprintf("%s/batch-%d", workload, size), func(b *testing.B) {
+				data, idxPath := photoPaths(b)
+				db, err := Open(data, idxPath, decodePhoto, Options{BatchSize: 64})
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer db.Close()
+				const stateCount = 1_000
+				states := make([]photoState, stateCount+1)
+				b.StopTimer()
+				for start := 1; start <= stateCount; start += 64 {
+					n := min(64, stateCount-start+1)
+					mutations := make([]Mutation, n)
+					for i := range mutations {
+						id := uint64(start + i)
+						states[id] = photoStateFor(id)
+						mutations[i] = Mutation{Entity: schema.EntityImage, ValueID: id, Projection: photoProjection(id, states[id])}
+					}
+					g, err := db.Commit(mutations...)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := db.WaitIndexed(context.Background(), g); err != nil {
+						b.Fatal(err)
+					}
+				}
+				rating, _ := db.Index().Bitmap(photoRatingNS)
+				lag := bench.NewRecorder(b.N)
+				query := bench.NewRecorder(b.N * 4)
+				mutations := make([]Mutation, size)
+				beforeStats := db.Stats()
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					for j := range mutations {
+						id := uint64((i*size+j)%stateCount + 1)
+						state := states[id]
+						switch workload {
+						case "rating":
+							state.rating = byte('1' + (int(state.rating)-'1'+1)%5)
+						case "tags":
+							state.tags[0] = byte('a' + (int(state.tags[0])-'a'+1)%8)
+						case "gps":
+							state.geo = photoGeoKey((int(state.geo) + 1) % 3)
+						case "ai":
+							state.ai = byte('a' + (int(state.ai)-'a'+1)%8)
+						}
+						states[id] = state
+						mutations[j] = Mutation{Entity: schema.EntityImage, ValueID: id, Projection: photoProjection(id, state)}
+					}
+					start := time.Now()
+					g, err := db.Commit(mutations...)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := db.WaitIndexed(context.Background(), g); err != nil {
+						b.Fatal(err)
+					}
+					lag.Record(time.Since(start))
+					for _, id := range []uint64{1, stateCount / 4, stateCount / 2, stateCount} {
+						start := time.Now()
+						if _, err := rating.Contains(id, bitmapidx.EnumBytesValue([]byte{byte('1')})); err != nil {
+							b.Fatal(err)
+						}
+						query.Record(time.Since(start))
+					}
+				}
+				b.StopTimer()
+				lag.Report(b, "commit-indexed")
+				query.Report(b, "bitmap-query")
+				stats := db.Stats()
+				ops := float64(max(b.N*size, 1))
+				b.ReportMetric(float64(stats.JournalBytes-beforeStats.JournalBytes)/ops, "journal-B/op")
+				b.ReportMetric(float64(stats.Store.ValueBytes-beforeStats.Store.ValueBytes)/ops, "store-B/op")
+				b.ReportMetric(float64(b.N*size)/b.Elapsed().Seconds(), "images/s")
+				// Derived file sizes and heap are reported after the timed loop.
+				b.ReportMetric(float64(bench.HeapBytes()), "heap-B")
+				b.ReportMetric(float64(bench.DiskBytes(b.TempDir())), "disk-B")
 			})
 		}
 	}

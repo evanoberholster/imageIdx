@@ -197,3 +197,32 @@ func TestProjectionMigrationCrashBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestProjectionMigrationRejectsSimultaneousConfigChange(t *testing.T) {
+	active := schema.NewDefinitions()
+	if err := active.Register(schema.NamespaceDef{
+		Namespace: 9, Name: "kv", Kind: schema.KindKV, Entity: schema.EntityImage,
+		ProjectionVersion: 1, Config: []byte("old"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target := schema.NewDefinitions()
+	if err := target.Register(schema.NamespaceDef{
+		Namespace: 9, Name: "kv", Kind: schema.KindKV, Entity: schema.EntityImage,
+		ProjectionVersion: 2, Config: []byte("new"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAddition(active, target, true); err == nil {
+		t.Fatal("simultaneous projection bump and config change was accepted")
+	}
+	// The same bypass must fail when the target also appends a namespace.
+	if err := target.Register(schema.NamespaceDef{
+		Namespace: 10, Name: "extra", Kind: schema.KindKV, Entity: schema.EntityImage,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAddition(active, target, true); err == nil {
+		t.Fatal("simultaneous config bypass with namespace addition was accepted")
+	}
+}
