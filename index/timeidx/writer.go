@@ -52,7 +52,19 @@ func NewBatch(capacity int) *Batch {
 }
 
 func (b *Batch) Append(m Mutation) bool {
-	if b == nil || b.inFlight.Load() || len(b.ops) == b.capacity || m.kind < mutationInsert || m.kind > mutationMove {
+	if b == nil || b.inFlight.Load() || m.kind < mutationInsert || m.kind > mutationMove {
+		return false
+	}
+	// Time is ID-authoritative: a later mutation for the same ID replaces the
+	// earlier one. Collapse duplicates in the writer buffer so one persistence
+	// pass sees the final operation.
+	for i := len(b.ops) - 1; i >= 0; i-- {
+		if b.ops[i].imageID == m.imageID {
+			b.ops[i] = m
+			return true
+		}
+	}
+	if len(b.ops) == b.capacity {
 		return false
 	}
 	b.ops = append(b.ops, m)

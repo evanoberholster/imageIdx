@@ -315,3 +315,22 @@ func TestWaitIndexedCancellation(t *testing.T) {
 	close(release)
 	wait(t, db, g)
 }
+
+func TestCommitSkipsIdenticalCanonicalValue(t *testing.T) {
+	data, idxPath := paths(t)
+	db := openTest(t, data, idxPath)
+	defer db.Close()
+	mutation := Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection(1, 'a'), Record: []byte("same")}
+	start := db.Stats().Store.ValueBytes
+	if _, err := db.Commit(mutation); err != nil {
+		t.Fatal(err)
+	}
+	first := db.Stats().Store.ValueBytes - start
+	if _, err := db.Commit(mutation); err != nil {
+		t.Fatal(err)
+	}
+	second := db.Stats().Store.ValueBytes - start - first
+	if second >= first {
+		t.Fatalf("identical canonical value was rewritten: first=%d second=%d", first, second)
+	}
+}

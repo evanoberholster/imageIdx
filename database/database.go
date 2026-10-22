@@ -3,6 +3,7 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -703,8 +704,10 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			if err != nil {
 				return 0, err
 			}
-			if err := b.Set(key, tombstone); err != nil {
-				return 0, err
+			if !bytes.Equal(tombstone, prior) {
+				if err := b.Set(key, tombstone); err != nil {
+					return 0, err
+				}
 			}
 		} else {
 			if len(m.Projection) > math.MaxUint32 {
@@ -722,15 +725,21 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			if err != nil {
 				return 0, err
 			}
-			if err := b.Set(key, record); err != nil {
-				return 0, err
+			if !bytes.Equal(record, prior) {
+				if err := b.Set(key, record); err != nil {
+					return 0, err
+				}
 			}
 		}
 		deltaBefore, deltaAfter := beforeEntry, afterEntry
 		if m.Delete {
 			deltaBefore, deltaAfter = index.Entry{}, index.Entry{}
 		} else if !insert {
-			deltaBefore, deltaAfter = changedProjectionScratch(beforeEntry, afterEntry, &db.commitScratch)
+			if bytes.Equal(before, m.Projection) {
+				deltaBefore, deltaAfter = index.Entry{}, index.Entry{}
+			} else {
+				deltaBefore, deltaAfter = changedProjectionScratch(beforeEntry, afterEntry, &db.commitScratch)
+			}
 		}
 		entry, err := appendMutation(db.journalScratch[:0], m, insert, deltaBefore, deltaAfter)
 		db.journalScratch = entry
