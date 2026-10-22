@@ -15,11 +15,9 @@ func (db *DB) buildGroups(ws *coordinatorWorkspace) ([]mutationGroup, bool) {
 	for i := 0; i < ws.count; i++ {
 		m := &ws.mutations[i]
 		event := &ws.decoded[i]
-		// SimHash dense appends and vector graph updates have engine-local
-		// ordering/precondition rules. Fall back to ordered sub-batches rather
-		// than guessing at a merged representation.
-		if len(event.before.Sims) != 0 || len(event.after.Sims) != 0 ||
-			len(event.before.Vectors) != 0 || len(event.after.Vectors) != 0 {
+		// Use the engine contract rather than guessing from association slices.
+		// SimHash and vector updates retain ordered fallback.
+		if !db.coalesceSafeEntry(event.before) || !db.coalesceSafeEntry(event.after) {
 			safe = false
 		}
 
@@ -56,6 +54,40 @@ func (db *DB) buildGroups(ws *coordinatorWorkspace) ([]mutationGroup, bool) {
 		}
 	}
 	return ws.groups[:ws.groupN], safe
+}
+
+func (db *DB) coalesceSafeEntry(entry index.Entry) bool {
+	for _, value := range entry.Times {
+		if !db.indexes.CoalesceSafe(value.Namespace) {
+			return false
+		}
+	}
+	for _, value := range entry.Geos {
+		if !db.indexes.CoalesceSafe(value.Namespace) {
+			return false
+		}
+	}
+	for _, value := range entry.Sims {
+		if !db.indexes.CoalesceSafe(value.Namespace) {
+			return false
+		}
+	}
+	for _, value := range entry.Hashes {
+		if !db.indexes.CoalesceSafe(value.Namespace) {
+			return false
+		}
+	}
+	for _, value := range entry.Vectors {
+		if !db.indexes.CoalesceSafe(value.Namespace) {
+			return false
+		}
+	}
+	for _, value := range entry.Bitmaps {
+		if !db.indexes.CoalesceSafe(value.Namespace) {
+			return false
+		}
+	}
+	return true
 }
 
 func (db *DB) applyWorkspace(ws *coordinatorWorkspace, batch *index.Batch) error {

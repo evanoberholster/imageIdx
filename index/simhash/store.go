@@ -113,14 +113,41 @@ func (l layout) walName() string {
 
 func (l layout) walPath() string { return filepath.Join(l.dir, l.walName()) }
 
-func (l layout) sparseName() string {
+func (l layout) sparseLegacyName() string {
 	if l.prefix == "" {
 		return "sparse.bin"
 	}
 	return l.prefix + ".sparse"
 }
 
-func (l layout) sparsePath() string { return filepath.Join(l.dir, l.sparseName()) }
+func (l layout) sparseLegacyPath() string { return filepath.Join(l.dir, l.sparseLegacyName()) }
+
+func (l layout) sparseManifestName() string {
+	if l.prefix == "" {
+		return "sparse.manifest"
+	}
+	return l.prefix + ".sparse.manifest"
+}
+
+func (l layout) sparseManifestPath() string { return filepath.Join(l.dir, l.sparseManifestName()) }
+
+func (l layout) sparseSegmentName(id uint64) string {
+	if l.prefix == "" {
+		return fmt.Sprintf("sparse-%016x.seg", id)
+	}
+	return fmt.Sprintf("%s.sparse-%016x.seg", l.prefix, id)
+}
+
+func (l layout) sparseSegmentPath(id uint64) string {
+	return filepath.Join(l.dir, l.sparseSegmentName(id))
+}
+
+func (l layout) sparseTempPattern() string {
+	if l.prefix == "" {
+		return "sparse.tmp-*"
+	}
+	return l.prefix + ".sparse.tmp-*"
+}
 
 // shardPath is the legacy directory-mode shard path helper.
 func shardPath(dir string, index uint64) string {
@@ -237,16 +264,19 @@ type Store struct {
 	tracker storage.ReaderTracker
 
 	// Writer-owned state, touched only under mu.
-	shards        []*shard
-	committed     uint64
-	generation    uint64
-	journal       *journal
-	sparseFile    *os.File
-	sparseOff     int64
-	sparseUsed    bool
-	sparseRecords []sparseRecord
-	sparseView    atomic.Pointer[[]sparseRecord]
-	denseScratch  []Record
+	shards                 []*shard
+	committed              uint64
+	generation             uint64
+	journal                *journal
+	sparseUsed             bool
+	sparseSegments         []sparseSegment
+	sparseView             atomic.Pointer[sparseView]
+	sparseGeneration       uint64
+	sparseLive             uint64
+	sparseStale            uint64
+	sparseSourceGeneration uint64
+	sparseWriteBuf         []byte
+	denseScratch           []Record
 	// singleWire / singleRec let the single-record APIs share the batch path
 	// without constructing one-element heap slices.
 	singleWire [1]Update
@@ -324,15 +354,19 @@ func openLayout(l layout, config Config) (*Store, error) {
 		_ = st.closeShards()
 		return nil, err
 	}
-	sparseRecords, sparseOff, sparseFile, err := openSparse(l)
+	sparseState, err := openSparse(l)
 	if err != nil {
 		_ = st.closeShards()
 		_ = st.journal.close()
 		return nil, err
 	}
-	st.sparseRecords, st.sparseOff, st.sparseFile = sparseRecords, sparseOff, sparseFile
-	st.sparseUsed = sparseOff > sparseHeaderBytes
-	st.sparseView.Store(&sparseRecords)
+	st.sparseSegments = sparseState.segments
+	st.sparseGeneration = sparseState.generation
+	st.sparseLive = sparseState.live
+	st.sparseStale = sparseState.stale
+	st.sparseSourceGeneration = sparseState.sourceGeneration
+	st.sparseUsed = len(sparseState.segments) != 0
+	st.sparseView.Store(makeSparseView(sparseState.segments, sparseState.live))
 	// Sequence counters are ephemeral: after journal recovery, reset every
 	// counter to an even value so a crash that left one odd cannot make a
 	// reader spin forever.
@@ -569,11 +603,6 @@ func (st *Store) Close() error {
 			err = e
 		}
 	}
-	if st.sparseFile != nil {
-		if e := st.sparseFile.Close(); e != nil && err == nil {
-			err = e
-		}
-	}
 	if e := st.closeShards(); e != nil && err == nil {
 		err = e
 	}
@@ -591,8 +620,11 @@ func (st *Store) Get(id schema.ImageID) (Record, bool) {
 	if st.closed.Load() {
 		return Record{}, false
 	}
-	if rec, ok := st.sparseGet(id); ok {
-		return rec, true
+	if rec, found := st.sparseRecord(id); found {
+		if rec.deleted {
+			return Record{}, false
+		}
+		return rec.record, true
 	}
 	v := st.view.Load()
 	committed := st.committedAtomic.Load()

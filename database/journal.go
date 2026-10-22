@@ -56,6 +56,12 @@ type journalEntry struct {
 // relative to the canonical prior state; after is the set added. insert means
 // there was no prior canonical projection.
 func encodeMutation(m Mutation, insert bool, before, after index.Entry) ([]byte, error) {
+	return appendMutation(nil, m, insert, before, after)
+}
+
+// appendMutation appends one journal payload to dst. The caller may reuse dst
+// after store.Batch.Set has copied the value.
+func appendMutation(dst []byte, m Mutation, insert bool, before, after index.Entry) ([]byte, error) {
 	beforeN := associationCount(before)
 	afterN := associationCount(after)
 	if beforeN > math.MaxUint16 || afterN > math.MaxUint16 {
@@ -69,7 +75,12 @@ func encodeMutation(m Mutation, insert bool, before, after index.Entry) ([]byte,
 	if !m.Delete {
 		capacity += associationSize(before) + associationSize(after)
 	}
-	b := make([]byte, journalHeader, capacity)
+	if cap(dst) < capacity {
+		dst = make([]byte, journalHeader, capacity)
+	} else {
+		dst = dst[:journalHeader]
+	}
+	b := dst
 	if !m.Delete {
 		var err error
 		b, err = appendAssociations(b, before)
@@ -91,6 +102,7 @@ func encodeMutation(m Mutation, insert bool, before, after index.Entry) ([]byte,
 	}
 	b = append(b, 0, 0, 0, 0)
 	b[0] = journalVersion
+	b[1] = 0
 	if m.Delete {
 		b[1] |= journalFlagDeleted
 	}
@@ -289,6 +301,9 @@ func decodeAssociations(data []byte, count uint16, dst *index.Entry) error {
 		}
 		family := data[pos]
 		ns := schema.Namespace(binary.BigEndian.Uint16(data[pos+1 : pos+3]))
+		if !ns.Valid() {
+			return ErrCorruptJournal
+		}
 		pos += 3
 		switch family {
 		case journalFamilyTime:
@@ -337,6 +352,9 @@ func decodeAssociations(data []byte, count uint16, dst *index.Entry) error {
 				return ErrCorruptJournal
 			}
 			kind := schema.NamespaceKind(data[pos])
+			if !kind.IsBitmap() {
+				return ErrCorruptJournal
+			}
 			value := int64(binary.BigEndian.Uint64(data[pos+1 : pos+9]))
 			isBool := data[pos+9] != 0
 			n := binary.BigEndian.Uint32(data[pos+10 : pos+14])

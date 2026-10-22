@@ -3,6 +3,7 @@ package database
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/evanoberholster/imageIdx/index"
@@ -164,5 +165,121 @@ func TestOldJournalVersionFailsClosed(t *testing.T) {
 func TestOldCanonicalVersionFailsClosed(t *testing.T) {
 	if _, err := decodeCanonicalValue([]byte{0, 0, 0, 0, 0}); !errors.Is(err, ErrUnsupportedCanonicalVersion) {
 		t.Fatalf("old canonical version: %v", err)
+	}
+}
+
+func TestJournalV2VectorElementKinds(t *testing.T) {
+	cases := []index.VectorValue{
+		{Namespace: 5, Element: vectoridx.ElementInt8, Int8: []int8{-1, 2}},
+		{Namespace: 5, Element: vectoridx.ElementUint8, Uint8: []uint8{1, 255}},
+		{Namespace: 5, Element: vectoridx.ElementInt16, Int16: []int16{-300, 300}},
+		{Namespace: 5, Element: vectoridx.ElementUint16, Uint16: []uint16{1, 65535}},
+		{Namespace: 5, Element: vectoridx.ElementFloat32, Float32: []float32{-1.5, 2.5}},
+	}
+	for _, value := range cases {
+		t.Run(fmt.Sprintf("%d", value.Element), func(t *testing.T) {
+			entry := index.Entry{ValueID: 1, Vectors: []index.VectorValue{value}}
+			raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 1}, true, index.Entry{}, entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeMutation(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got index.Entry
+			if err := decodeAssociations(decoded.after, decoded.afterN, &got); err != nil {
+				t.Fatal(err)
+			}
+			got.ValueID = 1
+			assertProjectionEqual(t, "vector", got, entry)
+		})
+	}
+}
+
+func TestJournalV2BitmapKindsRoundTrip(t *testing.T) {
+	entries := []index.BitmapValue{
+		{Namespace: 6, Value: bitmapidx.EnumStringValue("enum")},
+		{Namespace: 6, Value: bitmapidx.BoolValue(true)},
+		{Namespace: 6, Value: bitmapidx.IntValue(-12345)},
+		{Namespace: 6, Value: bitmapidx.Uint16Value(60000)},
+		{Namespace: 6, Value: bitmapidx.Uint32Value(4_000_000_000)},
+	}
+	for i, value := range entries {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			entry := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{value}}
+			raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 1}, true, index.Entry{}, entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeMutation(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got index.Entry
+			if err := decodeAssociations(decoded.after, decoded.afterN, &got); err != nil {
+				t.Fatal(err)
+			}
+			got.ValueID = 1
+			assertProjectionEqual(t, "bitmap", got, entry)
+		})
+	}
+}
+
+func TestAppendMutationReuseClearsHeaderFlags(t *testing.T) {
+	var scratch []byte
+	insert := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{{Namespace: 6, Value: bitmapidx.EnumStringValue("a")}}}
+	raw, err := appendMutation(scratch[:0], Mutation{Entity: schema.EntityImage, ValueID: 1}, true, index.Entry{}, insert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratch = raw
+	deleteRaw, err := appendMutation(scratch[:0], Mutation{Entity: schema.EntityImage, ValueID: 1, Delete: true}, false, index.Entry{}, index.Entry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := decodeMutation(deleteRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !entry.deleted || entry.insert {
+		t.Fatalf("reused header flags = deleted:%v insert:%v", entry.deleted, entry.insert)
+	}
+}
+
+func TestJournalV2RejectsInvalidAssociationKinds(t *testing.T) {
+	entry := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{{Namespace: 6, Value: bitmapidx.EnumStringValue("a")}}}
+	raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 1}, true, index.Entry{}, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeMutation(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badKind := append([]byte(nil), decoded.after...)
+	badKind[3] = 0 // family, namespace, then kind
+	if err := decodeAssociations(badKind, decoded.afterN, &index.Entry{}); err == nil {
+		t.Fatal("invalid bitmap kind accepted")
+	}
+	badNS := append([]byte(nil), decoded.after...)
+	badNS[1], badNS[2] = 0, 0
+	if err := decodeAssociations(badNS, decoded.afterN, &index.Entry{}); err == nil {
+		t.Fatal("zero namespace accepted")
+	}
+	vectorRaw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 1}, true, index.Entry{}, index.Entry{
+		ValueID: 1, Vectors: []index.VectorValue{{Namespace: 5, Element: vectoridx.ElementFloat32, Float32: []float32{1}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vectorEntry, err := decodeMutation(vectorRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badVector := append([]byte(nil), vectorEntry.after...)
+	badVector[3] = 0
+	if err := decodeAssociations(badVector, vectorEntry.afterN, &index.Entry{}); err == nil {
+		t.Fatal("invalid vector element accepted")
 	}
 }

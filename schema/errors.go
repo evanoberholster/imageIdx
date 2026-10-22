@@ -4,6 +4,7 @@ import "errors"
 
 var (
 	ErrCorrupt         = errors.New("schema: corrupt allocation file")
+	ErrConfigMismatch  = errors.New("schema: database config mismatch")
 	ErrClosed          = errors.New("schema: closed")
 	ErrNamespace       = errors.New("schema: invalid namespace")
 	ErrNamespaceExists = errors.New("schema: duplicate namespace")

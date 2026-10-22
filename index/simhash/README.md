@@ -68,13 +68,17 @@ if err := store.Checkpoint(); err != nil {
 ## Sparse external IDs
 
 Contiguous IDs keep the dense hash-page append path. `ApplyUpdates` accepts
-arbitrary nonzero `uint64` external IDs and persists non-dense records in a
-CRC-protected append-only `sparse.bin`/`*.sparse` overlay. Sparse searches scan
-the dense snapshot plus the sorted live overlay, filter dense IDs overridden by
-the overlay, and preserve ascending `ImageID` result order. Once the sparse
-overlay is used, dense `AppendBatch`/`UpsertBatch` calls are rejected so there
-is only one source of truth. A partial sparse tail is truncated during open;
-complete frames with bad checksums fail closed.
+arbitrary nonzero `uint64` external IDs and persists non-dense records in
+immutable CRC-checked `sparse-<generation>.seg` files published by an atomically
+replaced `sparse.manifest`. Ordinary batches write one bounded sorted delta
+segment; compaction merges live records and dense-suppressing tombstones into a
+replacement segment. Readers see an atomic base+overlay view, filter dense IDs
+overridden by the overlay, and preserve ascending `ImageID` result order. Once
+the segmented sparse overlay is used, dense `AppendBatch`/`UpsertBatch` calls
+are rejected so there is only one source of truth. A crash before manifest
+publication leaves only an orphan; complete corrupt segments and manifests fail
+closed. The retired experimental `sparse.bin`/`*.sparse` format is rejected with
+an explicit rebuild error.
 
 ## Addressing and format
 

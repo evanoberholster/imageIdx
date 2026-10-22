@@ -32,6 +32,8 @@ var (
 	ErrProjectionUnavailable       = errors.New("database: canonical projection is unavailable")
 	ErrUnsupportedJournalVersion   = errors.New("database: unsupported journal version")
 	ErrUnsupportedCanonicalVersion = errors.New("database: unsupported canonical record version")
+	ErrCanonicalModeMismatch       = errors.New("database: canonical projection mode mismatch")
+	ErrCorruptDatabaseConfig       = errors.New("database: corrupt canonical projection config")
 )
 
 // Decoder reconstructs an index projection from durable, application-encoded
@@ -77,15 +79,18 @@ type Options struct {
 	// opt-in; existing callers can continue using Decoder.
 	DecodeInto DecodeIntoFunc
 	// CanonicalProjection selects inline (A) or external (B) canonical
-	// projection storage. External requires ProjectFromRecord.
+	// projection storage. External requires ProjectFromRecord or ProjectInto.
 	CanonicalProjection CanonicalProjectionMode
 	// ProjectFromRecord re-derives complete projection bytes from an
 	// application canonical record. It is required for external canonical
 	// projections and for projection-semantic rebuilds.
 	ProjectFromRecord func(record []byte) ([]byte, error)
+	// ProjectInto is the destination-buffer form of ProjectFromRecord. When set
+	// it is preferred over ProjectFromRecord for reprojection.
+	ProjectInto func(dst, record []byte) ([]byte, error)
 	// ProjectionMigration permits an explicit target schema to change
 	// per-namespace ProjectionVersion and rebuild indexes from canonical
-	// records using ProjectFromRecord.
+	// records using ProjectFromRecord or ProjectInto.
 	ProjectionMigration bool
 	// Definitions, if provided, is the authoritative complete namespace model.
 	// Existing KV and index metadata must agree with it. When omitted on an
@@ -109,10 +114,11 @@ type DB struct {
 	decode            Decoder
 	decodeInto        DecodeIntoFunc
 	projectFromRecord func([]byte) ([]byte, error)
-	forceReproject    bool
+	projectInto       func([]byte, []byte) ([]byte, error)
 	options           Options
 	stats             dbStats
 	commitScratch     projectionScratch
+	journalScratch    []byte
 	committed         uint64
 	indexed           uint64
 	inflight          uint64
@@ -154,11 +160,11 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if !options.CanonicalProjection.valid() {
 		return nil, fmt.Errorf("%w: invalid canonical projection mode", ErrInvalidMutation)
 	}
-	if options.CanonicalProjection == CanonicalProjectionExternal && options.ProjectFromRecord == nil {
-		return nil, fmt.Errorf("%w: external canonical projection requires ProjectFromRecord", ErrInvalidMutation)
+	if options.CanonicalProjection == CanonicalProjectionExternal && options.ProjectFromRecord == nil && options.ProjectInto == nil {
+		return nil, fmt.Errorf("%w: external canonical projection requires ProjectFromRecord or ProjectInto", ErrInvalidMutation)
 	}
-	if options.ProjectionMigration && options.ProjectFromRecord == nil {
-		return nil, fmt.Errorf("%w: projection migration requires ProjectFromRecord", ErrInvalidMutation)
+	if options.ProjectionMigration && options.ProjectFromRecord == nil && options.ProjectInto == nil {
+		return nil, fmt.Errorf("%w: projection migration requires ProjectFromRecord or ProjectInto", ErrInvalidMutation)
 	}
 	owner, err := storage.AcquireLock(filepath.Dir(dir), "."+filepath.Base(filepath.Clean(dir))+".database.lock", false)
 	if err != nil {
@@ -192,11 +198,22 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		if openErr != nil {
 			return nil, openErr
 		}
+		options, openErr = ensureCanonicalMode(existing, options)
+		if openErr != nil {
+			_ = existing.Close()
+			return nil, openErr
+		}
 		if existing.PreparedDefinitions() != nil {
 			if err := recoverPreparedSchema(existing, dir, indexDir, decode, options); err != nil {
 				_ = existing.Close()
 				return nil, err
 			}
+		}
+	}
+	if existing != nil && options.Definitions != nil && projectionVersionsDiffer(existing.Definitions(), options.Definitions) {
+		if options.CanonicalProjection != CanonicalProjectionExternal || (options.ProjectFromRecord == nil && options.ProjectInto == nil) {
+			_ = existing.Close()
+			return nil, fmt.Errorf("%w: projection version change requires external canonical mode and a projector callback", ErrInvalidMutation)
 		}
 	}
 	if existing != nil && options.Definitions != nil && validateDefinitions(existing.Definitions(), options.Definitions) != nil {
@@ -268,6 +285,11 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		}
 		existing, err = schema.Open(path, schema.Options{Definitions: defs, Entities: entities})
 		if err != nil {
+			return nil, err
+		}
+		options, err = ensureCanonicalMode(existing, options)
+		if err != nil {
+			_ = existing.Close()
 			return nil, err
 		}
 	}
@@ -373,6 +395,15 @@ func canonicalSpecsFor(canonical [schema.EntityKindCount + 1]schema.Namespace) [
 }
 
 func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, options Options, existing *schema.Schema, canonical [schema.EntityKindCount + 1]schema.Namespace) (*DB, error) {
+	if existing != nil {
+		var err error
+		options, err = ensureCanonicalMode(existing, options)
+		if err != nil {
+			_ = existing.Close()
+			_ = values.Close()
+			return nil, err
+		}
+	}
 	if existing != nil && !existing.LegacyRetired() {
 		stored, err := values.Get(store.Key{Namespace: metadataNS, ID: schemaKeyID})
 		if err == nil {
@@ -416,7 +447,7 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 		_ = values.Close()
 		return nil, errors.Join(ErrRecoveryRequired, err)
 	}
-	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, projectFromRecord: options.ProjectFromRecord, forceReproject: options.ProjectionMigration, options: options,
+	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, projectFromRecord: options.ProjectFromRecord, projectInto: options.ProjectInto, options: options,
 		wake: make(chan struct{}, 1), changed: make(chan struct{}), done: make(chan struct{})}
 	ready := false
 	defer func() {
@@ -638,11 +669,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 			if err != nil {
 				return 0, err
 			}
-			if db.forceReproject && db.projectFromRecord != nil {
-				before, err = db.projectFromRecord(value.record)
-			} else {
-				before, err = db.projectionForValue(value)
-			}
+			before, err = db.projectionForValue(value)
 			if err != nil {
 				return 0, err
 			}
@@ -705,7 +732,8 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 		} else if !insert {
 			deltaBefore, deltaAfter = changedProjectionScratch(beforeEntry, afterEntry, &db.commitScratch)
 		}
-		entry, err := encodeMutation(m, insert, deltaBefore, deltaAfter)
+		entry, err := appendMutation(db.journalScratch[:0], m, insert, deltaBefore, deltaAfter)
+		db.journalScratch = entry
 		db.commitScratch.reset()
 		if err != nil {
 			return 0, err

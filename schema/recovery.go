@@ -56,7 +56,7 @@ func (s *Schema) create(defs []directoryEntry) error {
 	if err := s.sync(); err != nil {
 		return err
 	}
-	p := superPayload(dirOff, dir, s.definitionsData, end)
+	p := superPayload(dirOff, dir, s.definitionsData, end, s.config)
 	var sb [superBytes]byte
 	if err := storage.EncodeSuperblock(sb[:], storage.SuperblockHeader{Magic: superMagic, Version: SchemaVersion, Generation: 1}, p[:]); err != nil {
 		return err
@@ -79,7 +79,7 @@ func (s *Schema) commitDirectory(slot int, generation, off uint64, dir, definiti
 			return err
 		}
 	}
-	p := superPayload(off, dir, definitions, end)
+	p := superPayload(off, dir, definitions, end, s.config)
 	if prepared {
 		p[52] = 1
 	}
@@ -197,6 +197,9 @@ func (s *Schema) recover(defs []directoryEntry, prepare bool) error {
 	if !valid {
 		return ErrCorrupt
 	}
+	if version == SchemaVersion {
+		copy(s.config[:], payload[54:60])
+	}
 	definitionsOffset := binary.LittleEndian.Uint64(payload[32:40])
 	definitionsLength := binary.LittleEndian.Uint64(payload[40:48])
 	storedDefinitions := make([]byte, definitionsLength)
@@ -243,14 +246,21 @@ func (s *Schema) recover(defs []directoryEntry, prepare bool) error {
 		}
 		priorDefs := active.Defs()
 		targetDefs := stored.Defs()
-		if len(priorDefs) >= len(targetDefs) {
+		if len(priorDefs) > len(targetDefs) {
 			return ErrCorrupt
 		}
+		changed := len(targetDefs) > len(priorDefs)
 		for i, p := range priorDefs {
 			d := targetDefs[i]
 			if p.Namespace != d.Namespace || p.Name != d.Name || p.Kind != d.Kind || p.Entity != d.Entity || !bytes.Equal(p.Config, d.Config) {
 				return ErrCorrupt
 			}
+			if p.ProjectionVersion != d.ProjectionVersion {
+				changed = true
+			}
+		}
+		if !changed {
+			return ErrCorrupt
 		}
 		s.activeDefinitions, s.prepared = active, true
 	}

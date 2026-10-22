@@ -50,6 +50,10 @@ These existed only on unreleased branches and are rejected, not migrated:
 - Definitions-blob v3 adds a `ProjectionVersion:u16` after `EntityKind` in each
   namespace definition. Version 2 definitions are read with
   `ProjectionVersion=1`; registration order is preserved.
+- Superblock v3 uses `payload[54:60]` for a schema-owned, opaque 6-byte database
+  config (currently canonical projection mode/version). `payload[60:64]` must be
+  zero. Version 2 requires all twelve reserved bytes to be zero; reopening a v2
+  file with a config upgrade is explicit and fail-closed.
 
 Directory identifiers are `EntityKind` ordinals, not namespace numbers. The
 definitions blob maps namespaces to entities and is the only authority for

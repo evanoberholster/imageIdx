@@ -115,3 +115,97 @@ func assertPairStateForID(t *testing.T, db *DB, id uint64, camera, rating byte) 
 		t.Fatalf("pair state for %d missing", id)
 	}
 }
+
+func TestCanonicalProjectionModeIsPersistedAndMismatchFails(t *testing.T) {
+	data, idxPath := paths(t)
+	project := func(record []byte) ([]byte, error) { return record, nil }
+	db, err := Open(data, idxPath, decodePair, Options{
+		CanonicalProjection: CanonicalProjectionExternal,
+		ProjectFromRecord:   project,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection := pairProjection(1, 'C', '3')
+	if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection, Record: projection}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitIndexed(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The durable mode is authoritative: no option is needed, but external
+	// mode still requires its reprojection callback.
+	if _, err := Open(data, idxPath, decodePair, Options{}); !errors.Is(err, ErrProjectionUnavailable) {
+		t.Fatalf("external reopen without callback: %v", err)
+	}
+	db, err = Open(data, idxPath, decodePair, Options{
+		ProjectFromRecord: project,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.options.CanonicalProjection != CanonicalProjectionExternal {
+		t.Fatalf("persisted mode = %d", db.options.CanonicalProjection)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(data, idxPath, decodePair, Options{
+		CanonicalProjection: CanonicalProjectionInline,
+		ProjectFromRecord:   project,
+	}); !errors.Is(err, ErrCanonicalModeMismatch) {
+		t.Fatalf("inline mismatch: %v", err)
+	}
+}
+
+func TestInlineCanonicalProjectionModeRejectsExternalOption(t *testing.T) {
+	data, idxPath := paths(t)
+	db := openTest(t, data, idxPath)
+	if db.options.CanonicalProjection != CanonicalProjectionInline {
+		t.Fatalf("fresh mode = %d", db.options.CanonicalProjection)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(data, idxPath, decodePair, Options{
+		CanonicalProjection: CanonicalProjectionExternal,
+		ProjectFromRecord:   func(record []byte) ([]byte, error) { return record, nil },
+	}); !errors.Is(err, ErrCanonicalModeMismatch) {
+		t.Fatalf("external mismatch: %v", err)
+	}
+}
+
+func TestExternalCanonicalProjectIntoCallback(t *testing.T) {
+	data, idxPath := paths(t)
+	projectInto := func(dst, record []byte) ([]byte, error) {
+		return append(dst[:0], record...), nil
+	}
+	db, err := Open(data, idxPath, decodePair, Options{
+		CanonicalProjection: CanonicalProjectionExternal,
+		ProjectInto:         projectInto,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection := pairProjection(1, 'C', '3')
+	if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection, Record: projection}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitIndexed(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	assertPairStateForID(t, db, 1, 'C', '3')
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(data, idxPath, decodePair, Options{ProjectInto: projectInto})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	assertPairStateForID(t, db, 1, 'C', '3')
+}

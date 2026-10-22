@@ -321,7 +321,7 @@ func (s *Store) flushSimNamespace(ops []stagedSim) error {
 	}
 	s.flush.simUpd = updates
 	if len(updates) != 0 {
-		return idx.ApplyUpdates(updates)
+		return idx.ApplyUpdatesAt(updates, s.flushSourceGen)
 	}
 	return nil
 }

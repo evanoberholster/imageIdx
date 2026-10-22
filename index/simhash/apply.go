@@ -297,10 +297,7 @@ func (st *Store) Sync() error {
 	if err := st.persistLocked(); err != nil {
 		return err
 	}
-	if st.sparseFile != nil {
-		return st.sparseFile.Sync()
-	}
-	return nil
+	return st.syncSparseLocked()
 }
 
 // persistStage names a point in the durable-commit sequence for failure-injection

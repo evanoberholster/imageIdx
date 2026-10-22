@@ -270,3 +270,30 @@ func BenchmarkCanonicalProjectionModes(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkJournalEncodeReuse(b *testing.B) {
+	before := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{{Namespace: 6, Value: bitmapidx.EnumStringValue("before")}}}
+	after := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{{Namespace: 6, Value: bitmapidx.EnumStringValue("after")}}}
+	m := Mutation{Entity: schema.EntityImage, ValueID: 1}
+	var scratch []byte
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var err error
+		scratch, err = appendMutation(scratch[:0], m, false, before, after)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkJournalEncodeAlloc(b *testing.B) {
+	before := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{{Namespace: 6, Value: bitmapidx.EnumStringValue("before")}}}
+	after := index.Entry{ValueID: 1, Bitmaps: []index.BitmapValue{{Namespace: 6, Value: bitmapidx.EnumStringValue("after")}}}
+	m := Mutation{Entity: schema.EntityImage, ValueID: 1}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := encodeMutation(m, false, before, after); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

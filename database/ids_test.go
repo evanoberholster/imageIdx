@@ -974,6 +974,9 @@ func downgradeSchemaToV2(t *testing.T, path string) {
 			t.Fatalf("slot %d: invalid superblock", slot)
 		}
 		payload[52], payload[53] = 0, 0
+		for i := 54; i < 60; i++ {
+			payload[i] = 0
+		}
 		h.Version = 2
 		if err := storage.EncodeSuperblock(data[off:off+slotLen], h, payload); err != nil {
 			t.Fatal(err)

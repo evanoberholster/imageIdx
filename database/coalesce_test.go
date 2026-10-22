@@ -836,3 +836,123 @@ func TestCoalescedRevertAfterTombstoneRestoresLiveness(t *testing.T) {
 		t.Fatalf("indexed generation = %d, want 4", got)
 	}
 }
+
+func TestCoalescingMatchesSequentialRandomFamilies(t *testing.T) {
+	cellIDs := []uint64{
+		uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(37, -122)).Parent(geoidx.S2Level)),
+		uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(38, -121)).Parent(geoidx.S2Level)),
+		uint64(s2.CellIDFromLatLng(s2.LatLngFromDegrees(39, -120)).Parent(geoidx.S2Level)),
+	}
+	geoKeys := []uint64{uint64(geoidx.EncodeKey(cellIDs[0])), uint64(geoidx.EncodeKey(cellIDs[1])), uint64(geoidx.EncodeKey(cellIDs[2]))}
+	type event struct {
+		id     uint64
+		before []byte
+		after  []byte
+		delete bool
+	}
+	rng := rand.New(rand.NewSource(99))
+	current := map[uint64][]byte{}
+	events := make([]event, 0, 60)
+	for sequence := 0; sequence < 60; sequence++ {
+		id := uint64(rng.Intn(4) + 1)
+		prior := current[id]
+		switch {
+		case prior == nil || rng.Intn(5) == 0:
+			after := familyProjection(id, uint64(100+rng.Intn(1000)), geoKeys[rng.Intn(len(geoKeys))], byte(rng.Intn(256)))
+			current[id] = after
+			events = append(events, event{id: id, after: after})
+		case rng.Intn(4) == 0:
+			delete(current, id)
+			events = append(events, event{id: id, before: prior, delete: true})
+		default:
+			after := familyProjection(id, uint64(100+rng.Intn(1000)), geoKeys[rng.Intn(len(geoKeys))], byte(rng.Intn(256)))
+			current[id] = after
+			events = append(events, event{id: id, before: prior, after: after})
+		}
+	}
+
+	apply := func(coalesced bool) (*DB, func()) {
+		data, idxPath := familyPaths(t)
+		db, err := Open(data, idxPath, decodeFamilyProjection, Options{BatchSize: 64})
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.mu.Lock()
+		db.committed = uint64(len(events))
+		db.mu.Unlock()
+		ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+		ws.reset()
+		for i, ev := range events {
+			if ev.delete {
+				appendTypedJournal(t, ws, uint64(i+1), ev.id, false, true, index.Entry{}, index.Entry{})
+				continue
+			}
+			insert := ev.before == nil
+			dbefore, dafter := projectionDelta(t, decodeFamilyProjection, ev.before, ev.after, insert)
+			appendTypedJournal(t, ws, uint64(i+1), ev.id, insert, false, dbefore, dafter)
+		}
+		if err := db.decodeWorkspace(ws); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		if coalesced {
+			if err := db.applyWorkspace(ws, db.indexes.NewBatch(64)); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+		} else {
+			if err := db.applySequentialGroups(ws, db.indexes.NewBatch(64)); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+		}
+		return db, func() { db.Close() }
+	}
+
+	seqDB, closeSeq := apply(false)
+	defer closeSeq()
+	coalDB, closeCoal := apply(true)
+	defer closeCoal()
+	timeSeq, _ := seqDB.indexes.Time(111)
+	timeCoal, _ := coalDB.indexes.Time(111)
+	geoSeq, _ := seqDB.indexes.Geo(112)
+	geoCoal, _ := coalDB.indexes.Geo(112)
+	hashSeq, _ := seqDB.indexes.Hash(113)
+	hashCoal, _ := coalDB.indexes.Hash(113)
+	for id := uint64(1); id <= 4; id++ {
+		final := current[id]
+		if live := isLive(t, seqDB, schema.EntityImage, id); live != (final != nil) {
+			t.Fatalf("id %d liveness mismatch: seq=%v final=%v", id, live, final != nil)
+		}
+		if final == nil {
+			continue
+		}
+		timestamp := binary.BigEndian.Uint64(final[8:16])
+		geoKey := geoidx.S2Key(binary.BigEndian.Uint64(final[16:24]))
+		var hash radixhash.Hash
+		copy(hash[:], final[24:56])
+		seqTimes := timeSeq.Search(nil, timestamp, timestamp+1)
+		coalTimes := timeCoal.Search(nil, timestamp, timestamp+1)
+		if containsID(seqTimes, id) != containsID(coalTimes, id) || !containsID(coalTimes, id) {
+			t.Fatalf("id %d time mismatch: seq=%v coal=%v", id, seqTimes, coalTimes)
+		}
+		if geoSeq.Contains(geoKey, id) != geoCoal.Contains(geoKey, id) || !geoCoal.Contains(geoKey, id) {
+			t.Fatalf("id %d geo mismatch", id)
+		}
+		if hashSeq.Contains(hash) != hashCoal.Contains(hash) {
+			t.Fatalf("id %d hash index mismatch", id)
+		}
+	}
+	if seqDB.IndexedGeneration() != coalDB.IndexedGeneration() {
+		t.Fatalf("generation mismatch: seq=%d coal=%d", seqDB.IndexedGeneration(), coalDB.IndexedGeneration())
+	}
+}
+
+func containsID(ids []schema.ImageID, want uint64) bool {
+	for _, id := range ids {
+		if uint64(id) == want {
+			return true
+		}
+	}
+	return false
+}

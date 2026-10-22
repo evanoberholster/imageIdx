@@ -17,7 +17,8 @@ import (
 // Superblock payload: directory offset:u64, length:u64, CRC32C:u32,
 // entity count:u16, reserved:u16, end of committed file:u64,
 // definitions offset:u64, length:u64, CRC32C:u32, state:u8 (0 ACTIVE,
-// 1 PREPARED), legacy copies retired:u8, reserved:10 bytes. Version 2 has 12 zero reserved bytes and
+// 1 PREPARED), legacy copies retired:u8, database config:6 bytes, reserved:4
+// bytes. Version 2 has 12 zero reserved bytes and
 // is read as ACTIVE. A PREPARED slot's predecessor remains the active schema.
 // Directory keys are persisted EntityKind ordinals, not namespace IDs.
 // Metadata slot: generation:u64, reserved:u64, lastIssued:u64, clean:u8,
@@ -155,7 +156,7 @@ func parseDirectory(data []byte, end uint64) ([]directoryEntry, error) {
 	return entries, nil
 }
 
-func superPayload(dirOffset uint64, data, definitions []byte, end uint64) [64]byte {
+func superPayload(dirOffset uint64, data, definitions []byte, end uint64, config [6]byte) [64]byte {
 	var p [64]byte
 	binary.LittleEndian.PutUint64(p[0:8], dirOffset)
 	binary.LittleEndian.PutUint64(p[8:16], uint64(len(data)))
@@ -165,6 +166,7 @@ func superPayload(dirOffset uint64, data, definitions []byte, end uint64) [64]by
 	binary.LittleEndian.PutUint64(p[32:40], dirOffset+uint64(len(data)))
 	binary.LittleEndian.PutUint64(p[40:48], uint64(len(definitions)))
 	binary.LittleEndian.PutUint32(p[48:52], storage.Checksum(definitions))
+	copy(p[54:60], config[:])
 	return p
 }
 
@@ -191,9 +193,21 @@ func parseSuper(src []byte, size uint64) (uint64, uint64, uint64, uint64, error)
 	if version == previousVersion && (p[52] != 0 || p[53] != 0) || version == SchemaVersion && (p[52] > 1 || p[53] > 1) {
 		return 0, 0, 0, 0, ErrCorrupt
 	}
-	for _, b := range p[54:] {
-		if b != 0 {
-			return 0, 0, 0, 0, ErrCorrupt
+	reservedStart := 54
+	if version == previousVersion {
+		reservedStart = 52
+	}
+	if version == SchemaVersion {
+		for _, b := range p[60:] {
+			if b != 0 {
+				return 0, 0, 0, 0, ErrCorrupt
+			}
+		}
+	} else {
+		for _, b := range p[reservedStart:] {
+			if b != 0 {
+				return 0, 0, 0, 0, ErrCorrupt
+			}
 		}
 	}
 	return h.Generation, off, length, end, nil

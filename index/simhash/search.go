@@ -117,22 +117,17 @@ func (st *Store) SearchPDQ(dst []Result, query *PDQHash, maxDistance uint8) []Re
 }
 
 func (st *Store) mergeSparsePHash(dst []Result, start int, query uint64, maxDistance uint8) []Result {
-	sparse := st.sparseSnapshot()
-	if len(sparse) == 0 {
+	view := st.sparseSnapshot()
+	if view == nil || (len(view.base.records) == 0 && len(view.overlay) == 0) {
 		return dst
 	}
 	filtered := dst[:start]
 	for _, result := range dst[start:] {
-		if !sparseHasID(sparse, result.ImageID) {
+		if !view.contains(result.ImageID) {
 			filtered = append(filtered, result)
 		}
 	}
-	for _, record := range sparse {
-		distance := DistancePHash(record.record.PHash, query)
-		if distance <= maxDistance {
-			filtered = append(filtered, Result{ImageID: record.id, Distance: distance})
-		}
-	}
+	filtered = sparseSearchPHash(view, filtered, query, maxDistance)
 	slices.SortFunc(filtered[start:], func(a, b Result) int {
 		return cmp.Compare(a.ImageID, b.ImageID)
 	})
@@ -140,22 +135,17 @@ func (st *Store) mergeSparsePHash(dst []Result, start int, query uint64, maxDist
 }
 
 func (st *Store) mergeSparsePDQ(dst []Result, start int, query *PDQHash, maxDistance uint8) []Result {
-	sparse := st.sparseSnapshot()
-	if len(sparse) == 0 {
+	view := st.sparseSnapshot()
+	if view == nil || (len(view.base.records) == 0 && len(view.overlay) == 0) {
 		return dst
 	}
 	filtered := dst[:start]
 	for _, result := range dst[start:] {
-		if !sparseHasID(sparse, result.ImageID) {
+		if !view.contains(result.ImageID) {
 			filtered = append(filtered, result)
 		}
 	}
-	for _, record := range sparse {
-		distance := DistancePDQ(&record.record.PDQ, query)
-		if distance <= uint16(maxDistance) {
-			filtered = append(filtered, Result{ImageID: record.id, Distance: uint8(distance)})
-		}
-	}
+	filtered = sparseSearchPDQ(view, filtered, query, maxDistance)
 	slices.SortFunc(filtered[start:], func(a, b Result) int {
 		return cmp.Compare(a.ImageID, b.ImageID)
 	})
@@ -307,44 +297,44 @@ func (st *Store) SearchPDQBulk(dst []Result, query *PDQHash, maxDistance uint8) 
 		return dst
 	}
 	v := st.view.Load()
+	start := len(dst)
 	last := clampCommitted(st.committedAtomic.Load(), v.capacity)
-	if last == 0 {
-		return dst
-	}
 	// limit is 0..128, clamped by the public entry point, so the kernel never
 	// matches beyond MaxPDQSearchDistance and every selected distance fits uint8.
 	limit := int(maxDistance)
 	qp := (*[32]byte)(unsafe.Pointer(query))
-	lastPage := hashPageOf(last)
-	lastSlot := slotOf(last)
-	for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
-		sh, pi := v.shardForHashPage(hashPage)
-		pageBase := sh.base(pi) + pdqColumnOffset
-		maxSlot := slotsPerHashPage - 1
-		if hashPage == lastPage {
-			maxSlot = lastSlot
-		}
-		for s0 := 0; s0 <= maxSlot; s0 += hashkernel.BlockRecords {
-			n := maxSlot - s0 + 1
-			if n > hashkernel.BlockRecords {
-				n = hashkernel.BlockRecords
+	if last != 0 {
+		lastPage := hashPageOf(last)
+		lastSlot := slotOf(last)
+		for hashPage := uint64(0); hashPage <= lastPage; hashPage++ {
+			sh, pi := v.shardForHashPage(hashPage)
+			pageBase := sh.base(pi) + pdqColumnOffset
+			maxSlot := slotsPerHashPage - 1
+			if hashPage == lastPage {
+				maxSlot = lastSlot
 			}
-			off := pageBase + uint64(s0)*32
-			mask := hashkernel.PDQBlockMask(qp, sh.arena[off:], n, limit)
-			for mask != 0 {
-				bit := bits.TrailingZeros64(mask)
-				mask &= mask - 1
-				slot := s0 + bit
-				id := imageIDFromHashPage(hashPage, slot)
-				if id == 0 {
-					continue
+			for s0 := 0; s0 <= maxSlot; s0 += hashkernel.BlockRecords {
+				n := maxSlot - s0 + 1
+				if n > hashkernel.BlockRecords {
+					n = hashkernel.BlockRecords
 				}
-				d := hashkernel.PDQDistance(qp, (*[32]byte)(unsafe.Pointer(&sh.arena[pageBase+uint64(slot)*32])))
-				dst = append(dst, Result{ImageID: id, Distance: uint8(d)})
+				off := pageBase + uint64(s0)*32
+				mask := hashkernel.PDQBlockMask(qp, sh.arena[off:], n, limit)
+				for mask != 0 {
+					bit := bits.TrailingZeros64(mask)
+					mask &= mask - 1
+					slot := s0 + bit
+					id := imageIDFromHashPage(hashPage, slot)
+					if id == 0 {
+						continue
+					}
+					d := hashkernel.PDQDistance(qp, (*[32]byte)(unsafe.Pointer(&sh.arena[pageBase+uint64(slot)*32])))
+					dst = append(dst, Result{ImageID: id, Distance: uint8(d)})
+				}
 			}
 		}
 	}
-	return dst
+	return st.mergeSparsePDQ(dst, start, query, maxDistance)
 }
 
 // Quality returns the PDQ quality byte for id, validated by the block sequence.
@@ -356,6 +346,12 @@ func (st *Store) Quality(id schema.ImageID) (uint8, bool) {
 	defer st.tracker.Release(token)
 	if st.closed.Load() {
 		return 0, false
+	}
+	if rec, found := st.sparseRecord(id); found {
+		if rec.deleted {
+			return 0, false
+		}
+		return rec.record.Quality, true
 	}
 	v := st.view.Load()
 	committed := clampCommitted(st.committedAtomic.Load(), v.capacity)

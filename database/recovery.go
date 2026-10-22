@@ -311,12 +311,7 @@ func (db *DB) scanRebuild(stage *index.Store, schema *schematypes.Definitions, b
 		if value.tombstone {
 			return true, nil
 		}
-		var projection []byte
-		if db.forceReproject && db.projectFromRecord != nil {
-			projection, err = db.projectFromRecord(value.record)
-		} else {
-			projection, err = db.projectionForValue(value)
-		}
+		projection, err := db.projectionForValue(value)
 		if err != nil {
 			return false, err
 		}

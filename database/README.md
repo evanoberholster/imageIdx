@@ -182,8 +182,15 @@ versioned 7-byte header:
 - inline projection (strategy A): live values retain projection bytes plus the
   application record; tombstones retain the old projection.
 - external projection (strategy B): only the application record is stored and
-  `Options.ProjectFromRecord` reconstructs projection bytes. Tombstones retain
-  the old record.
+  `Options.ProjectFromRecord` or `Options.ProjectInto` reconstructs projection
+  bytes. Tombstones retain the old record.
+
+The selected mode is persisted in the schema-owned config bytes in `schema.dat`.
+A fresh database chooses it at creation; subsequent opens read and enforce it.
+Opening with a different explicit mode fails with `ErrCanonicalModeMismatch`.
+Mode changes are not supported. A projection-semantic version change requires
+external canonical mode plus a projector callback; inline mode is rejected
+because old inline projection bytes cannot be safely reinterpreted.
 
 The coordinator is one bounded background publisher. It stages entries in an
 `index.Batch` and calls `ApplyWithGenerationAll`, which confirms touched and
@@ -232,21 +239,26 @@ every mid-application crash.**
 ## Sparse SimHash
 
 `simhash` keeps its dense append fast path for contiguous IDs and adds a durable
-`sparse.bin`/`*.sparse` overlay for arbitrary nonzero `uint64` external IDs,
-including gaps, high IDs and out-of-order upserts. Sparse searches merge the
-dense snapshot with the sorted overlay, filter overridden dense IDs, and preserve
-ascending ImageID result order. Existing dense IDs remain compatible; once the
-sparse overlay is used, dense `AppendBatch`/`UpsertBatch` calls are rejected to
-avoid two sources of truth.
+segmented sparse overlay for arbitrary nonzero `uint64` external IDs, including
+gaps, high IDs and out-of-order upserts. `sparse.manifest` publishes immutable
+CRC-checked `sparse-<generation>.seg` files; an ordinary batch writes only a
+bounded delta segment, while explicit compaction merges live records (and
+dense-suppressing tombstones) into a replacement segment. Readers see an atomic
+base+overlay view, filter overridden dense IDs, and preserve ascending ImageID
+order. The old experimental `sparse.bin`/`*.sparse` format is rejected with an
+explicit rebuild error. Once the segmented sparse overlay is used, dense
+`AppendBatch`/`UpsertBatch` calls are rejected to avoid two sources of truth.
 
 ## Projection versions
 
 Each `schema.NamespaceDef` now carries `ProjectionVersion` in the definitions
 blob (blob version 3; versions 1/2 read as version 1). Projection changes are
 explicit restart-time migrations: `Options.ProjectionMigration` permits a
-version-only schema change when `ProjectFromRecord` is supplied; the database
-rebuilds indexes from canonical records through the existing PREPARED/ACTIVATE
-path. Canonical values are never rewritten solely to add an index definition.
+version-only schema change when external canonical mode and a projector
+callback (`ProjectFromRecord` or `ProjectInto`) are supplied; the database
+rebuilds indexes from canonical application records through the existing
+PREPARED/ACTIVATE path. Downgrades and inline-mode semantic migrations are
+rejected. Canonical values are never rewritten solely to add an index definition.
 
 ## Focused measurements
 
