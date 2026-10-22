@@ -877,6 +877,24 @@ func (db *DB) WaitIndexed(ctx context.Context, generation uint64) error {
 // Sync waits for every generation committed before this call to be indexed.
 func (db *DB) Sync(ctx context.Context) error { return db.WaitIndexed(ctx, db.DatabaseGeneration()) }
 
+// Checkpoint publishes the current derived-index state and truncates engine
+// journals where supported. It is an explicit maintenance hook; canonical
+// Pebble data is already durable. Callers should run it during idle periods.
+func (db *DB) Checkpoint() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrClosed
+	}
+	if db.err != nil {
+		return db.err
+	}
+	if db.indexes == nil {
+		return ErrRecoveryRequired
+	}
+	return db.indexes.Checkpoint()
+}
+
 func (db *DB) Close() error {
 	db.mu.Lock()
 	if db.closed {

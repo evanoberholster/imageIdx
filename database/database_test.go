@@ -334,3 +334,22 @@ func TestCommitSkipsIdenticalCanonicalValue(t *testing.T) {
 		t.Fatalf("identical canonical value was rewritten: first=%d second=%d", first, second)
 	}
 }
+
+func TestCheckpointPersistsDerivedIndex(t *testing.T) {
+	data, idxPath := paths(t)
+	db := openTest(t, data, idxPath)
+	g, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Projection: projection(1, 'a')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, g)
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openTest(t, data, idxPath)
+	defer db.Close()
+	contains(t, db, 1, 'a', true)
+}
