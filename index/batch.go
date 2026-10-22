@@ -5,13 +5,13 @@ import (
 	"math"
 	"slices"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Staged operations group one batch by engine so each engine commits once per
@@ -70,12 +70,19 @@ type stageState struct {
 }
 
 func (s *Store) resetStage() {
+	clear(s.stage.time)
 	s.stage.time = s.stage.time[:0]
+	clear(s.stage.geo)
 	s.stage.geo = s.stage.geo[:0]
+	clear(s.stage.sim)
 	s.stage.sim = s.stage.sim[:0]
+	clear(s.stage.hash)
 	s.stage.hash = s.stage.hash[:0]
+	clear(s.stage.bitmap)
 	s.stage.bitmap = s.stage.bitmap[:0]
+	clear(s.stage.vector)
 	s.stage.vector = s.stage.vector[:0]
+	clear(s.stage.live)
 	s.stage.live = s.stage.live[:0]
 }
 

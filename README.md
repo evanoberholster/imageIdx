@@ -460,13 +460,13 @@ historical design notes. The `schema.dat` persistent-format contract lives in
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on Linux and macOS: `go build ./...`,
+`.github/workflows/ci.yml` runs on Linux AMD64 and ARM64: `go build ./...`,
 `go vet ./...`, `go test ./...`, a full `go test -race ./...` job, a schema
 recovery/golden-fixture job, a database migration crash job, and an
 informational allocator benchmark job. The allocator fast path must stay at
 `0 B/op, 0 allocs/op`.
 
-Supported/tested platforms are Linux and macOS (both schema backends use
+CI-tested platforms are Linux AMD64 and ARM64 (both schema backends use
 `flock`-based locking). Windows is **not supported**: the crash-recovery and
 file-locking suites assume POSIX semantics, so `schema`/`database` mutating
 storage is documented as unavailable there.
@@ -474,11 +474,11 @@ storage is documented as unavailable there.
 ### Known unrelated CI failures
 
 On GitHub's AMD64 Linux runners, two pre-existing microkernel packages fail
-their own equivalence tests and are excluded from the Linux test job:
+their own equivalence tests and are excluded from the AMD64 test and race jobs:
 
 - `index/radixhash/internal/tailkernel` — `TestMatchMask*` backend vs scalar.
 - `index/simhash/internal/hashkernel` — `TestAVX2PDQBlockMaskAgainstScalar`.
 
-Neither package is touched by the schema work, and both pass on macOS/ARM
+Neither package is touched by the schema work, and both pass on Linux ARM
 (where the AMD64 assembly is not built). They are tracked separately and must
 be fixed before Linux AMD64 can be declared fully supported for those kernels.

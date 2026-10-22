@@ -37,6 +37,19 @@ var (
 // The database never interprets application-specific record contents.
 type Decoder func([]byte) (index.Entry, error)
 
+// DecodeScratch is optional decoder-owned transient storage. The database
+// resets Bytes before each DecodeInto call. Decoded projections may borrow
+// scratch.Bytes until the coordinator finishes the current journal batch; they
+// must not retain it in index-owned state.
+type DecodeScratch struct {
+	Bytes []byte
+}
+
+// DecodeIntoFunc is the allocation-conscious decoder form. If configured it
+// takes precedence over Decoder. dst is reset by the database before each call;
+// implementations may append to dst's slices to reuse their capacity.
+type DecodeIntoFunc func(encoded []byte, dst *index.Entry, scratch *DecodeScratch) error
+
 // RecoveryPolicy controls startup handling of an unhealthy derived index.
 // Automatic recovery is synchronous and builds a complete replacement before
 // the DB becomes available; it never modifies the canonical records.
@@ -51,6 +64,15 @@ type Options struct {
 	BatchSize  int    // defaults to 64; one publisher processes batches in order
 	MaxPending uint64 // maximum unacknowledged mutations; zero means no limit
 	Recovery   RecoveryPolicy
+	// MaxProjectionBytes bounds the sum of copied before+after projection
+	// payload bytes in one coordinator batch. Zero selects 1 MiB.
+	MaxProjectionBytes int
+	// OversizedRetentionBytes bounds the one reusable oversized projection
+	// buffer retained by a coordinator. Zero selects 4 MiB.
+	OversizedRetentionBytes int
+	// DecodeInto, when non-nil, replaces Decoder for projections. It is
+	// opt-in; existing callers can continue using Decoder.
+	DecodeInto DecodeIntoFunc
 	// Definitions, if provided, is the authoritative complete namespace model.
 	// Existing KV and index metadata must agree with it. When omitted on an
 	// existing database, the persisted schema file is authoritative.
@@ -63,30 +85,32 @@ type Options struct {
 }
 
 type DB struct {
-	owner     *os.File   // serializes schema startup, including close/reopen transitions
-	mu        sync.Mutex // serializes sequence allocation with the Pebble commit
-	values    *store.Store
-	ids       *schema.Schema
-	canonical [schema.EntityKindCount + 1]schema.Namespace
-	idsClosed atomic.Bool
-	indexes   *index.Store
-	decode    Decoder
-	options   Options
-	committed uint64
-	indexed   uint64
-	inflight  uint64
-	err       error
-	closed    bool
-	wake      chan struct{}
-	changed   chan struct{}
-	done      chan struct{}
+	owner      *os.File   // serializes schema startup, including close/reopen transitions
+	mu         sync.Mutex // serializes sequence allocation with the Pebble commit
+	values     *store.Store
+	ids        *schema.Schema
+	canonical  [schema.EntityKindCount + 1]schema.Namespace
+	idsClosed  atomic.Bool
+	indexes    *index.Store
+	decode     Decoder
+	decodeInto DecodeIntoFunc
+	options    Options
+	stats      dbStats
+	committed  uint64
+	indexed    uint64
+	inflight   uint64
+	err        error
+	closed     bool
+	wake       chan struct{}
+	changed    chan struct{}
+	done       chan struct{}
 }
 
 // Open opens the canonical Pebble directory and its derived index directory.
 // The index must have been created with index.Create before the first Open.
 // A reconciliation failure closes both stores and leaves the journal intact.
 func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
-	if decode == nil {
+	if decode == nil && options.DecodeInto == nil {
 		return nil, ErrInvalidMutation
 	}
 	if dir == "" {
@@ -100,6 +124,15 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	}
 	if options.BatchSize > 64 {
 		return nil, fmt.Errorf("%w: batch size > 64", ErrInvalidMutation)
+	}
+	if options.MaxProjectionBytes < 0 || options.OversizedRetentionBytes < 0 {
+		return nil, fmt.Errorf("%w: negative projection limits", ErrInvalidMutation)
+	}
+	if options.MaxProjectionBytes == 0 {
+		options.MaxProjectionBytes = defaultMaxProjectionBytes
+	}
+	if options.OversizedRetentionBytes == 0 {
+		options.OversizedRetentionBytes = defaultOversizedRetentionBytes
 	}
 	owner, err := storage.AcquireLock(filepath.Dir(dir), "."+filepath.Base(filepath.Clean(dir))+".database.lock", false)
 	if err != nil {
@@ -357,7 +390,7 @@ func openWithValues(values *store.Store, dir, indexDir string, decode Decoder, o
 		_ = values.Close()
 		return nil, errors.Join(ErrRecoveryRequired, err)
 	}
-	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, options: options,
+	db := &DB{values: values, ids: existing, indexes: idx, canonical: canonical, decode: decode, decodeInto: options.DecodeInto, options: options,
 		wake: make(chan struct{}, 1), changed: make(chan struct{}), done: make(chan struct{})}
 	ready := false
 	defer func() {
@@ -606,6 +639,8 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
+		db.stats.journalEntries.Add(1)
+		db.stats.journalBytes.Add(uint64(len(entry)))
 		if err := b.Set(store.Key{Namespace: journalNS, ID: db.committed + uint64(i) + 1}, entry); err != nil {
 			return 0, err
 		}
@@ -636,6 +671,7 @@ func (db *DB) Commit(mutations ...Mutation) (uint64, error) {
 		db.options.boundary("after canonical commit")
 	}
 	db.committed = gen
+	db.stats.canonicalCommits.Add(1)
 	db.notify()
 	db.signal()
 	return gen, nil

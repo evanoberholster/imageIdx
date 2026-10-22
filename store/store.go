@@ -35,11 +35,33 @@ func (s Spec) NamespaceDef() schematypes.NamespaceDef {
 	return schematypes.NamespaceDef{Namespace: s.Namespace, Name: s.Name, Kind: schematypes.KindKV, Entity: s.Entity}
 }
 
+// kvNamespaceWords covers the complete uint16 namespace space.
+const kvNamespaceWords = 1 << 10
+
+// kvNamespaceBits is an immutable-after-open membership set for KV namespaces.
+// It replaces the former map on the Store's hot validation path. The type is
+// intentionally unexported: callers register namespaces through schema
+// definitions, never through a mutable Store API.
+type kvNamespaceBits struct {
+	words [kvNamespaceWords]uint64
+}
+
+func (b *kvNamespaceBits) add(ns schematypes.Namespace) {
+	n := uint16(ns)
+	b.words[n>>6] |= uint64(1) << (n & 63)
+}
+
+func (b *kvNamespaceBits) contains(ns schematypes.Namespace) bool {
+	n := uint16(ns)
+	return b.words[n>>6]&(uint64(1)<<(n&63)) != 0
+}
+
 // Store owns one Pebble database. Pebble permits concurrent reads and writes.
 // Close must run after all callers have finished using the store.
 type Store struct {
 	db         *pebble.DB
-	namespaces map[schematypes.Namespace]struct{}
+	namespaces kvNamespaceBits
+	stats      storeStats
 }
 
 var schemaKey = EncodeKey(Key{}) // obsolete registry, migration-only
@@ -51,12 +73,12 @@ func Open(dir string, definitions *schematypes.Definitions) (*Store, error) {
 	if definitions == nil || definitions.Len() == 0 {
 		return nil, ErrEmptySpecs
 	}
-	namespaces := make(map[schematypes.Namespace]struct{}, definitions.Len())
+	var namespaces kvNamespaceBits
 	for _, def := range definitions.Defs() {
 		if def.Kind != schematypes.KindKV {
 			return nil, fmt.Errorf("store: namespace %d is not KV: %w", def.Namespace, ErrSchemaMismatch)
 		}
-		namespaces[def.Namespace] = struct{}{}
+		namespaces.add(def.Namespace)
 	}
 	return openPrepared(dir, nil, namespaces, false)
 }
@@ -79,12 +101,12 @@ func open(dir string, extend bool, specs ...Spec) (*Store, error) {
 		return nil, ErrEmptySpecs
 	}
 	schema := schematypes.NewDefinitions()
-	namespaces := make(map[schematypes.Namespace]struct{}, len(specs))
+	var namespaces kvNamespaceBits
 	for _, spec := range specs {
 		if err := schema.Register(spec.NamespaceDef()); err != nil {
 			return nil, fmt.Errorf("store: invalid spec: %w", err)
 		}
-		namespaces[spec.Namespace] = struct{}{}
+		namespaces.add(spec.Namespace)
 	}
 	schemaBytes, err := schema.MarshalBinary()
 	if err != nil {
@@ -93,7 +115,7 @@ func open(dir string, extend bool, specs ...Spec) (*Store, error) {
 	return openPrepared(dir, schemaBytes, namespaces, extend)
 }
 
-func openPrepared(dir string, schemaBytes []byte, namespaces map[schematypes.Namespace]struct{}, extend bool) (*Store, error) {
+func openPrepared(dir string, schemaBytes []byte, namespaces kvNamespaceBits, extend bool) (*Store, error) {
 	if dir == "" {
 		return nil, ErrInvalidDir
 	}
@@ -255,7 +277,7 @@ func verifySchema(db *pebble.DB, expected []byte, extend bool) error {
 }
 
 func (s *Store) check(key Key) error {
-	if _, ok := s.namespaces[key.Namespace]; !ok {
+	if !s.namespaces.contains(key.Namespace) {
 		return fmt.Errorf("%w: %d", ErrNamespace, key.Namespace)
 	}
 	return nil
@@ -267,7 +289,14 @@ func (s *Store) Set(key Key, value []byte) error {
 		return err
 	}
 	encoded := EncodeKey(key)
-	return s.db.Set(encoded[:], value, pebble.Sync)
+	if err := s.db.Set(encoded[:], value, pebble.Sync); err != nil {
+		return err
+	}
+	s.stats.commits.Add(1)
+	s.stats.sets.Add(1)
+	s.stats.keyBytes.Add(KeySize)
+	s.stats.valueBytes.Add(uint64(len(value)))
+	return nil
 }
 
 // Get returns an owned copy of the value. A missing key returns ErrNotFound.
@@ -293,7 +322,13 @@ func (s *Store) Delete(key Key) error {
 		return err
 	}
 	encoded := EncodeKey(key)
-	return s.db.Delete(encoded[:], pebble.Sync)
+	if err := s.db.Delete(encoded[:], pebble.Sync); err != nil {
+		return err
+	}
+	s.stats.commits.Add(1)
+	s.stats.deletes.Add(1)
+	s.stats.keyBytes.Add(KeySize)
+	return nil
 }
 
 // Scan visits a namespace in ascending ID and flags order. The value passed

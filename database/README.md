@@ -142,6 +142,19 @@ per index batch. `MaxPending` limits sequence lag and causes new commits to
 return `ErrJournalFull` rather than buffering unbounded work. A zero limit is
 unlimited.
 
+`Options.DecodeInto` is an optional allocation-conscious decoder form; when it
+is set, `Decoder` may be nil. The coordinator copies each journal entry's
+before+after payload once into reusable 64 KiB blocks, retains roughly 1 MiB of
+ordinary block capacity, and keeps at most one bounded oversized buffer.
+`Options.MaxProjectionBytes` (default 1 MiB) bounds the copied before+after
+bytes in one batch; a single oversized mutation is still processed alone.
+`Options.OversizedRetentionBytes` (default 4 MiB) bounds the one reused oversized
+buffer. The index copies any bytes it needs to retain; callers must not retain
+views into coordinator storage. `DB.Stats()` exposes cumulative application-level
+operation counters and logical byte estimates for benchmarks and diagnostics; it
+is not a transactional snapshot and does not measure device writes or `fsync`
+syscalls.
+
 ## Journal, ordering and replay
 
 Journal keys use `store.Key{Namespace: 65533, ID: sequence}`: `[uint16
@@ -159,9 +172,13 @@ intentional write amplification needed for correct explicit removals.
 The coordinator is one bounded background publisher. It stages entries in an
 `index.Batch` and calls `ApplyWithGenerationAll`, which confirms touched and
 untouched healthy namespaces in one index manifest write; it does **not**
-rewrite unchanged values. Identical before/after projections are pruned by
-family before staging a `Change`, including timestamp, geography, hash,
-bitmap and vector values. Only after the
+rewrite unchanged values. Projection diffs use typed deterministic sorting and a
+linear merge; identical before/after associations are pruned by family before
+staging a `Change`, including timestamp, geography, hash, bitmap and vector
+values. Within one bounded journal interval the coordinator coalesces repeated
+same-entity events when their initial/final state is equivalent and the engine
+families are safe; SimHash/vector groups fall back to ordered sub-batches. Only
+after the
 store-wide `SourceGeneration()` is at least the batch's last sequence does it
 sync the Pebble acknowledgment. Cleanup uses one Pebble range tombstone for
 the acknowledged interval. On startup it checks the durable database

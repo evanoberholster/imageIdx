@@ -22,7 +22,13 @@ func (b *Batch) Set(key Key, value []byte) error {
 		return err
 	}
 	k := EncodeKey(key)
-	return b.batch.Set(k[:], value, nil)
+	if err := b.batch.Set(k[:], value, nil); err != nil {
+		return err
+	}
+	b.store.stats.sets.Add(1)
+	b.store.stats.keyBytes.Add(KeySize)
+	b.store.stats.valueBytes.Add(uint64(len(value)))
+	return nil
 }
 
 func (b *Batch) Delete(key Key) error {
@@ -30,7 +36,12 @@ func (b *Batch) Delete(key Key) error {
 		return err
 	}
 	k := EncodeKey(key)
-	return b.batch.Delete(k[:], nil)
+	if err := b.batch.Delete(k[:], nil); err != nil {
+		return err
+	}
+	b.store.stats.deletes.Add(1)
+	b.store.stats.keyBytes.Add(KeySize)
+	return nil
 }
 
 // DeleteRange removes [start, end), including all flags for IDs in the range.
@@ -44,11 +55,22 @@ func (b *Batch) DeleteRange(ns schema.Namespace, start, end uint64) error {
 	}
 	a := EncodeKey(Key{Namespace: ns, ID: start})
 	z := EncodeKey(Key{Namespace: ns, ID: end})
-	return b.batch.DeleteRange(a[:], z[:], nil)
+	if err := b.batch.DeleteRange(a[:], z[:], nil); err != nil {
+		return err
+	}
+	b.store.stats.deleteRanges.Add(1)
+	b.store.stats.keyBytes.Add(2 * KeySize)
+	return nil
 }
 
-func (b *Batch) Commit() error { return b.batch.Commit(pebble.Sync) }
-func (b *Batch) Close() error  { return b.batch.Close() }
+func (b *Batch) Commit() error {
+	if err := b.batch.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	b.store.stats.commits.Add(1)
+	return nil
+}
+func (b *Batch) Close() error { return b.batch.Close() }
 
 // ScanFrom visits keys starting at start, stopping when visit returns false.
 // Values are borrowed until the next iterator step; do not retain them.
