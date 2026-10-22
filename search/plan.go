@@ -41,6 +41,7 @@ func (kind StageKind) String() string {
 type Stage struct {
 	Kind     StageKind
 	Estimate uint64
+	Cost     uint64
 	// Namespace is zero for timestamp and ACL stages.
 	Namespace        schema.Namespace
 	Predicate        string
@@ -55,6 +56,7 @@ type Stage struct {
 type stage struct {
 	kind     StageKind
 	estimate uint64
+	cost     uint64
 
 	namespaceIndex    *bitmapidx.Index
 	namespaceKind     namespaceClauseKind
@@ -73,8 +75,46 @@ type stage struct {
 	aclQueries []bitmapidx.Query
 }
 
+// stageCost is a bounded, deliberately small cost model. It estimates the
+// relative work of materializing/filtering a stage from its cardinality and
+// operation family; it is not a general optimizer or a promise of exact
+// selectivity. Costs saturate rather than overflow.
+func stageCost(s *stage) uint64 {
+	estimate := s.estimate
+	var fixed, per uint64
+	switch s.kind {
+	case StageNamespace:
+		switch s.namespaceKind {
+		case namespaceValues, namespaceText:
+			fixed, per = 1, 1
+		case namespaceRange:
+			fixed, per = 2, 2
+		case namespaceBSIRange:
+			fixed, per = 4, 3
+		default:
+			fixed, per = 2, 2
+		}
+	case StageTimestamp:
+		fixed, per = 2, 2
+		if s.tsExact == nil {
+			fixed, per = 1, 1
+		}
+	case StageGeo:
+		fixed, per = 8, 6
+		fixed += uint64(len(s.geoRanges)) * 2
+	case StageACL:
+		fixed, per = 2, 2
+	default:
+		fixed, per = 4, 4
+	}
+	if estimate > (^uint64(0)-fixed)/max(per, 1) {
+		return ^uint64(0)
+	}
+	return fixed + estimate*max(per, 1)
+}
+
 func (s *stage) metadata() Stage {
-	meta := Stage{Kind: s.kind, Estimate: s.estimate, CanProbe: s.canFilter(),
+	meta := Stage{Kind: s.kind, Estimate: s.estimate, Cost: s.cost, CanProbe: s.canFilter(),
 		OrderedSource:    s.kind != StageTimestamp,
 		BufferedFallback: s.kind == StageTimestamp && s.tsExact == nil}
 	switch s.kind {
@@ -396,14 +436,16 @@ func compile(store *bitmapidx.Store, clauses ...Clause) (Plan, error) {
 	// Estimates may be stale. A zero estimate affects order, not correctness;
 	// execution short-circuits only when live candidates are empty.
 	slices.SortStableFunc(ordered, func(left, right orderedStage) int {
-		if left.s.estimate != right.s.estimate {
-			return cmp.Compare(left.s.estimate, right.s.estimate)
+		leftCost, rightCost := stageCost(&left.s), stageCost(&right.s)
+		if leftCost != rightCost {
+			return cmp.Compare(leftCost, rightCost)
 		}
 		return cmp.Compare(left.order, right.order)
 	})
 	stages := make([]stage, len(ordered))
 	for i := range ordered {
 		stages[i] = ordered[i].s
+		stages[i].cost = stageCost(&stages[i])
 	}
 	return Plan{stages: stages, empty: empty}, nil
 }
@@ -452,8 +494,14 @@ func (plan Plan) Refresh(ctx context.Context) (Plan, error) {
 		if err != nil {
 			return Plan{}, err
 		}
+		st.cost = stageCost(st)
 	}
-	slices.SortStableFunc(stages, func(a, b stage) int { return cmp.Compare(a.estimate, b.estimate) })
+	slices.SortStableFunc(stages, func(a, b stage) int {
+		if a.cost != b.cost {
+			return cmp.Compare(a.cost, b.cost)
+		}
+		return cmp.Compare(a.estimate, b.estimate)
+	})
 	if err := ctx.Err(); err != nil {
 		return Plan{}, err
 	}
