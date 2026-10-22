@@ -33,6 +33,9 @@ func (st *Store) AppendBatch(recs []Record) (schema.ImageID, error) {
 }
 
 func (st *Store) appendBatchLocked(recs []Record) (schema.ImageID, error) {
+	if st.sparseUsed {
+		return 0, ErrInvalidID
+	}
 	if len(recs) == 0 {
 		return schema.ImageID(st.committed + 1), nil
 	}
@@ -179,6 +182,9 @@ func (st *Store) upsertLocked(updates []Update) error {
 	if st.closed.Load() {
 		return ErrClosed
 	}
+	if st.sparseUsed {
+		return ErrInvalidID
+	}
 	if len(updates) == 0 {
 		return nil
 	}
@@ -288,7 +294,13 @@ func (st *Store) Sync() error {
 	if st.closed.Load() {
 		return ErrClosed
 	}
-	return st.persistLocked()
+	if err := st.persistLocked(); err != nil {
+		return err
+	}
+	if st.sparseFile != nil {
+		return st.sparseFile.Sync()
+	}
+	return nil
 }
 
 // persistStage names a point in the durable-commit sequence for failure-injection

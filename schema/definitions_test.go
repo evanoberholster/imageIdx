@@ -169,8 +169,8 @@ func TestSchemaMalformedLengthsAndNames(t *testing.T) {
 	}
 	good, _ := d.MarshalBinary()
 	for name, change := range map[string]func([]byte){
-		"oversized config": func(b []byte) { binary.LittleEndian.PutUint32(b[16:20], ^uint32(0)) },
-		"oversized name":   func(b []byte) { binary.LittleEndian.PutUint16(b[14:16], ^uint16(0)) },
+		"oversized config": func(b []byte) { binary.LittleEndian.PutUint32(b[18:22], ^uint32(0)) },
+		"oversized name":   func(b []byte) { binary.LittleEndian.PutUint16(b[16:18], ^uint16(0)) },
 		"bad entity":       func(b []byte) { b[13] = 0xff },
 		"legacy padding":   func(b []byte) { binary.LittleEndian.PutUint16(b[4:6], schemaVersionLegacy); b[13] = 1 },
 		"trailing":         func(b []byte) { binary.LittleEndian.PutUint32(b[6:10], 0) },

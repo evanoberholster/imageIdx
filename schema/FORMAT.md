@@ -11,8 +11,9 @@ plan. The committed fixtures under `schema/testdata/` pin the current bytes.
 |---|---|---|---|---|
 | `schema.dat` container | 3 | **V1 baseline**: ACTIVE/PREPARED generation and legacy-retirement state | yes | yes |
 | `schema.dat` container | 2 | prior release: same slot/directory layout, no PREPARED state | yes (read as ACTIVE) | upgraded to 3 on the next directory publication |
-| definitions blob (`NSPC`) | 2 | per-definition `EntityKind` | yes | yes |
-| definitions blob (`NSPC`) | 1 | pre-entity, `EntityKind` byte reserved zero | yes (Entity is `EntityInvalid`) | rewritten as 2 on the next publication |
+| definitions blob (`NSPC`) | 3 | per-definition `EntityKind` and `ProjectionVersion` | yes | yes |
+| definitions blob (`NSPC`) | 2 | per-definition `EntityKind`; projection version defaults to 1 | yes | rewritten as 3 on the next publication |
+| definitions blob (`NSPC`) | 1 | pre-entity, `EntityKind` byte reserved zero | yes (Entity is `EntityInvalid`) | rewritten as 3 on the next publication |
 
 Everything else fails closed with `schema.ErrVersion` for containers and
 `schema.ErrCorruptSchema` for definition blobs. Unknown versions are never
@@ -26,7 +27,7 @@ These existed only on unreleased branches and are rejected, not migrated:
 - Allocator format v1 whose counters were namespace-scoped. Reinterpreting
   namespace counters as entity counters would permit ID reuse, so `Open`
   returns `schema.ErrVersion`. No automatic conversion exists.
-- Any definitions blob version other than 1 or 2.
+- Any definitions blob version other than 1, 2, or 3.
 
 ## Container layout (version 3)
 
@@ -46,6 +47,9 @@ These existed only on unreleased branches and are rejected, not migrated:
 - Directories and definitions are append-only; an append publishes the inactive
   superblock after the new bytes are synced. Uncommitted crash tails are never
   reused because offsets extend from the physical EOF.
+- Definitions-blob v3 adds a `ProjectionVersion:u16` after `EntityKind` in each
+  namespace definition. Version 2 definitions are read with
+  `ProjectionVersion=1`; registration order is preserved.
 
 Directory identifiers are `EntityKind` ordinals, not namespace numbers. The
 definitions blob maps namespaces to entities and is the only authority for

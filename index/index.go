@@ -22,12 +22,12 @@ package index
 import (
 	"errors"
 
-	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/radixhash"
 	"github.com/evanoberholster/imageIdx/index/simhash"
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
+	schematypes "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Sentinel errors. They are wrapped with context where useful.
@@ -69,8 +69,8 @@ var (
 	// signal, never corruption.
 	ErrIndexStale = errors.New("index: index is behind the authoritative database")
 	// ErrNamespaceIDModel reports a ValueID incompatible with an engine's
-	// native identifier model. simhash assigns dense, 1-based record IDs, so a
-	// simhash value must use the next dense ValueID.
+	// native identifier model. Contiguous simhash IDs use dense appends; sparse
+	// IDs use the engine's durable sparse overlay.
 	ErrNamespaceIDModel = errors.New("index: ValueID incompatible with namespace id model")
 )
 

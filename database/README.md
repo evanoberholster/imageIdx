@@ -1,5 +1,10 @@
 # database: authoritative records and derived indexes (alpha)
 
+> **Format note:** this branch uses journal v2 and magic-tagged canonical
+> records. ImageIdx is pre-V1; databases created by earlier development
+> branches must be recreated or explicitly rebuilt rather than opened in place.
+> Unsupported journal/canonical versions fail closed.
+
 `database.DB` coordinates `schema.dat` (entity IDs and all logical namespace
 definitions), Pebble (canonical bytes, journal, operational generations), and
 the unified index (physical engines and recovery metadata). The initial index
@@ -158,16 +163,27 @@ syscalls.
 ## Journal, ordering and replay
 
 Journal keys use `store.Key{Namespace: 65533, ID: sequence}`: `[uint16
-namespace][uint64 big-endian sequence][uint16 flags=0]`. Payload v1 is
-`[version:1][op:1][entity:1][valueID:8][beforeLen:4][afterLen:4]
-[beforeProjection][afterProjection][crc32:4]`. The before projection is read
-from the canonical value/tombstone while the writer lock is held. This avoids
-guessing old hashes, locations or tags from the **current** record when
-replaying an earlier update. Full canonical record bytes are not journaled;
-the caller's compact, versioned projection may contain an embedding if the
-index requires it. Projection bytes are also stored with canonical values to
-permit a subsequent `Change{Before, After}` after journal cleanup. This is
-intentional write amplification needed for correct explicit removals.
+namespace][uint64 big-endian sequence][uint16 flags=0]`. Payload v2 is a typed,
+CRC32-protected delta envelope:
+
+```text
+version:u8 | flags:u8 | entity:u8 | valueID:u64
+beforeCount:u16 | afterCount:u16 | beforeLen:u32 | afterLen:u32
+beforeAssociations | afterAssociations | crc32:u32
+```
+
+Each association is `family:u8 | namespace:u16 | payload`. The before list is
+the set removed by the mutation and the after list is the set added; inserts,
+no-op updates and deletes are explicit. The database owns this encoding; the
+application still owns complete `index.Entry` projection decoding. Full
+canonical record bytes are not journaled. Canonical values use a magic-tagged,
+versioned 7-byte header:
+
+- inline projection (strategy A): live values retain projection bytes plus the
+  application record; tombstones retain the old projection.
+- external projection (strategy B): only the application record is stored and
+  `Options.ProjectFromRecord` reconstructs projection bytes. Tombstones retain
+  the old record.
 
 The coordinator is one bounded background publisher. It stages entries in an
 `index.Batch` and calls `ApplyWithGenerationAll`, which confirms touched and
@@ -212,6 +228,25 @@ canonical commit, before index apply, after index durability, after
 acknowledgment, and before cleanup. The incomplete intent case is deliberately
 recovery-required: **do not represent this alpha as automatic recovery from
 every mid-application crash.**
+
+## Sparse SimHash
+
+`simhash` keeps its dense append fast path for contiguous IDs and adds a durable
+`sparse.bin`/`*.sparse` overlay for arbitrary nonzero `uint64` external IDs,
+including gaps, high IDs and out-of-order upserts. Sparse searches merge the
+dense snapshot with the sorted overlay, filter overridden dense IDs, and preserve
+ascending ImageID result order. Existing dense IDs remain compatible; once the
+sparse overlay is used, dense `AppendBatch`/`UpsertBatch` calls are rejected to
+avoid two sources of truth.
+
+## Projection versions
+
+Each `schema.NamespaceDef` now carries `ProjectionVersion` in the definitions
+blob (blob version 3; versions 1/2 read as version 1). Projection changes are
+explicit restart-time migrations: `Options.ProjectionMigration` permits a
+version-only schema change when `ProjectFromRecord` is supplied; the database
+rebuilds indexes from canonical records through the existing PREPARED/ACTIVATE
+path. Canonical values are never rewritten solely to add an index definition.
 
 ## Focused measurements
 

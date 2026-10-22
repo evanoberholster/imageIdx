@@ -1,13 +1,15 @@
 package simhash
 
 import (
+	"cmp"
 	"math/bits"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	hashkernel "github.com/evanoberholster/imageIdx/index/simhash/internal/hashkernel"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // SIMD note: the scalar scans below use sync/atomic loads so they are correct
@@ -81,7 +83,9 @@ func (st *Store) SearchPHash(dst []Result, query uint64, maxDistance uint8) []Re
 		return dst
 	}
 	v := st.view.Load()
-	return v.searchPHash(dst, query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
+	start := len(dst)
+	dense := v.searchPHash(dst, query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
+	return st.mergeSparsePHash(dense, start, query, maxDistance)
 }
 
 // SearchPDQ appends every committed record whose 256-bit PDQ hash is within
@@ -107,7 +111,55 @@ func (st *Store) SearchPDQ(dst []Result, query *PDQHash, maxDistance uint8) []Re
 		return dst
 	}
 	v := st.view.Load()
-	return v.searchPDQ(dst, query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
+	start := len(dst)
+	dense := v.searchPDQ(dst, query, maxDistance, clampCommitted(st.committedAtomic.Load(), v.capacity))
+	return st.mergeSparsePDQ(dense, start, query, maxDistance)
+}
+
+func (st *Store) mergeSparsePHash(dst []Result, start int, query uint64, maxDistance uint8) []Result {
+	sparse := st.sparseSnapshot()
+	if len(sparse) == 0 {
+		return dst
+	}
+	filtered := dst[:start]
+	for _, result := range dst[start:] {
+		if !sparseHasID(sparse, result.ImageID) {
+			filtered = append(filtered, result)
+		}
+	}
+	for _, record := range sparse {
+		distance := DistancePHash(record.record.PHash, query)
+		if distance <= maxDistance {
+			filtered = append(filtered, Result{ImageID: record.id, Distance: distance})
+		}
+	}
+	slices.SortFunc(filtered[start:], func(a, b Result) int {
+		return cmp.Compare(a.ImageID, b.ImageID)
+	})
+	return filtered
+}
+
+func (st *Store) mergeSparsePDQ(dst []Result, start int, query *PDQHash, maxDistance uint8) []Result {
+	sparse := st.sparseSnapshot()
+	if len(sparse) == 0 {
+		return dst
+	}
+	filtered := dst[:start]
+	for _, result := range dst[start:] {
+		if !sparseHasID(sparse, result.ImageID) {
+			filtered = append(filtered, result)
+		}
+	}
+	for _, record := range sparse {
+		distance := DistancePDQ(&record.record.PDQ, query)
+		if distance <= uint16(maxDistance) {
+			filtered = append(filtered, Result{ImageID: record.id, Distance: uint8(distance)})
+		}
+	}
+	slices.SortFunc(filtered[start:], func(a, b Result) int {
+		return cmp.Compare(a.ImageID, b.ImageID)
+	})
+	return filtered
 }
 
 func (v *view) searchPHash(dst []Result, query uint64, maxDistance uint8, last uint64) []Result {

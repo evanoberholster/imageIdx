@@ -129,36 +129,128 @@ func (db *DB) applyCoalescedGroups(ws *coordinatorWorkspace, groups []mutationGr
 	}
 	for g := range groups {
 		group := &groups[g]
-		first := &ws.mutations[group.first]
 		last := &ws.mutations[group.last]
-		firstEvent := &ws.decoded[group.first]
-		lastEvent := &ws.decoded[group.last]
-
-		switch {
-		case last.deleted:
+		if last.deleted {
 			if err := batch.Delete(group.entity, group.id); err != nil {
 				return err
 			}
-		case !first.before.valid && !group.sawDelete:
-			// A pure insert (no intervening delete) is already a complete
-			// final-state upsert.
-			if err := batch.Add(lastEvent.after); err != nil {
+			continue
+		}
+
+		scratch := ws.diff(g)
+		first := &ws.decoded[group.first]
+		scratch.timesBefore = append(scratch.timesBefore[:0], first.before.Times...)
+		scratch.timesAfter = append(scratch.timesAfter[:0], first.after.Times...)
+		scratch.geosBefore = append(scratch.geosBefore[:0], first.before.Geos...)
+		scratch.geosAfter = append(scratch.geosAfter[:0], first.after.Geos...)
+		scratch.simsBefore = append(scratch.simsBefore[:0], first.before.Sims...)
+		scratch.simsAfter = append(scratch.simsAfter[:0], first.after.Sims...)
+		scratch.hashesBefore = append(scratch.hashesBefore[:0], first.before.Hashes...)
+		scratch.hashesAfter = append(scratch.hashesAfter[:0], first.after.Hashes...)
+		scratch.vectorsBefore = append(scratch.vectorsBefore[:0], first.before.Vectors...)
+		scratch.vectorsAfter = append(scratch.vectorsAfter[:0], first.after.Vectors...)
+		scratch.bitmapsBefore = append(scratch.bitmapsBefore[:0], first.before.Bitmaps...)
+		scratch.bitmapsAfter = append(scratch.bitmapsAfter[:0], first.after.Bitmaps...)
+
+		for i := group.first + 1; i <= group.last; i++ {
+			event := &ws.decoded[i]
+			scratch.timesBefore, scratch.timesAfter = mergeDeltaSet(scratch.timesBefore, scratch.timesAfter, event.before.Times, sameTime)
+			scratch.timesBefore, scratch.timesAfter = mergeAddedSet(scratch.timesBefore, scratch.timesAfter, event.after.Times, sameTime)
+			scratch.geosBefore, scratch.geosAfter = mergeDeltaSet(scratch.geosBefore, scratch.geosAfter, event.before.Geos, sameGeo)
+			scratch.geosBefore, scratch.geosAfter = mergeAddedSet(scratch.geosBefore, scratch.geosAfter, event.after.Geos, sameGeo)
+			scratch.simsBefore, scratch.simsAfter = mergeDeltaSet(scratch.simsBefore, scratch.simsAfter, event.before.Sims, sameSim)
+			scratch.simsBefore, scratch.simsAfter = mergeAddedSet(scratch.simsBefore, scratch.simsAfter, event.after.Sims, sameSim)
+			scratch.hashesBefore, scratch.hashesAfter = mergeDeltaSet(scratch.hashesBefore, scratch.hashesAfter, event.before.Hashes, sameHash)
+			scratch.hashesBefore, scratch.hashesAfter = mergeAddedSet(scratch.hashesBefore, scratch.hashesAfter, event.after.Hashes, sameHash)
+			scratch.vectorsBefore, scratch.vectorsAfter = mergeDeltaSet(scratch.vectorsBefore, scratch.vectorsAfter, event.before.Vectors, sameVector)
+			scratch.vectorsBefore, scratch.vectorsAfter = mergeAddedSet(scratch.vectorsBefore, scratch.vectorsAfter, event.after.Vectors, sameVector)
+			scratch.bitmapsBefore, scratch.bitmapsAfter = mergeDeltaSet(scratch.bitmapsBefore, scratch.bitmapsAfter, event.before.Bitmaps, sameBitmap)
+			scratch.bitmapsBefore, scratch.bitmapsAfter = mergeAddedSet(scratch.bitmapsBefore, scratch.bitmapsAfter, event.after.Bitmaps, sameBitmap)
+		}
+
+		after := netEntryAfter(group.id, scratch)
+		if ws.mutations[group.first].insert {
+			if err := batch.Add(after); err != nil {
 				return err
 			}
-		default:
-			initial := firstEvent.before
-			if !first.before.valid {
-				initial = firstEvent.after
+			continue
+		}
+		before := netEntryBefore(group.id, scratch)
+		if entryAssociations(before)+entryAssociations(after) == 0 {
+			if !ws.mutations[group.first].insert {
+				if err := batch.Touch(group.entity, group.id); err != nil {
+					return err
+				}
 			}
-			before, after := changedProjectionScratch(initial, lastEvent.after, ws.diff(g))
-			if entryAssociations(before)+entryAssociations(after) == 0 {
-				continue
-			}
-			if err := batch.Update(index.Change{Before: before, After: after}); err != nil {
-				return err
-			}
+			continue
+		}
+		if err := batch.Update(index.Change{Before: before, After: after}); err != nil {
+			return err
 		}
 	}
 	last := ws.mutations[ws.count-1].sequence
 	return db.commitAndApply(batch, last)
+}
+
+func mergeDeltaSet[T any](removed, added, event []T, equal func(T, T) bool) ([]T, []T) {
+	for _, value := range event {
+		if index := indexOfEqual(added, value, equal); index >= 0 {
+			added = removeAt(added, index)
+			continue
+		}
+		if indexOfEqual(removed, value, equal) < 0 {
+			removed = append(removed, value)
+		}
+	}
+	return removed, added
+}
+
+func mergeAddedSet[T any](removed, added, event []T, equal func(T, T) bool) ([]T, []T) {
+	for _, value := range event {
+		if index := indexOfEqual(removed, value, equal); index >= 0 {
+			removed = removeAt(removed, index)
+			continue
+		}
+		if indexOfEqual(added, value, equal) < 0 {
+			added = append(added, value)
+		}
+	}
+	return removed, added
+}
+
+func indexOfEqual[T any](values []T, target T, equal func(T, T) bool) int {
+	for i := range values {
+		if equal(values[i], target) {
+			return i
+		}
+	}
+	return -1
+}
+
+func removeAt[T any](values []T, index int) []T {
+	return append(values[:index], values[index+1:]...)
+}
+
+func netEntryBefore(id schema.ValueID, s *projectionScratch) index.Entry {
+	return index.Entry{
+		ValueID: id,
+		Times:   s.timesBefore,
+		Geos:    s.geosBefore,
+		Sims:    s.simsBefore,
+		Hashes:  s.hashesBefore,
+		Vectors: s.vectorsBefore,
+		Bitmaps: s.bitmapsBefore,
+	}
+}
+
+func netEntryAfter(id schema.ValueID, s *projectionScratch) index.Entry {
+	return index.Entry{
+		ValueID: id,
+		Times:   s.timesAfter,
+		Geos:    s.geosAfter,
+		Sims:    s.simsAfter,
+		Hashes:  s.hashesAfter,
+		Vectors: s.vectorsAfter,
+		Bitmaps: s.bitmapsAfter,
+	}
 }

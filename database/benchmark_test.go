@@ -226,3 +226,47 @@ func BenchmarkKVNamespaceAddition(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkCanonicalProjectionModes(b *testing.B) {
+	for _, external := range []bool{false, true} {
+		name := "inline"
+		if external {
+			name = "external"
+		}
+		b.Run(name, func(b *testing.B) {
+			data, idxPath := paths(b)
+			options := Options{BatchSize: 64}
+			if external {
+				options.CanonicalProjection = CanonicalProjectionExternal
+				options.ProjectFromRecord = func(record []byte) ([]byte, error) { return record, nil }
+			}
+			db, err := Open(data, idxPath, decodeTest, options)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer db.Close()
+			const size = 16
+			mutations := make([]Mutation, size)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for j := range mutations {
+					id := uint64(i*size + j + 1)
+					projection := projection(id, 'x')
+					mutations[j] = Mutation{Entity: schema.EntityImage, ValueID: id, Projection: projection, Record: projection}
+				}
+				g, err := db.Commit(mutations...)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := db.WaitIndexed(context.Background(), g); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			stats := db.Stats()
+			b.ReportMetric(float64(stats.Store.ValueBytes)/float64(max(b.N, 1)), "store-value-B/op")
+			b.ReportMetric(float64(stats.JournalBytes)/float64(max(b.N, 1)), "journal-B/op")
+		})
+	}
+}

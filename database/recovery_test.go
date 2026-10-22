@@ -280,7 +280,7 @@ func TestRetiredPebbleBackupCannotOverrideCentralSchema(t *testing.T) {
 	}
 }
 
-func TestSparseSimHashRebuildFailsExplicitly(t *testing.T) {
+func TestSparseSimHashRebuildPreservesExternalID(t *testing.T) {
 	root := t.TempDir()
 	data, dir := filepath.Join(root, "data"), filepath.Join(root, "index")
 	schema := schematypes.NewDefinitions()
@@ -308,17 +308,23 @@ func TestSparseSimHashRebuildFailsExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The canonical mutation is durable despite the index writer rejecting a
-	// sparse first simhash ID. Rebuilding must not silently remap it.
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(dir, "sim-008d.manifest")); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(data, dir, decode, Options{Recovery: RecoveryAutomatic})
-	if !errors.Is(err, ErrUnsupportedRebuild) {
-		t.Fatalf("sparse simhash: %v", err)
+	db, err = Open(data, dir, decode, Options{Recovery: RecoveryAutomatic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sim, ok := db.Index().Sim(141)
+	if !ok {
+		t.Fatal("rebuilt simhash missing")
+	}
+	if got := sim.SearchPHash(nil, 42, 0); len(got) != 1 || got[0].ImageID != 2 {
+		t.Fatalf("rebuilt sparse simhash = %+v", got)
 	}
 }
 

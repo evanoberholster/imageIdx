@@ -163,16 +163,25 @@ func (db *DB) decodeEvent(ws *coordinatorWorkspace, i int) error {
 	m := &ws.mutations[i]
 	event := &ws.decoded[i]
 	if m.before.valid {
-		if err := db.decodeEntryInto(ws.refBytes(m.before), m.entity, m.id, &event.before, &ws.scratch[i]); err != nil {
+		if err := db.decodeDeltaInto(ws.refBytes(m.before), m.beforeN, m.entity, m.id, &event.before); err != nil {
 			return err
 		}
 	}
 	if !m.deleted {
-		if err := db.decodeEntryInto(ws.refBytes(m.after), m.entity, m.id, &event.after, &ws.scratch[i]); err != nil {
+		if err := db.decodeDeltaInto(ws.refBytes(m.after), m.afterN, m.entity, m.id, &event.after); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (db *DB) decodeDeltaInto(data []byte, count uint16, entity schema.EntityKind, id schema.ValueID, dst *index.Entry) error {
+	resetEntry(dst)
+	dst.ValueID = id
+	if err := decodeAssociations(data, count, dst); err != nil {
+		return fmt.Errorf("%w: %v", ErrCorruptJournal, err)
+	}
+	return db.validateDecodedEntry(dst, entity, id)
 }
 
 func (db *DB) applyRange(ws *coordinatorWorkspace, start, end int, batch *index.Batch) error {
@@ -197,14 +206,12 @@ func (db *DB) stageEvent(ws *coordinatorWorkspace, i int, batch *index.Batch) er
 	switch {
 	case m.deleted:
 		return batch.Delete(m.entity, m.id)
-	case !m.before.valid:
+	case m.insert:
 		return batch.Add(event.after)
+	case entryAssociations(event.before)+entryAssociations(event.after) == 0:
+		return nil
 	default:
-		before, after := changedProjectionScratch(event.before, event.after, ws.diff(i))
-		if entryAssociations(before)+entryAssociations(after) == 0 {
-			return nil
-		}
-		return batch.Update(index.Change{Before: before, After: after})
+		return batch.Update(index.Change{Before: event.before, After: event.after})
 	}
 }
 

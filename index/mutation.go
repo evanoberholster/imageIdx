@@ -24,6 +24,14 @@ type DeleteOp struct {
 	ID     schema.ValueID
 }
 
+// TouchOp marks an entity live without changing any index associations. It is
+// used when a coalesced update returns to its initial projection but an
+// intermediate update would have published liveness.
+type TouchOp struct {
+	Entity schema.EntityKind
+	ID     schema.ValueID
+}
+
 // Batch is a reusable, caller-owned group of mutations. Add/Update/Delete stage
 // operations; Apply commits them through the same internal pipeline as the
 // single-operation Store methods. A batch is not safe for concurrent use and
@@ -32,6 +40,7 @@ type Batch struct {
 	entries  []Entry
 	changes  []Change
 	deletes  []DeleteOp
+	touches  []TouchOp
 	capacity int
 	inFlight atomic.Bool
 }
@@ -77,12 +86,24 @@ func (b *Batch) Delete(entity schema.EntityKind, id schema.ValueID) error {
 	return nil
 }
 
+// Touch stages a liveness add without an association change.
+func (b *Batch) Touch(entity schema.EntityKind, id schema.ValueID) error {
+	if b.inFlight.Load() {
+		return ErrBatchClosed
+	}
+	if !entity.Valid() || id == 0 {
+		return fmt.Errorf("%w: entity %d id %d", ErrEntityMismatch, entity, id)
+	}
+	b.touches = append(b.touches, TouchOp{Entity: entity, ID: id})
+	return nil
+}
+
 // Len reports the number of staged operations.
 func (b *Batch) Len() int {
 	if b == nil {
 		return 0
 	}
-	return len(b.entries) + len(b.changes) + len(b.deletes)
+	return len(b.entries) + len(b.changes) + len(b.deletes) + len(b.touches)
 }
 
 // Reset clears staged operations while retaining capacity.
@@ -93,9 +114,11 @@ func (b *Batch) Reset() error {
 	clear(b.entries)
 	clear(b.changes)
 	clear(b.deletes)
+	clear(b.touches)
 	b.entries = b.entries[:0]
 	b.changes = b.changes[:0]
 	b.deletes = b.deletes[:0]
+	b.touches = b.touches[:0]
 	return nil
 }
 
@@ -179,7 +202,7 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit, all bool
 	} else {
 		sourceGeneration = s.source
 	}
-	if len(b.entries)+len(b.changes)+len(b.deletes) == 0 {
+	if len(b.entries)+len(b.changes)+len(b.deletes)+len(b.touches) == 0 {
 		// An empty batch is a no-op unless it advances the completeness
 		// watermark, which is a supported way to mark a bulk import complete.
 		// It claims completeness through sourceGeneration for every healthy
@@ -195,7 +218,7 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit, all bool
 		s.safeSource.Store(s.recomputeSafe())
 		return s.writeManifest()
 	}
-	if err := s.prevalidate(b.entries, b.changes, b.deletes); err != nil {
+	if err := s.prevalidate(b.entries, b.changes, b.deletes, b.touches); err != nil {
 		return err
 	}
 	// If this batch could make some engines durable and others not, record the
@@ -208,7 +231,7 @@ func (s *Store) applyBatch(b *Batch, sourceGeneration uint64, explicit, all bool
 	}
 	s.flushSourceGen = sourceGeneration
 	s.flushExplicit = explicit
-	applyErr := s.applyLocked(b.entries, b.changes, b.deletes)
+	applyErr := s.applyLocked(b.entries, b.changes, b.deletes, b.touches)
 	s.flushExplicit = false
 	s.flushSourceGen = 0
 	if applyErr != nil {
@@ -489,7 +512,7 @@ func applyTimeGeneration(idx *timeidx.Index, gen uint64) error {
 // applyOne runs a single staged operation under the caller-held write lock.
 func (s *Store) applyOne(entry Entry, change *Change, del *DeleteOp) error {
 	entries, changes, deletes := entrySlice(entry), changeSlice(change), deleteSlice(del)
-	if err := s.prevalidate(entries, changes, deletes); err != nil {
+	if err := s.prevalidate(entries, changes, deletes, nil); err != nil {
 		return err
 	}
 	risky := s.batchMayPartiallyPersist()
@@ -498,7 +521,7 @@ func (s *Store) applyOne(entry Entry, change *Change, del *DeleteOp) error {
 			return err
 		}
 	}
-	if err := s.applyLocked(entries, changes, deletes); err != nil {
+	if err := s.applyLocked(entries, changes, deletes, nil); err != nil {
 		s.degradeIntended(err)
 		return err
 	}
@@ -544,8 +567,8 @@ func deleteSlice(d *DeleteOp) []DeleteOp {
 // one commit per affected namespace. Liveness is cleared before value changes
 // and set after them, so a later addition of the same entity wins and a partial
 // batch never exposes an incomplete entity as live.
-func (s *Store) applyLocked(entries []Entry, changes []Change, deletes []DeleteOp) error {
-	if len(entries)+len(changes)+len(deletes) == 0 {
+func (s *Store) applyLocked(entries []Entry, changes []Change, deletes []DeleteOp, touches []TouchOp) error {
+	if len(entries)+len(changes)+len(deletes)+len(touches) == 0 {
 		return ErrEmptyBatch
 	}
 	s.resetStage()
@@ -563,6 +586,9 @@ func (s *Store) applyLocked(entries []Entry, changes []Change, deletes []DeleteO
 		if err := s.stageEntry(entries[i]); err != nil {
 			return err
 		}
+	}
+	for _, touch := range touches {
+		s.stageLiveAdd(touch.Entity, touch.ID)
 	}
 	return s.flushStage()
 }
@@ -669,14 +695,13 @@ func (s *Store) stageDelete(d DeleteOp) error {
 // records every namespace the batch intends to modify. It rejects routing,
 // entity, ValueID, vector-dimension and identifier-model errors so a malformed
 // batch cannot partially apply. It has no engine side effects.
-func (s *Store) prevalidate(entries []Entry, changes []Change, deletes []DeleteOp) error {
+func (s *Store) prevalidate(entries []Entry, changes []Change, deletes []DeleteOp, touches []TouchOp) error {
 	words := (len(s.reg.routes) + 63) / 64
 	if cap(s.pvSet) < words {
 		s.pvSet = make([]uint64, words)
 	}
 	s.pvSet = s.pvSet[:words]
 	clear(s.pvSet)
-	s.pvCursors = s.pvCursors[:0]
 	s.pvVectorOps = 0
 	s.pvSimUpdate = false
 
@@ -717,6 +742,15 @@ func (s *Store) prevalidate(entries []Entry, changes []Change, deletes []DeleteO
 		if err := s.prevalidateEntry(changes[i].After); err != nil {
 			return err
 		}
+	}
+	for _, touch := range touches {
+		if !touch.Entity.Valid() || touch.ID == 0 {
+			return fmt.Errorf("%w: touch entity %d id %d", ErrEntityMismatch, touch.Entity, touch.ID)
+		}
+		if _, _, ok := s.reg.liveness(touch.Entity); !ok {
+			return fmt.Errorf("%w: entity %d", ErrNamespaceNotFound, touch.Entity)
+		}
+		s.pvMark(schema.Namespace(0xFFF0))
 	}
 	return nil
 }
@@ -795,39 +829,14 @@ func (s *Store) pvSim(ns schema.Namespace, id schema.ValueID) error {
 	if s.isDegraded(ns) {
 		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, ns)
 	}
-	idx, ok := s.reg.simStore(ns)
-	if !ok {
+	if id == 0 {
+		return fmt.Errorf("%w: entity id 0", ErrEntityMismatch)
+	}
+	if _, ok := s.reg.simStore(ns); !ok {
 		return fmt.Errorf("%w: namespace %d", ErrNamespaceUnavailable, ns)
 	}
 	s.pvMark(ns)
-	n := idx.Len()
-	if id <= n {
-		// Updating an existing record is journaled and crash-durable.
-		s.pvSimUpdate = true
-	}
-	for i := range s.pvCursors {
-		if s.pvCursors[i].ns == ns {
-			switch {
-			case id == s.pvCursors[i].next:
-				s.pvCursors[i].next++
-				return nil
-			case id <= n:
-				return nil
-			default:
-				return fmt.Errorf("%w: simhash id %d, next %d", ErrNamespaceIDModel, id, s.pvCursors[i].next)
-			}
-		}
-	}
-	switch {
-	case id <= n:
-		s.pvCursors = append(s.pvCursors, simCursor{ns: ns, next: n + 1})
-		return nil
-	case id == n+1:
-		s.pvCursors = append(s.pvCursors, simCursor{ns: ns, next: n + 2})
-		return nil
-	default:
-		return fmt.Errorf("%w: simhash id %d, next %d", ErrNamespaceIDModel, id, n+1)
-	}
+	return nil
 }
 
 func (s *Store) pvVector(v VectorValue, id schema.ValueID) error {
@@ -1092,30 +1101,16 @@ func (s *Store) addSims(id schema.ValueID, values []SimValue, touched *entitySet
 	return nil
 }
 
-// addSim writes one perceptual record. simhash assigns dense, 1-based record
-// IDs, so an existing id is updated and a new id must be exactly the next
-// dense ValueID; anything else is rejected rather than silently remapped.
+// addSim writes one perceptual record. Contiguous simhash IDs use the dense
+// append path; gaps and out-of-order IDs use the durable sparse overlay. IDs
+// are never remapped.
 func (s *Store) addSim(v SimValue, id schema.ValueID, touched *entitySet) error {
 	st, rt, err := s.simFor(v.Namespace)
 	if err != nil {
 		return err
 	}
-	n := st.Len()
-	switch {
-	case id != 0 && id <= n:
-		if err := st.Upsert(id, v.Record); err != nil {
-			return err
-		}
-	case id == n+1:
-		assigned, err := st.Append(v.Record)
-		if err != nil {
-			return err
-		}
-		if assigned != id {
-			return fmt.Errorf("%w: simhash assigned %d, want %d", ErrNamespaceIDModel, assigned, id)
-		}
-	default:
-		return fmt.Errorf("%w: simhash id %d, next dense id %d", ErrNamespaceIDModel, id, n+1)
+	if err := st.ApplyUpdates([]simhash.Update{{ImageID: id, Record: v.Record}}); err != nil {
+		return err
 	}
 	touched.add(rt.entity)
 	return nil

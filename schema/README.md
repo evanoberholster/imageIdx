@@ -13,7 +13,9 @@ IDs through `NextID(entity)`, `NextIDs(entity, count)`, and
 the same ValueID sequence. Different entities may use the same numeric ID.
 `Open(path, Options{Definitions: defs, Entities: []EntityConfig{...}})` copies
 the definitions and locks the file until `Close`. Registration-order binary
-encoding (`NSPC` v2) is unchanged; v1 definitions still decode with an invalid
+encoding is `NSPC` v3 with per-namespace `ProjectionVersion`; v1/v2 definitions
+still decode (v2 defaults each projection version to 1); v1 definitions decode
+with an invalid
 entity, which must be assigned before allocating IDs.
 `Open(path, Options{})` opens only an existing file and loads its persisted
 definitions under the exclusive lock. Lookup returns owned Config bytes;

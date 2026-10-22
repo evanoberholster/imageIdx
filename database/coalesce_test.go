@@ -15,14 +15,13 @@ import (
 	"github.com/golang/geo/s2"
 )
 
-func appendTestJournal(t *testing.T, ws *coordinatorWorkspace, sequence, id uint64, before, after []byte, deleted bool) {
+func appendTypedJournal(t *testing.T, ws *coordinatorWorkspace, sequence, id uint64, insert, deleted bool, before, after index.Entry) {
 	t.Helper()
 	raw, err := encodeMutation(Mutation{
-		Entity:     schema.EntityImage,
-		ValueID:    id,
-		Delete:     deleted,
-		Projection: after,
-	}, before)
+		Entity:  schema.EntityImage,
+		ValueID: id,
+		Delete:  deleted,
+	}, insert, before, after)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +32,41 @@ func appendTestJournal(t *testing.T, ws *coordinatorWorkspace, sequence, id uint
 	if !ws.appendMutation(sequence, raw, entry) {
 		t.Fatal("appendMutation rejected")
 	}
+}
+
+func projectionDelta(t *testing.T, decoder func([]byte) (index.Entry, error), before, after []byte, insert bool) (index.Entry, index.Entry) {
+	t.Helper()
+	var beforeEntry, afterEntry index.Entry
+	var err error
+	if before != nil {
+		beforeEntry, err = decoder(before)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after != nil {
+		afterEntry, err = decoder(after)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if insert {
+		return index.Entry{}, afterEntry
+	}
+	var scratch projectionScratch
+	deltaBefore, deltaAfter := changedProjectionScratch(beforeEntry, afterEntry, &scratch)
+	return deltaBefore, deltaAfter
+}
+
+func appendTestJournal(t *testing.T, ws *coordinatorWorkspace, sequence, id uint64, before, after []byte, deleted bool) {
+	t.Helper()
+	if deleted {
+		appendTypedJournal(t, ws, sequence, id, false, true, index.Entry{}, index.Entry{})
+		return
+	}
+	insert := before == nil
+	deltaBefore, deltaAfter := projectionDelta(t, decodeTest, before, after, insert)
+	appendTypedJournal(t, ws, sequence, id, insert, false, deltaBefore, deltaAfter)
 }
 
 func TestCoalescedAddThenUpdate(t *testing.T) {
@@ -457,17 +491,9 @@ func TestCoalescedTimeGeoHashFamilies(t *testing.T) {
 
 func appendFamilyJournal(t *testing.T, ws *coordinatorWorkspace, sequence uint64, before, after []byte) {
 	t.Helper()
-	raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: after}, before)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry, err := decodeMutation(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ws.appendMutation(sequence, raw, entry) {
-		t.Fatal("appendMutation rejected")
-	}
+	insert := before == nil
+	deltaBefore, deltaAfter := projectionDelta(t, decodeFamilyProjection, before, after, insert)
+	appendTypedJournal(t, ws, sequence, 1, insert, false, deltaBefore, deltaAfter)
 }
 
 func pairProjection(id uint64, camera, rating byte) []byte {
@@ -505,10 +531,15 @@ func decodePairInto(p []byte, dst *index.Entry, scratch *DecodeScratch) error {
 func writeCanonicalProjection(t *testing.T, db *DB, id uint64, projection []byte, record []byte, generation uint64) {
 	t.Helper()
 	b := db.values.NewBatch()
-	value := make([]byte, 5+len(projection)+len(record))
-	binary.BigEndian.PutUint32(value[1:5], uint32(len(projection)))
-	copy(value[5:], projection)
-	copy(value[5+len(projection):], record)
+	value, err := encodeCanonicalValue(canonicalValue{
+		version:    canonicalVersionForMode(db.options.CanonicalProjection),
+		projection: projection,
+		record:     record,
+	})
+	if err != nil {
+		_ = b.Close()
+		t.Fatal(err)
+	}
 	if err := b.Set(store.Key{Namespace: db.canonical[schema.EntityImage], ID: id}, value); err != nil {
 		_ = b.Close()
 		t.Fatal(err)
@@ -528,10 +559,14 @@ func writeCanonicalProjection(t *testing.T, db *DB, id uint64, projection []byte
 
 func appendCanonicalToBatch(t *testing.T, b *store.Batch, db *DB, id uint64, projection, record []byte) {
 	t.Helper()
-	value := make([]byte, 5+len(projection)+len(record))
-	binary.BigEndian.PutUint32(value[1:5], uint32(len(projection)))
-	copy(value[5:], projection)
-	copy(value[5+len(projection):], record)
+	value, err := encodeCanonicalValue(canonicalValue{
+		version:    canonicalVersionForMode(db.options.CanonicalProjection),
+		projection: projection,
+		record:     record,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := b.Set(store.Key{Namespace: db.canonical[schema.EntityImage], ID: id}, value); err != nil {
 		t.Fatal(err)
 	}
@@ -543,9 +578,10 @@ func writeCoalescingFixture(t *testing.T, db *DB) {
 	defer b.Close()
 	appendCanonicalToBatch(t, b, db, 42, pairProjection(42, 'C', '4'), []byte("42-final"))
 	appendCanonicalToBatch(t, b, db, 99, pairProjection(99, 'N', '5'), []byte("99-final"))
-	appendJournal := func(sequence uint64, mutation Mutation, before []byte) {
+	appendJournal := func(sequence, id uint64, insert bool, before, after []byte) {
 		t.Helper()
-		raw, err := encodeMutation(mutation, before)
+		deltaBefore, deltaAfter := projectionDelta(t, decodePair, before, after, insert)
+		raw, err := encodeMutation(Mutation{Entity: schema.EntityImage, ValueID: id}, insert, deltaBefore, deltaAfter)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -553,9 +589,9 @@ func writeCoalescingFixture(t *testing.T, db *DB) {
 			t.Fatal(err)
 		}
 	}
-	appendJournal(1, Mutation{Entity: schema.EntityImage, ValueID: 42, Projection: pairProjection(42, 'C', '3')}, nil)
-	appendJournal(2, Mutation{Entity: schema.EntityImage, ValueID: 99, Projection: pairProjection(99, 'N', '5')}, nil)
-	appendJournal(3, Mutation{Entity: schema.EntityImage, ValueID: 42, Projection: pairProjection(42, 'C', '4')}, pairProjection(42, 'C', '3'))
+	appendJournal(1, 42, true, nil, pairProjection(42, 'C', '3'))
+	appendJournal(2, 99, true, nil, pairProjection(99, 'N', '5'))
+	appendJournal(3, 42, false, pairProjection(42, 'C', '3'), pairProjection(42, 'C', '4'))
 	if err := putGeneration(b, 1, 3); err != nil {
 		t.Fatal(err)
 	}
@@ -752,12 +788,51 @@ func TestEmptyProjectionAdvancesGeneration(t *testing.T) {
 
 	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
 	ws.reset()
-	appendTestJournal(t, ws, 1, 1, nil, projection(1, 0), false)
-	appendTestJournal(t, ws, 2, 1, projection(1, 0), projection(1, 0), false)
+	appendTypedJournal(t, ws, 1, 1, true, false, index.Entry{}, index.Entry{ValueID: 1})
+	appendTypedJournal(t, ws, 2, 1, false, false, index.Entry{ValueID: 1}, index.Entry{ValueID: 1})
 	if err := db.applyWorkspace(ws, db.indexes.NewBatch(64)); err != nil {
 		t.Fatal(err)
 	}
 	if got := db.IndexedGeneration(); got != 2 {
 		t.Fatalf("indexed generation = %d, want 2", got)
+	}
+}
+
+func TestCoalescedRevertAfterTombstoneRestoresLiveness(t *testing.T) {
+	data, idxPath := paths(t)
+	db := openTest(t, data, idxPath)
+	defer db.Close()
+	if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Projection: projection(1, 'a')}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitIndexed(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Commit(Mutation{Entity: schema.EntityImage, ValueID: 1, Delete: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitIndexed(t.Context(), 2); err != nil {
+		t.Fatal(err)
+	}
+	db.mu.Lock()
+	db.committed = 4
+	db.mu.Unlock()
+
+	ws := newCoordinatorWorkspace(defaultMaxProjectionBytes, defaultOversizedRetentionBytes)
+	ws.reset()
+	appendTestJournal(t, ws, 3, 1, projection(1, 'a'), projection(1, 'b'), false)
+	appendTestJournal(t, ws, 4, 1, projection(1, 'b'), projection(1, 'a'), false)
+	if err := db.applyWorkspace(ws, db.indexes.NewBatch(64)); err != nil {
+		t.Fatal(err)
+	}
+	if !isLive(t, db, schema.EntityImage, 1) {
+		t.Fatal("revert after tombstone left entity dead")
+	}
+	idx, _ := db.indexes.Bitmap(tagNS)
+	if !containsTag(t, idx, 1, 'a') {
+		t.Fatal("reverted association missing")
+	}
+	if got := db.IndexedGeneration(); got != 4 {
+		t.Fatalf("indexed generation = %d, want 4", got)
 	}
 }

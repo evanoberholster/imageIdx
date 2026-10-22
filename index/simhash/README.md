@@ -65,6 +65,17 @@ if err := store.Checkpoint(); err != nil {
 }
 ```
 
+## Sparse external IDs
+
+Contiguous IDs keep the dense hash-page append path. `ApplyUpdates` accepts
+arbitrary nonzero `uint64` external IDs and persists non-dense records in a
+CRC-protected append-only `sparse.bin`/`*.sparse` overlay. Sparse searches scan
+the dense snapshot plus the sorted live overlay, filter dense IDs overridden by
+the overlay, and preserve ascending `ImageID` result order. Once the sparse
+overlay is used, dense `AppendBatch`/`UpsertBatch` calls are rejected so there
+is only one source of truth. A partial sparse tail is truncated during open;
+complete frames with bad checksums fail closed.
+
 ## Addressing and format
 
 No `ImageID` is stored and there is no per-record offset table. The low 16 bits
