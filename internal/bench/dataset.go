@@ -17,7 +17,7 @@ const largeEnv = "IMAGEIDX_BENCH_LARGE"
 // -short.
 var smallSizes = []int{100, 1_000, 10_000}
 
-// defaultSizes is the standard matrix from AGENTS/Bench.MD section 26.
+// defaultSizes is the standard matrix from AGENTS/CONTRACTS.md#benchmarks.
 var defaultSizes = []int{1_000, 10_000, 100_000, 1_000_000}
 
 // largeSizes extends defaultSizes with the explicit 10M tier.

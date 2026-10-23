@@ -1,5 +1,5 @@
 // Package vectoridx implements VectorIdx, a persistent HNSW
-// approximate-nearest-neighbor vector index following AGENTS/VectorIdx.MD.
+// approximate-nearest-neighbor vector index. See AGENTS/ARCHITECTURE.md.
 //
 // # Experimental status
 //

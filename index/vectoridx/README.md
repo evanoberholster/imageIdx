@@ -6,7 +6,7 @@
 > feature.
 
 Persistent HNSW approximate-nearest-neighbor vector index implementing
-`AGENTS/VectorIdx.MD` phases 1–2 (scalar core, in-memory HNSW correctness),
+experimental phases 1–2 (scalar core, in-memory HNSW correctness),
 4 (WAL and tombstones), 5 (pooled search state), 6 (post-ANN filtering), and
 8 (explicit compact/rebuild), plus Weaviate-inspired production features:
 multi-metric distance (L2/cosine/dot), dynamic `ef`, heuristic neighbor

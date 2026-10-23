@@ -1,73 +1,115 @@
-# Agent documentation
+# imageIdx engineering documentation
 
-The repository-root [`AGENTS.md`](../AGENTS.md) is the agent workflow contract.
-This directory contains architecture notes, design history, and subsystem
-references. It is not a second public API specification.
+This directory is the current architecture and contributor guide for imageIdx.
+It replaces the previous collection of per-subsystem proposals and phase reports.
+Historical material remains in git history; it is not a current API contract.
 
-For current behavior, precedence is:
+Read these three files:
 
-1. source and tests;
-2. package `README.md` files and Go package documentation;
-3. this directory’s current architecture notes;
-4. design proposals and historical reports.
+| Document | Purpose |
+|---|---|
+| [README.md](README.md) | Orientation, package map, workflow, and authority |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Current runtime structure, data flow, concurrency, and recovery |
+| [CONTRACTS.md](CONTRACTS.md) | Stable/advanced/experimental APIs, ownership, limits, and release policy |
 
-## Current architecture and workflow
+For public usage and persistence details, the package documentation is
+authoritative:
 
-| Document | Status | Notes |
+- [`README.md`](../README.md) — V1 user guide and quick start
+- [`database/README.md`](../database/README.md) — primary application lifecycle
+- [`database/FORMAT.md`](../database/FORMAT.md) — canonical, journal, key, and recovery formats
+- [`schema/README.md`](../schema/README.md) and [`schema/FORMAT.md`](../schema/FORMAT.md) — schema and IDs
+- [`index/README.md`](../index/README.md) — unified/standalone index store
+- [`search/README.md`](../search/README.md) — plans, workspaces, and snapshots
+- [`store/README.md`](../store/README.md) — advanced KV primitive
+
+## Package map
+
+| Package | Role | V1 status |
 |---|---|---|
-| [`BuildConcepts.MD`](BuildConcepts.MD) | Current | Package map, consistency, validation |
-| [`BitmapIndex.md`](BitmapIndex.md) | Current | Bitmap/BSI namespace guide |
-| [`Search.md`](Search.md) | Current | Search planning and snapshot contract |
-| [`Bench.MD`](Bench.MD) | Current methodology | Benchmark rules; some engine names are historical |
-| [`KVStore.md`](KVStore.md) | Current | Advanced `store` guide |
-| [`Schema.md`](Schema.md) | Current | Schema/ID guide; authoritative format lives in `schema/` |
+| `schema` | Namespace definitions, entity identity, `schema.dat`, durable ValueIDs | Stable |
+| `database` | Primary lifecycle, canonical records, journal, indexing coordinator, recovery | Stable |
+| `store` | Pebble-backed KV primitive for canonical records and the journal | Advanced stable |
+| `index` | Unified index store, namespace routing, liveness, recovery markers | Advanced stable |
+| `index/bitmapidx` | Enum, bool, text, continuous, and BSI bitmap namespaces | Advanced stable |
+| `index/timeidx` | Exact timestamp index | Advanced stable |
+| `index/geoidx` | S2 geographic index | Advanced stable |
+| `index/radixhash` | Exact 256-bit hash index | Advanced stable |
+| `index/simhash` | pHash/PDQ perceptual similarity, dense and sparse IDs | Advanced stable |
+| `index/vectoridx` | HNSW vector index | Experimental |
+| `search` | Reusable conjunctive plans, snapshots, executors, metrics | Stable |
+| `search/ranking` | Optional ranking/fusion helpers | Advanced |
+| `roar` | Immutable roaring bitmaps and kernels | Advanced stable |
+| `internal/*` | Private storage, kernels, benchmark harness | Internal |
+| `cmd/imageidx` | CLI, HTTP demos, and runnable examples | Examples/tools |
 
-## Subsystem design notes
+`database.DB` is the stable application entry point. `index` and `store` remain
+public for advanced and standalone use. Vector APIs, performance, and file
+formats are explicitly experimental in V1.
 
-These documents explain engine design and may contain implementation history.
-Verify exact APIs against the package docs and source.
+## Data flow
 
-- [`RoarFormat.md`](RoarFormat.md) — bitmap serialization
-- [`BitmapKernel.MD`](BitmapKernel.MD) — SIMD/bitmap kernels
-- [`SimHash.md`](SimHash.md) — perceptual hash store
-- [`Timeidx.md`](Timeidx.md) — timestamp index
-- [`RadixTreeHash.MD`](RadixTreeHash.MD) — exact hash index
-- [`Ranking.MD`](Ranking.MD) — optional ranking/fusion
-- [`VectorIdx.MD`](VectorIdx.MD) — **experimental** vector design
+```text
+application Mutation
+        |
+        v
+database.Commit
+  canonical value + ordered journal + generation (one synced Pebble batch)
+        |
+        v
+database coordinator
+  decode projection -> diff/coalesce -> index.Batch
+        |
+        v
+index.Store
+  serialized writer -> bitmap/time/geo/hash/simhash/vector engines
+  -> unified manifest + source generation
+        |
+        v
+index durable and visible
+        |
+        v
+Pebble acknowledgment -> journal cleanup
+```
 
-## Historical proposals
+Searches never participate in the write path. `WaitIndexed(ctx, generation)`
+gates freshness when an application needs read-after-index behavior. `search.Engine`
+plans pin one coherent snapshot for the duration of an execution; writers do not
+hold a query-wide lock.
 
-These are retained for design context only. They do not describe the current
-implementation and must not be used as API guidance.
+## Contributor workflow
 
-- [`CryptoHash.MD`](CryptoHash.MD) — retired exact-hash proposal; use
-  `index/radixhash`.
-- [`HashIdx2.MD`](HashIdx2.MD) — retired hash-index proposal; use
-  `index/radixhash` and `index/simhash`.
-- [`Refactor/`](Refactor/) — Phase 1–3 working material, benchmark evidence, and
-  the active V1 plan; see [`Refactor/README.md`](Refactor/README.md).
+1. Locate the smallest relevant surface with SigMap.
+2. Read the current implementation and tests.
+3. Make the smallest correct change.
+4. Run focused tests.
+5. Run the broad validation commands below before handoff.
 
-## Authoritative package documentation
+```sh
+go fmt ./...
+go build ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+sigmap validate
+```
 
-- [`database/README.md`](../database/README.md) — primary V1 lifecycle and
-  search integration.
-- [`database/FORMAT.md`](../database/FORMAT.md) — canonical, journal, key, and
-  `schema.dat` compatibility.
-- [`schema/README.md`](../schema/README.md) and
-  [`schema/FORMAT.md`](../schema/FORMAT.md) — namespace definitions and IDs.
-- [`index/README.md`](../index/README.md) — unified/standalone index store.
-- [`search/README.md`](../search/README.md) — plans, workspaces, snapshots.
-- [`store/README.md`](../store/README.md) — advanced KV primitive.
-- [`index/vectoridx/README.md`](../index/vectoridx/README.md) — experimental
-  vector API.
+Use `IMAGEIDX_BENCH_LARGE` only for opt-in large benchmarks. Do not replace the
+shared `internal/bench` harness with a parallel framework.
 
-## Terminology corrections
+## Documentation rules
 
-The old `common` package name is retired. Current code uses `schema` for
-namespace definitions, entity identity, and ValueIDs. Do not add a new
-`common` package or a parallel schema registry.
+- Current source, tests, and package docs take precedence over this directory.
+- Do not add a second implementation proposal under `AGENTS/`. Update the
+  current architecture or contracts instead.
+- Historical phase instructions and design reports are available in git history.
+- Package READMEs should describe public behavior. This directory explains how
+  the pieces fit together.
 
-Derived indexes are rebuildable caches. `schema.dat` and canonical Pebble
-records are the durability authority. Search plans compiled by `search.Engine`
-pin one coherent snapshot per execution; direct `search.Compile` plans retain
-live-view semantics.
+## Known release gate
+
+Linux `amd64` CI currently excludes two internal SIMD-kernel equivalence suites:
+`index/radixhash/internal/tailkernel` and
+`index/simhash/internal/hashkernel`. They pass on ARM64. This must be fixed or
+explicitly scoped out of the supported platform matrix before a V1 release tag.
+See [`CONTRACTS.md`](CONTRACTS.md#release-and-platform-policy).

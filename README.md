@@ -19,8 +19,8 @@ and `search` packages remain available for advanced and standalone use.
   `schema.dat` allocation.
 - [Unified index](index/README.md) — standalone/advanced index store.
 - [Search](search/README.md) — reusable plans, workspaces, and execution.
-- [V1 API decision](AGENTS/Refactor/V1-API-Decision.md) — stable, advanced, and
-  experimental API classification.
+- [V1 contracts](AGENTS/CONTRACTS.md) — stable, advanced, and experimental API
+  classification, limits, and release policy.
 
 ## Package map
 
@@ -230,9 +230,9 @@ demonstrated correctness or data-loss defect is found:
 - new SIMD/SoA architecture or storage allocator changes;
 - ranking redesign or new cardinality systems.
 
-See [`AGENTS/`](AGENTS/README.md) for design notes, current architecture guides,
-and historical proposals. Historical documents are not API contracts; source,
-tests, and package documentation take precedence.
+See [`AGENTS/`](AGENTS/README.md) for the current architecture and V1 contracts.
+Historical design material is available in git history; source, tests, and
+package documentation take precedence.
 
 ## Known CI limitations
 
@@ -241,4 +241,4 @@ tests, and package documentation take precedence.
 equivalence failures and are excluded from the AMD64 CI test/race jobs. They
 pass on ARM64, where the AMD64 assembly is not built. This is a known V1
 release-gate issue; see
-[`AGENTS/Refactor/V1-API-Decision.md`](AGENTS/Refactor/V1-API-Decision.md).
+[`AGENTS/CONTRACTS.md`](AGENTS/CONTRACTS.md#release-and-platform-policy).

@@ -2,8 +2,8 @@
 // the canonical image-hash tuple: a 64-bit pHash, a 256-bit PDQ hash, and a PDQ
 // quality byte.
 //
-// The full design is documented in AGENTS/SimHash.md; usage and measured results
-// are in index/simhash/README.md.
+// Current architecture is summarized in AGENTS/ARCHITECTURE.md; usage and
+// measured results are in index/simhash/README.md.
 //
 // # Addressing
 //
