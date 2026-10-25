@@ -181,12 +181,8 @@ regression must be explained and measured on matched hardware/compiler/config.
 
 - V1 must reopen V1 databases and fail closed on unsupported/corrupt formats.
 - The release tag must point to the exact validated commit.
-- Supported CI currently exercises Linux `amd64` and `arm64`.
-- Known blocker: `index/radixhash/internal/tailkernel` and
-  `index/simhash/internal/hashkernel` AMD64 backend-vs-scalar equivalence suites
-  are excluded from AMD64 CI. They pass on ARM64, where the assembly is not
-  built. Fix the kernels or explicitly remove AMD64 SIMD from the supported
-  matrix before tagging V1.
+- Supported CI exercises Linux `amd64` and `arm64`, including the internal
+  SIMD-kernel equivalence suites.
 - No selective recovery, per-family writers, adaptive batching, vector
   stabilization, new SIMD architecture, allocator rewrite, or ranking redesign
   is required for V1.

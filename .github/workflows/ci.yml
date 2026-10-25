@@ -52,16 +52,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: test
-        run: |
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            # Known pre-existing AMD64 microkernel equivalence failures; see
-            # README.md "Known unrelated CI failures".
-            go list ./... \
-              | grep -v -E 'index/radixhash/internal/tailkernel|index/simhash/internal/hashkernel' \
-              | xargs go test -count=1
-          else
-            go test -count=1 ./...
-          fi
+        run: go test -count=1 ./...
 
   race:
     name: race (${{ matrix.arch }})
@@ -81,14 +72,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: race
-        run: |
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            go list ./... \
-              | grep -v -E 'index/radixhash/internal/tailkernel|index/simhash/internal/hashkernel' \
-              | xargs go test -count=1 -race
-          else
-            go test -count=1 -race ./...
-          fi
+        run: go test -count=1 -race ./...
 
   schema-recovery:
     name: schema recovery (${{ matrix.arch }})

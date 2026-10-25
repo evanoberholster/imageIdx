@@ -15,7 +15,8 @@ TEXT ·matchMaskAVX2Asm(SB), NOSPLIT, $0-40
 	MOVQ $1, R10
 
 loop:
-	CMPQ CX, R8
+	// Plan 9 CMPQ computes first-second: loop while i < count.
+	CMPQ R8, CX
 	JGE done
 	MOVQ R8, R11
 	IMULQ BX, R11

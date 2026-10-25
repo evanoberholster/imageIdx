@@ -263,9 +263,9 @@ changes require versioning and explicit migration or fail-closed rejection.
   metrics, and service load.
 - `internal/bench` owns deterministic datasets and latency recording. Package
   benchmarks cover hot paths. Opt-in 10M runs use `IMAGEIDX_BENCH_LARGE`.
-- CI runs Linux amd64/arm64 build, test, race, schema recovery, migration crash,
-  and allocator jobs. See the known AMD64 kernel exclusion in
-  [`CONTRACTS.md`](CONTRACTS.md#release-and-platform-policy).
+- CI runs Linux amd64/arm64 build, full test, race, schema recovery, migration
+  crash, and allocator jobs, including the internal SIMD-kernel equivalence
+  suites.
 
 ## Current limitations
 
@@ -273,4 +273,3 @@ changes require versioning and explicit migration or fail-closed rejection.
 - Full-index recovery only; no selective namespace/family rebuild.
 - Engine reclamation can delay writers while an old snapshot drains.
 - Vector functionality is experimental.
-- Linux amd64 SIMD kernel equivalence has two excluded internal test suites.
