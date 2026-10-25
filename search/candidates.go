@@ -30,6 +30,12 @@ func (plan Plan) FilterIDsWithMetrics(ctx context.Context, dst, candidates []Ima
 }
 
 func (plan Plan) filterIDs(ctx context.Context, dst, candidates []ImageID, ws *Workspace, metrics *SearchMetrics) ([]ImageID, error) {
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return dst, pinErr
+	}
+	plan = pinned
+	defer release()
 	start := len(dst)
 	if err := ctx.Err(); err != nil {
 		return dst, err

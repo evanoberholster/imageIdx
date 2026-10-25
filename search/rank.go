@@ -8,9 +8,9 @@ import (
 	"slices"
 	"time"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // RankedResult preserves the ranker's native score precision. Lower scores
@@ -44,13 +44,19 @@ func (plan Plan) RankTimeWithMetrics(ctx context.Context, dst []Result, workspac
 }
 
 func (plan Plan) rankTime(ctx context.Context, dst []Result, workspace *Workspace, lookup timeidx.ExactTimestampFunc, target uint64, k int, metrics *SearchMetrics) ([]Result, error) {
+	if lookup == nil {
+		return dst, ErrInvalidOptions
+	}
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return dst, pinErr
+	}
+	plan = pinned
+	defer release()
 	if metrics != nil {
 		started := time.Now()
 		metrics.reset(plan, OperationRankTime)
 		defer func() { metrics.TotalDuration = time.Since(started) }()
-	}
-	if lookup == nil {
-		return dst, ErrInvalidOptions
 	}
 	return rankByScore(ctx, dst, plan, workspace, k, metrics, func(id ImageID) (uint64, bool) {
 		stamp, ok := lookup(id)
@@ -86,16 +92,22 @@ func (plan Plan) RankGeoWithMetrics(ctx context.Context, dst []GeoResult, worksp
 }
 
 func (plan Plan) rankGeo(ctx context.Context, dst []GeoResult, workspace *Workspace, latitude, longitude float64, lookup geoidx.CoordinateLookup, k int, metrics *SearchMetrics) ([]GeoResult, error) {
-	if metrics != nil {
-		started := time.Now()
-		metrics.reset(plan, OperationRankGeo)
-		defer func() { metrics.TotalDuration = time.Since(started) }()
-	}
 	if lookup == nil {
 		return dst, ErrInvalidOptions
 	}
 	if _, err := geoidx.KeyFromLatLng(latitude, longitude); err != nil {
 		return dst, errors.Join(ErrInvalidOptions, err)
+	}
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return dst, pinErr
+	}
+	plan = pinned
+	defer release()
+	if metrics != nil {
+		started := time.Now()
+		metrics.reset(plan, OperationRankGeo)
+		defer func() { metrics.TotalDuration = time.Since(started) }()
 	}
 	return rankByScore(ctx, dst, plan, workspace, k, metrics, func(id ImageID) (float64, bool) {
 		lat, lng, ok := lookup(id)
@@ -300,6 +312,12 @@ func (plan Plan) FilterRanked[T any](ctx context.Context, dst []Result, workspac
 	if imageID == nil || score == nil {
 		return dst, ErrInvalidClause
 	}
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return dst, pinErr
+	}
+	plan = pinned
+	defer release()
 	var scratch Workspace
 	ws := workspace
 	if ws == nil {

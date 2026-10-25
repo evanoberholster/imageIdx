@@ -110,6 +110,11 @@ type Index struct {
 	// loop goroutine.
 	commits    *commitqueue.Queue[commitReq]
 	barrierErr error
+
+	// snapshot pins this handle to one reader-visible namespaceView. It is
+	// non-nil only on handles returned by Snapshot; writer methods are not
+	// supported on snapshot handles.
+	snapshot *snapshotPin
 }
 
 // NewMemory constructs an empty namespace index from a validated

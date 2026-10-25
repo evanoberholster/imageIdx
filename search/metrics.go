@@ -129,6 +129,12 @@ func (plan Plan) SearchWithMetrics(ctx context.Context, dst []ImageID, ws *Works
 	if metrics == nil {
 		return dst, ErrInvalidOptions
 	}
+	pinned, release, pinErr := plan.beginQuery(ctx)
+	if pinErr != nil {
+		return dst, pinErr
+	}
+	plan = pinned
+	defer release()
 	start := time.Now()
 	metrics.reset(plan, OperationSearch)
 	defer func() { metrics.TotalDuration = time.Since(start) }()

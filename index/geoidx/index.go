@@ -8,9 +8,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // Config configures an index.
@@ -225,6 +225,12 @@ type Index struct {
 	dirOffset  uint64
 	dirLength  uint32
 	migrateAll bool
+
+	// snapshotTracker is set on handles returned by Snapshot. The handle's
+	// outer reader token lives on the live index's tracker.
+	snapshotTracker *storage.ReaderTracker
+	snapshotToken   uint32
+	snapshotOnce    sync.Once
 }
 
 // NewMemory returns an empty heap-backed index.
@@ -327,11 +333,19 @@ func (i *Index) publishLocked() {
 // reclaim or unmap an arena the reader may still touch. The order is strict:
 // Acquire -> check closed -> use view -> Release.
 func (i *Index) withView(fn func(*view)) {
-	token := i.tracker.Acquire()
+	tracker := i.readerTracker()
+	token := tracker.Acquire()
 	if !i.closed.Load() {
 		fn(i.view.Load())
 	}
-	i.tracker.Release(token)
+	tracker.Release(token)
+}
+
+func (i *Index) readerTracker() *storage.ReaderTracker {
+	if i.snapshotTracker != nil {
+		return i.snapshotTracker
+	}
+	return &i.tracker
 }
 
 // Insert records id at key.

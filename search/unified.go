@@ -105,10 +105,18 @@ func (e *Engine) Compile(entity schema.EntityKind, clauses ...Clause) (Plan, err
 	all := make([]Clause, 0, len(clauses)+1)
 	all = append(all, AllValues(live, value))
 	all = append(all, clauses...)
+	var plan Plan
+	var err error
 	if hasACL(clauses) {
-		return CompileWithStore(e.db.BitmapStore(), all...)
+		plan, err = CompileWithStore(e.db.BitmapStore(), all...)
+	} else {
+		plan, err = Compile(all...)
 	}
-	return Compile(all...)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan.guard = e.db
+	return plan, nil
 }
 
 // validateClauses resolves each clause's namespace and enforces that it belongs

@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"slices"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/pagealloc"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 const (
@@ -696,7 +696,7 @@ func (i *Index) publish(plans []*shard, gen, sourceGeneration uint64) error {
 	}
 	// Keep the old allocator (which still reserves obsolete extents) until ALL
 	// readers of the previous view have drained. Only then make reuse possible.
-	i.readers.WaitForPriorReaders()
+	i.readerTracker().WaitForPriorReaders()
 	i.alloc = nextAlloc
 	for _, m := range i.retired {
 		_ = m.Close()

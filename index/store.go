@@ -2,12 +2,14 @@ package index
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/bits"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -50,10 +52,11 @@ type Store struct {
 
 	stats indexStats
 
-	mu     sync.Mutex // serializes Apply/lifecycle
-	closed atomic.Bool
-	source uint64 // last requested watermark; guarded by mu
-	gen    uint64 // guarded by mu
+	mu       sync.Mutex // serializes Apply/lifecycle
+	writeSeq atomic.Uint64
+	closed   atomic.Bool
+	source   uint64 // last requested watermark; guarded by mu
+	gen      uint64 // guarded by mu
 
 	// nsSource holds the confirmed completeness generation per namespace
 	// (dense, indexed by namespace number) and safeSource is the store-wide
@@ -1028,10 +1031,43 @@ func (s *Store) DegradedNamespaces() []schematypes.Namespace {
 	return out
 }
 
+// BeginQuerySnapshot waits for an in-flight engine publication to finish and
+// returns the sequence token that identifies the quiescent publication.
+// Writers increment writeSeq before the first engine mutation and again after
+// the last one; a query that captures its engine snapshots between those two
+// increments observes one coherent generation.
+func (s *Store) BeginQuerySnapshot(ctx context.Context) (uint64, error) {
+	for spin := 0; ; spin++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		seq := s.writeSeq.Load()
+		if seq&1 == 0 {
+			return seq, nil
+		}
+		if spin >= 64 {
+			runtime.Gosched()
+			spin = 0
+		}
+	}
+}
+
+// QuerySnapshotValid reports whether the quiescent sequence observed by
+// BeginQuerySnapshot is still current. A false result means a writer began
+// during snapshot capture; the caller must discard the snapshots and retry.
+func (s *Store) QuerySnapshotValid(seq uint64) bool { return s.writeSeq.Load() == seq }
+
 // SourceGeneration returns the confirmed store-wide canonical-database
 // completeness watermark: the minimum confirmed generation across every
 // declared namespace. Zero means unrecorded. It is read lock-free.
 func (s *Store) SourceGeneration() uint64 { return s.safeSource.Load() }
+
+// beginWriteSequence brackets all reader-visible engine publications. The
+// returned function must be called exactly once, normally with defer.
+func (s *Store) beginWriteSequence() func() {
+	s.writeSeq.Add(1)
+	return func() { s.writeSeq.Add(1) }
+}
 
 // CheckSourceGeneration returns ErrIndexStale when the confirmed watermark is
 // behind required, and ErrClosed after shutdown. Staleness is never corruption.
