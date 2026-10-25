@@ -2,16 +2,16 @@
 
 imageIdx is a performance-oriented Go image indexing and search library.
 
-## V1 documentation
+## 0.5 documentation
 
-`database.DB` is the stable V1 application entry point. Start with
+`database.DB` is the primary 0.5 application entry point. ImageIdx 0.5 is pre-1.0; the documented API may still change. Start with
 [`README.md`](README.md), [`database/README.md`](database/README.md), and
 [`database/FORMAT.md`](database/FORMAT.md). Package documentation and tests are
 authoritative; files under [`AGENTS/`](AGENTS/README.md) are architecture notes,
 design history, or workflow guidance unless they explicitly say otherwise.
 
 Vector APIs under `index/vectoridx` and vector portions of `index` are
-experimental in V1.
+experimental in 0.5.
 
 ## Repository navigation
 

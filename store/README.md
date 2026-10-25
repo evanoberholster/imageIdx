@@ -44,7 +44,7 @@ KV namespaces is an explicit closed-store migration coordinated by `database`;
 it is not supported at runtime.
 
 `OpenLegacy` and `OpenLegacyWithExtension` exist only for migration fixtures and
-pre-`schema.dat` construction. Do not use them with a database-managed V1 store.
+pre-`schema.dat` construction. Do not use them with a database-managed 0.5 store.
 
 ## Mutations
 

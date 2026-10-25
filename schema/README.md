@@ -1,14 +1,14 @@
-# schema: definitions and entity IDs (schema.dat v3, V1 baseline)
+# schema: definitions and entity IDs (schema.dat v3, 0.5 baseline)
 
 The persistent-format compatibility contract, the supported version matrix, the
 unsupported development formats, and the golden fixtures are documented in
-[`FORMAT.md`](FORMAT.md). `schema.dat` v3 is the V1 baseline; v2 is read as ACTIVE
+[`FORMAT.md`](FORMAT.md). `schema.dat` v3 is the 0.5 baseline; v2 is read as ACTIVE
 and upgraded on the next directory publication; container v1 and allocator
 format v1 are rejected with `ErrVersion`.
 
 `schema` is authoritative for the database namespace model, entity identity, and
 durable ValueIDs. It is used through [`database.DB`](../database/README.md) for
-the stable application lifecycle, or directly by advanced standalone tools.
+the primary application lifecycle, or directly by advanced standalone tools.
 
 `schema.Definitions` registers namespaces, their collection kinds, and owning
 entities. `schema.Schema` owns the persistent, immutable snapshot and allocates

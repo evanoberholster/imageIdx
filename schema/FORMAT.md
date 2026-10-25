@@ -1,4 +1,4 @@
-# schema.dat persistent format contract (V1)
+# schema.dat persistent format contract (0.5)
 
 This document is the compatibility contract for the single authoritative schema
 and allocator file. Any change to the byte layout, the accepted versions, or the
@@ -9,7 +9,7 @@ plan. The committed fixtures under `schema/testdata/` pin the current bytes.
 
 | Artifact | Version | Meaning | Read | Write |
 |---|---|---|---|---|
-| `schema.dat` container | 3 | **V1 baseline**: ACTIVE/PREPARED generation and legacy-retirement state | yes | yes |
+| `schema.dat` container | 3 | **0.5 baseline**: ACTIVE/PREPARED generation and legacy-retirement state | yes | yes |
 | `schema.dat` container | 2 | prior release: same slot/directory layout, no PREPARED state | yes (read as ACTIVE) | upgraded to 3 on the next directory publication |
 | definitions blob (`NSPC`) | 3 | per-definition `EntityKind` and `ProjectionVersion` | yes | yes |
 | definitions blob (`NSPC`) | 2 | per-definition `EntityKind`; projection version defaults to 1 | yes | rewritten as 3 on the next publication |

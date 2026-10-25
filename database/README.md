@@ -1,6 +1,6 @@
-# database: authoritative records and derived indexes (V1)
+# database: authoritative records and derived indexes (0.5)
 
-`database.DB` is the primary V1 entry point for applications. It coordinates:
+`database.DB` is the primary 0.5 entry point for applications. It coordinates:
 
 - the authoritative `schema.dat` file;
 - Pebble canonical records and the ordered mutation journal;
@@ -29,7 +29,7 @@ store while the coordinator is running.
 
 ## Create and open
 
-The current V1 bootstrap creates the derived index directory once with
+The current 0.5 bootstrap creates the derived index directory once with
 `index.Create`, then opens `database.Open`:
 
 ```go
@@ -54,11 +54,11 @@ defer db.Close()
 
 On the first successful open, `database` validates the independently created
 index, writes `schema.dat`, and initializes Pebble. Later opens of an existing
-V1 database use `database.Open` directly; the index directory already exists.
+0.5 database use `database.Open` directly; the index directory already exists.
 The index creation step is a bootstrap exception, not a second database
 lifecycle.
 
-An existing V1 database rejects missing `schema.dat`, incompatible index
+An existing 0.5 database rejects missing `schema.dat`, incompatible index
 definitions, unsupported formats, and unrecoverable journal state. See
 [`FORMAT.md`](FORMAT.md) for the exact compatibility matrix.
 
@@ -210,7 +210,7 @@ ids, err := plan.AppendIDs(ctx, nil, workspace)
 
 ### Error families
 
-Stable sentinels are suitable for `errors.Is`:
+Exported sentinels are suitable for `errors.Is`:
 
 | Error | Meaning |
 |---|---|
@@ -245,13 +245,13 @@ modifies canonical records.
 ### Recovery units
 
 Bitmap namespaces share one physical bitmap store and timestamp namespaces share
-one physical time store, so selective namespace replacement is not safe in V1.
+one physical time store, so selective namespace replacement is not safe in 0.5.
 Recovery uses the complete unified-index rebuild. The activation and staging
 boundaries are documented in [`FORMAT.md`](FORMAT.md).
 
 ## Limits and options
 
-| Option / limit | V1 behavior |
+| Option / limit | 0.5 behavior |
 |---|---|
 | `Options.BatchSize` | Defaults to 64; values above 64 are rejected. This is the per-index-apply batch, not the total mutations allowed in one `Commit`. |
 | `Options.MaxPending` | Bounds unacknowledged journal lag; zero means unbounded. |
@@ -261,12 +261,12 @@ boundaries are documented in [`FORMAT.md`](FORMAT.md).
 | Vector IDs | Must fit the vector engine's `uint32` NodeID range; vector APIs remain experimental. |
 | Journal | Journal v2 only; unsupported versions fail closed. |
 
-## V1 persistence policy
+## 0.5 persistence policy
 
-- `schema.dat` and canonical record semantics are V1 compatibility contracts.
-- Journal replay must remain correct for committed V1 databases.
+- `schema.dat` and canonical record semantics are 0.5 compatibility contracts.
+- Journal replay must remain correct for committed 0.5 databases.
 - Derived index files are rebuildable caches, not permanent format promises.
-- Pre-V1 experimental databases are not automatically opened.
+- Pre-0.5 experimental databases are not automatically opened.
 - See [`FORMAT.md`](FORMAT.md) and [`schema/FORMAT.md`](../schema/FORMAT.md)
   for the versioned details.
 

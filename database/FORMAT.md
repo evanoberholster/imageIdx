@@ -1,6 +1,6 @@
-# Database on-disk formats (V1)
+# Database on-disk formats (0.5)
 
-This document is the V1 compatibility contract for the database-owned durable
+This document is the 0.5 compatibility contract for the database-owned durable
 data. It covers `schema.dat`, canonical values, the mutation journal, fixed-width
 store keys, and the derived-index boundary.
 
@@ -8,11 +8,11 @@ The authoritative schema layout is documented separately in
 [`schema/FORMAT.md`](../schema/FORMAT.md). Derived index formats are described
 in [`index/README.md`](../index/README.md) and are rebuildable.
 
-## Supported V1 formats
+## Supported 0.5 formats
 
-| Artifact | V1 version | Read | Write | Notes |
+| Artifact | 0.5 version | Read | Write | Notes |
 |---|---:|---|---|---|
-| `schema.dat` container | 3 | yes | yes | V1 baseline; v2 is read as ACTIVE and upgraded on publication |
+| `schema.dat` container | 3 | yes | yes | 0.5 baseline; v2 is read as ACTIVE and upgraded on publication |
 | Definitions blob (`NSPC`) | 3 | yes | yes | Includes `EntityKind` and `ProjectionVersion`; v1/v2 are read |
 | Canonical value — inline | 1 | yes | yes | Projection bytes stored beside the application record |
 | Canonical value — external | 2 | yes | yes | Only the application record is stored; projector required |
@@ -20,7 +20,7 @@ in [`index/README.md`](../index/README.md) and are rebuildable.
 | `store.bin` (derived index manifest) | 2 | yes | yes | Rebuildable cache; not a permanent compatibility promise |
 | Journal v1 / canonical unknown / index unknown | — | no | no | Fail closed; never reinterpret |
 
-Pre-V1 experimental databases are not promised to open. V1 must reopen V1
+Pre-0.5 experimental databases are not promised to open. 0.5 must reopen 0.5
 databases and reject unsupported or corrupt state explicitly.
 
 ## Pebble namespace layout
@@ -45,7 +45,7 @@ Their numbers are persisted; they are not assumed to equal `EntityKind` ordinals
 
 Database-owned keys use `flags = 0`. The 2-byte field is preserved in the
 12-byte key representation for the generic `store` API; non-zero flags are not
-part of the V1 database format.
+part of the 0.5 database format.
 
 ### Generation metadata
 
@@ -163,7 +163,7 @@ journal.
 
 ## Derived-index recovery boundary
 
-Derived index files are rebuildable and are not covered by the canonical V1
+Derived index files are rebuildable and are not covered by the canonical 0.5
 binary compatibility promise. `RecoveryAutomatic` may replace the complete
 unified index directory from canonical projections using:
 
@@ -184,7 +184,7 @@ one physical store and time namespaces share one physical store.
 
 ## Golden and negative tests
 
-The V1 formats are exercised by:
+The 0.5 formats are exercised by:
 
 - `schema/testdata/` and `schema/golden_test.go` for `schema.dat`;
 - `database/journal_test.go` for journal v2 roundtrip, golden prefix, CRC,
@@ -196,7 +196,7 @@ The V1 formats are exercised by:
 - crash and restart tests under `database/*_crash_test.go` and
   `schema/recovery_test.go`.
 
-## V1 change policy
+## 0.5 change policy
 
 - Changing `schema.dat`, canonical record meaning, or journal semantics requires
   a new format version and an explicit migration or fail-closed rejection.
@@ -204,5 +204,5 @@ The V1 formats are exercised by:
   the decoder rejects malformed values and tests pin the bytes.
 - Derived index formats may evolve with explicit version detection and a safe
   rebuild route. They are never silently reinterpreted.
-- APIs are stable only for the documented stable surface. Vector APIs and vector
-  file formats remain experimental.
+- APIs follow the documented 0.5 public surface; breaking changes remain possible
+  before 1.0. Vector APIs and file formats remain experimental.

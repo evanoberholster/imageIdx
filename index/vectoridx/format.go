@@ -8,8 +8,8 @@ import (
 	"sort"
 	"sync/atomic"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 var _ = atomic.LoadInt32
@@ -187,7 +187,7 @@ func decodeRegionEntry(src []byte) fileRegion {
 
 // decodeFile validates the header and all region bounds/checksums, returning
 // zero-copy region slices. No mmap is retained; Open copies payloads into
-// heap storage (V1 simplification documented in doc.go).
+// heap storage (0.5 simplification documented in doc.go).
 func decodeFile(data []byte) (fileHeader, [][]byte, error) {
 	h, err := decodeHeader(data)
 	if err != nil {

@@ -1,8 +1,8 @@
 # vectoridx (experimental)
 
-> **Experimental in V1.** Keep existing vector functionality working, but do not
-> treat the public API, performance, or on-disk format as a stable V1 contract.
-> Stable applications should treat vector search as an optional experimental
+> **Experimental in 0.5.** Keep existing vector functionality working, but do not
+> treat the public API, performance, or on-disk format as a 0.5 contract.
+> Applications relying on the documented public surface should treat vector search as an optional experimental
 > feature.
 
 Persistent HNSW approximate-nearest-neighbor vector index implementing

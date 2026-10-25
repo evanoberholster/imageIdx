@@ -1,4 +1,4 @@
-// Command database demonstrates the stable V1 database workflow: schema
+// Command database demonstrates the 0.5 database workflow: schema
 // bootstrap, durable commit, indexing wait, search, canonical read,
 // delete/reinsert, checkpoint, and close/reopen.
 package main
@@ -156,7 +156,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Reopen the same V1 database. No index creation or schema resupply is needed.
+	// Reopen the same 0.5 database. No index creation or schema resupply is needed.
 	db, err = database.Open(dataDir, indexDir, decodeProjection, database.Options{})
 	if err != nil {
 		log.Fatal(err)

@@ -5,46 +5,48 @@ It stores authoritative application records in Pebble and derives bitmap,
 timestamp, geographic, exact-hash, perceptual-hash, and vector indexes from
 canonical projections.
 
-This is the V1 documentation baseline. The stable entry point for applications
-is [`database.DB`](database/README.md). Lower-level `index`, `store`, `schema`,
-and `search` packages remain available for advanced and standalone use.
+This is the 0.5 documentation baseline. ImageIdx 0.5 is a pre-1.0 release:
+the documented API may still change, so pin versions and read release notes
+before upgrading. The primary entry point is [`database.DB`](database/README.md).
+Lower-level `index`, `store`, `schema`, and `search` packages remain available
+for advanced and standalone use.
 
 ## Start here
 
 - [Database integration](database/README.md) — canonical records, commits,
   indexing waits, search integration, recovery, and public contracts.
-- [Database on-disk format](database/FORMAT.md) — V1 canonical, journal, key,
+- [Database on-disk format](database/FORMAT.md) — 0.5 canonical, journal, key,
   and schema compatibility rules.
 - [Schema and entity IDs](schema/README.md) — namespace definitions and durable
   `schema.dat` allocation.
 - [Unified index](index/README.md) — standalone/advanced index store.
 - [Search](search/README.md) — reusable plans, workspaces, and execution.
-- [V1 contracts](AGENTS/CONTRACTS.md) — stable, advanced, and experimental API
+- [0.5 contracts](AGENTS/CONTRACTS.md) — public, advanced, and experimental API
   classification, limits, and release policy.
 
 ## Package map
 
-| Package | Role | V1 status |
+| Package | Role | 0.5 status |
 |---|---|---|
-| `database` | Authoritative Pebble records, mutation journal, derived-index coordination, recovery | **Stable** |
-| `schema` | Namespace definitions, entity identity, durable ValueID allocation | **Stable** |
-| `search` | Conjunctive plans, workspaces, executors, ranking helpers ([guide](search/README.md)) | **Stable** |
-| `index` | Unified index store and namespace routing ([guide](index/README.md)) | Advanced stable |
-| `index/bitmapidx` | Enum, bool, text, continuous, and BSI bitmap namespaces | Advanced stable |
-| `index/timeidx` | Exact timestamp index | Advanced stable |
-| `index/geoidx` | S2 geographic index | Advanced stable |
-| `index/radixhash` | Exact 256-bit hash index | Advanced stable |
-| `index/simhash` | pHash/PDQ perceptual similarity store | Advanced stable |
+| `database` | Authoritative Pebble records, mutation journal, derived-index coordination, recovery | **Primary** |
+| `schema` | Namespace definitions, entity identity, durable ValueID allocation | **Primary** |
+| `search` | Conjunctive plans, workspaces, executors, ranking helpers ([guide](search/README.md)) | **Primary** |
+| `index` | Unified index store and namespace routing ([guide](index/README.md)) | Advanced |
+| `index/bitmapidx` | Enum, bool, text, continuous, and BSI bitmap namespaces | Advanced |
+| `index/timeidx` | Exact timestamp index | Advanced |
+| `index/geoidx` | S2 geographic index | Advanced |
+| `index/radixhash` | Exact 256-bit hash index | Advanced |
+| `index/simhash` | pHash/PDQ perceptual similarity store | Advanced |
 | `index/vectoridx` | HNSW vector index | **Experimental** |
-| `store` | Generic Pebble-backed KV collection ([guide](store/README.md)) | Advanced stable |
-| `roar` | Immutable roaring-bitmap representation and operators | Advanced stable |
+| `store` | Generic Pebble-backed KV collection ([guide](store/README.md)) | Advanced |
+| `roar` | Immutable roaring-bitmap representation and operators | Advanced |
 | `search/ranking` | Optional ranking/fusion helpers | Advanced |
 | `internal/*` | Private storage, kernels, benchmarks | Internal |
 | `cmd/imageidx` | CLI, HTTP demo, and examples | Examples/tools |
 
 Vector APIs, vector file formats, vector performance, and vector compatibility
-are **experimental** in V1. They remain functional and tested, but are not part
-of the stable V1 compatibility promise.
+are **experimental** in 0.5. They remain functional and tested, but are not part
+of the 0.5 compatibility promise.
 
 ## Durable and derived data
 
@@ -60,8 +62,8 @@ There are three distinct durability layers:
    byte-compatible forever. `database` rebuilds the complete index from
    canonical projections when recovery requires it.
 
-No pre-V1 experimental database is guaranteed to open. V1 databases must reopen
-with V1; unsupported container, journal, canonical, or index versions are
+No pre-0.5 experimental database is guaranteed to open. 0.5 databases must reopen
+with 0.5; unsupported container, journal, canonical, or index versions are
 rejected explicitly rather than reinterpreted.
 
 ## Quick start
@@ -214,12 +216,13 @@ Silicon is used for development benchmarks, not as a CI replacement.
   contracts.
 - Derived index files are versioned caches. They may be rebuilt or rejected
   when their format is unsupported.
-- Stable public API compatibility applies to documented stable APIs. Vector
-  APIs and vector formats are experimental for V1.
+- The documented 0.5 public API may still change before 1.0. Breaking changes
+  require release notes and, for persistence, an explicit migration or
+  fail-closed rejection. Vector APIs and formats remain experimental.
 
-## Post-V1
+## Post-0.5
 
-The following are intentionally deferred and are **not** V1 blockers unless a
+The following are intentionally deferred and are **not** 0.5 blockers unless a
 demonstrated correctness or data-loss defect is found:
 
 - per-family parallel writers and a composite root/epoch reclamation redesign;
@@ -229,6 +232,6 @@ demonstrated correctness or data-loss defect is found:
 - new SIMD/SoA architecture or storage allocator changes;
 - ranking redesign or new cardinality systems.
 
-See [`AGENTS/`](AGENTS/README.md) for the current architecture and V1 contracts.
+See [`AGENTS/`](AGENTS/README.md) for the current architecture and 0.5 contracts.
 Historical design material is available in git history; source, tests, and
 package documentation take precedence.

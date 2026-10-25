@@ -4,18 +4,21 @@ This directory is the current architecture and contributor guide for imageIdx.
 It replaces the previous collection of per-subsystem proposals and phase reports.
 Historical material remains in git history; it is not a current API contract.
 
+ImageIdx 0.5 is pre-1.0. The package map below describes the intended public
+surface, but breaking API changes remain possible before 1.0.
+
 Read these three files:
 
 | Document | Purpose |
 |---|---|
 | [README.md](README.md) | Orientation, package map, workflow, and authority |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Current runtime structure, data flow, concurrency, and recovery |
-| [CONTRACTS.md](CONTRACTS.md) | Stable/advanced/experimental APIs, ownership, limits, and release policy |
+| [CONTRACTS.md](CONTRACTS.md) | Public/advanced/experimental APIs, ownership, limits, and release policy |
 
 For public usage and persistence details, the package documentation is
 authoritative:
 
-- [`README.md`](../README.md) — V1 user guide and quick start
+- [`README.md`](../README.md) — 0.5 user guide and quick start
 - [`database/README.md`](../database/README.md) — primary application lifecycle
 - [`database/FORMAT.md`](../database/FORMAT.md) — canonical, journal, key, and recovery formats
 - [`schema/README.md`](../schema/README.md) and [`schema/FORMAT.md`](../schema/FORMAT.md) — schema and IDs
@@ -25,27 +28,27 @@ authoritative:
 
 ## Package map
 
-| Package | Role | V1 status |
+| Package | Role | 0.5 status |
 |---|---|---|
-| `schema` | Namespace definitions, entity identity, `schema.dat`, durable ValueIDs | Stable |
-| `database` | Primary lifecycle, canonical records, journal, indexing coordinator, recovery | Stable |
-| `store` | Pebble-backed KV primitive for canonical records and the journal | Advanced stable |
-| `index` | Unified index store, namespace routing, liveness, recovery markers | Advanced stable |
-| `index/bitmapidx` | Enum, bool, text, continuous, and BSI bitmap namespaces | Advanced stable |
-| `index/timeidx` | Exact timestamp index | Advanced stable |
-| `index/geoidx` | S2 geographic index | Advanced stable |
-| `index/radixhash` | Exact 256-bit hash index | Advanced stable |
-| `index/simhash` | pHash/PDQ perceptual similarity, dense and sparse IDs | Advanced stable |
+| `schema` | Namespace definitions, entity identity, `schema.dat`, durable ValueIDs | Primary |
+| `database` | Primary lifecycle, canonical records, journal, indexing coordinator, recovery | Primary |
+| `store` | Pebble-backed KV primitive for canonical records and the journal | Advanced |
+| `index` | Unified index store, namespace routing, liveness, recovery markers | Advanced |
+| `index/bitmapidx` | Enum, bool, text, continuous, and BSI bitmap namespaces | Advanced |
+| `index/timeidx` | Exact timestamp index | Advanced |
+| `index/geoidx` | S2 geographic index | Advanced |
+| `index/radixhash` | Exact 256-bit hash index | Advanced |
+| `index/simhash` | pHash/PDQ perceptual similarity, dense and sparse IDs | Advanced |
 | `index/vectoridx` | HNSW vector index | Experimental |
-| `search` | Reusable conjunctive plans, snapshots, executors, metrics | Stable |
+| `search` | Reusable conjunctive plans, snapshots, executors, metrics | Primary |
 | `search/ranking` | Optional ranking/fusion helpers | Advanced |
-| `roar` | Immutable roaring bitmaps and kernels | Advanced stable |
+| `roar` | Immutable roaring bitmaps and kernels | Advanced |
 | `internal/*` | Private storage, kernels, benchmark harness | Internal |
 | `cmd/imageidx` | CLI, HTTP demos, and runnable examples | Examples/tools |
 
-`database.DB` is the stable application entry point. `index` and `store` remain
+`database.DB` is the primary application entry point. `index` and `store` remain
 public for advanced and standalone use. Vector APIs, performance, and file
-formats are explicitly experimental in V1.
+formats are explicitly experimental in 0.5.
 
 ## Data flow
 

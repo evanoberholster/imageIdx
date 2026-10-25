@@ -1,36 +1,38 @@
-# V1 contracts and release policy
+# 0.5 contracts and release policy
 
-This file freezes the intended V1 public surface and operational contracts. It
-is a summary; package documentation and tests are authoritative for exact
+This file records the intended 0.5 public surface and operational contracts.
+ImageIdx 0.5 is pre-1.0, so breaking API changes remain possible. Persistence
+changes still require explicit versioning, migration, or fail-closed rejection.
+This is a summary; package documentation and tests are authoritative for exact
 signatures and error wrapping.
 
-## Stable V1 API
+## Public 0.5 API
 
-| Package | Stable surface |
+| Package | Public surface |
 |---|---|
-| `database` | `DB`, `Open`, `Mutation`, `Options`, `CanonicalProjectionMode`, `RecoveryPolicy`, `RecoveryStatus`, stable error sentinels, `Commit`, `WaitIndexed`, `Sync`, `Checkpoint`, `Get`, `DatabaseGeneration`, `IndexedGeneration`, `Close` |
+| `database` | `DB`, `Open`, `Mutation`, `Options`, `CanonicalProjectionMode`, `RecoveryPolicy`, `RecoveryStatus`, exported error sentinels, `Commit`, `WaitIndexed`, `Sync`, `Checkpoint`, `Get`, `DatabaseGeneration`, `IndexedGeneration`, `Close` |
 | `schema` | `Definitions`, `NamespaceDef`, `EntityKind`, `Namespace`, identifier aliases, `Schema` open/ID APIs, durable format errors |
-| `search` | `Engine`, `Plan`, `Executor`, clause constructors, `Workspace`, `Page`, result types, metrics, stable errors |
-| `store` | Advanced stable KV `Store`, `Key`, `Batch`, `Spec`/`Open`, sync durability, owned `Get`, scan ownership |
-| `index` | Advanced stable unified store, typed accessors, `Entry`, `Change`, `Batch`, matcher, definition helpers, health/recovery diagnostics |
-| `index/bitmapidx` | Advanced stable namespaces and BSI APIs |
-| `index/timeidx` | Advanced stable timestamp APIs |
-| `index/geoidx` | Advanced stable geographic APIs |
-| `index/radixhash` | Advanced stable exact-hash APIs |
-| `index/simhash` | Advanced stable perceptual APIs, including sparse external IDs |
-| `roar` | Advanced stable immutable bitmap representation/operators |
+| `search` | `Engine`, `Plan`, `Executor`, clause constructors, `Workspace`, `Page`, result types, metrics, exported errors |
+| `store` | Advanced KV `Store`, `Key`, `Batch`, `Spec`/`Open`, sync durability, owned `Get`, scan ownership |
+| `index` | Advanced unified store, typed accessors, `Entry`, `Change`, `Batch`, matcher, definition helpers, health/recovery diagnostics |
+| `index/bitmapidx` | Advanced namespaces and BSI APIs |
+| `index/timeidx` | Advanced timestamp APIs |
+| `index/geoidx` | Advanced geographic APIs |
+| `index/radixhash` | Advanced exact-hash APIs |
+| `index/simhash` | Advanced perceptual APIs, including sparse external IDs |
+| `roar` | Advanced immutable bitmap representation/operators |
 | `search/ranking` | Optional advanced ranking/fusion helpers |
 
 ## Experimental surface
 
 `index/vectoridx` and vector portions of `index` (`KindVector`, `VectorDef`,
 `VectorValue`, vector accessors, and rank/filter integration) are functional but
-**experimental**. V1 does not promise vector API, performance, or file-format
-stability. No Phase 4 batching or graph redesign is required for V1.
+**experimental**. 0.5 does not promise vector API, performance, or file-format
+stability. No Phase 4 batching or graph redesign is required for 0.5.
 
 ## Primary lifecycle
 
-Current V1 bootstrap:
+Current 0.5 bootstrap:
 
 1. build a `schema.Definitions`;
 2. create the derived index once with `index.Create` or
@@ -38,11 +40,11 @@ Current V1 bootstrap:
 3. call `database.Open(dataDir, indexDir, decoder, options)`;
 4. use `database.DB` for subsequent lifecycle operations.
 
-`database.Open` on an existing V1 database consumes `schema.dat` and does not
+`database.Open` on an existing 0.5 database consumes `schema.dat` and does not
 need definitions or index creation repeated. `DB.Index()` is an advanced
 read accessor; do not write to or close it while the coordinator runs.
 
-There is no `database.DB.Search` in V1. Search remains explicit:
+There is no `database.DB.Search` in 0.5. Search remains explicit:
 
 ```go
 engine, err := search.New(db.Index())
@@ -52,7 +54,7 @@ ids, err := plan.AppendIDs(ctx, dst, workspace)
 
 This preserves caller-owned plans, workspaces, destinations, metrics, and
 pagination. A future database-level facade must be benchmarked and must not
-replace this path; absent that proof, it is not part of V1.
+replace this path; absent that proof, it is not part of 0.5.
 
 ## Ownership
 
@@ -127,7 +129,7 @@ stable sentinels (`ErrClosed`, `ErrInvalidSchema`, `ErrNamespaceUnavailable`,
 
 ## Limits and options
 
-| Limit | V1 behavior |
+| Limit | 0.5 behavior |
 |---|---|
 | `Options.BatchSize` | Default 64; values above 64 rejected. This is one index-apply batch, not the total mutations in a `Commit`. |
 | `Options.MaxPending` | Bounds unacknowledged journal lag; zero is unbounded. |
@@ -142,17 +144,18 @@ stable sentinels (`ErrClosed`, `ErrInvalidSchema`, `ErrNamespaceUnavailable`,
 
 ## Version and persistence policy
 
-- `schema.dat` is authoritative. V1 container v3 is the baseline; v2 is read as
+- `schema.dat` is authoritative. 0.5 container v3 is the baseline; v2 is read as
   ACTIVE and upgraded on publication. Container/allocator v1 is rejected.
-- Canonical inline v1, external v2, and journal v2 are V1 contracts. Derived
+- Canonical inline v1, external v2, and journal v2 are 0.5 contracts. Derived
   index files are versioned, rebuildable caches, not permanent binary promises.
-- Pre-V1 experimental databases are not automatically opened. Unsupported or
+- Pre-0.5 experimental databases are not automatically opened. Unsupported or
   corrupt formats fail closed and are never silently reinterpreted.
 - Canonical/schema semantic changes require a version bump and explicit migration
   or rejection.
-- Journal replay must remain correct for committed V1 databases.
-- API compatibility is promised only for the documented stable surface; vector
-  components are experimental.
+- Journal replay must remain correct for committed 0.5 databases.
+- The documented 0.5 public surface is the intended API contract. Before 1.0,
+  breaking changes remain possible and must be called out in release notes.
+  Vector components are experimental.
 
 See [`database/FORMAT.md`](../database/FORMAT.md) and
 [`schema/FORMAT.md`](../schema/FORMAT.md).
@@ -173,21 +176,21 @@ queries, sparse SimHash lookups, concurrent ingest/search, reopen, allocations,
 and retained memory. Keep 10M runs opt-in via `IMAGEIDX_BENCH_LARGE`. Report
 logical byte counters separately from actual filesystem/device I/O.
 
-V1 has no throughput-improvement quota. Correctness, durability, stable documented
+0.5 has no throughput-improvement quota. Correctness, durability, documented
 APIs, and no serious unexplained regression are the release gates. Any material
 regression must be explained and measured on matched hardware/compiler/config.
 
 ## Release and platform policy
 
-- V1 must reopen V1 databases and fail closed on unsupported/corrupt formats.
+- 0.5 must reopen 0.5 databases and fail closed on unsupported/corrupt formats.
 - The release tag must point to the exact validated commit.
 - Supported CI exercises Linux `amd64` and `arm64`, including the internal
   SIMD-kernel equivalence suites.
 - No selective recovery, per-family writers, adaptive batching, vector
   stabilization, new SIMD architecture, allocator rewrite, or ranking redesign
-  is required for V1.
+  is required for 0.5.
 
-## Post-V1
+## Post-0.5
 
 Deferred unless a demonstrated correctness/data-loss defect forces work:
 

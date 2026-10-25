@@ -3,8 +3,8 @@
 //
 // # Experimental status
 //
-// VectorIdx is functional but experimental in V1. Its public API, performance,
-// and on-disk formats are not covered by the stable V1 compatibility promise.
+// VectorIdx is functional but experimental in 0.5. Its public API, performance,
+// and on-disk formats are not covered by the 0.5 compatibility promise.
 // The scope below describes the current implementation, not a release guarantee.
 //
 //   - Closed dimensions {512, 768, 1024} and one element type per index

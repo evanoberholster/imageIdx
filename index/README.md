@@ -1,14 +1,14 @@
 # index — unified index Store
 
 `index` is the advanced unified store that owns and coordinates the six imageIdx
-index families in one root directory. Applications using the stable database
+index families in one root directory. Applications using the primary database
 lifecycle should normally use [`database.DB`](../database/README.md); `index`
 remains public for standalone use, import/matcher workflows, and advanced
 services.
 
 > **Experimental family:** `KindVector` and `index/vectoridx` are functional but
-> experimental in V1. Vector APIs, performance, and on-disk formats are not part
-> of the stable V1 compatibility promise.
+> experimental in 0.5. Vector APIs, performance, and on-disk formats are not part
+> of the 0.5 compatibility promise.
 
 | Namespace kind | Engine | Files |
 |---|---|---|

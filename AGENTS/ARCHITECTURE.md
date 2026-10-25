@@ -199,7 +199,7 @@ APIs are rejected.
 `index/vectoridx` implements persistent HNSW with one serialized writer,
 atomic snapshots, WAL/delta generations, tombstones, candidate filtering, and
 exact-scan fallback. Vector APIs, performance, and file formats are **not**
-stable V1 contracts.
+0.5 contracts.
 
 ## search
 
@@ -241,14 +241,14 @@ See [`search/README.md`](../search/README.md).
 
 | Artifact | Authority |
 |---|---|
-| `schema.dat` | `schema`; V1 container v3 |
-| Canonical values / journal keys | `database`; V1 canonical v1/v2, journal v2 |
+| `schema.dat` | `schema`; 0.5 container v3 |
+| Canonical values / journal keys | `database`; 0.5 canonical v1/v2, journal v2 |
 | Journal and canonical semantics | `database/FORMAT.md` |
 | `store.bin` | `index`; derived version 2 |
 | Engine files | Each engine package; rebuildable caches |
 | Roaring serialization | `roar/FORMAT.md` |
 
-Derived index files are not permanent V1 binary contracts. They must carry
+Derived index files are not permanent 0.5 binary contracts. They must carry
 version checks and a safe rebuild route. `schema.dat` and canonical semantic
 changes require versioning and explicit migration or fail-closed rejection.
 
