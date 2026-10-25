@@ -1,7 +1,12 @@
-# vectoridx
+# vectoridx (experimental)
+
+> **Experimental in V1.** Keep existing vector functionality working, but do not
+> treat the public API, performance, or on-disk format as a stable V1 contract.
+> Stable applications should treat vector search as an optional experimental
+> feature.
 
 Persistent HNSW approximate-nearest-neighbor vector index implementing
-`AGENTS/VectorIdx.MD` phases 1–2 (scalar core, in-memory HNSW correctness),
+experimental phases 1–2 (scalar core, in-memory HNSW correctness),
 4 (WAL and tombstones), 5 (pooled search state), 6 (post-ANN filtering), and
 8 (explicit compact/rebuild), plus Weaviate-inspired production features:
 multi-metric distance (L2/cosine/dot), dynamic `ef`, heuristic neighbor
@@ -191,7 +196,7 @@ that degrade the graph fail loudly.
 
 | File | Contents |
 |---|---|
-| `doc.go` | Package overview, V1 scope and simplifications |
+| `doc.go` | Package overview, experimental scope and current limitations |
 | `types.go` | Namespace/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
 | `distance.go` | Scalar L2/cosine/dot kernels, dispatch, `EncodeScore` |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
@@ -203,7 +208,7 @@ that degrade the graph fail loudly.
 | `manifest.go` | Manifest and delta generations, Checkpoint/Vacuum, promotion |
 | `wal.go` | Segmented framed WAL: rotation, append, prefix recovery |
 
-## Deliberate V1 simplifications (future work)
+## Current experimental limitations (future work)
 
 - Readers are lock-free over heap snapshots (tracker + atomic view), not
   yet mmap epochs; generations on disk are already immutable, so the swap

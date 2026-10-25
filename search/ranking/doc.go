@@ -2,7 +2,7 @@
 // RRF fusion, deterministic sorting and Top-K selection over candidate
 // ImageIDs.
 //
-// # Invariants (changed from AGENTS/Ranking.MD after review)
+// # Invariants (documented in AGENTS/ARCHITECTURE.md)
 //   - Higher Rank is better. NoRank (0) means missing/unranked and sorts last.
 //     Ordinary values are 1 (worst) .. 65535 (best). Exact matches encode to
 //     65535. This inverts the proposal's lower-is-better convention so that a

@@ -5,8 +5,7 @@ canonical image tuple `pHash64 + PDQ256 + PDQQuality`**. It is deliberately not 
 generic column store: the only supported shape is this tuple, indexed directly by
 `schema.ImageID`.
 
-The full design is in [`AGENTS/SimHash.md`](../../AGENTS/SimHash.md). This README
-covers usage and measured results.
+Current architecture is summarized in [`AGENTS/ARCHITECTURE.md`](../../AGENTS/ARCHITECTURE.md#perceptual-hashes). This README covers usage and measured results.
 
 ## Properties
 

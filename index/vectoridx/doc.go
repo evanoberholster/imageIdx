@@ -1,7 +1,11 @@
 // Package vectoridx implements VectorIdx, a persistent HNSW
-// approximate-nearest-neighbor vector index following AGENTS/VectorIdx.MD.
+// approximate-nearest-neighbor vector index. See AGENTS/ARCHITECTURE.md.
 //
-// # Scope of V1
+// # Experimental status
+//
+// VectorIdx is functional but experimental in V1. Its public API, performance,
+// and on-disk formats are not covered by the stable V1 compatibility promise.
+// The scope below describes the current implementation, not a release guarantee.
 //
 //   - Closed dimensions {512, 768, 1024} and one element type per index
 //     {int8, uint8, int16, uint16, float32}, stored as received.
@@ -36,7 +40,7 @@
 //     query buffer) and SearchInto result reuse with zero steady-state allocs
 //     on the flat and ANN paths.
 //
-// # What V1 simplifies
+// # Current experimental limits
 //
 //   - Readers use heap snapshots rather than fully lock-free mmap epoch
 //     reads. File generations remain immutable; a future change can swap in

@@ -72,7 +72,7 @@
 // readers, a dual-superblock mmap arena with reopen/checkpoint, and NEON/AVX2
 // tail kernels behind a scalar reference. WAL durability modes, shard
 // rollover, and the unified index.Store integration are follow-ups described
-// in AGENTS/RadixTreeHash.MD.
+// in AGENTS/ARCHITECTURE.md.
 package radixhash
 
 import (

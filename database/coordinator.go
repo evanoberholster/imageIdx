@@ -207,9 +207,20 @@ func (db *DB) stageEvent(ws *coordinatorWorkspace, i int, batch *index.Batch) er
 	case m.deleted:
 		return batch.Delete(m.entity, m.id)
 	case m.insert:
+		if entryAssociations(event.after) == 0 {
+			return batch.Touch(m.entity, m.id)
+		}
 		return batch.Add(event.after)
+	case m.reinsert:
+		if entryAssociations(event.before)+entryAssociations(event.after) == 0 {
+			return batch.Touch(m.entity, m.id)
+		}
+		// A tombstone carries the old projection so reinsertion can remove
+		// associations absent from the new projection. Update also restores
+		// liveness for the touched entities.
+		return batch.Update(index.Change{Before: event.before, After: event.after})
 	case entryAssociations(event.before)+entryAssociations(event.after) == 0:
-		return nil
+		return batch.Touch(m.entity, m.id)
 	default:
 		return batch.Update(index.Change{Before: event.before, After: event.after})
 	}

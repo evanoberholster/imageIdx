@@ -2,20 +2,28 @@
 // the canonical image-hash tuple: a 64-bit pHash, a 256-bit PDQ hash, and a PDQ
 // quality byte.
 //
-// The full design is documented in AGENTS/SimHash.md; usage and measured results
-// are in index/simhash/README.md.
+// Current architecture is summarized in AGENTS/ARCHITECTURE.md; usage and
+// measured results are in index/simhash/README.md.
 //
 // # Addressing
 //
-// There is no stored ImageID and no per-record offset table. ImageIDs are dense,
-// stable, monotonically assigned, and never reused. The low 16 bits select the
-// slot within a hash page and the high bits select the hash page:
+// The dense path has no stored ImageID and no per-record offset table. Dense
+// ImageIDs are contiguous, stable, and assigned by the append API. The low 16
+// bits select the slot within a hash page and the high bits select the hash
+// page:
 //
 //	slot := uint16(imageID & 0xffff)
 //	hashPage := imageID >> 16
 //
 // A hash page covers exactly 65,536 ImageIDs; the ImageID is recovered by
 // hashPage<<16|slot.
+//
+// Arbitrary nonzero external IDs use the durable sparse overlay described in
+// index/simhash/README.md. Sparse records are stored in immutable CRC-checked
+// segments with an atomically replaced manifest; the overlay filters dense
+// records it replaces and results remain in ascending ImageID order. Once a
+// sparse overlay is used, dense append APIs are rejected so there is one source
+// of truth.
 //
 // # Columnar layout
 //

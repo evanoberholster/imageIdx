@@ -1,302 +1,276 @@
-# database: authoritative records and derived indexes (alpha)
+# database: authoritative records and derived indexes (V1)
 
-> **Format note:** this branch uses journal v2 and magic-tagged canonical
-> records. ImageIdx is pre-V1; databases created by earlier development
-> branches must be recreated or explicitly rebuilt rather than opened in place.
-> Unsupported journal/canonical versions fail closed.
+`database.DB` is the primary V1 entry point for applications. It coordinates:
 
-`database.DB` coordinates `schema.dat` (entity IDs and all logical namespace
-definitions), Pebble (canonical bytes, journal, operational generations), and
-the unified index (physical engines and recovery metadata). The initial index
-may be created with standalone `index.Create`; database startup validates and
-retires its old `schema.bin` after establishing schema.dat. Subsequent index
-opens consume central definitions. Allocation-file format v1 returns
-`schema.ErrVersion`; no namespace-scoped counter migration is attempted.
+- the authoritative `schema.dat` file;
+- Pebble canonical records and the ordered mutation journal;
+- the derived unified index and its recovery state;
+- the asynchronous coordinator that applies journal entries to indexes and
+  acknowledges completed generations.
 
-`database.Open` takes an exclusive database lock. On new databases it validates
-the index and writes schema.dat before creating Pebble; Pebble never receives
-a serialized schema registry. Existing databases validate old Pebble and index
-copies during their one-time migration, preserve namespace IDs and allocator
-reservations, remove those copies, then durably mark retirement in schema.dat.
-Later opens do not read old Pebble schema keys. Losing schema.dat after migration
-fails closed, without scanning records to invent IDs.
+Canonical commits are durable before indexing completes. Search is eventually
+consistent unless the caller waits for the returned generation.
 
-Additions supplied through `Options.Definitions` are allowed only at startup.
-Existing definitions must remain an identical prefix; removal, renaming,
-reassignment, or changing configuration fails. schema.dat publishes the full
-target as PREPARED before physical index work; the previous superblock remains
-ACTIVE. The index is rebuilt into a verified staging directory from canonical
-projections and activated with the index recovery marker. Once every namespace
-is healthy and durable, schema.dat publishes ACTIVE. A crash can repeat staging
-or finish a verified activation; recovery loads the durable target from
-schema.dat without requiring the caller's original options. An index that
-cannot be rebuilt from canonical projections fails closed. A KV-only addition
-reuses the healthy index unchanged: the coordinator still publishes PREPARED
-and ACTIVE, but no index rebuild or backfill runs. Canonical namespaces
-come from persisted `entity-<kind>` definitions and need not match EntityKind
-ordinals; `Options.CanonicalNamespaces` never renumbers existing databases.
+## Package direction
 
-`NextID` issues unique IDs from the entity allocator. Explicit IDs in `Commit`
-use caller-owned, last-writer-wins canonical record semantics. `EnsureMinimum`
-protects future allocations, **not** IDs already issued to another goroutine.
-A bulk import must finish and reconcile its maximum before concurrent `NextID`
-for that entity using `PrepareImport(entity, maximum)`; callers must coordinate
-this phase themselves. Runtime
-external-ID insertion cannot promise uniqueness against outstanding issued IDs.
-database directory is exclusively owned by this package: its fixed `entity-*`
-collections contain canonical records, namespace 65533 holds ordered journal
-entries, and 65534 holds generation metadata. Do not mutate these namespaces
-through a separate `store.Store` handle. `db.Index()` exposes the derived
-store for searches; **do not write to or close it directly** while the
-coordinator is running, or completeness claims no longer cover every mutation.
+```text
+schema + database + index + store + search
+```
 
-## Startup recovery (experimental)
-
-`Options.Recovery` defaults to `RecoveryManual`: an unhealthy index returns
-`ErrRecoveryRequired`, leaving canonical data and journal intact.
-`RecoveryAutomatic` can perform a **synchronous startup** rebuild if the
-derived index is missing, corrupt, has an interrupted recovery marker, or
-cannot establish the Pebble acknowledgment. A healthy index merely behind the
-database instead uses the journal publisher; it does not rebuild. `DB` also
-exposes `RecoveryStatus()` for per-namespace `RecoveryHealthy`,
-`RecoveryBehind`, `RecoveryRequired`, or `RecoveryFailed` states and durable namespace source
-generations. No ordinary database reader or writer receives a DB while its
-startup rebuild is in progress.
-
-An existing schema.dat supplies index definitions for rebuild, even if the
-entire index directory or old `schema.bin` is missing. A pre-schema.dat legacy
-database without either copy cannot recover definitions and fails closed. After
-the retirement marker, the old Pebble backup is never consulted.
-
-The current physical rebuild reconstructs **all declared namespaces**, not
-just the damaged logical namespace. Bitmap namespaces share one segment and
-WAL, and every namespace's liveness uses that store; targeted physical
-activation is not implemented. The original directory remains untouched until
-a replacement has been completely scanned, durably assigned the canonical
-generation, structurally verified, closed, and reopened. The replacement lives
-at `<indexDir>.rebuild`; a checksummed `<indexDir>.activation` records BUILDING
-or VERIFIED, the source generation, and a fingerprint of the index definitions
-from schema.dat. Reopen validates this fingerprint before any rename. Only a
-VERIFIED replacement may replace `<indexDir>`; the previous generation is
-temporarily moved to `<indexDir>.previous`. Every rename is followed by parent
-directory sync. On restart the activation record finishes or restarts the
-operation, and cleanup only removes this package's owned staging/previous
-directories. This uses *directory* renames, not a single-file rename across
-multi-file index families.
-
-The canonical scan streams in bounded index batches (default 64) and skips
-deleted tombstones. Namespace definitions and entity ownership are checked
-before indexing, so two entities with the same numeric ID cannot mix. SimHash
-must still use dense IDs; a sparse record returns `ErrUnsupportedRebuild` and
-leaves the original index and canonical records intact. No ImageID remapping
-is performed.
-
-**Limits:** activation is safe only before `Open` publishes the index to any
-caller. There is no runtime `Rebuild` or hot-swap API: compiled search plans
-could otherwise retain old mmap-backed pointers. This version does not permit
-canonical writes during a rebuild, independently replace healthy non-bitmap
-engines, implement record-by-record logical verification for every index
-family, or meet the full PR #22 crash/performance matrix. Do not mark automatic
-recovery feature-complete on the strength of these startup tests alone.
-
-## Usage
-
-The application supplies a stable, deterministic binary projection encoder and
-`database.Decoder` for its domain. The projection represents a **complete**
-`index.Entry` for an entity; both old and new projections must decode after a
-restart. Keep photography-specific schemas out of this package. For example,
-with an image-tag namespace `101`, a projection can be nine bytes (big-endian
-image ID followed by one tag byte); the decoder maps those bytes to
-`index.Entry{ValueID: id, Bitmaps: []index.BitmapValue{...}}`.
+`database` owns `schema.Schema`, a canonical `store.Store`, and an
+`index.Store`. `database` does not import `search`; applications bind search with:
 
 ```go
-// idxDir was initialized once using index.Create(idxDir, index.Spec{Schema: schema}).
+engine, err := search.New(db.Index())
+```
+
+`DB.Index()` is an advanced accessor. Do not write to or close the returned
+store while the coordinator is running.
+
+## Create and open
+
+The current V1 bootstrap creates the derived index directory once with
+`index.Create`, then opens `database.Open`:
+
+```go
+defs := schema.NewDefinitions()
+tag, err := index.BitmapDef(bitmapidx.NamespaceSpec{
+    Namespace: schema.NamespaceTag,
+    Kind:      schema.KindBitmapEnum,
+}, "tags", schema.EntityImage)
+if err != nil { return err }
+if err := defs.Register(tag); err != nil { return err }
+
+idx, err := index.Create(idxDir, index.Spec{Schema: defs})
+if err != nil { return err }
+if err := idx.Close(); err != nil { return err }
+
 db, err := database.Open(dataDir, idxDir, decodeProjection, database.Options{
-    BatchSize: 64, MaxPending: 100_000,
+    BatchSize: 64,
 })
 if err != nil { return err }
 defer db.Close()
+```
 
+On the first successful open, `database` validates the independently created
+index, writes `schema.dat`, and initializes Pebble. Later opens of an existing
+V1 database use `database.Open` directly; the index directory already exists.
+The index creation step is a bootstrap exception, not a second database
+lifecycle.
+
+An existing V1 database rejects missing `schema.dat`, incompatible index
+definitions, unsupported formats, and unrecoverable journal state. See
+[`FORMAT.md`](FORMAT.md) for the exact compatibility matrix.
+
+## Projection contract
+
+The application owns the meaning of canonical records and index projections.
+`database` never interprets application-specific record bytes.
+
+`Decoder` receives durable projection bytes and returns a complete
+`index.Entry`. The projection must contain every association required to remove
+or replace the previous indexed state. It must be deterministic across process
+restarts.
+
+```go
+func decodeProjection(p []byte) (index.Entry, error) {
+    if len(p) != 9 {
+        return index.Entry{}, database.ErrCorruptJournal
+    }
+    return index.Entry{
+        ValueID: binary.BigEndian.Uint64(p[:8]),
+        Bitmaps: []index.BitmapValue{{
+            Namespace: schema.NamespaceTag,
+            Value:     bitmapidx.EnumBytesValue(p[8:9]),
+        }},
+    }, nil
+}
+```
+
+`Options.DecodeInto` is the allocation-conscious form. It takes precedence over
+`Decoder`; decoded projections may borrow the supplied scratch only until the
+coordinator finishes the current journal batch.
+
+### Canonical projection modes
+
+- `CanonicalProjectionInline` stores projection bytes with the application
+  record. It is the default for a fresh database.
+- `CanonicalProjectionExternal` stores only the application record and requires
+  `ProjectFromRecord` or `ProjectInto` to reconstruct projections.
+- The mode is persisted in `schema.dat`. Reopening with a different explicit
+  mode fails with `ErrCanonicalModeMismatch`.
+- Projection-version migrations require external mode and a projector callback.
+
+## Commit and indexing
+
+```go
 generation, err := db.Commit(database.Mutation{
-    Entity: schema.EntityImage, ValueID: imageID,
-    Record: imageMetadata, Projection: encodedIndexEntry,
+    Entity:     schema.EntityImage,
+    ValueID:    id,
+    Record:     canonicalRecord,
+    Projection: encodedIndexEntry,
 })
-if err != nil { return err } // canonical commit + journal are already durable
+if err != nil { return err }
 if err := db.WaitIndexed(ctx, generation); err != nil { return err }
+```
 
+`Commit` atomically writes the canonical value, the journal entry, and the next
+committed generation in one synced Pebble batch. A failed commit consumes no
+sequence. Duplicate `(Entity, ValueID)` entries in one call are rejected; submit
+revisions separately.
+
+`WaitIndexed(ctx, generation)` waits until the derived index is durable and
+visible through `generation`. `Sync(ctx)` waits for every generation committed
+before the call. Ordinary searches may lag the latest canonical commit until
+the wait completes.
+
+`DB.Checkpoint()` checkpoints derived indexes and truncates engine journals
+where supported. Canonical Pebble data is already durable. Run it during idle
+periods; it does not replace `WaitIndexed`.
+
+### Delete and reinsert
+
+A delete writes a canonical tombstone and a journal delete. The tombstone keeps
+the old inline projection or external canonical record so a later reinsertion can
+remove the previous indexed associations correctly.
+
+```go
+if _, err := db.Commit(database.Mutation{
+    Entity: schema.EntityImage, ValueID: id, Delete: true,
+}); err != nil { return err }
+
+if _, err := db.Commit(database.Mutation{
+    Entity: schema.EntityImage, ValueID: id,
+    Record: record, Projection: projection,
+}); err != nil { return err }
+```
+
+### Schema changes
+
+Namespace additions are startup-only. Close the database, supply the complete
+target through `Options.Definitions` on the next open, and let `database`
+publish PREPARED/ACTIVE schema state and rebuild index resources. Removed,
+renamed, retyped, reconfigured, or reassigned existing namespaces are rejected.
+Projection-version changes require the explicit `ProjectionMigration` path and
+an external projector.
+
+## Read canonical records
+
+```go
+record, err := db.Get(schema.EntityImage, id)
+```
+
+`Get` returns caller-owned bytes without projection metadata. A tombstoned or
+missing ID returns `store.ErrNotFound`.
+
+## Search integration
+
+Search remains a separate package so applications can keep explicit control over
+plans, workspaces, destination buffers, and execution mode:
+
+```go
 engine, err := search.New(db.Index())
 if err != nil { return err }
-clause, err := engine.Values(101, bitmapidx.EnumBytesValue([]byte("favorite")))
+
+clause, err := engine.Values(schema.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
 if err != nil { return err }
+
 plan, err := engine.Compile(schema.EntityImage, clause)
 if err != nil { return err }
-ids, err := plan.AppendIDs(ctx, nil, search.NewWorkspace(128))
-_ = ids
-return err
+
+workspace := search.NewWorkspace(1024)
+ids, err := plan.AppendIDs(ctx, nil, workspace)
 ```
 
-`Commit(mutations...)` returns the last strictly increasing sequence, assigning
-one sequence per operation and writing all records, journal entries, and the
-next sequence in **one synced Pebble batch**. A failed batch consumes no
-sequence. Duplicate `(Entity, ValueID)` in the same call is rejected; commit
-such revisions separately. `Get` reads authoritative bytes; a deletion is
-represented by a canonical tombstone so the old index projection survives a
-later re-insertion of the same ID. `Commit` accepts up to the caller's memory
-budget; the coordinator reads at most `Options.BatchSize` entries (default 64)
-per index batch. `MaxPending` limits sequence lag and causes new commits to
-return `ErrJournalFull` rather than buffering unbounded work. A zero limit is
-unlimited.
+- Every `Engine` plan execution pins one coherent published snapshot across its
+  participating indexes.
+- Search does not fetch canonical records. Call `db.Get` only after selecting
+  the IDs that require materialization.
+- `search.Executor` pools workspaces for services; the caller still owns plans,
+  destinations, and result buffers.
+- Direct `search.Compile` plans are lower-level and read live engine views.
+  Keep their indexes open.
 
-`Options.DecodeInto` is an optional allocation-conscious decoder form; when it
-is set, `Decoder` may be nil. The coordinator copies each journal entry's
-before+after payload once into reusable 64 KiB blocks, retains roughly 1 MiB of
-ordinary block capacity, and keeps at most one bounded oversized buffer.
-`Options.MaxProjectionBytes` (default 1 MiB) bounds the copied before+after
-bytes in one batch; a single oversized mutation is still processed alone.
-`Options.OversizedRetentionBytes` (default 4 MiB) bounds the one reused oversized
-buffer. The index copies any bytes it needs to retain; callers must not retain
-views into coordinator storage. `DB.Stats()` exposes cumulative application-level
-operation counters and logical byte estimates for benchmarks and diagnostics; it
-is not a transactional snapshot and does not measure device writes or `fsync`
-syscalls.
+## Ownership, concurrency, and consistency
 
-## Journal, ordering and replay
+- `DB` is safe for concurrent callers except where a method documents exclusive
+  ownership of a batch, workspace, or report.
+- `Mutation.Record` and `Mutation.Projection` are caller-owned and may be reused
+  after `Commit` returns.
+- `DB.Get` returns caller-owned bytes.
+- `DB.Index()` returns the live derived store. Treat it as read-only and keep it
+  open while plans or executors reference it.
+- `DB.Close` rejects new operations, drains the coordinator, closes the index,
+  and releases database locks. It may wait for active query plans to release
+  their pinned snapshots; drain long-running reads before close.
+- A search plan sees one published generation for the duration of one
+  execution. Separate pages or separate executions may observe newer writes.
+- Cancellation is reported through the context. `WaitIndexed` does not poll and
+  returns the coordinator error if indexing fails permanently.
 
-Journal keys use `store.Key{Namespace: 65533, ID: sequence}`: `[uint16
-namespace][uint64 big-endian sequence][uint16 flags=0]`. Payload v2 is a typed,
-CRC32-protected delta envelope:
+### Error families
 
-```text
-version:u8 | flags:u8 | entity:u8 | valueID:u64
-beforeCount:u16 | afterCount:u16 | beforeLen:u32 | afterLen:u32
-beforeAssociations | afterAssociations | crc32:u32
-```
+Stable sentinels are suitable for `errors.Is`:
 
-Each association is `family:u8 | namespace:u16 | payload`. The before list is
-the set removed by the mutation and the after list is the set added; inserts,
-no-op updates and deletes are explicit. The database owns this encoding; the
-application still owns complete `index.Entry` projection decoding. Full
-canonical record bytes are not journaled. Canonical values use a magic-tagged,
-versioned 7-byte header:
+| Error | Meaning |
+|---|---|
+| `ErrInvalidMutation` | Invalid entity, ID, projection length, or option |
+| `ErrClosed` | Database already closed |
+| `ErrJournalFull` | `MaxPending` limit reached |
+| `ErrSequenceOverflow` | Generation space exhausted |
+| `ErrRecoveryRequired` | Startup reconciliation or index recovery required |
+| `ErrCorruptJournal` | Invalid journal sequence, payload, or canonical state |
+| `ErrUnsupportedJournalVersion` | Unsupported journal format |
+| `ErrUnsupportedCanonicalVersion` | Unsupported canonical value format |
+| `ErrCanonicalModeMismatch` | Reopen requested a different projection mode |
+| `ErrCorruptDatabaseConfig` | Corrupt persisted database configuration |
+| `ErrProjectionUnavailable` | External projection callback required but absent |
 
-- inline projection (strategy A): live values retain projection bytes plus the
-  application record; tombstones retain the old projection.
-- external projection (strategy B): only the application record is stored and
-  `Options.ProjectFromRecord` or `Options.ProjectInto` reconstructs projection
-  bytes. Tombstones retain the old record.
+`store.ErrNotFound` identifies a missing or tombstoned canonical record.
+Unexpected storage errors are wrapped rather than converted to not-found.
 
-The selected mode is persisted in the schema-owned config bytes in `schema.dat`.
-A fresh database chooses it at creation; subsequent opens read and enforce it.
-Opening with a different explicit mode fails with `ErrCanonicalModeMismatch`.
-Mode changes are not supported. A projection-semantic version change requires
-external canonical mode plus a projector callback; inline mode is rejected
-because old inline projection bytes cannot be safely reinterpreted.
+## Recovery
 
-The coordinator is one bounded background publisher. It stages entries in an
-`index.Batch` and calls `ApplyWithGenerationAll`, which confirms touched and
-untouched healthy namespaces in one index manifest write; it does **not**
-rewrite unchanged values. Projection diffs use typed deterministic sorting and a
-linear merge; identical before/after associations are pruned by family before
-staging a `Change`, including timestamp, geography, hash, bitmap and vector
-values. Within one bounded journal interval the coordinator coalesces repeated
-same-entity events when their initial/final state is equivalent and the engine
-families are safe; SimHash/vector groups fall back to ordered sub-batches. Only
-after the
-store-wide `SourceGeneration()` is at least the batch's last sequence does it
-sync the Pebble acknowledgment. Cleanup uses one Pebble range tombstone for
-the acknowledged interval. On startup it checks the durable database
-generation, acknowledgment, index health/recovery markers and source watermark
-before replay. If the index watermark is **ahead** of the Pebble acknowledgment,
-it can safely acknowledge that already-durable prefix. If the acknowledgment
-is ahead of the recoverable index, it returns `ErrRecoveryRequired` and leaves
-the journal intact. Startup reads generation keys, not the whole record store.
+`Options.Recovery` defaults to `RecoveryManual`: an unhealthy index returns
+`ErrRecoveryRequired` and preserves canonical data and the journal.
 
-**Crash limitation:** a durable intent is written before applying an index
-batch. If a crash occurs after intent but before complete store-wide index
-durability, manual `Open` returns `ErrRecoveryRequired` instead of replaying
-over unknown partial state. Automatic startup recovery replaces the physical
-index from canonical projections. In particular, simhash append IDs are dense
-and cannot be assumed idempotent. The replacement has no old recovery marker;
-the live index's marker is not cleared merely by `Sync` or `Checkpoint`. A
-journal checksum or sequence gap is reported as `ErrCorruptJournal` and never
-skipped.
+`RecoveryAutomatic` performs a synchronous startup rebuild before the DB is
+published. The rebuild scans canonical projections, flags unsupported or corrupt
+state, and replaces the complete unified index using a verified staging
+directory. It does not attempt selective namespace replacement, and it never
+modifies canonical records.
 
-Search is **eventually consistent** after a canonical commit. Call
-`WaitIndexed(ctx, generation)` or `Sync(ctx)` before requiring search
-completeness. Waiters share a broadcast channel, respect cancellation and
-receive permanent coordinator errors. `DatabaseGeneration` is the latest
-committed sequence; `IndexedGeneration` is the durable acknowledged sequence;
-the latter never exceeds the former. Searches do not acquire the canonical
-writer lock. Cross-engine snapshots and atomic transactions are not supplied
-by `index.Store`.
+`DB.RecoveryStatus()` reports namespace health and the acknowledged generation.
 
-Tests include independent-process crashes before canonical commit, after
-canonical commit, before index apply, after index durability, after
-acknowledgment, and before cleanup. The incomplete intent case is deliberately
-recovery-required: **do not represent this alpha as automatic recovery from
-every mid-application crash.**
+### Recovery units
 
-## Sparse SimHash
+Bitmap namespaces share one physical bitmap store and timestamp namespaces share
+one physical time store, so selective namespace replacement is not safe in V1.
+Recovery uses the complete unified-index rebuild. The activation and staging
+boundaries are documented in [`FORMAT.md`](FORMAT.md).
 
-`simhash` keeps its dense append fast path for contiguous IDs and adds a durable
-segmented sparse overlay for arbitrary nonzero `uint64` external IDs, including
-gaps, high IDs and out-of-order upserts. `sparse.manifest` publishes immutable
-CRC-checked `sparse-<generation>.seg` files; an ordinary batch writes only a
-bounded delta segment, while explicit compaction merges live records (and
-dense-suppressing tombstones) into a replacement segment. Readers see an atomic
-base+overlay view, filter overridden dense IDs, and preserve ascending ImageID
-order. The old experimental `sparse.bin`/`*.sparse` format is rejected with an
-explicit rebuild error. Once the segmented sparse overlay is used, dense
-`AppendBatch`/`UpsertBatch` calls are rejected to avoid two sources of truth.
+## Limits and options
 
-## Recovery units
+| Option / limit | V1 behavior |
+|---|---|
+| `Options.BatchSize` | Defaults to 64; values above 64 are rejected. This is the per-index-apply batch, not the total mutations allowed in one `Commit`. |
+| `Options.MaxPending` | Bounds unacknowledged journal lag; zero means unbounded. |
+| `Options.MaxProjectionBytes` | Bounds copied before+after projection bytes in one coordinator batch; default 1 MiB. |
+| `Options.OversizedRetentionBytes` | Bounds the one retained oversized projection buffer; default 4 MiB. |
+| IDs | `ValueID` zero is reserved. Entity IDs are allocated by `schema.dat`; explicit IDs are last-writer-wins and do not protect against already-issued concurrent IDs. |
+| Vector IDs | Must fit the vector engine's `uint32` NodeID range; vector APIs remain experimental. |
+| Journal | Journal v2 only; unsupported versions fail closed. |
 
-The current unified-index layout shares one bitmap namespace segment/WAL across
-all bitmap namespaces and one time store across timestamp namespaces. There is
-no safe namespace-granular replacement boundary for those families. As a result,
-this release intentionally supports only the **full unified-index rebuild** as
-the recovery fallback: staging index, canonical rescan, verification and
-PREPARED/ACTIVATE-style replacement. `RecoveryManual` reports the unhealthy
-namespaces and requires an explicit `RecoveryAutomatic` reopen; automatic recovery
-never serves an incomplete namespace.
+## V1 persistence policy
 
-Family-granular recovery requires isolating bitmap/time physical directories and
-adding a staged family replacement protocol. It is not claimed by this release.
+- `schema.dat` and canonical record semantics are V1 compatibility contracts.
+- Journal replay must remain correct for committed V1 databases.
+- Derived index files are rebuildable caches, not permanent format promises.
+- Pre-V1 experimental databases are not automatically opened.
+- See [`FORMAT.md`](FORMAT.md) and [`schema/FORMAT.md`](../schema/FORMAT.md)
+  for the versioned details.
 
-## Projection versions
+## Example
 
-Each `schema.NamespaceDef` now carries `ProjectionVersion` in the definitions
-blob (blob version 3; versions 1/2 read as version 1). Projection changes are
-explicit restart-time migrations: `Options.ProjectionMigration` permits a
-version-only schema change when external canonical mode and a projector
-callback (`ProjectFromRecord` or `ProjectInto`) are supplied; the database
-rebuilds indexes from canonical application records through the existing
-PREPARED/ACTIVATE path. Downgrades and inline-mode semantic migrations are
-rejected. Canonical values are never rewritten solely to add an index definition.
-
-## Focused measurements
-
-On an Apple M4 Pro (`go test ./database -run '^$' -bench
-'^BenchmarkGenerationPublication$' -benchtime=30x -count=8`), `benchstat`
-compared the former nonempty-plus-empty generation path with the integrated
-publication path on the same two-namespace fixture: median **9.787 ms →
-4.933 ms** per mutation (-49.59%, p<0.001), **6.261 KiB → 4.932 KiB**
-allocated (-21.22%), **78 → 64** allocs/op. This isolates generation
-publication, not all database ingestion. The 64-image end-to-end batch
-measurement with a separate short run was about **2,869–2,890 images/s**;
-these are local numbers, not a production throughput guarantee.
-
-One measured startup-rebuild iteration reconstructed **10,000** enum records
-in **179 ms** (~56k records/s) and **100,000** in **397 ms** (~252k records/s),
-excluding fixture ingestion. These single observations are not a base-branch
-`benchstat` comparison and do not validate other index families.
-## ID allocation
-
-`DB.NextID(entity)` uses the standalone `schema` package's single-file
-`schema.dat` allocator, keyed by the entity's canonical namespace. Other
-namespaces for that entity reference the same ID; they do not allocate it.
-On first open, the database transfers the former Pebble allocator's durable
-high-water marks (if present) and reconciles canonical records and tombstones
-before publishing a synced migration marker. Later opens use only the schema
-file and never scan canonical records to reconstruct issued IDs. A clean close
-preserves the last issued ID; an unclean close skips unused reservations.
+A runnable end-to-end example is
+[`cmd/imageidx/examples/database`](../cmd/imageidx/examples/database/main.go).

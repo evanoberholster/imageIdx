@@ -29,12 +29,13 @@ not all query shapes or end-to-end application throughput.
 | Filter 100 candidate IDs | 432–434 ns | 0 |
 | Rank by time, best 10 of 100k | 1.49–1.50 ms | ~18.4 KB, 1 alloc |
 
-Persistent bitmap sources detach from mmap ownership, so count, paging and
-ranking still copy the selected source bitmap. Candidate filtering probes
-postings under a short read guard and avoids that copy. Timestamp sources and
-lossy timestamp filters can buffer IDs because `timeidx` has no ID-ordered
-cursor. Ranking still scores every verified match even when it retains only
-the best `k` results.
+Plans compiled by `search.Engine` execute against one reader-pinned engine
+snapshot. Persistent source materialization can copy selected bitmap data while
+the snapshot remains pinned; candidate filtering probes postings under that
+snapshot and avoids a full source copy. Direct `search.Compile` plans retain the
+older live-view behavior. Timestamp sources and lossy timestamp filters can
+buffer IDs because `timeidx` has no ID-ordered cursor. Ranking still scores every
+verified match even when it retains only the best `k` results.
 
 `BenchmarkPlanRefresh` was 90.7–94.4 ns and 448 B per call. The fixed-plan
 `BenchmarkExecutorQuery` was 36.7–36.9 µs and 0 allocs per operation. Refresh

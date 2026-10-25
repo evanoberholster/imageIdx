@@ -16,7 +16,10 @@
 // so a partially failed batch never makes an incomplete entity searchable.
 // Individual engines keep their own crash-safe, copy-on-write commit and reopen
 // guarantees, and every engine is independently rebuildable from the canonical
-// application database. See Store.Apply and the package README for details.
+// application database. Queries executed through search.Engine capture one
+// reader-pinned snapshot across participating engines; direct engine access and
+// direct search.Compile plans read live views. See Store.Apply and the package
+// README for details.
 package index
 
 import (

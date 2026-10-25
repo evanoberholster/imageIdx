@@ -201,18 +201,22 @@ func (db *DB) applyCoalescedGroups(ws *coordinatorWorkspace, groups []mutationGr
 		}
 
 		after := netEntryAfter(group.id, scratch)
-		if ws.mutations[group.first].insert {
+		before := netEntryBefore(group.id, scratch)
+		if ws.mutations[group.first].insert && entryAssociations(before) == 0 {
+			if entryAssociations(after) == 0 {
+				if err := batch.Touch(group.entity, group.id); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := batch.Add(after); err != nil {
 				return err
 			}
 			continue
 		}
-		before := netEntryBefore(group.id, scratch)
 		if entryAssociations(before)+entryAssociations(after) == 0 {
-			if !ws.mutations[group.first].insert {
-				if err := batch.Touch(group.entity, group.id); err != nil {
-					return err
-				}
+			if err := batch.Touch(group.entity, group.id); err != nil {
+				return err
 			}
 			continue
 		}

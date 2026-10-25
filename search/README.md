@@ -4,6 +4,25 @@ Compile conjunctive predicates once into an immutable, shareable `Plan`,
 then select an explicit execution operation. Destination buffers and
 `Workspace` scratch are exclusively owned by one execution.
 
+`search` is the query layer for the stable `database.DB` workflow. Bind it with
+`search.New(db.Index())`; `Engine.Compile` adds the entity liveness restriction
+and binds each execution to one coherent index snapshot.
+
+```go
+engine, err := search.New(db.Index())
+if err != nil { return err }
+clause, err := engine.Values(schema.NamespaceTag, bitmapidx.EnumStringValue("favorite"))
+if err != nil { return err }
+plan, err := engine.Compile(schema.EntityImage, clause)
+if err != nil { return err }
+ids, err := plan.AppendIDs(ctx, nil, search.NewWorkspace(1024))
+```
+
+Every `Engine` plan execution pins one snapshot for its participating indexes;
+writers may publish newer data while the query runs. Direct `search.Compile`
+plans are lower-level, hold live index handles, and require the indexes to stay
+open. `AppendPage` and separate executions may observe later publications.
+
 ## Search usage
 
 Compile once and reuse the plan. `Compile` canonicalizes predicates and
@@ -21,9 +40,10 @@ if err != nil { return err }
 var ws search.Workspace // reusable scratch; do not share across goroutines
 ```
 
-With a unified `index.Store`, use `search.New(db)` and `Engine.Compile` to
-include entity liveness automatically. For example, after registering a
-`KindBitmapBSI` namespace with width 16 in `schema.Definitions`:
+With a unified `index.Store`, use `search.New(store)` and `Engine.Compile` to
+include entity liveness automatically. In a `database.DB` application, pass
+`db.Index()`. For example, after registering a `KindBitmapBSI` namespace with
+width 16 in `schema.Definitions`:
 
 ```go
 engine, err := search.New(db)
@@ -145,10 +165,12 @@ updated, err := plan.Refresh(ctx) // reuses canonicalized predicates
 stages := updated.Stages()        // predicate, estimate, capabilities
 ```
 
-Stages read independently published views: a query is not a
-database-wide snapshot. `AfterID` is an ID cursor, not a score cursor.
-Keep indexes open during execution and never reuse the active workspace
-inside callbacks.
+`Engine` plans read one coherent pinned generation per execution; direct
+`Compile` plans read live per-engine views. Snapshot pins are held through
+`Visit` callbacks, so engine reclamation may wait before unmapping an old
+mapping. Successive `AppendPage` calls are separate executions and may observe
+newer writes. `AfterID` is an ID cursor, not a score cursor. Keep indexes open
+during execution and never reuse the active workspace inside callbacks.
 
 ## Exact-hash presence checks
 
