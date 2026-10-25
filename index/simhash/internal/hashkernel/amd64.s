@@ -20,7 +20,8 @@ TEXT ·avx2PDQBlockMaskAsm(SB), NOSPLIT, $0-40
 	MOVQ $1, R11 // bit = 1 << i
 
 loop:
-	CMPQ CX, R9
+	// Plan 9 CMPQ computes first-second: loop while i < count.
+	CMPQ R9, CX
 	JGE  done
 	MOVQ R9, R10
 	SHLQ $5, R10
@@ -42,7 +43,8 @@ loop:
 	ADDQ R13, R12
 	ADDQ DI, BX
 	ADDQ BX, R12
-	CMPQ DX, R12
+	// R12-DX: set bit when distance <= limit.
+	CMPQ R12, DX
 	JG   next
 	ORQ R11, R8
 

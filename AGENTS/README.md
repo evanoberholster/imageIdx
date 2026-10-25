@@ -105,11 +105,3 @@ shared `internal/bench` harness with a parallel framework.
 - Historical phase instructions and design reports are available in git history.
 - Package READMEs should describe public behavior. This directory explains how
   the pieces fit together.
-
-## Known release gate
-
-Linux `amd64` CI currently excludes two internal SIMD-kernel equivalence suites:
-`index/radixhash/internal/tailkernel` and
-`index/simhash/internal/hashkernel`. They pass on ARM64. This must be fixed or
-explicitly scoped out of the supported platform matrix before a V1 release tag.
-See [`CONTRACTS.md`](CONTRACTS.md#release-and-platform-policy).

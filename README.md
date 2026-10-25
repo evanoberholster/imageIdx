@@ -201,11 +201,10 @@ services without changing plan or result ownership.
 
 ## Platform support
 
-The repository CI currently exercises Linux `amd64` and Linux `arm64`. The
-public build, tests, and race suites run on both. Two internal SIMD-kernel
-equivalence suites are currently excluded on Linux `amd64`; see
-the known CI limitation below. Native Apple Silicon is used for development
-benchmarks, not as a CI replacement.
+The repository CI exercises Linux `amd64` and Linux `arm64`. Build, full tests,
+race tests, schema recovery, migration crash, and allocator checks run on both
+platforms, including the internal SIMD-kernel equivalence suites. Native Apple
+Silicon is used for development benchmarks, not as a CI replacement.
 
 ## Version policy
 
@@ -233,12 +232,3 @@ demonstrated correctness or data-loss defect is found:
 See [`AGENTS/`](AGENTS/README.md) for the current architecture and V1 contracts.
 Historical design material is available in git history; source, tests, and
 package documentation take precedence.
-
-## Known CI limitations
-
-`index/radixhash/internal/tailkernel` and
-`index/simhash/internal/hashkernel` currently have AMD64 backend-vs-scalar
-equivalence failures and are excluded from the AMD64 CI test/race jobs. They
-pass on ARM64, where the AMD64 assembly is not built. This is a known V1
-release-gate issue; see
-[`AGENTS/CONTRACTS.md`](AGENTS/CONTRACTS.md#release-and-platform-policy).
