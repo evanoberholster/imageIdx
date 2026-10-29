@@ -102,6 +102,51 @@ func (s *vectorSnapshot) vectorAt(ord int) []byte {
 	return s.vectors[off : off+s.vecBytes]
 }
 
+// rawNorm returns |raw| for cosine indexes and zero for other metrics. The
+// value is computed once per query and for each stored vector on append/load,
+// so the hot loop never recomputes a norm.
+func (s *vectorSnapshot) rawNorm(raw []byte) float64 {
+	if s.cfg.Metric != MetricCosine {
+		return 0
+	}
+	return math.Sqrt(s.dot(raw, raw))
+}
+
+// appendVectorNorm records the norm for a vector just appended to candidates.
+func (s *vectorSnapshot) appendVectorNorm(raw []byte) {
+	if s.cfg.Metric == MetricCosine {
+		s.norms = append(s.norms, s.rawNorm(raw))
+	}
+}
+
+// normAt returns the cached norm for a stored ordinal, or zero for metrics
+// that do not use norms.
+func (s *vectorSnapshot) normAt(ord int) float64 {
+	if s.cfg.Metric == MetricCosine {
+		return s.norms[ord]
+	}
+	return 0
+}
+
+// distQuery computes the metric distance from query (with precomputed norm)
+// to stored ordinal ord. Cosine reuses cached norms; other metrics call the
+// pre-resolved raw kernel directly.
+func (s *vectorSnapshot) distQuery(query []byte, queryNorm float64, ord int) float64 {
+	if s.cfg.Metric == MetricCosine {
+		return cosineFromDotNorms(s.dot(query, s.vectorAt(ord)), queryNorm, s.norms[ord])
+	}
+	return s.dist(query, s.vectorAt(ord))
+}
+
+// distOrds computes the metric distance between two stored ordinals. Cosine
+// reuses both cached norms.
+func (s *vectorSnapshot) distOrds(a, b int) float64 {
+	if s.cfg.Metric == MetricCosine {
+		return cosineFromDotNorms(s.dot(s.vectorAt(a), s.vectorAt(b)), s.norms[a], s.norms[b])
+	}
+	return s.dist(s.vectorAt(a), s.vectorAt(b))
+}
+
 // linkAt loads one node's immutable layer set (lock-free).
 func (s *vectorSnapshot) linkAt(ord int) *nodeLayers {
 	if ord < 0 || ord >= len(s.links) {
@@ -112,9 +157,9 @@ func (s *vectorSnapshot) linkAt(ord int) *nodeLayers {
 
 // greedyStep moves from cur to its closest neighbor at level (including
 // itself) by query distance, repeating until no improvement.
-func (s *vectorSnapshot) greedyStep(cur, level int, query []byte) int {
+func (s *vectorSnapshot) greedyStep(cur, level int, query []byte, queryNorm float64) int {
 	best := cur
-	bestDist := s.dist(query, s.vectorAt(cur))
+	bestDist := s.distQuery(query, queryNorm, cur)
 	for {
 		improved := false
 		g := s.linkAt(cur)
@@ -126,7 +171,7 @@ func (s *vectorSnapshot) greedyStep(cur, level int, query []byte) int {
 			if !ok {
 				continue
 			}
-			d := s.dist(query, s.vectorAt(nOrd))
+			d := s.distQuery(query, queryNorm, nOrd)
 			if d < bestDist {
 				bestDist = d
 				best = nOrd
@@ -142,13 +187,13 @@ func (s *vectorSnapshot) greedyStep(cur, level int, query []byte) int {
 
 // searchLayer runs best-first HNSW exploration at one level from entryOrd,
 // returning up to ef closest entries in ctx-owned scratch.
-func (s *vectorSnapshot) searchLayer(ctx *SearchContext, query []byte, entryOrd, ef, level int) []searchEntry {
+func (s *vectorSnapshot) searchLayer(ctx *SearchContext, query []byte, queryNorm float64, entryOrd, ef, level int) []searchEntry {
 	gen := ctx.gen
 	visited := ctx.visited
 	cand := &ctx.cand
 	best := &ctx.best
 
-	entryDist := s.dist(query, s.vectorAt(entryOrd))
+	entryDist := s.distQuery(query, queryNorm, entryOrd)
 	visited[entryOrd] = gen
 	cand.push(searchEntry{ord: entryOrd, dist: entryDist})
 	best.push(searchEntry{ord: entryOrd, dist: entryDist})
@@ -171,7 +216,7 @@ func (s *vectorSnapshot) searchLayer(ctx *SearchContext, query []byte, entryOrd,
 				continue
 			}
 			visited[nOrd] = gen
-			d := s.dist(query, s.vectorAt(nOrd))
+			d := s.distQuery(query, queryNorm, nOrd)
 			if best.len() < ef || d < best.peek().dist {
 				cand.push(searchEntry{ord: nOrd, dist: d})
 				best.push(searchEntry{ord: nOrd, dist: d})
@@ -195,9 +240,9 @@ func (s *vectorSnapshot) layer0Search(ctx *SearchContext, query []byte, ef int) 
 	}
 	cur := entryOrd
 	for l := s.maxLevel; l > 0; l-- {
-		cur = s.greedyStep(cur, l, query)
+		cur = s.greedyStep(cur, l, query, ctx.queryNorm)
 	}
-	return s.searchLayer(ctx, query, cur, ef, 0)
+	return s.searchLayer(ctx, query, ctx.queryNorm, cur, ef, 0)
 }
 
 // effectiveEf computes the layer-0 exploration budget for k, applying the
@@ -309,7 +354,7 @@ func (s *vectorSnapshot) exactSearchInto(ctx *SearchContext, query []byte, filte
 		if filter != nil && !filter(id) {
 			continue
 		}
-		d := s.dist(query, s.vectorAt(ord))
+		d := s.distQuery(query, ctx.queryNorm, ord)
 		if best.len() < k {
 			best.push(searchEntry{ord: ord, dist: d})
 			continue
@@ -345,6 +390,7 @@ func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int
 		id   NodeID
 		dist float64
 	}
+	queryNorm := s.rawNorm(query)
 	all := make([]scored, 0, len(s.ids))
 	for ord, id := range s.ids {
 		if s.tomb.Contains(uint64(id)) {
@@ -353,7 +399,7 @@ func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int
 		if filter != nil && !filter(id) {
 			continue
 		}
-		all = append(all, scored{id: id, dist: s.dist(query, s.vectorAt(ord))})
+		all = append(all, scored{id: id, dist: s.distQuery(query, queryNorm, ord)})
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].dist != all[j].dist {
@@ -383,6 +429,7 @@ func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter
 	if k > len(s.ids) {
 		k = len(s.ids)
 	}
+	ctx.queryNorm = s.rawNorm(query)
 	live := len(s.ids) - len(s.tombSorted)
 	if s.cfg.FlatThreshold >= 0 && live <= s.cfg.FlatThreshold {
 		out := s.exactSearchInto(ctx, query, filter, k, ctx.output[:0])

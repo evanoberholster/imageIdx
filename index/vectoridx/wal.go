@@ -180,23 +180,23 @@ func (v *VectorIdx) appendWALRecord(rtype uint8, id NodeID, raw []byte) error {
 	if rtype == walTypeAdd {
 		vecLen = len(raw)
 	}
-	record := make([]byte, 0, walHeaderSize+vecLen+walCRCSize)
-	var hdr [walHeaderSize]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], walMagic)
-	binary.LittleEndian.PutUint16(hdr[4:6], walVersion)
-	hdr[6] = rtype
-	hdr[7] = v.cfgBase.ElementType.byte()
-	binary.LittleEndian.PutUint64(hdr[8:16], v.lsn+1)
-	binary.LittleEndian.PutUint32(hdr[16:20], uint32(id))
-	binary.LittleEndian.PutUint32(hdr[20:24], uint32(vecLen))
-	record = append(record, hdr[:]...)
-	if vecLen != 0 {
-		record = append(record, raw...)
+	frameLen := walHeaderSize + vecLen + walCRCSize
+	if cap(v.walBuf) < frameLen {
+		v.walBuf = make([]byte, frameLen)
 	}
-	crc := crc32.ChecksumIEEE(record)
-	var crcBuf [4]byte
-	binary.LittleEndian.PutUint32(crcBuf[:], crc)
-	record = append(record, crcBuf[:]...)
+	frame := v.walBuf[:frameLen]
+	binary.LittleEndian.PutUint32(frame[0:4], walMagic)
+	binary.LittleEndian.PutUint16(frame[4:6], walVersion)
+	frame[6] = rtype
+	frame[7] = v.cfgBase.ElementType.byte()
+	binary.LittleEndian.PutUint64(frame[8:16], v.lsn+1)
+	binary.LittleEndian.PutUint32(frame[16:20], uint32(id))
+	binary.LittleEndian.PutUint32(frame[20:24], uint32(vecLen))
+	if vecLen != 0 {
+		copy(frame[walHeaderSize:], raw)
+	}
+	binary.LittleEndian.PutUint32(frame[frameLen-walCRCSize:], crc32.ChecksumIEEE(frame[:frameLen-walCRCSize]))
+	record := frame
 	if v.walSize > 0 && v.walSize+int64(len(record)) > v.walSegBytes {
 		if err := v.rotateWALLocked(); err != nil {
 			return err

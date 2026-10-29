@@ -10,8 +10,10 @@
 //   - Closed dimensions {512, 768, 1024} and one element type per index
 //     {int8, uint8, int16, uint16, float32}, stored as received.
 //   - One metric per index {L2, cosine, dot} with scalar kernels and float64
-//     accumulation; public Result Score is a saturating uint32, monotonic
-//     per metric and zero for self matches.
+//     accumulation; the float32 kernels use four independent partial sums.
+//     Cosine indexes cache one norm per stored vector and compute the query
+//     norm once per search. Public Result Score is a saturating uint32,
+//     monotonic per metric and zero for self matches.
 //   - Namespace is the shared schema identity of one vector space: a
 //     non-zero schema.Namespace (KindVector) assigned by the application's
 //     schema. IDs are stored and filtered as compact uint32 NodeIDs and

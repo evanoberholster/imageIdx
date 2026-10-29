@@ -10,10 +10,10 @@ import (
 // Dispatch is resolved once per index open; the hot loop calls a single
 // pre-resolved func(a, b []byte) float64 with no interface or type switch.
 
-// distRaw computes the index-metric distance between two raw little-endian
-// vectors of the index's configured length. Smaller is better for every
-// metric: L2 returns squared L2, cosine returns 1-cos in [0,2], dot returns
-// -dot. Slices must be exactly VectorBytes long.
+// distRaw is a raw little-endian vector kernel. Distance kernels return the
+// index-metric distance (smaller is better: squared L2, 1-cos, or -dot);
+// resolveDot returns the positive dot-product kernel used with cached norms.
+// Slices must be exactly VectorBytes long.
 type distRaw func(a, b []byte) float64
 
 // resolveDistance returns the scalar kernel for cfg. Callers must validate
@@ -71,6 +71,27 @@ func resolveDistance(cfg Config) distRaw {
 	}
 }
 
+// resolveDot returns the raw dot-product kernel for cfg. The cosine metric
+// caches each stored vector's norm, so comparisons need only this one pass;
+// callers combine it with cosineFromDotNorms. Unknown element types return nil.
+func resolveDot(cfg Config) distRaw {
+	n := int(cfg.Dimensions)
+	switch cfg.ElementType {
+	case ElementInt8:
+		return func(a, b []byte) float64 { return DotInt8(bytesAsInt8(a, n), bytesAsInt8(b, n)) }
+	case ElementUint8:
+		return func(a, b []byte) float64 { return DotUint8(bytesAsUint8(a, n), bytesAsUint8(b, n)) }
+	case ElementInt16:
+		return func(a, b []byte) float64 { return DotInt16(bytesAsInt16(a, n), bytesAsInt16(b, n)) }
+	case ElementUint16:
+		return func(a, b []byte) float64 { return DotUint16(bytesAsUint16(a, n), bytesAsUint16(b, n)) }
+	case ElementFloat32:
+		return func(a, b []byte) float64 { return DotFloat32(bytesAsFloat32(a, n), bytesAsFloat32(b, n)) }
+	default:
+		return nil
+	}
+}
+
 // Typed scalar kernels. All use a float64 accumulator so integer inputs are
 // exact (max int16/1024D distance ~4.4e12 < 2^53) and float32 inputs keep
 // reference precision for ranking.
@@ -116,13 +137,26 @@ func SquaredL2Uint16(a, b []uint16) float64 {
 }
 
 // SquaredL2Float32 returns sum (a[i]-b[i])^2 accumulated in float64.
+// Four independent accumulators break the serial dependency chain on the
+// vector units; the final sum is still float64.
 func SquaredL2Float32(a, b []float32) float64 {
-	var acc float64
-	for i := range a {
-		d := float64(a[i]) - float64(b[i])
-		acc += d * d
+	var a0, a1, a2, a3 float64
+	i := 0
+	for ; i+4 <= len(a); i += 4 {
+		d0 := float64(a[i+0]) - float64(b[i+0])
+		d1 := float64(a[i+1]) - float64(b[i+1])
+		d2 := float64(a[i+2]) - float64(b[i+2])
+		d3 := float64(a[i+3]) - float64(b[i+3])
+		a0 += d0 * d0
+		a1 += d1 * d1
+		a2 += d2 * d2
+		a3 += d3 * d3
 	}
-	return acc
+	for ; i < len(a); i++ {
+		d := float64(a[i]) - float64(b[i])
+		a0 += d * d
+	}
+	return (a0 + a1) + (a2 + a3)
 }
 
 // Dot-product kernels. All use a float64 accumulator; integer inputs are
@@ -166,12 +200,21 @@ func DotUint16(a, b []uint16) float64 {
 }
 
 // DotFloat32 returns sum a[i]*b[i] accumulated in float64.
+// Four independent accumulators break the serial dependency chain on the
+// vector units; the final sum is still float64.
 func DotFloat32(a, b []float32) float64 {
-	var acc float64
-	for i := range a {
-		acc += float64(a[i]) * float64(b[i])
+	var a0, a1, a2, a3 float64
+	i := 0
+	for ; i+4 <= len(a); i += 4 {
+		a0 += float64(a[i+0]) * float64(b[i+0])
+		a1 += float64(a[i+1]) * float64(b[i+1])
+		a2 += float64(a[i+2]) * float64(b[i+2])
+		a3 += float64(a[i+3]) * float64(b[i+3])
 	}
-	return acc
+	for ; i < len(a); i++ {
+		a0 += float64(a[i]) * float64(b[i])
+	}
+	return (a0 + a1) + (a2 + a3)
 }
 
 // Cosine kernels return 1-cos in [0,2]; 0 for identical, 1 for orthogonal.
@@ -235,11 +278,18 @@ func normUint16(a []uint16) float64 {
 }
 
 func normFloat32(a []float32) float64 {
-	var acc float64
-	for _, x := range a {
-		acc += float64(x) * float64(x)
+	var a0, a1, a2, a3 float64
+	i := 0
+	for ; i+4 <= len(a); i += 4 {
+		a0 += float64(a[i+0]) * float64(a[i+0])
+		a1 += float64(a[i+1]) * float64(a[i+1])
+		a2 += float64(a[i+2]) * float64(a[i+2])
+		a3 += float64(a[i+3]) * float64(a[i+3])
 	}
-	return math.Sqrt(acc)
+	for ; i < len(a); i++ {
+		a0 += float64(a[i]) * float64(a[i])
+	}
+	return math.Sqrt((a0 + a1) + (a2 + a3))
 }
 
 func cosineFromDotNorms(dot, na, nb float64) float64 {
@@ -418,6 +468,28 @@ func encodeScoreForMetric(metric uint8, dist, querySelfDot float64) uint32 {
 
 // encodeQuery helpers copy typed query vectors into a scratch raw buffer
 // so the hot path always works on raw bytes.
+
+func encodeRawInt8(dst []byte, q []int8) []byte {
+	need := len(q)
+	if cap(dst) < need {
+		dst = make([]byte, need)
+	} else {
+		dst = dst[:need]
+	}
+	copy(bytesAsInt8(dst, len(q)), q)
+	return dst
+}
+
+func encodeRawUint8(dst []byte, q []uint8) []byte {
+	need := len(q)
+	if cap(dst) < need {
+		dst = make([]byte, need)
+	} else {
+		dst = dst[:need]
+	}
+	copy(dst, q)
+	return dst
+}
 
 func encodeRawInt16(dst []byte, q []int16) []byte {
 	need := len(q) * 2

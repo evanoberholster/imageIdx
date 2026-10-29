@@ -59,7 +59,7 @@ func benchDistance(b *testing.B, elem ElementType, dims Dimensions) {
 
 func buildBenchIndex(b *testing.B, n int) (*VectorIdx, [][]float32) {
 	b.Helper()
-	idx, err := NewMemory(Config{
+	return buildBenchIndexCfg(b, n, Config{
 		Namespace:      testNamespace,
 		Dimensions:     Dim512,
 		ElementType:    ElementFloat32,
@@ -68,13 +68,18 @@ func buildBenchIndex(b *testing.B, n int) (*VectorIdx, [][]float32) {
 		EfConstruction: 100,
 		EfSearch:       64,
 	})
+}
+
+func buildBenchIndexCfg(b *testing.B, n int, cfg Config) (*VectorIdx, [][]float32) {
+	b.Helper()
+	idx, err := NewMemory(cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
 	rng := rand.New(rand.NewSource(78))
 	vecs := make([][]float32, n)
 	for i := range vecs {
-		vecs[i] = randFloatVec(rng, Dim512)
+		vecs[i] = randFloatVec(rng, cfg.Dimensions)
 		if err := idx.AddFloat32(NodeID(i+1), vecs[i]); err != nil {
 			b.Fatal(err)
 		}
@@ -119,6 +124,74 @@ func BenchmarkExactSearchFloat32(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := idx.ExactSearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSearchFloat32_768ANN(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim768,
+		ElementType:    ElementFloat32,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+		// Force ANN even though the fixture is below the default flat cutoff.
+		FlatThreshold: -1,
+	})
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSearchFloat32_768CosineANN(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim768,
+		ElementType:    ElementFloat32,
+		Metric:         MetricCosine,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+		FlatThreshold:  -1,
+	})
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAddFloat32_768(b *testing.B) {
+	idx, _ := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim768,
+		ElementType:    ElementFloat32,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+	})
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(83))
+	vec := randFloatVec(rng, Dim768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := idx.AddFloat32(NodeID(1_000_000+i), vec); err != nil {
 			b.Fatal(err)
 		}
 	}
