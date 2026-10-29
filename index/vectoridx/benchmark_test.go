@@ -152,6 +152,51 @@ func BenchmarkSearchFloat32_768ANN(b *testing.B) {
 	}
 }
 
+func BenchmarkSearchFloat32_512ANN(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim512,
+		ElementType:    ElementFloat32,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+		FlatThreshold:  -1,
+	})
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSearchFloat32_512CosineANN(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim512,
+		ElementType:    ElementFloat32,
+		Metric:         MetricCosine,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+		FlatThreshold:  -1,
+	})
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkSearchFloat32_768CosineANN(b *testing.B) {
 	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
 		Namespace:      testNamespace,
@@ -170,6 +215,28 @@ func BenchmarkSearchFloat32_768CosineANN(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := idx.SearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAddFloat32_512(b *testing.B) {
+	idx, _ := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim512,
+		ElementType:    ElementFloat32,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+	})
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(84))
+	vec := randFloatVec(rng, Dim512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := idx.AddFloat32(NodeID(1_000_000+i), vec); err != nil {
 			b.Fatal(err)
 		}
 	}

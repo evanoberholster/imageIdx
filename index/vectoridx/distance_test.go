@@ -102,7 +102,7 @@ func TestFloat32KernelsStayAccurate(t *testing.T) {
 	rng := rand.New(rand.NewSource(43))
 	// Include lengths above and below the 4-way unrolled body so the tail
 	// path is exercised too.
-	for _, n := range []int{1, 3, 4, 5, 7, 768, 769, 1024} {
+	for _, n := range []int{1, 3, 4, 5, 7, 512, 768, 769, 1024} {
 		a := make([]float32, n)
 		b := make([]float32, n)
 		var wantL2, wantDot, wantNorm float64

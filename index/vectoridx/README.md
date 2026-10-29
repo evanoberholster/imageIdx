@@ -196,11 +196,11 @@ go test ./vectoridx -run TestHNSWRecall -v -count=1
 ```
 
 Distance microbenchmarks cover every element type × dimension with
-`ns/op`, `bytes/s`, and `allocs/op`. `BenchmarkSearchFloat32_768ANN` and
-`BenchmarkSearchFloat32_768CosineANN` force the graph path at 768D (the
-smaller fixture stays below `FlatThreshold` and therefore exercises the exact
-scan); `BenchmarkAddFloat32_768` covers the writer path. `BenchmarkSearchFloat32`
-/ `BenchmarkSearchIntoFloat32Reuse` measure the flat path against
+`ns/op`, `bytes/s`, and `allocs/op`. `BenchmarkSearchFloat32_512ANN` /
+`BenchmarkSearchFloat32_768ANN` and their cosine variants set
+`FlatThreshold: -1` so they exercise the graph path; `BenchmarkAddFloat32_512`
+/ `BenchmarkAddFloat32_768` cover the writer path. `BenchmarkSearchFloat32` /
+`BenchmarkSearchIntoFloat32Reuse` measure the default flat path against
 `BenchmarkExactSearchFloat32`; recall tests pin ANN quality
 (`recall@5 ≥ 0.70` on the 300-vector fixture) so speedups that degrade the
 graph fail loudly.
