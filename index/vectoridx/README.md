@@ -166,9 +166,16 @@ generation.
   tombstoned ID is a no-op.
 - `Search` with `k <= 0` returns `ErrInvalidQuery`. Fewer than `k` live
   (or filter-passing) nodes returns what's available, not an error.
+- `Snapshot` / `ReleaseSnapshot` pin one published generation for consistent
+  vector + metadata queries. `SearchFloat32WithOptions` adds `context.Context`
+  cancellation, per-query `ef`/oversample, and a filter hint.
+- `SearchCandidatesFloat32` scores exactly a caller-supplied unique candidate
+  set. It is the selective-filter path for metadata/ACL predicates; cost scales
+  with the candidate count rather than the index size.
 - `Score` is `uint32` saturating: monotonic with the index metric distance
   (L2, cosine, or dot), ties at `math.MaxUint32` only for extremely distant
-  pairs / NaN.
+  pairs / NaN. `Distance` carries the raw metric distance at float32 precision
+  for ranking and fusion.
 
 ## Concurrency and allocation
 
@@ -213,6 +220,7 @@ graph fail loudly.
 | `types.go` | Namespace/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
 | `distance.go` | Scalar L2/cosine/dot kernels, dispatch, `EncodeScore` |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
+| `snapshot.go` | Pinned read-only snapshot, context-aware search, candidate scoring |
 | `hnsw.go` | Locator, greedy descent, layer search, assembly, exact oracle |
 | `index.go` | VectorIdx: typed Add/Search, Delete, Checkpoint/Compact/Verify, async queue, policies |
 | `options.go` | Runtime `Option`s (WithSyncInterval) |

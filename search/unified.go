@@ -7,6 +7,7 @@ import (
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
 	"github.com/evanoberholster/imageIdx/index/geoidx"
 	"github.com/evanoberholster/imageIdx/index/timeidx"
+	"github.com/evanoberholster/imageIdx/index/vectoridx"
 	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
@@ -46,6 +47,9 @@ func (e *Engine) Geo(ns schema.Namespace) (*geoidx.Index, bool) { return e.db.Ge
 
 // Bitmap returns the bitmap engine for a namespace, or false if unavailable.
 func (e *Engine) Bitmap(ns schema.Namespace) (*bitmapidx.Index, bool) { return e.db.Bitmap(ns) }
+
+// Vector returns the vector engine for a namespace, or false if unavailable.
+func (e *Engine) Vector(ns schema.Namespace) (*vectoridx.VectorIdx, bool) { return e.db.Vector(ns) }
 
 // During builds a timestamp clause for a namespace.
 func (e *Engine) During(ns schema.Namespace, start, end uint64, options ...TimestampOption) (Clause, error) {

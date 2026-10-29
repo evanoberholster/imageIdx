@@ -1,8 +1,9 @@
 package search
 
 import (
-	schema "github.com/evanoberholster/imageIdx/schema"
+	"github.com/evanoberholster/imageIdx/index/vectoridx"
 	"github.com/evanoberholster/imageIdx/roar"
+	schema "github.com/evanoberholster/imageIdx/schema"
 	"unsafe"
 )
 
@@ -24,6 +25,13 @@ type Workspace struct {
 	bitmaps    []roar.Bitmap
 	aclMask    []bool
 	aclMatches []ImageID
+
+	// Vector ranking scratch. The three buffers are kept separate because
+	// filter probes use batch/scratch while the vector source and result
+	// conversions are live.
+	vectorIDs     []ImageID
+	vectorNodes   []vectoridx.NodeID
+	vectorResults []vectoridx.Result
 }
 
 func NewWorkspace(capacity int) *Workspace {
@@ -41,6 +49,9 @@ func (workspace *Workspace) Reset() {
 		workspace.source = workspace.source[:0]
 		workspace.aclMask = workspace.aclMask[:0]
 		workspace.aclMatches = workspace.aclMatches[:0]
+		workspace.vectorIDs = workspace.vectorIDs[:0]
+		workspace.vectorNodes = workspace.vectorNodes[:0]
+		workspace.vectorResults = workspace.vectorResults[:0]
 		clear(workspace.bitmaps)
 		workspace.bitmaps = workspace.bitmaps[:0]
 		for n := range workspace.fallback {
@@ -58,7 +69,10 @@ func (workspace *Workspace) RetainedBytes() int {
 	if workspace == nil {
 		return 0
 	}
-	n := int(unsafe.Sizeof(*workspace)) + 8*(cap(workspace.scratch)+cap(workspace.batch)+cap(workspace.source)+cap(workspace.aclMatches)) + cap(workspace.aclMask) +
+	n := int(unsafe.Sizeof(*workspace)) + 8*(cap(workspace.scratch)+cap(workspace.batch)+cap(workspace.source)+cap(workspace.aclMatches)+cap(workspace.vectorIDs)) +
+		cap(workspace.aclMask) +
+		cap(workspace.vectorNodes)*4 +
+		cap(workspace.vectorResults)*int(unsafe.Sizeof(vectoridx.Result{})) +
 		cap(workspace.bitmaps)*int(unsafe.Sizeof(roar.Bitmap{})) + cap(workspace.fallback)*int(unsafe.Sizeof([]ImageID{}))
 	for _, ids := range workspace.fallback {
 		n += 8 * cap(ids)

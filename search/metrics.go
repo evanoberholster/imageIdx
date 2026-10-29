@@ -12,10 +12,11 @@ import (
 type SearchOperation = searchmetrics.SearchOperation
 
 const (
-	OperationSearch    = searchmetrics.OperationSearch
-	OperationFilterIDs = searchmetrics.OperationFilterIDs
-	OperationRankTime  = searchmetrics.OperationRankTime
-	OperationRankGeo   = searchmetrics.OperationRankGeo
+	OperationSearch     = searchmetrics.OperationSearch
+	OperationFilterIDs  = searchmetrics.OperationFilterIDs
+	OperationRankTime   = searchmetrics.OperationRankTime
+	OperationRankGeo    = searchmetrics.OperationRankGeo
+	OperationRankVector = searchmetrics.OperationRankVector
 )
 
 // StageMode describes how a stage ran. It is an alias for the shared

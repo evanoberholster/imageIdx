@@ -5,9 +5,10 @@ import (
 	"testing"
 )
 
-// Candidate filtering is post-ANN only: traversal is never constrained by
-// the filter, oversampling fills k where reachable, and the exact fallback
-// guarantees k-or-available under highly selective filters.
+// Candidate filtering never constrains graph connectivity, but FilterAware
+// tracks filter-passing nodes in a second result heap during traversal.
+// Oversampling fills k where reachable, and the exact fallback guarantees
+// k-or-available under highly selective filters.
 
 func buildFilterIndex(t *testing.T, n int) (*VectorIdx, [][]float32) {
 	t.Helper()

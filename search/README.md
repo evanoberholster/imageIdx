@@ -118,6 +118,7 @@ ids, err := executor.AppendIDs(ctx, dst[:0], plan)
 | `Visit` | Sorted IDs with error reporting and early callback stop. |
 | `RankTime` | Top-k by exact `uint64` timestamp gap. |
 | `RankGeo` | Top-k by `float64` haversine metres, including fractional metres. |
+| `RankVector` | Top-k vector matches with plan liveness/ACL and selective-filter handling. |
 | `FilterRanked` | Probe supplied entries, preserving order, duplicates and scores. |
 
 ## Per-run metrics
@@ -195,10 +196,21 @@ byTime, err := plan.RankTime(ctx, nil, &ws, lookupTime, target, 100)
 byGeo, err := plan.RankGeo(ctx, nil, &ws, lat, lng, lookupGeo, 100)
 ```
 
-`FilterRanked` bridges external vector search: map each vector ValueID to an
-ImageID, then probe ANN entries against the plan while preserving source order,
-duplicates, and integer scores. Over-fetch from the ANN side because a
-selective plan can under-fill.
+`RankVector` is the first-class vector path. It pins a `vectoridx` snapshot,
+applies liveness/ACL and the rest of the plan, and uses exact candidate scoring
+when the plan estimate is selective or filtered ANN with over-fetch otherwise.
+The result carries the raw vector distance for ranking/fusion.
+
+```go
+vec, ok := engine.Vector(ns) // the registered embedding namespace
+if !ok { return search.ErrNamespaceUnavailable }
+hits, err := plan.RankVector(ctx, nil, &ws, vec, queryEmbedding, 50)
+// hits[i].ImageID, hits[i].Distance, hits[i].Score
+```
+
+`FilterRanked` remains as the low-level bridge when the caller already owns an
+ANN result list. It preserves source order, duplicates, and integer scores;
+over-fetch from the ANN side because a selective plan can under-fill.
 
 ```go
 kept, err := plan.FilterRanked(ctx, nil, &ws, annResults,
@@ -222,6 +234,8 @@ ranking.RankTimeSignal(timeRanks, ids, target, lookup)
 for i, sim := range cosineSims {
     vecRanks[i] = ranking.QuantizeCosine(sim)
 }
+// Or convert vectoridx's 1-cos distance directly:
+// vecRanks[i] = ranking.QuantizeCosineDistance(hits[i].Distance)
 
 // Fuse heterogeneous lanes with RRF and sort the output.
 var sig ranking.Signals

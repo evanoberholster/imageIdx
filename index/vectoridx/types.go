@@ -10,6 +10,7 @@ import (
 	"errors"
 
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	"github.com/evanoberholster/imageIdx/roar"
 	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
@@ -240,14 +241,33 @@ func (c Config) VectorBytes() int { return int(c.Dimensions) * c.ElementSize() }
 
 // Result is one nearest-neighbor match. ValueID is the stored NodeID widened
 // to the database-wide identifier type; its semantics come from the index's
-// schema namespace. Score is monotonic with the index metric distance:
-// a smaller distance always yields a smaller-or-equal Score. For L2 it tracks
+// schema namespace. Distance is the raw metric distance (float32 precision)
+// used for internal ordering: squared L2, 1-cos, or -dot. Score is monotonic
+// with Distance: a smaller distance always yields a smaller-or-equal Score.
+// For L2 it tracks
 // squared L2; for cosine it tracks (1-cos)*2^30; for dot it tracks
 // querySelfDot-dot (zero for self). See EncodeScore for the saturation rule.
 type Result struct {
-	ValueID schema.ValueID
-	Score   uint32
+	ValueID  schema.ValueID
+	Score    uint32
+	Distance float32
 }
+
+// SearchOptions configures one search. K must be positive; zero
+// EfSearch/Oversample use the index defaults and FilterHint 0 or
+// UnknownFilterHint means the filter cardinality is unknown.
+type SearchOptions struct {
+	K          int
+	Filter     CandidateFilter
+	FilterHint int // estimated filter cardinality; -1 when unknown
+	// EfSearch overrides Config.EfSearch and disables dynamic ef when non-zero.
+	EfSearch uint32
+	// Oversample overrides Config.OversampleFactor for filtered searches.
+	Oversample uint32
+}
+
+// UnknownFilterHint marks an unknown filter cardinality.
+const UnknownFilterHint = -1
 
 // widenedID converts a stored NodeID to the database-wide identifier type.
 func widenedID(id NodeID) schema.ValueID { return schema.ValueID(id) }
@@ -263,6 +283,12 @@ func widenedID(id NodeID) schema.ValueID { return schema.ValueID(id) }
 //	    return ok && bitmap.Contains(imageID)
 //	})
 type CandidateFilter func(NodeID) bool
+
+// BitmapFilter adapts a roaring bitmap to a CandidateFilter. Pair it with a
+// filter hint from the bitmap cardinality for the cost-based flat fallback.
+func BitmapFilter(bitmap roar.Bitmap) CandidateFilter {
+	return func(id NodeID) bool { return bitmap.Contains(uint64(id)) }
+}
 
 // Durability controls persistent WAL synchronization. DurabilityOS returns
 // once the frame is visible to the OS; DurabilitySync fsyncs before

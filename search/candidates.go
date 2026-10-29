@@ -34,8 +34,12 @@ func (plan Plan) filterIDs(ctx context.Context, dst, candidates []ImageID, ws *W
 	if pinErr != nil {
 		return dst, pinErr
 	}
-	plan = pinned
 	defer release()
+	return pinned.filterIDsPinned(ctx, dst, candidates, ws, metrics)
+}
+
+// filterIDsPinned is filterIDs for a plan that is already pinned by the caller.
+func (plan Plan) filterIDsPinned(ctx context.Context, dst, candidates []ImageID, ws *Workspace, metrics *SearchMetrics) ([]ImageID, error) {
 	start := len(dst)
 	if err := ctx.Err(); err != nil {
 		return dst, err

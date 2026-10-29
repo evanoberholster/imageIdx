@@ -1,6 +1,7 @@
 package vectoridx
 
 import (
+	"context"
 	"math"
 	"sort"
 	"sync"
@@ -125,14 +126,19 @@ func (h *maxHeap) len() int          { return len(h.items) }
 // SearchContext owns complete per-query scratch state. It is pooled and must
 // never escape to callers: SearchInto copies final Results out before Put.
 type SearchContext struct {
-	cand    minHeap
-	best    maxHeap
-	visited []uint32
-	gen     uint32
+	cand     minHeap
+	best     maxHeap
+	filtered maxHeap
+	visited  []uint32
+	gen      uint32
 	// queryBuf holds the encoded raw query vector for the hot loop.
 	queryBuf []byte
 	// queryNorm caches the query's norm for the cosine metric.
 	queryNorm float64
+	// ctx is the caller cancellation scope for this execution; nil on write
+	// paths. err records the first cancellation seen in a hot loop.
+	ctx context.Context
+	err error
 	// layer reuses the per-level candidate buffer across layer searches.
 	layer []searchEntry
 	// output reuses the result-assembly buffer; callers copy out before Put.
@@ -142,6 +148,7 @@ type SearchContext struct {
 func (s *SearchContext) resetForNodes(nodeCount, vecBytes int) {
 	s.cand.reset()
 	s.best.reset()
+	s.filtered.reset()
 	s.layer = s.layer[:0]
 	s.output = s.output[:0]
 	if cap(s.visited) < nodeCount {
@@ -173,12 +180,29 @@ func acquireSearchContext() *SearchContext {
 }
 
 func releaseSearchContext(s *SearchContext) {
-	// Keep backing arrays for reuse but drop logical lengths.
+	// Keep backing arrays for reuse but drop logical lengths and references
+	// that would otherwise retain a request context between queries.
 	s.cand.reset()
 	s.best.reset()
+	s.filtered.reset()
 	s.layer = s.layer[:0]
 	s.output = s.output[:0]
+	s.ctx = nil
+	s.err = nil
 	searchPool.Put(s)
+}
+
+// cancelled reports and records caller cancellation. It is checked at bounded
+// intervals in hot loops so cancellation stays cheap on the write paths.
+func (s *SearchContext) cancelled() bool {
+	if s.ctx == nil {
+		return false
+	}
+	if err := s.ctx.Err(); err != nil {
+		s.err = err
+		return true
+	}
+	return false
 }
 
 // PrewarmSearchContexts places n ready contexts into the pool so the first
