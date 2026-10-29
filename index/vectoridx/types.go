@@ -1,6 +1,6 @@
 // Package vectoridx implements a persistent HNSW approximate-nearest-neighbor
-// vector index with direct uint32 NodeIDs, fixed dimensions, and scalar L2
-// distance kernels.
+// vector index with direct uint32 NodeIDs, fixed dimensions, and FP32
+// L2/cosine/dot distance kernels with SIMD acceleration where available.
 //
 // This file defines the core domain types. See doc.go for the package
 // overview, format notes, and concurrency model.

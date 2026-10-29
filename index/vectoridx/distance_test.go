@@ -127,6 +127,33 @@ func TestFloat32KernelsStayAccurate(t *testing.T) {
 	}
 }
 
+func TestSIMDFloat32KernelsMatchScalar(t *testing.T) {
+	if !simdSupported {
+		t.Skip("no SIMD kernel on this architecture")
+	}
+	rng := rand.New(rand.NewSource(44))
+	for _, dims := range []Dimensions{Dim512, Dim768, Dim1024} {
+		a := make([]float32, dims)
+		b := make([]float32, dims)
+		for i := range a {
+			a[i] = rng.Float32()*4 - 2
+			b[i] = rng.Float32()*4 - 2
+		}
+		rawA := encodeRawFloat32(nil, a)
+		rawB := encodeRawFloat32(nil, b)
+		wantL2 := SquaredL2Float32(a, b)
+		gotL2 := simdL2Float32Bytes(rawA, rawB)
+		if math.Abs(gotL2-wantL2) > 1e-4*math.Max(1, math.Abs(wantL2)) {
+			t.Fatalf("SIMD L2 dim %d = %v, want %v", dims, gotL2, wantL2)
+		}
+		wantDot := DotFloat32(a, b)
+		gotDot := simdDotFloat32Bytes(rawA, rawB)
+		if math.Abs(gotDot-wantDot) > 1e-4*math.Max(1, math.Abs(wantDot)) {
+			t.Fatalf("SIMD dot dim %d = %v, want %v", dims, gotDot, wantDot)
+		}
+	}
+}
+
 func TestAccumulatorHeadroom1024D(t *testing.T) {
 	n := int(Dim1024)
 	// int8/uint8 worst case: every diff is 255.

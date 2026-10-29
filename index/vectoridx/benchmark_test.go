@@ -1,6 +1,7 @@
 package vectoridx
 
 import (
+	"context"
 	"math/rand"
 	"path/filepath"
 	"testing"
@@ -215,6 +216,78 @@ func BenchmarkSearchFloat32_768CosineANN(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := idx.SearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFilteredSearchFloat32_768(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim768,
+		ElementType:    ElementFloat32,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+		FlatThreshold:  -1,
+	})
+	defer idx.Close()
+	filter := CandidateFilter(func(id NodeID) bool { return id%8 == 0 })
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32(q, filter, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFilteredSearchFloat32_768NoAware(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:          testNamespace,
+		Dimensions:         Dim768,
+		ElementType:        ElementFloat32,
+		M:                  DefaultM,
+		M0:                 DefaultM0,
+		EfConstruction:     100,
+		EfSearch:           64,
+		FlatThreshold:      -1,
+		DisableFilterAware: true,
+	})
+	defer idx.Close()
+	filter := CandidateFilter(func(id NodeID) bool { return id%8 == 0 })
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32(q, filter, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSearchCandidatesFloat32_768(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim768,
+		ElementType:    ElementFloat32,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+	})
+	defer idx.Close()
+	candidates := make([]NodeID, 0, 125)
+	for id := NodeID(1); id <= 1000; id += 8 {
+		candidates = append(candidates, id)
+	}
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchCandidatesFloat32(context.Background(), candidates, q, 10); err != nil {
 			b.Fatal(err)
 		}
 	}

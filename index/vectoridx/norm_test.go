@@ -15,24 +15,24 @@ func cosineSnapshotMatchesKernel(t *testing.T, idx *VectorIdx, query []float32) 
 	snap := idx.view.Load()
 	defer idx.readers.Release(token)
 
-	if len(snap.norms) != len(snap.ids) {
-		t.Fatalf("norms = %d, ids = %d", len(snap.norms), len(snap.ids))
+	if len(snap.normChunks) != snap.vectorChunkCount() {
+		t.Fatalf("norm chunks = %d, vector chunks = %d", len(snap.normChunks), snap.vectorChunkCount())
 	}
 	rawQ := encodeRawFloat32(nil, query)
 	q := bytesAsFloat32(rawQ, len(query))
 	qNorm := snap.rawNorm(rawQ)
-	if want := normFloat32(q); math.Abs(qNorm-want) > 1e-12 {
+	if want := normFloat32(q); math.Abs(qNorm-want) > 1e-5 {
 		t.Fatalf("query norm = %v, want %v", qNorm, want)
 	}
 	for ord := range snap.ids {
 		v := bytesAsFloat32(snap.vectorAt(ord), snap.dims)
 		want := CosineFloat32(q, v)
 		got := snap.distQuery(rawQ, qNorm, ord)
-		if math.Abs(got-want) > 1e-12 {
+		if math.Abs(got-want) > 1e-5 {
 			t.Fatalf("ord %d: distQuery = %v, want %v", ord, got, want)
 		}
-		if wantNorm := normFloat32(v); math.Abs(snap.norms[ord]-wantNorm) > 1e-12 {
-			t.Fatalf("ord %d: cached norm = %v, want %v", ord, snap.norms[ord], wantNorm)
+		if wantNorm := normFloat32(v); math.Abs(snap.normAt(ord)-wantNorm) > 1e-5 {
+			t.Fatalf("ord %d: cached norm = %v, want %v", ord, snap.normAt(ord), wantNorm)
 		}
 	}
 	if len(snap.ids) > 1 {
@@ -42,7 +42,7 @@ func cosineSnapshotMatchesKernel(t *testing.T, idx *VectorIdx, query []float32) 
 			vb := bytesAsFloat32(snap.vectorAt(b), snap.dims)
 			want := CosineFloat32(va, vb)
 			got := snap.distOrds(a, b)
-			if math.Abs(got-want) > 1e-12 {
+			if math.Abs(got-want) > 1e-5 {
 				t.Fatalf("distOrds(%d,%d) = %v, want %v", a, b, got, want)
 			}
 		}

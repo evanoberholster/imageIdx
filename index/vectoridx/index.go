@@ -32,17 +32,19 @@ import (
 // filter via bounds checks, link rewrites clone short inner slices, and
 // tombstones swap an immutable roar bitmap. See doc.go.
 type vectorSnapshot struct {
-	cfg      Config
-	dist     distRaw
-	dot      distRaw   // raw dot product; set for MetricCosine
-	norms    []float64 // per-ordinal vector norms; set for MetricCosine
-	vecBytes int
-	elemSize int
-	dims     int
+	cfg        Config
+	dist       distRaw
+	dot        distRaw     // raw dot product; set for MetricCosine
+	normChunks [][]float64 // per-chunk cached norms; set for MetricCosine
+	vecBytes   int
+	elemSize   int
+	dims       int
 
-	// Dense physical storage in insertion-ordinal order.
+	// Dense physical storage in insertion-ordinal order. Vectors live in
+	// fixed-size chunks so appends never copy the whole store and an in-place
+	// update copies only one chunk (copy-on-write for readers).
 	ids     []NodeID
-	vectors []byte // len == len(ids)*vecBytes, contiguous
+	vectors [][]byte // chunk directory; published bytes are bounded by len(ids)
 	levels  []int
 	links   []*atomic.Pointer[nodeLayers] // links[ord] -> per-node layers
 
@@ -284,11 +286,17 @@ func OpenStore(path string, durability Durability, opts ...Option) (*VectorIdx, 
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(path)
+	data, err := storage.MapFile(path, ErrCorruptStorage)
 	if err != nil {
 		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
+	mapped := true
+	defer func() {
+		if mapped {
+			_ = storage.Unmap(data)
+		}
+	}()
 	header, regions, err := decodeFile(data)
 	if err != nil {
 		_ = storage.ReleaseLock(lock)
@@ -366,6 +374,10 @@ func OpenStore(path string, durability Durability, opts ...Option) (*VectorIdx, 
 		_ = storage.ReleaseLock(lock)
 		return nil, err
 	}
+	// loadRegions copies the regions it retains; release the read-only map
+	// before replaying deltas/WAL.
+	_ = storage.Unmap(data)
+	mapped = false
 	v.gen.Store(header.generation + 1)
 	if err := v.applyDeltasLocked(manifest); err != nil {
 		_ = storage.ReleaseLock(lock)
@@ -511,6 +523,68 @@ func logFloat(x float64) float64 {
 func cloneSnapshot(s *vectorSnapshot) *vectorSnapshot {
 	c := *s
 	return &c
+}
+
+// Vector chunks bound append growth and copy-on-write update cost. Sixty-four
+// vectors is 128-256 KiB at the supported 512-1024 dimensions.
+const vectorChunkShift = 6
+
+const vectorChunkVectors = 1 << vectorChunkShift
+
+func (s *vectorSnapshot) vectorChunkCount() int {
+	return (len(s.ids) + vectorChunkVectors - 1) >> vectorChunkShift
+}
+
+func (s *vectorSnapshot) newVectorChunk() []byte {
+	return make([]byte, vectorChunkVectors*s.vecBytes)
+}
+
+// appendVectorAt writes vector ord into the chunk directory. ord must equal
+// the current published count; existing snapshots are unaffected because they
+// bound reads by their older len(ids).
+func (s *vectorSnapshot) appendVectorAt(ord int, raw []byte) {
+	ci := ord >> vectorChunkShift
+	if ci == len(s.vectors) {
+		s.vectors = append(s.vectors, s.newVectorChunk())
+	}
+	off := (ord & (vectorChunkVectors - 1)) * s.vecBytes
+	copy(s.vectors[ci][off:off+s.vecBytes], raw)
+}
+
+// replaceVectorAt replaces a published vector with copy-on-write at chunk
+// granularity. Readers holding an older snapshot keep the old chunk.
+func (s *vectorSnapshot) replaceVectorAt(ord int, raw []byte) {
+	ci := ord >> vectorChunkShift
+	if ci >= len(s.vectors) {
+		s.appendVectorAt(ord, raw)
+		return
+	}
+	old := s.vectors[ci]
+	chunk := make([]byte, len(old))
+	copy(chunk, old)
+	off := (ord & (vectorChunkVectors - 1)) * s.vecBytes
+	copy(chunk[off:off+s.vecBytes], raw)
+	// The directory slice is shared with published snapshots; clone it before
+	// swapping one chunk pointer.
+	dir := make([][]byte, len(s.vectors))
+	copy(dir, s.vectors)
+	dir[ci] = chunk
+	s.vectors = dir
+}
+
+// vectorChunks returns only the published portion of each chunk, suitable for
+// streaming to a base generation without materializing a contiguous copy.
+func (s *vectorSnapshot) vectorChunks() [][]byte {
+	n := s.vectorChunkCount()
+	if n == 0 {
+		return nil
+	}
+	chunks := make([][]byte, n)
+	for i := range chunks {
+		count := min(vectorChunkVectors, len(s.ids)-i*vectorChunkVectors)
+		chunks[i] = s.vectors[i][:count*s.vecBytes]
+	}
+	return chunks
 }
 
 // pickNeighbors selects up to m candidates using the configured policy.
@@ -789,7 +863,7 @@ func (v *VectorIdx) addRawLockedAtLevel(cur *vectorSnapshot, id NodeID, raw []by
 	ns := cloneSnapshot(cur)
 	ord := len(ns.ids)
 	ns.ids = append(ns.ids, id)
-	ns.vectors = append(ns.vectors, raw...)
+	ns.appendVectorAt(ord, raw)
 	ns.appendVectorNorm(raw)
 	ns.levels = append(ns.levels, level)
 	holder := &atomic.Pointer[nodeLayers]{}
@@ -911,9 +985,9 @@ func (v *VectorIdx) resurrectLocked(cur *vectorSnapshot, ord int, id NodeID, raw
 		v.lsn++
 	}
 	ns := cloneSnapshot(cur)
-	copy(ns.vectorAt(ord), raw)
+	ns.replaceVectorAt(ord, raw)
 	if ns.cfg.Metric == MetricCosine {
-		ns.norms[ord] = ns.rawNorm(raw)
+		ns.replaceVectorNorm(ord, ns.rawNorm(raw))
 	}
 	ns.tombSorted = removeTombSorted(ns.tombSorted, id)
 	ns.tomb, ns.tombSorted = rebuildTombeset(ns.tombSorted)
@@ -1178,6 +1252,121 @@ func (v *VectorIdx) AddFloat32(id NodeID, vec []float32) error {
 		v.writeMu.Unlock()
 		return err
 	}
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
+}
+
+// AddFloat32Batch inserts vectors as one writer batch. It validates duplicate
+// IDs and vector widths before writing, holds writeMu once, publishes one
+// snapshot, and performs one durability sync. Graph construction remains
+// single-writer so replay and neighbor order stay deterministic.
+func (v *VectorIdx) AddFloat32Batch(ids []NodeID, vecs [][]float32) error {
+	if v.cfgBase.ElementType != ElementFloat32 || len(ids) != len(vecs) {
+		return ErrInvalidVector
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	for _, vec := range vecs {
+		if len(vec) != v.dims {
+			return ErrInvalidVector
+		}
+	}
+	v.writeMu.Lock()
+	if v.closed.Load() {
+		v.writeMu.Unlock()
+		return ErrClosed
+	}
+	cur := v.view.Load()
+	seen := make(map[NodeID]struct{}, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			v.writeMu.Unlock()
+			return ErrDuplicateNodeID
+		}
+		seen[id] = struct{}{}
+		if ord, ok := cur.locate(id); ok && !cur.tomb.Contains(uint64(id)) {
+			_ = ord
+			v.writeMu.Unlock()
+			return ErrDuplicateNodeID
+		}
+	}
+	for i, id := range ids {
+		raw := encodeRawFloat32(v.encodeBuf[:0], vecs[i])
+		v.encodeBuf = raw
+		ns, err := v.addRawLocked(cur, id, raw)
+		if err != nil {
+			v.view.Store(cur)
+			v.maybeAutoCompactLocked(cur)
+			wal := v.takePendingSyncLocked()
+			v.writeMu.Unlock()
+			return errors.Join(err, v.syncWALAfterWrite(wal))
+		}
+		cur = ns
+	}
+	v.view.Store(cur)
+	v.maybeAutoCompactLocked(cur)
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
+}
+
+// DeleteBatch tombstones ids as one writer batch with one publish/sync.
+// Unknown IDs fail the batch before any WAL write; already-tombstoned IDs are
+// ignored.
+func (v *VectorIdx) DeleteBatch(ids []NodeID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	v.writeMu.Lock()
+	if v.closed.Load() {
+		v.writeMu.Unlock()
+		return ErrClosed
+	}
+	cur := v.view.Load()
+	for _, id := range ids {
+		if _, ok := cur.locate(id); !ok {
+			v.writeMu.Unlock()
+			return ErrNodeNotFound
+		}
+	}
+	ns := cloneSnapshot(cur)
+	deleted := make([]NodeID, 0, len(ids))
+	for _, id := range ids {
+		if cur.tomb.Contains(uint64(id)) {
+			continue
+		}
+		if v.wal != nil {
+			if err := v.appendWALRecord(walTypeDelete, id, nil); err != nil {
+				v.view.Store(cur)
+				wal := v.takePendingSyncLocked()
+				v.writeMu.Unlock()
+				return errors.Join(err, v.syncWALAfterWrite(wal))
+			}
+			v.lsn++
+		}
+		deleted = append(deleted, id)
+		v.markPendingLocked(id)
+	}
+	tomb := make([]NodeID, 0, len(ns.tombSorted)+len(deleted))
+	tomb = append(tomb, ns.tombSorted...)
+	tomb = append(tomb, deleted...)
+	sort.Slice(tomb, func(i, j int) bool { return tomb[i] < tomb[j] })
+	if len(tomb) > 1 {
+		out := tomb[:1]
+		for _, id := range tomb[1:] {
+			if id != out[len(out)-1] {
+				out = append(out, id)
+			}
+		}
+		tomb = out
+	}
+	ns.tombSorted = tomb
+	ns.tomb, ns.tombSorted = rebuildTombeset(tomb)
+	ns.gen = v.gen.Add(1)
 	v.view.Store(ns)
 	v.maybeAutoCompactLocked(ns)
 	wal := v.takePendingSyncLocked()
@@ -1621,10 +1810,10 @@ func (v *VectorIdx) Compact() (CompactionResult, error) {
 		vecBytes: v.vecBytes,
 		elemSize: v.elemSize,
 		dims:     v.dims,
-		vectors:  make([]byte, 0, len(lives)*v.vecBytes),
+		vectors:  make([][]byte, 0, (len(lives)+vectorChunkVectors-1)>>vectorChunkShift),
 	}
 	if cur.cfg.Metric == MetricCosine {
-		ns.norms = make([]float64, 0, len(lives))
+		ns.normChunks = make([][]float64, 0, (len(lives)+vectorChunkVectors-1)>>vectorChunkShift)
 	}
 	v.rng = rand.New(rand.NewSource(0xC0FAC7))
 	ctx := acquireSearchContext()
@@ -1634,9 +1823,9 @@ func (v *VectorIdx) Compact() (CompactionResult, error) {
 		level := v.sampleLevelLocked()
 		ord := len(ns.ids)
 		ns.ids = append(ns.ids, lv.id)
-		ns.vectors = append(ns.vectors, raw...)
+		ns.appendVectorAt(ord, raw)
 		if ns.cfg.Metric == MetricCosine {
-			ns.norms = append(ns.norms, cur.norms[lv.ord])
+			ns.setVectorNorm(ord, cur.normAt(lv.ord))
 		}
 		ns.levels = append(ns.levels, level)
 		holder := &atomic.Pointer[nodeLayers]{}
@@ -1739,16 +1928,21 @@ func (v *VectorIdx) Verify() error {
 	token := v.readers.Acquire()
 	s := v.view.Load()
 	defer v.readers.Release(token)
-	if len(s.vectors) != len(s.ids)*v.vecBytes {
+	if len(s.vectors) != s.vectorChunkCount() {
 		return ErrCorruptStorage
 	}
+	for _, chunk := range s.vectors {
+		if len(chunk) != vectorChunkVectors*v.vecBytes {
+			return ErrCorruptStorage
+		}
+	}
 	if s.cfg.Metric == MetricCosine {
-		if s.dot == nil || len(s.norms) != len(s.ids) {
+		if s.dot == nil || len(s.normChunks) != s.vectorChunkCount() {
 			return ErrCorruptStorage
 		}
 		for ord := range s.ids {
 			want := math.Sqrt(s.dot(s.vectorAt(ord), s.vectorAt(ord)))
-			if math.Abs(want-s.norms[ord]) > 1e-9*math.Max(1, want) {
+			if math.Abs(want-s.normAt(ord)) > 1e-9*math.Max(1, want) {
 				return ErrCorruptStorage
 			}
 		}
