@@ -245,6 +245,8 @@ graph fail loudly.
   yet mmap epochs; generations on disk are already immutable, so the swap
   is API-safe.
 - Heap-backed (copied) reads instead of retained mmaps; the format is
-  offset/length-addressed for a compatible mmap upgrade.
+  offset/length-addressed for a compatible mmap upgrade. `AddFloat32Batch`
+  and `DeleteBatch` amortize locking/publication/sync, but graph construction
+  itself remains single-writer and deterministic.
 - Scalar distance only; `resolveDistance` is the v2 AVX2/NEON plug point.
 - Stored vectors are never quantized (quantization deferred to v2).
