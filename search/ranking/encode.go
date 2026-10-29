@@ -39,6 +39,12 @@ func EncodeTimeGap(target, stamp uint64) Rank {
 // MinRank, NaN -> NoRank. Out-of-range values clamp. Higher is better.
 func QuantizeCosine(sim float32) Rank { return Rank(rankkernel.QuantizeCosine(sim)) }
 
+// QuantizeCosineDistance maps vectoridx's cosine distance (1-cos, smaller is
+// better) to Rank. NaN maps to NoRank.
+func QuantizeCosineDistance(distance float32) Rank {
+	return QuantizeCosine(1 - distance)
+}
+
 // EncodeDistances writes one rank per native distance. Caller-owned dst must
 // hold at least len(src) slots. Zero allocations.
 func EncodeDistances(dst []Rank, src []uint32) {

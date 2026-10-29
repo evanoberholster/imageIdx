@@ -1,6 +1,7 @@
 package vectoridx
 
 import (
+	"context"
 	"math"
 	"sort"
 	"sync/atomic"
@@ -187,18 +188,34 @@ func (s *vectorSnapshot) greedyStep(cur, level int, query []byte, queryNorm floa
 
 // searchLayer runs best-first HNSW exploration at one level from entryOrd,
 // returning up to ef closest entries in ctx-owned scratch.
-func (s *vectorSnapshot) searchLayer(ctx *SearchContext, query []byte, queryNorm float64, entryOrd, ef, level int) []searchEntry {
+func (s *vectorSnapshot) searchLayer(ctx *SearchContext, query []byte, queryNorm float64, filter CandidateFilter, entryOrd, ef, level int) []searchEntry {
 	gen := ctx.gen
 	visited := ctx.visited
 	cand := &ctx.cand
 	best := &ctx.best
+	filtered := &ctx.filtered
+	useFiltered := filter != nil && s.cfg.FilterAware
+	if useFiltered {
+		filtered.reset()
+	}
 
 	entryDist := s.distQuery(query, queryNorm, entryOrd)
 	visited[entryOrd] = gen
-	cand.push(searchEntry{ord: entryOrd, dist: entryDist})
-	best.push(searchEntry{ord: entryOrd, dist: entryDist})
+	entry := searchEntry{ord: entryOrd, dist: entryDist}
+	cand.push(entry)
+	best.push(entry)
+	if useFiltered && filter(s.ids[entryOrd]) {
+		filtered.push(entry)
+	}
 
+	checks := 0
 	for cand.len() != 0 {
+		if ctx.ctx != nil {
+			checks++
+			if checks&255 == 0 && ctx.cancelled() {
+				break
+			}
+		}
 		c := cand.pop()
 		if best.len() >= ef && c.dist > best.peek().dist {
 			break
@@ -217,23 +234,39 @@ func (s *vectorSnapshot) searchLayer(ctx *SearchContext, query []byte, queryNorm
 			}
 			visited[nOrd] = gen
 			d := s.distQuery(query, queryNorm, nOrd)
+			entry := searchEntry{ord: nOrd, dist: d}
 			if best.len() < ef || d < best.peek().dist {
-				cand.push(searchEntry{ord: nOrd, dist: d})
-				best.push(searchEntry{ord: nOrd, dist: d})
+				cand.push(entry)
+				best.push(entry)
 				if best.len() > ef {
 					best.pop()
 				}
 			}
+			if useFiltered && filter(s.ids[nOrd]) {
+				if filtered.len() < ef || d < filtered.peek().dist {
+					filtered.push(entry)
+					if filtered.len() > ef {
+						filtered.pop()
+					}
+				}
+			}
 		}
 	}
-	out := append(ctx.layer[:0], best.items...)
+	if ctx.ctx != nil && ctx.cancelled() {
+		return nil
+	}
+	source := best.items
+	if useFiltered && filtered.len() != 0 {
+		source = filtered.items
+	}
+	out := append(ctx.layer[:0], source...)
 	ctx.layer = out
 	return out
 }
 
 // layer0Search descends from the entry to layer 0 then explores with budget
 // ef, returning raw entries (unfiltered, may include tombstones).
-func (s *vectorSnapshot) layer0Search(ctx *SearchContext, query []byte, ef int) []searchEntry {
+func (s *vectorSnapshot) layer0Search(ctx *SearchContext, query []byte, filter CandidateFilter, ef int) []searchEntry {
 	entryOrd, ok := s.locate(s.entry)
 	if !ok {
 		return nil
@@ -242,14 +275,16 @@ func (s *vectorSnapshot) layer0Search(ctx *SearchContext, query []byte, ef int) 
 	for l := s.maxLevel; l > 0; l-- {
 		cur = s.greedyStep(cur, l, query, ctx.queryNorm)
 	}
-	return s.searchLayer(ctx, query, ctx.queryNorm, cur, ef, 0)
+	return s.searchLayer(ctx, query, ctx.queryNorm, filter, cur, ef, 0)
 }
 
 // effectiveEf computes the layer-0 exploration budget for k, applying the
 // dynamic-ef policy (Weaviate dynamicEf analogue) and filtered oversampling.
-func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter) int {
+func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter, efOverride, oversample uint32) int {
 	ef := int(s.cfg.EfSearch)
-	if s.cfg.DynamicEfFactor > 0 {
+	if efOverride != 0 {
+		ef = int(efOverride)
+	} else if s.cfg.DynamicEfFactor > 0 {
 		dyn := int(uint64(k) * uint64(s.cfg.DynamicEfFactor))
 		if dyn < int(s.cfg.DynamicEfMin) {
 			dyn = int(s.cfg.DynamicEfMin)
@@ -263,7 +298,11 @@ func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter) int {
 		ef = k
 	}
 	if filter != nil {
-		if want := k * int(s.cfg.OversampleFactor); want > ef {
+		factor := s.cfg.OversampleFactor
+		if oversample != 0 {
+			factor = oversample
+		}
+		if want := k * int(factor); want > ef {
 			ef = want
 		}
 	}
@@ -278,9 +317,9 @@ func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter) int {
 
 // assemble converts raw layer-0 entries into the final top-k: skip
 // tombstones, apply the candidate filter, sort, and encode scores into buf.
-// With FilterAware enabled the result heap favors filter-passing nodes while
-// traversal stays unconstrained (ACORN-lite): callers oversample ef, so this
-// stays a post-filter with iterative expansion in the caller.
+// Filter-aware traversal may already have selected filter-passing entries;
+// assemble still rechecks them because it also serves the exact and
+// filter-disabled paths.
 func (s *vectorSnapshot) assemble(entries []searchEntry, filter CandidateFilter, k int, buf []Result, querySelfDot float64) []Result {
 	if k <= 0 || len(entries) == 0 {
 		return buf[:0]
@@ -309,7 +348,7 @@ func (s *vectorSnapshot) assemble(entries []searchEntry, filter CandidateFilter,
 	metric := s.cfg.Metric
 	out := buf[:0]
 	for _, e := range filtered {
-		out = append(out, Result{ValueID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
+		out = append(out, Result{ValueID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot), Distance: float32(e.dist)})
 	}
 	return out
 }
@@ -348,6 +387,9 @@ func (s *vectorSnapshot) exactSearchInto(ctx *SearchContext, query []byte, filte
 	ctx.best.reset()
 	best := &ctx.best
 	for ord, id := range s.ids {
+		if ctx.ctx != nil && ord&4095 == 0 && ctx.cancelled() {
+			break
+		}
 		if s.tomb.Contains(uint64(id)) {
 			continue
 		}
@@ -365,6 +407,9 @@ func (s *vectorSnapshot) exactSearchInto(ctx *SearchContext, query []byte, filte
 			best.push(searchEntry{ord: ord, dist: d})
 		}
 	}
+	if ctx.ctx != nil && ctx.cancelled() {
+		return buf[:0]
+	}
 	all := append(ctx.layer[:0], best.items...)
 	ctx.layer = all
 	sortAssembled(all, s.ids)
@@ -375,16 +420,16 @@ func (s *vectorSnapshot) exactSearchInto(ctx *SearchContext, query []byte, filte
 	}
 	out := buf[:0]
 	for _, e := range all {
-		out = append(out, Result{ValueID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot)})
+		out = append(out, Result{ValueID: widenedID(s.ids[e.ord]), Score: encodeScoreForMetric(metric, e.dist, querySelfDot), Distance: float32(e.dist)})
 	}
 	return out
 }
 
 // exactSearch is the scalar exact reference for the index metric: full scan
 // over live nodes honoring tombstones and filter, sorted, truncated to k.
-func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int) []Result {
+func (s *vectorSnapshot) exactSearch(ctx context.Context, query []byte, filter CandidateFilter, k int) ([]Result, error) {
 	if k <= 0 || len(s.ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	type scored struct {
 		id   NodeID
@@ -393,6 +438,11 @@ func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int
 	queryNorm := s.rawNorm(query)
 	all := make([]scored, 0, len(s.ids))
 	for ord, id := range s.ids {
+		if ctx != nil && ord&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if s.tomb.Contains(uint64(id)) {
 			continue
 		}
@@ -400,6 +450,11 @@ func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int
 			continue
 		}
 		all = append(all, scored{id: id, dist: s.distQuery(query, queryNorm, ord)})
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].dist != all[j].dist {
@@ -417,15 +472,100 @@ func (s *vectorSnapshot) exactSearch(query []byte, filter CandidateFilter, k int
 	}
 	out := make([]Result, len(all))
 	for i, sc := range all {
-		out[i] = Result{ValueID: widenedID(sc.id), Score: encodeScoreForMetric(metric, sc.dist, querySelfDot)}
+		out[i] = Result{ValueID: widenedID(sc.id), Score: encodeScoreForMetric(metric, sc.dist, querySelfDot), Distance: float32(sc.dist)}
 	}
-	return out
+	return out, nil
+}
+
+// searchCandidatesInto scores a caller-supplied set of unique NodeIDs and
+// appends the best k to dst. It is the exact, filter-first path for selective
+// metadata/ACL predicates: distance work is proportional to the candidate set,
+// not the index size.
+func (s *vectorSnapshot) searchCandidatesInto(ctx *SearchContext, dst []Result, candidates []NodeID, query []byte, k int) []Result {
+	if k <= 0 || len(candidates) == 0 {
+		return dst
+	}
+	ctx.cand.reset()
+	ctx.best.reset()
+	ctx.layer = ctx.layer[:0]
+	ctx.queryNorm = s.rawNorm(query)
+	best := &ctx.best
+	checks := 0
+	for _, id := range candidates {
+		if ctx.ctx != nil {
+			checks++
+			if checks&1023 == 0 && ctx.cancelled() {
+				break
+			}
+		}
+		ord, ok := s.locate(id)
+		if !ok || s.tomb.Contains(uint64(id)) {
+			continue
+		}
+		d := s.distQuery(query, ctx.queryNorm, ord)
+		if best.len() < k {
+			best.push(searchEntry{ord: ord, dist: d})
+			continue
+		}
+		top := best.peek()
+		if d < top.dist || (d == top.dist && id < s.ids[top.ord]) {
+			best.pop()
+			best.push(searchEntry{ord: ord, dist: d})
+		}
+	}
+	if ctx.ctx != nil && ctx.cancelled() {
+		return dst
+	}
+	if ctx.err != nil {
+		return dst
+	}
+	all := append(ctx.layer[:0], best.items...)
+	ctx.layer = all
+	sortAssembled(all, s.ids)
+	metric := s.cfg.Metric
+	var querySelfDot float64
+	if metric == MetricDot {
+		querySelfDot = dotSelfBytes(s.cfg, query)
+	}
+	for _, e := range all {
+		dst = append(dst, Result{
+			ValueID:  widenedID(s.ids[e.ord]),
+			Score:    encodeScoreForMetric(metric, e.dist, querySelfDot),
+			Distance: float32(e.dist),
+		})
+	}
+	return dst
+}
+
+func (s *vectorSnapshot) searchCandidatesFloat32(queryCtx context.Context, dst []Result, candidates []NodeID, query []float32, k int) ([]Result, error) {
+	if k <= 0 {
+		return dst, ErrInvalidQuery
+	}
+	if queryCtx != nil {
+		if err := queryCtx.Err(); err != nil {
+			return dst, err
+		}
+	}
+	ctx := acquireSearchContext()
+	defer releaseSearchContext(ctx)
+	ctx.ctx = queryCtx
+	ctx.err = nil
+	if cap(ctx.queryBuf) < s.vecBytes {
+		ctx.queryBuf = make([]byte, s.vecBytes)
+	}
+	raw := encodeRawFloat32(ctx.queryBuf[:0], query)
+	ctx.queryBuf = raw
+	out := s.searchCandidatesInto(ctx, dst, candidates, raw, k)
+	if ctx.err != nil {
+		return dst, ctx.err
+	}
+	return out, nil
 }
 
 // searchWithHint runs the full ANN path with an optional filter cardinality
 // hint for the cost-based flat fallback. flatSmall reports whether the flat
 // path was taken.
-func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter CandidateFilter, k int, filterHint int) ([]Result, bool) {
+func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter CandidateFilter, k int, filterHint int, efOverride, oversample uint32) ([]Result, bool) {
 	if k > len(s.ids) {
 		k = len(s.ids)
 	}
@@ -434,20 +574,29 @@ func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter
 	if s.cfg.FlatThreshold >= 0 && live <= s.cfg.FlatThreshold {
 		out := s.exactSearchInto(ctx, query, filter, k, ctx.output[:0])
 		ctx.output = out
+		if ctx.err != nil {
+			return nil, true
+		}
 		return out, true
 	}
 	if filter != nil && filterHint >= 0 && s.cfg.FlatSearchCutoff >= 0 && filterHint <= s.cfg.FlatSearchCutoff {
 		out := s.exactSearchInto(ctx, query, filter, k, ctx.output[:0])
 		ctx.output = out
+		if ctx.err != nil {
+			return nil, true
+		}
 		return out, true
 	}
 	var querySelfDot float64
 	if s.cfg.Metric == MetricDot {
 		querySelfDot = dotSelfBytes(s.cfg, query)
 	}
-	ef := s.effectiveEf(k, filter)
+	ef := s.effectiveEf(k, filter, efOverride, oversample)
 	ctx.resetForNodes(len(s.ids), s.vecBytes)
-	entries := s.layer0Search(ctx, query, ef)
+	entries := s.layer0Search(ctx, query, filter, ef)
+	if ctx.err != nil {
+		return nil, false
+	}
 	results := s.assemble(entries, filter, k, ctx.output[:0], querySelfDot)
 	ctx.output = results
 	if filter != nil && len(results) < k {
@@ -458,7 +607,10 @@ func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter
 			}
 			if ef2 > ef {
 				ctx.resetForNodes(len(s.ids), s.vecBytes)
-				entries = s.layer0Search(ctx, query, ef2)
+				entries = s.layer0Search(ctx, query, filter, ef2)
+				if ctx.err != nil {
+					return nil, false
+				}
 				expanded := s.assemble(entries, filter, k, ctx.output[:0], querySelfDot)
 				ctx.output = expanded
 				if len(expanded) > len(results) {
@@ -500,7 +652,14 @@ func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter
 			if available <= k || len(results) < k {
 				// Allocating fallback: results aliases ctx scratch, so the
 				// exact scan takes its own storage here.
-				exact := s.exactSearch(query, filter, k)
+				exact, err := s.exactSearch(ctx.ctx, query, filter, k)
+				if err != nil {
+					ctx.err = err
+					return nil, false
+				}
+				if ctx.err != nil {
+					return nil, false
+				}
 				if len(exact) > len(results) {
 					return exact, true
 				}

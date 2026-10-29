@@ -10,6 +10,7 @@ const (
 	OperationFilterIDs
 	OperationRankTime
 	OperationRankGeo
+	OperationRankVector
 )
 
 // StageMode describes how a stage ran. A stage not reached because an

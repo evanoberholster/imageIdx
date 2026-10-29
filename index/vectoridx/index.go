@@ -768,7 +768,7 @@ func (v *VectorIdx) addRawLockedAtLevel(cur *vectorSnapshot, id NodeID, raw []by
 			}
 			for l := min(cur.maxLevel, level); l >= 0; l-- {
 				ef := int(cur.cfg.EfConstruction)
-				cands := cur.searchLayer(ctx, raw, ctx.queryNorm, curBest, ef, l)
+				cands := cur.searchLayer(ctx, raw, ctx.queryNorm, nil, curBest, ef, l)
 				m := int(cur.cfg.M)
 				if l == 0 {
 					m = int(cur.cfg.M0)
@@ -1190,12 +1190,16 @@ func (v *VectorIdx) AddFloat32(id NodeID, vec []float32) error {
 type queryEncoder func(dst []byte) []byte
 
 func (v *VectorIdx) searchEncoded(filter CandidateFilter, k int, encode queryEncoder) ([]Result, error) {
-	return v.searchEncodedWithHint(filter, k, -1, encode)
+	return v.searchEncodedWithHint(filter, k, UnknownFilterHint, encode)
 }
 
 // searchEncodedWithHint is searchEncoded with a filter cardinality hint for
 // the cost-based flat fallback (Weaviate flatSearchCutoff analogue).
 func (v *VectorIdx) searchEncodedWithHint(filter CandidateFilter, k int, filterHint int, encode queryEncoder) ([]Result, error) {
+	return v.searchEncodedWithOptions(nil, filter, k, filterHint, 0, 0, encode)
+}
+
+func (v *VectorIdx) searchEncodedWithOptions(queryCtx context.Context, filter CandidateFilter, k, filterHint int, ef, oversample uint32, encode queryEncoder) ([]Result, error) {
 	if k <= 0 {
 		return nil, ErrInvalidQuery
 	}
@@ -1205,33 +1209,53 @@ func (v *VectorIdx) searchEncodedWithHint(filter CandidateFilter, k int, filterH
 		v.readers.Release(token)
 		return nil, ErrClosed
 	}
+	out, err := snap.searchEncodedWithOptions(queryCtx, filter, k, filterHint, ef, oversample, encode)
+	v.readers.Release(token)
+	return out, err
+}
+
+func (s *vectorSnapshot) searchEncodedWithOptions(queryCtx context.Context, filter CandidateFilter, k, filterHint int, ef, oversample uint32, encode queryEncoder) ([]Result, error) {
+	if k <= 0 {
+		return nil, ErrInvalidQuery
+	}
+	if queryCtx != nil {
+		if err := queryCtx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	ctx := acquireSearchContext()
-	if cap(ctx.queryBuf) < v.vecBytes {
-		ctx.queryBuf = make([]byte, v.vecBytes)
+	defer releaseSearchContext(ctx)
+	ctx.ctx = queryCtx
+	ctx.err = nil
+	if cap(ctx.queryBuf) < s.vecBytes {
+		ctx.queryBuf = make([]byte, s.vecBytes)
 	}
 	query := encode(ctx.queryBuf[:0])
 	ctx.queryBuf = query
-	var results []Result
-	if !snap.hasEntry || len(snap.ids) == 0 {
-		results = nil
-	} else {
-		if k > len(snap.ids) {
-			k = len(snap.ids)
-		}
-		results, _ = snap.searchWithHint(ctx, query, filter, k, filterHint)
+	if !s.hasEntry || len(s.ids) == 0 {
+		return nil, nil
+	}
+	if k > len(s.ids) {
+		k = len(s.ids)
+	}
+	results, _ := s.searchWithHint(ctx, query, filter, k, filterHint, ef, oversample)
+	if ctx.err != nil {
+		return nil, ctx.err
 	}
 	out := make([]Result, len(results))
 	copy(out, results)
-	releaseSearchContext(ctx)
-	v.readers.Release(token)
 	return out, nil
 }
 
 func (v *VectorIdx) searchIntoEncoded(dst []Result, filter CandidateFilter, k int, encode queryEncoder) ([]Result, error) {
-	return v.searchIntoEncodedWithHint(dst, filter, k, -1, encode)
+	return v.searchIntoEncodedWithHint(dst, filter, k, UnknownFilterHint, encode)
 }
 
 func (v *VectorIdx) searchIntoEncodedWithHint(dst []Result, filter CandidateFilter, k int, filterHint int, encode queryEncoder) ([]Result, error) {
+	return v.searchIntoEncodedWithOptions(nil, dst, filter, k, filterHint, 0, 0, encode)
+}
+
+func (v *VectorIdx) searchIntoEncodedWithOptions(queryCtx context.Context, dst []Result, filter CandidateFilter, k, filterHint int, ef, oversample uint32, encode queryEncoder) ([]Result, error) {
 	if k <= 0 {
 		return nil, ErrInvalidQuery
 	}
@@ -1241,21 +1265,39 @@ func (v *VectorIdx) searchIntoEncodedWithHint(dst []Result, filter CandidateFilt
 		v.readers.Release(token)
 		return nil, ErrClosed
 	}
+	dst, err := snap.searchIntoEncodedWithOptions(queryCtx, dst, filter, k, filterHint, ef, oversample, encode)
+	v.readers.Release(token)
+	return dst, err
+}
+
+func (s *vectorSnapshot) searchIntoEncodedWithOptions(queryCtx context.Context, dst []Result, filter CandidateFilter, k, filterHint int, ef, oversample uint32, encode queryEncoder) ([]Result, error) {
+	if k <= 0 {
+		return nil, ErrInvalidQuery
+	}
+	if queryCtx != nil {
+		if err := queryCtx.Err(); err != nil {
+			return dst, err
+		}
+	}
 	ctx := acquireSearchContext()
-	if cap(ctx.queryBuf) < v.vecBytes {
-		ctx.queryBuf = make([]byte, v.vecBytes)
+	defer releaseSearchContext(ctx)
+	ctx.ctx = queryCtx
+	ctx.err = nil
+	if cap(ctx.queryBuf) < s.vecBytes {
+		ctx.queryBuf = make([]byte, s.vecBytes)
 	}
 	query := encode(ctx.queryBuf[:0])
 	ctx.queryBuf = query
-	if snap.hasEntry && len(snap.ids) != 0 {
-		if k > len(snap.ids) {
-			k = len(snap.ids)
+	if s.hasEntry && len(s.ids) != 0 {
+		if k > len(s.ids) {
+			k = len(s.ids)
 		}
-		results, _ := snap.searchWithHint(ctx, query, filter, k, filterHint)
+		results, _ := s.searchWithHint(ctx, query, filter, k, filterHint, ef, oversample)
+		if ctx.err != nil {
+			return dst, ctx.err
+		}
 		dst = append(dst, results...)
 	}
-	releaseSearchContext(ctx)
-	v.readers.Release(token)
 	return dst, nil
 }
 
@@ -1313,6 +1355,84 @@ func (v *VectorIdx) SearchFloat32(query []float32, filter CandidateFilter, k int
 	return v.searchEncoded(filter, k, func(dst []byte) []byte {
 		return encodeRawFloat32(dst, query)
 	})
+}
+
+// SearchFloat32WithOptions is SearchFloat32 with cancellation and per-query
+// ef/oversample/filter-hint controls.
+func (v *VectorIdx) SearchFloat32WithOptions(queryCtx context.Context, query []float32, opts SearchOptions) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
+		return nil, ErrInvalidVector
+	}
+	hint := opts.FilterHint
+	if hint == 0 {
+		hint = UnknownFilterHint
+	}
+	return v.searchEncodedWithOptions(queryCtx, opts.Filter, opts.K, hint, opts.EfSearch, opts.Oversample, func(dst []byte) []byte {
+		return encodeRawFloat32(dst, query)
+	})
+}
+
+// SearchFloat32Context is SearchFloat32 with cancellation.
+func (v *VectorIdx) SearchFloat32Context(queryCtx context.Context, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return v.SearchFloat32WithOptions(queryCtx, query, SearchOptions{K: k, Filter: filter, FilterHint: UnknownFilterHint})
+}
+
+// SearchIntoFloat32WithOptions is SearchIntoFloat32 with cancellation and
+// per-query controls. It reuses dst and pooled scratch after warm-up.
+func (v *VectorIdx) SearchIntoFloat32WithOptions(queryCtx context.Context, dst []Result, query []float32, opts SearchOptions) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
+		return nil, ErrInvalidVector
+	}
+	hint := opts.FilterHint
+	if hint == 0 {
+		hint = UnknownFilterHint
+	}
+	return v.searchIntoEncodedWithOptions(queryCtx, dst, opts.Filter, opts.K, hint, opts.EfSearch, opts.Oversample, func(scratch []byte) []byte {
+		return encodeRawFloat32(scratch, query)
+	})
+}
+
+// SearchIntoFloat32Context is SearchIntoFloat32 with cancellation.
+func (v *VectorIdx) SearchIntoFloat32Context(queryCtx context.Context, dst []Result, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return v.SearchIntoFloat32WithOptions(queryCtx, dst, query, SearchOptions{K: k, Filter: filter, FilterHint: UnknownFilterHint})
+}
+
+// SearchCandidatesFloat32 scores exactly the supplied candidate NodeIDs and
+// returns the best k. Candidates should be unique. It is the selective-filter
+// path: cost scales with len(candidates), not with the index size. Tombstoned
+// or unknown IDs are skipped.
+func (v *VectorIdx) SearchCandidatesFloat32(queryCtx context.Context, candidates []NodeID, query []float32, k int) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
+		return nil, ErrInvalidVector
+	}
+	if k <= 0 {
+		return nil, ErrInvalidQuery
+	}
+	out := make([]Result, 0, min(k, len(candidates)))
+	return v.SearchCandidatesIntoFloat32(queryCtx, out, candidates, query, k)
+}
+
+// SearchCandidatesIntoFloat32 appends the best k candidate matches to dst.
+func (v *VectorIdx) SearchCandidatesIntoFloat32(queryCtx context.Context, dst []Result, candidates []NodeID, query []float32, k int) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
+		return dst, ErrInvalidVector
+	}
+	return v.searchCandidatesIntoFloat32(queryCtx, dst, candidates, query, k)
+}
+
+func (v *VectorIdx) searchCandidatesIntoFloat32(queryCtx context.Context, dst []Result, candidates []NodeID, query []float32, k int) ([]Result, error) {
+	if k <= 0 {
+		return dst, ErrInvalidQuery
+	}
+	token := v.readers.Acquire()
+	snap := v.view.Load()
+	if v.closed.Load() {
+		v.readers.Release(token)
+		return dst, ErrClosed
+	}
+	out, err := snap.searchCandidatesFloat32(queryCtx, dst, candidates, query, k)
+	v.readers.Release(token)
+	return out, err
 }
 
 // SearchIntoInt8 appends up to k matches to dst, reusing caller storage.
@@ -1387,9 +1507,34 @@ func (v *VectorIdx) ExactSearchFloat32(query []float32, filter CandidateFilter, 
 		v.readers.Release(token)
 		return nil, ErrClosed
 	}
-	out := snap.exactSearch(raw, filter, k)
+	out, err := snap.exactSearch(nil, raw, filter, k)
 	v.readers.Release(token)
-	return out, nil
+	return out, err
+}
+
+// ExactSearchFloat32Context is ExactSearchFloat32 with cancellation.
+func (v *VectorIdx) ExactSearchFloat32Context(queryCtx context.Context, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat32 || len(query) != v.dims {
+		return nil, ErrInvalidVector
+	}
+	if k <= 0 {
+		return nil, ErrInvalidQuery
+	}
+	if queryCtx != nil {
+		if err := queryCtx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	raw := encodeRawFloat32(nil, query)
+	token := v.readers.Acquire()
+	snap := v.view.Load()
+	if v.closed.Load() {
+		v.readers.Release(token)
+		return nil, ErrClosed
+	}
+	out, err := snap.exactSearch(queryCtx, raw, filter, k)
+	v.readers.Release(token)
+	return out, err
 }
 
 // SearchWithFilterHint runs SearchFloat32 with a filter cardinality hint for
@@ -1557,7 +1702,7 @@ func (v *VectorIdx) wireRebuilt(ctx *SearchContext, s *vectorSnapshot, raw []byt
 	}
 	for l := min(s.maxLevel, level); l >= 0; l-- {
 		ef := int(s.cfg.EfConstruction)
-		cands := s.searchLayer(ctx, raw, ctx.queryNorm, cur, ef, l)
+		cands := s.searchLayer(ctx, raw, ctx.queryNorm, nil, cur, ef, l)
 		filtered := cands[:0]
 		for _, c := range cands {
 			if c.ord != ord {

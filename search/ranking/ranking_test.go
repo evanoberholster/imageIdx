@@ -15,6 +15,12 @@ func TestHigherIsBetter(t *testing.T) {
 	if QuantizeCosine(1) != MaxRank || QuantizeCosine(-1) != MinRank {
 		t.Fatalf("cosine boundaries wrong: +1=%d -1=%d", QuantizeCosine(1), QuantizeCosine(-1))
 	}
+	if QuantizeCosineDistance(0) != MaxRank || QuantizeCosineDistance(2) != MinRank {
+		t.Fatalf("cosine-distance boundaries wrong: 0=%d 2=%d", QuantizeCosineDistance(0), QuantizeCosineDistance(2))
+	}
+	if QuantizeCosineDistance(float32(math.NaN())) != NoRank {
+		t.Fatalf("NaN cosine distance should be NoRank")
+	}
 }
 
 func TestTimeEncodingMonotonic(t *testing.T) {

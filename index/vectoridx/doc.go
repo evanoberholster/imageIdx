@@ -37,10 +37,13 @@
 //   - Durability policy per open (OS page cache, per-record fsync, or
 //     interval group commit), explicit Sync, and Stats/FileSize counters.
 //   - Lock-free reads over atomically published snapshots plus a
-//     ReaderTracker epoch; one serialized writer with an async queue.
+//     ReaderTracker epoch; one serialized writer with an async queue. Snapshot
+//     and ReleaseSnapshot pin one generation for cross-index query planning.
 //   - Pooled SearchContext scratch (heaps, generation-tag visited set,
 //     query buffer) and SearchInto result reuse with zero steady-state allocs
-//     on the flat and ANN paths.
+//     on the flat and ANN paths. SearchFloat32WithOptions adds cancellation,
+//     per-query ef/oversample controls, and SearchCandidatesFloat32 scores a
+//     caller-supplied filtered candidate set exactly.
 //
 // # Current experimental limits
 //
