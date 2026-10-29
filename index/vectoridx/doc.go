@@ -9,11 +9,12 @@
 //
 //   - Closed dimensions {512, 768, 1024} and one element type per index
 //     {int8, uint8, int16, uint16, float32}, stored as received.
-//   - One metric per index {L2, cosine, dot} with scalar kernels and float64
-//     accumulation; the float32 kernels use four independent partial sums.
-//     Cosine indexes cache one norm per stored vector and compute the query
-//     norm once per search. Public Result Score is a saturating uint32,
-//     monotonic per metric and zero for self matches.
+//   - One metric per index {L2, cosine, dot}. FP32 L2/dot use NEON on arm64
+//     and AVX2 on amd64 when available, with scalar float64-accumulator
+//     fallbacks; other element types remain scalar. Cosine indexes cache one
+//     norm per stored vector and compute the query norm once per search.
+//     Public Result Score is a saturating uint32, monotonic per metric and
+//     zero for self matches.
 //   - Namespace is the shared schema identity of one vector space: a
 //     non-zero schema.Namespace (KindVector) assigned by the application's
 //     schema. IDs are stored and filtered as compact uint32 NodeIDs and
@@ -50,12 +51,15 @@
 //   - Readers use heap snapshots rather than fully lock-free mmap epoch
 //     reads. File generations remain immutable; a future change can swap in
 //     mmap views without altering the file format or public API.
-//   - Distance is scalar only. resolveDistance is the single dispatch point
-//     where v2 AVX2/NEON kernels plug in behind the distRaw signature.
-//   - Stored vectors are never quantized (v2 work).
-//   - OpenStore copies region payloads into heap storage instead of retaining an
-//     mmap. The on-disk layout is already offset/length-addressed so a later
-//     mmap optimisation keeps format compatibility.
+//   - SIMD covers FP32 L2/dot only; int8/int16 kernels remain scalar.
+//     resolveDistance/resolveDot are the single dispatch points behind the
+//     distRaw signature.
+//   - Stored vectors are never quantized (v2 work). Vector storage is chunked
+//     copy-on-write, not yet mmap-backed.
+//   - OpenStore maps the base for validation, then copies retained regions into
+//     chunked heap storage and unmaps instead of retaining a vector mmap. The
+//     on-disk layout is offset/length-addressed, so a later zero-copy vector
+//     mmap keeps format compatibility.
 //   - Re-adding a live NodeID is rejected; re-adding a tombstoned NodeID
 //     replaces its vector and reconnects it, so Delete followed by Add is an
 //     update. Compact remains the way to purge tombstones and rebuild.

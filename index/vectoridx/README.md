@@ -6,13 +6,13 @@
 > feature.
 
 Persistent HNSW approximate-nearest-neighbor vector index implementing
-experimental phases 1–2 (scalar core, in-memory HNSW correctness),
-4 (WAL and tombstones), 5 (pooled search state), 6 (post-ANN filtering), and
-8 (explicit compact/rebuild), plus Weaviate-inspired production features:
+experimental phases 1–2 (in-memory HNSW correctness), 4 (WAL and
+tombstones), 5 (pooled search state), 6 (post-ANN filtering), 7 (FP32 SIMD),
+and 8 (explicit compact/rebuild), plus Weaviate-inspired production features:
 multi-metric distance (L2/cosine/dot), dynamic `ef`, heuristic neighbor
 selection, dense O(1) locator, cost-based flat fallback, async writes, and
-lock-free reads. SIMD kernels (phase 7) plug into `resolveDistance`; the
-scalar kernels here are their correctness reference.
+lock-free reads. FP32 L2/dot use NEON on arm64 and AVX2 on amd64 when
+available; the scalar kernels remain the correctness reference.
 
 ## Concepts
 
@@ -172,6 +172,12 @@ generation.
 - `SearchCandidatesFloat32` scores exactly a caller-supplied unique candidate
   set. It is the selective-filter path for metadata/ACL predicates; cost scales
   with the candidate count rather than the index size.
+- `AddFloat32Batch` / `DeleteBatch` hold the writer lock, publish once, and
+  sync once per batch. Consecutive float32 puts in an `index` batch use the
+  vector batch path automatically.
+- Vector payloads live in fixed-size copy-on-write chunks. Replacing a
+  tombstoned node copies one chunk instead of writing into a published
+  snapshot, so re-embedding is race-free for readers.
 - `Score` is `uint32` saturating: monotonic with the index metric distance
   (L2, cosine, or dot), ties at `math.MaxUint32` only for extremely distant
   pairs / NaN. `Distance` carries the raw metric distance at float32 precision
@@ -206,9 +212,11 @@ Distance microbenchmarks cover every element type × dimension with
 `ns/op`, `bytes/s`, and `allocs/op`. `BenchmarkSearchFloat32_512ANN` /
 `BenchmarkSearchFloat32_768ANN` and their cosine variants set
 `FlatThreshold: -1` so they exercise the graph path; `BenchmarkAddFloat32_512`
-/ `BenchmarkAddFloat32_768` cover the writer path. `BenchmarkSearchFloat32` /
-`BenchmarkSearchIntoFloat32Reuse` measure the default flat path against
-`BenchmarkExactSearchFloat32`; recall tests pin ANN quality
+/ `BenchmarkAddFloat32_768` cover the writer path. The filtered benchmarks
+compare `FilterAware` traversal with `SearchCandidatesFloat32` exact scoring.
+`BenchmarkSearchFloat32` / `BenchmarkSearchIntoFloat32Reuse` measure the
+default flat path against `BenchmarkExactSearchFloat32`; recall tests pin ANN
+quality
 (`recall@5 ≥ 0.70` on the 300-vector fixture) so speedups that degrade the
 graph fail loudly.
 
@@ -219,6 +227,8 @@ graph fail loudly.
 | `doc.go` | Package overview, experimental scope and current limitations |
 | `types.go` | Namespace/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
 | `distance.go` | Scalar L2/cosine/dot kernels, dispatch, `EncodeScore` |
+| `distance_neon_arm64.*` | FP32 NEON L2/dot kernels |
+| `distance_avx2_amd64.*` | FP32 AVX2 L2/dot kernels |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
 | `snapshot.go` | Pinned read-only snapshot, context-aware search, candidate scoring |
 | `hnsw.go` | Locator, greedy descent, layer search, assembly, exact oracle |
@@ -235,6 +245,8 @@ graph fail loudly.
   yet mmap epochs; generations on disk are already immutable, so the swap
   is API-safe.
 - Heap-backed (copied) reads instead of retained mmaps; the format is
-  offset/length-addressed for a compatible mmap upgrade.
+  offset/length-addressed for a compatible mmap upgrade. `AddFloat32Batch`
+  and `DeleteBatch` amortize locking/publication/sync, but graph construction
+  itself remains single-writer and deterministic.
 - Scalar distance only; `resolveDistance` is the v2 AVX2/NEON plug point.
 - Stored vectors are never quantized (quantization deferred to v2).

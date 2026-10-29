@@ -1,0 +1,67 @@
+//go:build arm64
+
+#include "textflag.h"
+
+// func dotNEON(a, b []byte) float32
+// Processes floor(len(a)/64) blocks of 16 floats. The Go wrapper handles the
+// scalar tail.
+TEXT ·dotNEON(SB), NOSPLIT, $0-52
+	MOVD a_base+0(FP), R0
+	MOVD a_len+8(FP), R1
+	MOVD b_base+24(FP), R2
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V1.B16, V1.B16, V1.B16
+	VEOR V2.B16, V2.B16, V2.B16
+	VEOR V3.B16, V3.B16, V3.B16
+	LSR  $6, R1, R3
+	CBZ  R3, done
+loop:
+	VLD1.P 64(R0), [V4.S4, V5.S4, V6.S4, V7.S4]
+	VLD1.P 64(R2), [V8.S4, V9.S4, V10.S4, V11.S4]
+	VFMLA V8.S4, V4.S4, V0.S4
+	VFMLA V9.S4, V5.S4, V1.S4
+	VFMLA V10.S4, V6.S4, V2.S4
+	VFMLA V11.S4, V7.S4, V3.S4
+	SUBS $1, R3, R3
+	BNE  loop
+done:
+	VFADD V1.S4, V0.S4, V0.S4
+	VFADD V3.S4, V2.S4, V2.S4
+	VFADD V2.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	FMOVS F0, ret+48(FP)
+	RET
+
+// func l2NEON(a, b []byte) float32
+TEXT ·l2NEON(SB), NOSPLIT, $0-52
+	MOVD a_base+0(FP), R0
+	MOVD a_len+8(FP), R1
+	MOVD b_base+24(FP), R2
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V1.B16, V1.B16, V1.B16
+	VEOR V2.B16, V2.B16, V2.B16
+	VEOR V3.B16, V3.B16, V3.B16
+	LSR  $6, R1, R3
+	CBZ  R3, done2
+loop2:
+	VLD1.P 64(R0), [V4.S4, V5.S4, V6.S4, V7.S4]
+	VLD1.P 64(R2), [V8.S4, V9.S4, V10.S4, V11.S4]
+	VFSUB V8.S4, V4.S4, V12.S4
+	VFSUB V9.S4, V5.S4, V13.S4
+	VFSUB V10.S4, V6.S4, V14.S4
+	VFSUB V11.S4, V7.S4, V15.S4
+	VFMLA V12.S4, V12.S4, V0.S4
+	VFMLA V13.S4, V13.S4, V1.S4
+	VFMLA V14.S4, V14.S4, V2.S4
+	VFMLA V15.S4, V15.S4, V3.S4
+	SUBS $1, R3, R3
+	BNE  loop2
+done2:
+	VFADD V1.S4, V0.S4, V0.S4
+	VFADD V3.S4, V2.S4, V2.S4
+	VFADD V2.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	FMOVS F0, ret+48(FP)
+	RET

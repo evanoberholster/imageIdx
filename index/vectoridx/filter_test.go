@@ -58,6 +58,41 @@ func TestFilterEvenIDs(t *testing.T) {
 	}
 }
 
+func TestFilterAwareRecall(t *testing.T) {
+	idx, _ := buildFilterIndex(t, 800)
+	defer idx.Close()
+	filter := CandidateFilter(func(id NodeID) bool { return id%10 == 0 })
+	rng := rand.New(rand.NewSource(37))
+	var hits, total int
+	for range 20 {
+		q := randFloatVec(rng, Dim512)
+		ann, err := idx.SearchFloat32(q, filter, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exact, err := idx.ExactSearchFloat32(q, filter, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := make(map[NodeID]struct{}, len(exact))
+		for _, r := range exact {
+			want[NodeID(r.ValueID)] = struct{}{}
+		}
+		for _, r := range ann {
+			if _, ok := want[NodeID(r.ValueID)]; ok {
+				hits++
+			}
+		}
+		total += len(exact)
+	}
+	if total == 0 {
+		t.Fatal("no filtered matches")
+	}
+	if recall := float64(hits) / float64(total); recall < 0.7 {
+		t.Fatalf("filtered recall@10 = %.3f, want >= 0.7", recall)
+	}
+}
+
 func TestFilterHighlySelective(t *testing.T) {
 	idx, _ := buildFilterIndex(t, 200)
 	defer idx.Close()

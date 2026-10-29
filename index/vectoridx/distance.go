@@ -5,10 +5,11 @@ import (
 	"unsafe"
 )
 
-// This file holds the scalar distance kernels. They are the correctness
-// reference for future v2 AVX2/NEON kernels (VectorIdx.MD section 22).
-// Dispatch is resolved once per index open; the hot loop calls a single
-// pre-resolved func(a, b []byte) float64 with no interface or type switch.
+// This file holds the scalar distance kernels. They remain the correctness
+// reference; FP32 L2/dot select NEON or AVX2 implementations in resolveDistance
+// and resolveDot when the host supports them. Dispatch is resolved once per
+// index open; the hot loop calls a single pre-resolved func(a, b []byte)
+// float64 with no interface or type switch.
 
 // distRaw is a raw little-endian vector kernel. Distance kernels return the
 // index-metric distance (smaller is better: squared L2, 1-cos, or -dot);
@@ -32,6 +33,9 @@ func resolveDistance(cfg Config) distRaw {
 		case ElementUint16:
 			return func(a, b []byte) float64 { return squaredL2Uint16Bytes(a, b, n) }
 		case ElementFloat32:
+			if simdSupported {
+				return simdL2Float32Bytes
+			}
 			return func(a, b []byte) float64 { return squaredL2Float32Bytes(a, b, n) }
 		default:
 			return nil
@@ -62,6 +66,9 @@ func resolveDistance(cfg Config) distRaw {
 		case ElementUint16:
 			return func(a, b []byte) float64 { return negDotUint16Bytes(a, b, n) }
 		case ElementFloat32:
+			if simdSupported {
+				return func(a, b []byte) float64 { return -simdDotFloat32Bytes(a, b) }
+			}
 			return func(a, b []byte) float64 { return negDotFloat32Bytes(a, b, n) }
 		default:
 			return nil
@@ -86,6 +93,9 @@ func resolveDot(cfg Config) distRaw {
 	case ElementUint16:
 		return func(a, b []byte) float64 { return DotUint16(bytesAsUint16(a, n), bytesAsUint16(b, n)) }
 	case ElementFloat32:
+		if simdSupported {
+			return simdDotFloat32Bytes
+		}
 		return func(a, b []byte) float64 { return DotFloat32(bytesAsFloat32(a, n), bytesAsFloat32(b, n)) }
 	default:
 		return nil
@@ -300,9 +310,12 @@ func cosineFromDotNorms(dot, na, nb float64) float64 {
 		return 1
 	}
 	cos := dot / (na * nb)
-	if cos > 1 {
+	// SIMD and scalar accumulation can differ by a few ulps near identical
+	// vectors. Snap the endpoints so a self-search stays exactly zero.
+	const cosineSnap = 1e-7
+	if cos > 1-cosineSnap {
 		cos = 1
-	} else if cos < -1 {
+	} else if cos < -1+cosineSnap {
 		cos = -1
 	}
 	return 1 - cos

@@ -442,9 +442,10 @@ func (s *Store) flushLiveness(add bool) error {
 	return err
 }
 
-// flushVector executes staged vector operations. vectoridx has no value-batch
-// API, so operations are applied one typed vector at a time, in staged order,
-// grouped by namespace. Staging itself never touches the engine.
+// flushVector executes staged vector operations in staged order, grouped by
+// namespace. Consecutive float32 puts share one vectoridx writer batch, so a
+// projection with many embeddings pays one lock/publish/sync instead of one per
+// vector. Staging itself never touches the engine.
 func (s *Store) flushVector() error {
 	sortStageByNS(s.stage.vector, func(o stagedVector) schema.Namespace { return o.ns })
 	for i := 0; i < len(s.stage.vector); {
@@ -456,20 +457,39 @@ func (s *Store) flushVector() error {
 		if err != nil {
 			return err
 		}
-		for k := i; k < j; k++ {
+		for k := i; k < j; {
 			op := &s.stage.vector[k]
 			if op.delete {
 				if err := deleteVectorIndex(idx, op.id); err != nil {
 					return err
 				}
+				k++
 				continue
 			}
 			if op.id > math.MaxUint32 {
 				return ErrValueIDTooLarge
 			}
+			if op.value.Element == vectoridx.ElementFloat32 {
+				ids := make([]vectoridx.NodeID, 0, j-k)
+				vecs := make([][]float32, 0, j-k)
+				for k < j {
+					next := &s.stage.vector[k]
+					if next.delete || next.value.Element != vectoridx.ElementFloat32 || next.id > math.MaxUint32 {
+						break
+					}
+					ids = append(ids, vectoridx.NodeID(next.id))
+					vecs = append(vecs, next.value.Float32)
+					k++
+				}
+				if err := idx.AddFloat32Batch(ids, vecs); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := addVector(idx, vectoridx.NodeID(op.id), op.value); err != nil {
 				return err
 			}
+			k++
 		}
 		i = j
 	}

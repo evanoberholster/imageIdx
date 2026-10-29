@@ -99,8 +99,9 @@ func (s *vectorSnapshot) live(id NodeID) bool {
 // reader token release. Resurrected vectors may read fresh under concurrent
 // updates (eventual consistency, never out of bounds).
 func (s *vectorSnapshot) vectorAt(ord int) []byte {
-	off := ord * s.vecBytes
-	return s.vectors[off : off+s.vecBytes]
+	chunk := s.vectors[ord>>vectorChunkShift]
+	off := (ord & (vectorChunkVectors - 1)) * s.vecBytes
+	return chunk[off : off+s.vecBytes]
 }
 
 // rawNorm returns |raw| for cosine indexes and zero for other metrics. The
@@ -113,18 +114,48 @@ func (s *vectorSnapshot) rawNorm(raw []byte) float64 {
 	return math.Sqrt(s.dot(raw, raw))
 }
 
-// appendVectorNorm records the norm for a vector just appended to candidates.
+// appendVectorNorm records the norm for the vector just appended to ids.
 func (s *vectorSnapshot) appendVectorNorm(raw []byte) {
-	if s.cfg.Metric == MetricCosine {
-		s.norms = append(s.norms, s.rawNorm(raw))
+	if s.cfg.Metric != MetricCosine {
+		return
 	}
+	ord := len(s.ids) - 1
+	s.setVectorNorm(ord, s.rawNorm(raw))
+}
+
+// setVectorNorm records a cached norm with chunk-level copy-on-write.
+func (s *vectorSnapshot) setVectorNorm(ord int, norm float64) {
+	ci := ord >> vectorChunkShift
+	if ci == len(s.normChunks) {
+		s.normChunks = append(s.normChunks, make([]float64, vectorChunkVectors))
+	} else if ci > len(s.normChunks) {
+		return
+	}
+	s.normChunks[ci][ord&(vectorChunkVectors-1)] = norm
+}
+
+// replaceVectorNorm updates an existing cached norm with copy-on-write.
+func (s *vectorSnapshot) replaceVectorNorm(ord int, norm float64) {
+	ci := ord >> vectorChunkShift
+	if ci >= len(s.normChunks) {
+		s.setVectorNorm(ord, norm)
+		return
+	}
+	old := s.normChunks[ci]
+	chunk := make([]float64, len(old))
+	copy(chunk, old)
+	chunk[ord&(vectorChunkVectors-1)] = norm
+	dir := make([][]float64, len(s.normChunks))
+	copy(dir, s.normChunks)
+	dir[ci] = chunk
+	s.normChunks = dir
 }
 
 // normAt returns the cached norm for a stored ordinal, or zero for metrics
 // that do not use norms.
 func (s *vectorSnapshot) normAt(ord int) float64 {
 	if s.cfg.Metric == MetricCosine {
-		return s.norms[ord]
+		return s.normChunks[ord>>vectorChunkShift][ord&(vectorChunkVectors-1)]
 	}
 	return 0
 }
@@ -134,7 +165,7 @@ func (s *vectorSnapshot) normAt(ord int) float64 {
 // pre-resolved raw kernel directly.
 func (s *vectorSnapshot) distQuery(query []byte, queryNorm float64, ord int) float64 {
 	if s.cfg.Metric == MetricCosine {
-		return cosineFromDotNorms(s.dot(query, s.vectorAt(ord)), queryNorm, s.norms[ord])
+		return cosineFromDotNorms(s.dot(query, s.vectorAt(ord)), queryNorm, s.normAt(ord))
 	}
 	return s.dist(query, s.vectorAt(ord))
 }
@@ -143,7 +174,7 @@ func (s *vectorSnapshot) distQuery(query []byte, queryNorm float64, ord int) flo
 // reuses both cached norms.
 func (s *vectorSnapshot) distOrds(a, b int) float64 {
 	if s.cfg.Metric == MetricCosine {
-		return cosineFromDotNorms(s.dot(s.vectorAt(a), s.vectorAt(b)), s.norms[a], s.norms[b])
+		return cosineFromDotNorms(s.dot(s.vectorAt(a), s.vectorAt(b)), s.normAt(a), s.normAt(b))
 	}
 	return s.dist(s.vectorAt(a), s.vectorAt(b))
 }

@@ -1,11 +1,13 @@
 package vectoridx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math"
 	"math/rand"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/evanoberholster/imageIdx/roar"
@@ -57,6 +59,101 @@ func TestSnapshotPinsView(t *testing.T) {
 	}
 	if len(live) == 1 && live[0].ValueID == 1 {
 		t.Fatalf("live search returned deleted node 1: %+v", live)
+	}
+}
+
+func TestChunkedVectorCopyOnWrite(t *testing.T) {
+	idx, err := NewMemory(testConfigFloat512())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(307))
+	for i := NodeID(1); i <= 150; i++ {
+		mustAddFloat(t, idx, i, randFloatVec(rng, Dim512))
+	}
+	if err := idx.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	oldSnap := idx.Snapshot()
+	defer oldSnap.Release()
+	oldView := oldSnap.view
+	if got, want := oldView.vectorChunkCount(), (150+vectorChunkVectors-1)>>vectorChunkShift; got != want {
+		t.Fatalf("chunks = %d, want %d", got, want)
+	}
+	const id = NodeID(70)
+	oldOrd := int(id - 1)
+	oldChunk := oldView.vectors[oldOrd>>vectorChunkShift]
+	oldBytes := append([]byte(nil), oldView.vectorAt(oldOrd)...)
+	newVec := randFloatVec(rng, Dim512)
+	if err := idx.Delete(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.AddFloat32(id, newVec); err != nil {
+		t.Fatal(err)
+	}
+	current := idx.view.Load()
+	newChunk := current.vectors[oldOrd>>vectorChunkShift]
+	if &newChunk[0] == &oldChunk[0] {
+		t.Fatal("resurrect did not copy the vector chunk")
+	}
+	if !bytes.Equal(oldView.vectorAt(oldOrd), oldBytes) {
+		t.Fatal("published snapshot vector changed after resurrect")
+	}
+	if !bytes.Equal(current.vectorAt(oldOrd), encodeRawFloat32(nil, newVec)) {
+		t.Fatal("new snapshot did not receive resurrected vector")
+	}
+	if err := idx.Verify(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSnapshotResurrectRace(t *testing.T) {
+	idx, err := NewMemory(testConfigFloat512())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	rng := rand.New(rand.NewSource(308))
+	vecs := make([][]float32, 64)
+	for i := range vecs {
+		vecs[i] = randFloatVec(rng, Dim512)
+		mustAddFloat(t, idx, NodeID(i+1), vecs[i])
+	}
+	old := idx.Snapshot()
+	defer old.Release()
+	query := vecs[0]
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				if _, err := old.ExactSearchFloat32(query, nil, 5); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= 20; i++ {
+			id := NodeID(i)
+			if err := idx.Delete(id); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := idx.AddFloat32(id, randFloatVec(rng, Dim512)); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	if err := idx.Verify(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -129,7 +226,7 @@ func TestSearchCandidatesMatchesExact(t *testing.T) {
 		if got[i].ValueID != want[i].ValueID || got[i].Score != want[i].Score {
 			t.Fatalf("candidate result %d = %+v, want %+v", i, got[i], want[i])
 		}
-		if math.Abs(float64(got[i].Distance)-float64(want[i].Distance)) > 1e-4 {
+		if math.Abs(float64(got[i].Distance)-float64(want[i].Distance)) > 1e-3*math.Max(1, math.Abs(float64(want[i].Distance))) {
 			t.Fatalf("candidate distance %d = %v, want %v", i, got[i].Distance, want[i].Distance)
 		}
 	}
@@ -174,7 +271,7 @@ func TestSearchResultDistance(t *testing.T) {
 	for _, r := range results {
 		stored := vecs[int(r.ValueID)-1]
 		want := SquaredL2Float32(query, stored)
-		if math.Abs(float64(r.Distance)-want) > 1e-4 {
+		if math.Abs(float64(r.Distance)-want) > 1e-3*math.Max(1, math.Abs(want)) {
 			t.Fatalf("Distance for %d = %v, want %v", r.ValueID, r.Distance, want)
 		}
 	}

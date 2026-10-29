@@ -187,8 +187,8 @@ func decodeRegionEntry(src []byte) fileRegion {
 }
 
 // decodeFile validates the header and all region bounds/checksums, returning
-// zero-copy region slices. No mmap is retained; Open copies payloads into
-// heap storage (0.5 simplification documented in doc.go).
+// zero-copy region slices. Open maps the base for validation and copies the
+// retained regions into heap storage before unmapping (see doc.go).
 func decodeFile(data []byte) (fileHeader, [][]byte, error) {
 	h, err := decodeHeader(data)
 	if err != nil {
@@ -262,7 +262,14 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 		holder.Store(&nodeLayers{layers: make([][]NodeID, level+1)})
 		linkHolders = append(linkHolders, holder)
 	}
-	vec := append([]byte(nil), vectors...)
+	chunks := make([][]byte, (count+vectorChunkVectors-1)>>vectorChunkShift)
+	for ci := range chunks {
+		chunk := make([]byte, vectorChunkVectors*vecBytes)
+		start := ci * vectorChunkVectors * vecBytes
+		end := min(start+vectorChunkVectors*vecBytes, len(vectors))
+		copy(chunk, vectors[start:end])
+		chunks[ci] = chunk
+	}
 	// Graph payload: per node u16 numLevels then per level u16 degree + ids.
 	pos := 0
 	for ord := range count {
@@ -325,7 +332,7 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 		elemSize:   v.elemSize,
 		dims:       v.dims,
 		ids:        ids,
-		vectors:    vec,
+		vectors:    chunks,
 		levels:     levels,
 		links:      linkHolders,
 		tomb:       tomb,
@@ -339,9 +346,12 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 		if ns.dot == nil {
 			return ErrCorruptStorage
 		}
-		ns.norms = make([]float64, count)
+		ns.normChunks = make([][]float64, (count+vectorChunkVectors-1)>>vectorChunkShift)
+		for ci := range ns.normChunks {
+			ns.normChunks[ci] = make([]float64, vectorChunkVectors)
+		}
 		for ord := range count {
-			ns.norms[ord] = ns.rawNorm(ns.vectorAt(ord))
+			ns.setVectorNorm(ord, ns.rawNorm(ns.vectorAt(ord)))
 		}
 	}
 	type pair struct {
@@ -444,10 +454,34 @@ func (v *VectorIdx) writeBaseLocked() error {
 		tombstoneCount: uint64(len(snap.tombSorted)),
 		checkpointLSN:  v.checkpointLSN,
 	}
-	// Keep the vector region as a view into the published snapshot: stream it
-	// directly to the temporary file instead of copying the whole payload into
-	// a second buffer (and then into the output file).
-	payloads := [][]byte{nodeMeta, snap.vectors, graph, tomb}
+	// Keep the vector region as a view into the published snapshot: stream
+	// each chunk directly to the temporary file instead of copying the whole
+	// payload into a second buffer (and then into the output file).
+	type payload struct {
+		data   []byte
+		chunks [][]byte
+		length uint64
+		crc    uint32
+	}
+	payloads := []payload{
+		{data: nodeMeta},
+		{chunks: snap.vectorChunks()},
+		{data: graph},
+		{data: tomb},
+	}
+	for i := range payloads {
+		if payloads[i].data != nil {
+			payloads[i].length = uint64(len(payloads[i].data))
+			payloads[i].crc = crc32.ChecksumIEEE(payloads[i].data)
+			continue
+		}
+		hash := crc32.NewIEEE()
+		for _, chunk := range payloads[i].chunks {
+			payloads[i].length += uint64(len(chunk))
+			_, _ = hash.Write(chunk)
+		}
+		payloads[i].crc = hash.Sum32()
+	}
 	kinds := []uint16{regionKindNodeMeta, regionKindVectors, regionKindGraph, regionKindTombstones}
 	dirOff := uint64(vectorHeaderSize)
 	next := dirOff + uint64(4*regionEntrySize)
@@ -455,7 +489,7 @@ func (v *VectorIdx) writeBaseLocked() error {
 	for i, p := range payloads {
 		next = storage.Align(next, 8)
 		offsets[i] = next
-		next += uint64(len(p))
+		next += p.length
 	}
 	header := make([]byte, dirOff+uint64(4*regionEntrySize))
 	encodeHeader(header[:vectorHeaderSize], h)
@@ -463,8 +497,8 @@ func (v *VectorIdx) writeBaseLocked() error {
 		r := fileRegion{
 			kind:     kinds[i],
 			offset:   offsets[i],
-			length:   uint64(len(p)),
-			checksum: uint64(crc32.ChecksumIEEE(p)),
+			length:   p.length,
+			checksum: uint64(p.crc),
 		}
 		encodeRegionEntry(header[dirOff+uint64(i*regionEntrySize):], r)
 	}
@@ -485,10 +519,18 @@ func (v *VectorIdx) writeBaseLocked() error {
 					return err
 				}
 			}
-			if err := storage.WriteFull(w, p); err != nil {
-				return err
+			if p.data != nil {
+				if err := storage.WriteFull(w, p.data); err != nil {
+					return err
+				}
+			} else {
+				for _, chunk := range p.chunks {
+					if err := storage.WriteFull(w, chunk); err != nil {
+						return err
+					}
+				}
 			}
-			cursor = offsets[i] + uint64(len(p))
+			cursor = offsets[i] + p.length
 		}
 		return nil
 	})
