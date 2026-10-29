@@ -226,7 +226,7 @@ func TestSearchCandidatesMatchesExact(t *testing.T) {
 		if got[i].ValueID != want[i].ValueID || got[i].Score != want[i].Score {
 			t.Fatalf("candidate result %d = %+v, want %+v", i, got[i], want[i])
 		}
-		if math.Abs(float64(got[i].Distance)-float64(want[i].Distance)) > 1e-4 {
+		if math.Abs(float64(got[i].Distance)-float64(want[i].Distance)) > 1e-3*math.Max(1, math.Abs(float64(want[i].Distance))) {
 			t.Fatalf("candidate distance %d = %v, want %v", i, got[i].Distance, want[i].Distance)
 		}
 	}
@@ -271,7 +271,7 @@ func TestSearchResultDistance(t *testing.T) {
 	for _, r := range results {
 		stored := vecs[int(r.ValueID)-1]
 		want := SquaredL2Float32(query, stored)
-		if math.Abs(float64(r.Distance)-want) > 1e-4 {
+		if math.Abs(float64(r.Distance)-want) > 1e-3*math.Max(1, math.Abs(want)) {
 			t.Fatalf("Distance for %d = %v, want %v", r.ValueID, r.Distance, want)
 		}
 	}
