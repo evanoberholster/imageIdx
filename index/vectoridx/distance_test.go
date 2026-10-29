@@ -98,6 +98,35 @@ func TestRawKernelsMatchTyped(t *testing.T) {
 	}
 }
 
+func TestFloat32KernelsStayAccurate(t *testing.T) {
+	rng := rand.New(rand.NewSource(43))
+	// Include lengths above and below the 4-way unrolled body so the tail
+	// path is exercised too.
+	for _, n := range []int{1, 3, 4, 5, 7, 512, 768, 769, 1024} {
+		a := make([]float32, n)
+		b := make([]float32, n)
+		var wantL2, wantDot, wantNorm float64
+		for i := range a {
+			a[i] = rng.Float32()*4 - 2
+			b[i] = rng.Float32()*4 - 2
+			d := float64(a[i]) - float64(b[i])
+			wantL2 += d * d
+			wantDot += float64(a[i]) * float64(b[i])
+			wantNorm += float64(a[i]) * float64(a[i])
+		}
+		wantNorm = math.Sqrt(wantNorm)
+		if got := SquaredL2Float32(a, b); math.Abs(got-wantL2) > 1e-12*math.Max(1, math.Abs(wantL2)) {
+			t.Fatalf("L2 n=%d = %v, want %v", n, got, wantL2)
+		}
+		if got := DotFloat32(a, b); math.Abs(got-wantDot) > 1e-12*math.Max(1, math.Abs(wantDot)) {
+			t.Fatalf("dot n=%d = %v, want %v", n, got, wantDot)
+		}
+		if got := normFloat32(a); math.Abs(got-wantNorm) > 1e-12*math.Max(1, wantNorm) {
+			t.Fatalf("norm n=%d = %v, want %v", n, got, wantNorm)
+		}
+	}
+}
+
 func TestAccumulatorHeadroom1024D(t *testing.T) {
 	n := int(Dim1024)
 	// int8/uint8 worst case: every diff is 255.
@@ -170,10 +199,16 @@ func TestResolveDistanceCoversMatrix(t *testing.T) {
 			if fn == nil {
 				t.Fatalf("no kernel for elem %d dim %d", elem, dims)
 			}
+			if dot := resolveDot(Config{Dimensions: dims, ElementType: elem}); dot == nil {
+				t.Fatalf("no dot kernel for elem %d dim %d", elem, dims)
+			}
 		}
 	}
 	if fn := resolveDistance(Config{Dimensions: Dim512, ElementType: ElementInvalid}); fn != nil {
 		t.Fatalf("expected nil kernel for invalid element type")
+	}
+	if fn := resolveDot(Config{Dimensions: Dim512, ElementType: ElementInvalid}); fn != nil {
+		t.Fatalf("expected nil dot kernel for invalid element type")
 	}
 }
 

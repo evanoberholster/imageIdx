@@ -777,6 +777,9 @@ func TestVacuumMergesDeltas(t *testing.T) {
 	if baseAfter.Size() <= baseBefore.Size() {
 		t.Fatalf("base did not grow on vacuum: %d -> %d", baseBefore.Size(), baseAfter.Size())
 	}
+	if err := VerifyFile(path); err != nil {
+		t.Fatalf("VerifyFile after vacuum: %v", err)
+	}
 	files, err := filepath.Glob(path + ".delta.*")
 	if err != nil {
 		t.Fatal(err)

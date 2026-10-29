@@ -33,6 +33,9 @@ scalar kernels here are their correctness reference.
   no locks. File generations are immutable once published.
 - **Metrics.** One fixed metric per index: L2 (squared), cosine (`1-cos`),
   or dot (`querySelfDot-dot`, zero for self). Persisted in the superblock.
+  Cosine indexes cache one norm per stored vector and compute the query
+  norm once per search, so the hot loop performs a single dot product per
+  comparison instead of three passes.
 - **Tombstone deletion.** `Delete` records into an immutable roaring
   tombstone bitmap. Deleted nodes stay traversable but are never returned;
   `Compact` rebuilds the graph from live vectors and never renumbers
@@ -175,6 +178,13 @@ generation.
 - Steady state after pool warm-up: `SearchInto` performs **zero heap
   allocations** (`TestSearchSteadyStateAllocs`); `Search` allocates once
   for the caller-owned copy; distance kernels allocate nothing.
+- Writer-owned scratch buffers (`encodeBuf`, `walBuf`, `pruneScored`,
+  `pruneCands`) remove per-add and per-prune allocations; the WAL record and
+  the encoded vector are rewritten in place under the writer lock.
+- Base publication streams the vector region from the published snapshot
+  instead of copying it into a second payload buffer and then into the output
+  file. `Compact` likewise copies each live vector once, directly into the new
+  snapshot.
 - `PrewarmSearchContexts(n)` primes the pool before serving.
 
 ## Benchmarks
@@ -186,11 +196,14 @@ go test ./vectoridx -run TestHNSWRecall -v -count=1
 ```
 
 Distance microbenchmarks cover every element type × dimension with
-`ns/op`, `bytes/s`, and `allocs/op`. `BenchmarkSearchFloat32` /
-`BenchmarkSearchIntoFloat32Reuse` measure end-to-end ANN latency and
-allocations against `BenchmarkExactSearchFloat32`; recall tests pin
-ANN quality (`recall@5 ≥ 0.70` on the 300-vector fixture) so speedups
-that degrade the graph fail loudly.
+`ns/op`, `bytes/s`, and `allocs/op`. `BenchmarkSearchFloat32_512ANN` /
+`BenchmarkSearchFloat32_768ANN` and their cosine variants set
+`FlatThreshold: -1` so they exercise the graph path; `BenchmarkAddFloat32_512`
+/ `BenchmarkAddFloat32_768` cover the writer path. `BenchmarkSearchFloat32` /
+`BenchmarkSearchIntoFloat32Reuse` measure the default flat path against
+`BenchmarkExactSearchFloat32`; recall tests pin ANN quality
+(`recall@5 ≥ 0.70` on the 300-vector fixture) so speedups that degrade the
+graph fail loudly.
 
 ## File map
 

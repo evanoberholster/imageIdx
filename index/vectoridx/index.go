@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
 	"github.com/evanoberholster/imageIdx/roar"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // VectorIdx is a persistent HNSW approximate-nearest-neighbor index over one
@@ -34,6 +34,8 @@ import (
 type vectorSnapshot struct {
 	cfg      Config
 	dist     distRaw
+	dot      distRaw   // raw dot product; set for MetricCosine
+	norms    []float64 // per-ordinal vector norms; set for MetricCosine
 	vecBytes int
 	elemSize int
 	dims     int
@@ -84,9 +86,18 @@ type VectorIdx struct {
 	mL  float64    // immutable
 
 	dist     distRaw // immutable (metric fixed for lifetime)
+	dot      distRaw // immutable; raw dot product for MetricCosine
 	vecBytes int
 	elemSize int
 	dims     int
+
+	// Writer-only scratch buffers guarded by writeMu. They remove per-vector
+	// allocations from the Add and WAL paths, and per-prune allocations from
+	// graph maintenance.
+	encodeBuf   []byte
+	walBuf      []byte
+	pruneScored []pruneScore
+	pruneCands  []searchEntry
 
 	walPath string
 	wal     *os.File // writer-only under writeMu (active segment)
@@ -136,12 +147,19 @@ func NewMemory(cfg Config) (*VectorIdx, error) {
 	if dist == nil {
 		return nil, ErrInvalidConfig
 	}
+	var dot distRaw
+	if validated.Metric == MetricCosine {
+		if dot = resolveDot(validated); dot == nil {
+			return nil, ErrInvalidConfig
+		}
+	}
 	v := &VectorIdx{
 		cfgBase:  validated,
 		readers:  &storage.ReaderTracker{},
 		rng:      rand.New(rand.NewSource(1)),
 		mL:       levelMultiplier(validated.M),
 		dist:     dist,
+		dot:      dot,
 		vecBytes: validated.VectorBytes(),
 		elemSize: validated.ElementSize(),
 		dims:     int(validated.Dimensions),
@@ -149,6 +167,7 @@ func NewMemory(cfg Config) (*VectorIdx, error) {
 	v.view.Store(&vectorSnapshot{
 		cfg:      validated,
 		dist:     dist,
+		dot:      dot,
 		vecBytes: v.vecBytes,
 		elemSize: v.elemSize,
 		dims:     v.dims,
@@ -203,9 +222,17 @@ func NewStore(path string, cfg Config, durability Durability, opts ...Option) (*
 		walSegBytes:  runtimeOpts.walSegmentBytes,
 	}
 	v.dist = resolveDistance(validated)
+	if validated.Metric == MetricCosine {
+		v.dot = resolveDot(validated)
+		if v.dot == nil {
+			_ = storage.ReleaseLock(lock)
+			return nil, ErrInvalidConfig
+		}
+	}
 	v.view.Store(&vectorSnapshot{
 		cfg:      validated,
 		dist:     v.dist,
+		dot:      v.dot,
 		vecBytes: v.vecBytes,
 		elemSize: v.elemSize,
 		dims:     v.dims,
@@ -319,9 +346,17 @@ func OpenStore(path string, durability Durability, opts ...Option) (*VectorIdx, 
 		}
 	}
 	v.dist = resolveDistance(validated)
+	if validated.Metric == MetricCosine {
+		v.dot = resolveDot(validated)
+		if v.dot == nil {
+			_ = storage.ReleaseLock(lock)
+			return nil, ErrCorruptStorage
+		}
+	}
 	v.view.Store(&vectorSnapshot{
 		cfg:      validated,
 		dist:     v.dist,
+		dot:      v.dot,
 		vecBytes: v.vecBytes,
 		elemSize: v.elemSize,
 		dims:     v.dims,
@@ -479,9 +514,9 @@ func cloneSnapshot(s *vectorSnapshot) *vectorSnapshot {
 }
 
 // pickNeighbors selects up to m candidates using the configured policy.
-func pickNeighbors(s *vectorSnapshot, cands []searchEntry, m int, query []byte) []searchEntry {
+func pickNeighbors(s *vectorSnapshot, cands []searchEntry, m int) []searchEntry {
 	if s.cfg.UseHeuristic {
-		return selectHeuristic(cands, m, query, s)
+		return selectHeuristic(cands, m, s)
 	}
 	return selectClosest(cands, m)
 }
@@ -723,21 +758,22 @@ func (v *VectorIdx) addRawLockedAtLevel(cur *vectorSnapshot, id NodeID, raw []by
 	if cur.hasEntry {
 		ctx := acquireSearchContext()
 		ctx.resetForNodes(len(cur.ids), v.vecBytes)
+		ctx.queryNorm = cur.rawNorm(raw)
 		entryOrd, ok := cur.locate(cur.entry)
 		curBest := -1
 		if ok {
 			curBest = entryOrd
 			for l := cur.maxLevel; l > level; l-- {
-				curBest = cur.greedyStep(curBest, l, raw)
+				curBest = cur.greedyStep(curBest, l, raw, ctx.queryNorm)
 			}
 			for l := min(cur.maxLevel, level); l >= 0; l-- {
 				ef := int(cur.cfg.EfConstruction)
-				cands := cur.searchLayer(ctx, raw, curBest, ef, l)
+				cands := cur.searchLayer(ctx, raw, ctx.queryNorm, curBest, ef, l)
 				m := int(cur.cfg.M)
 				if l == 0 {
 					m = int(cur.cfg.M0)
 				}
-				picked := pickNeighbors(cur, cands, m, raw)
+				picked := pickNeighbors(cur, cands, m)
 				fwd := make([]NodeID, len(picked))
 				for i, p := range picked {
 					fwd[i] = cur.ids[p.ord]
@@ -754,6 +790,7 @@ func (v *VectorIdx) addRawLockedAtLevel(cur *vectorSnapshot, id NodeID, raw []by
 	ord := len(ns.ids)
 	ns.ids = append(ns.ids, id)
 	ns.vectors = append(ns.vectors, raw...)
+	ns.appendVectorNorm(raw)
 	ns.levels = append(ns.levels, level)
 	holder := &atomic.Pointer[nodeLayers]{}
 	holder.Store(&nodeLayers{layers: make([][]NodeID, level+1)})
@@ -812,29 +849,31 @@ func (v *VectorIdx) linkAppend(s *vectorSnapshot, ord, l int, id NodeID, m int) 
 	s.links[ord].Store(nl)
 }
 
+type pruneScore struct {
+	id   NodeID
+	dist float64
+	ord  int
+}
+
 // pruneList keeps the m best neighbors of ord from nbs by current distance.
 func (v *VectorIdx) pruneList(s *vectorSnapshot, ord int, nbs []NodeID, m int) []NodeID {
-	type nd struct {
-		id   NodeID
-		dist float64
-		ord  int
-	}
-	base := s.vectorAt(ord)
-	scored := make([]nd, 0, len(nbs))
+	scored := v.pruneScored[:0]
 	for _, nb := range nbs {
 		nOrd, ok := s.locate(nb)
 		if !ok {
 			continue
 		}
-		scored = append(scored, nd{id: nb, dist: s.dist(base, s.vectorAt(nOrd)), ord: nOrd})
+		scored = append(scored, pruneScore{id: nb, dist: s.distOrds(ord, nOrd), ord: nOrd})
 	}
+	v.pruneScored = scored
 	if s.cfg.UseHeuristic {
 		// Heuristic on neighbor-neighbor diversity with base as query.
-		cands := make([]searchEntry, len(scored))
-		for i, sc := range scored {
-			cands[i] = searchEntry{ord: sc.ord, dist: sc.dist}
+		cands := v.pruneCands[:0]
+		for _, sc := range scored {
+			cands = append(cands, searchEntry{ord: sc.ord, dist: sc.dist})
 		}
-		picked := selectHeuristic(cands, m, base, s)
+		v.pruneCands = cands
+		picked := selectHeuristic(cands, m, s)
 		out := make([]NodeID, len(picked))
 		for i, p := range picked {
 			out[i] = s.ids[p.ord]
@@ -873,6 +912,9 @@ func (v *VectorIdx) resurrectLocked(cur *vectorSnapshot, ord int, id NodeID, raw
 	}
 	ns := cloneSnapshot(cur)
 	copy(ns.vectorAt(ord), raw)
+	if ns.cfg.Metric == MetricCosine {
+		ns.norms[ord] = ns.rawNorm(raw)
+	}
 	ns.tombSorted = removeTombSorted(ns.tombSorted, id)
 	ns.tomb, ns.tombSorted = rebuildTombeset(ns.tombSorted)
 	if len(ns.ids) > 1 && ns.hasEntry {
@@ -884,7 +926,7 @@ func (v *VectorIdx) resurrectLocked(cur *vectorSnapshot, ord int, id NodeID, raw
 			ctx.resetForNodes(len(ns.ids), v.vecBytes)
 			restoreEntry := ns.entry
 			ns.entry = seed
-			v.wireRebuilt(ctx, ns, raw, ord, level, id)
+			v.wireRebuilt(ctx, ns, raw, ns.normAt(ord), ord, level, id)
 			ns.entry = restoreEntry
 			releaseSearchContext(ctx)
 		}
@@ -1016,8 +1058,8 @@ func (v *VectorIdx) AddInt8(id NodeID, vec []int8) error {
 		v.writeMu.Unlock()
 		return ErrClosed
 	}
-	raw := make([]byte, v.vecBytes)
-	copy(bytesAsInt8(raw, len(vec)), vec)
+	raw := encodeRawInt8(v.encodeBuf[:0], vec)
+	v.encodeBuf = raw
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
@@ -1044,8 +1086,8 @@ func (v *VectorIdx) AddUint8(id NodeID, vec []uint8) error {
 		v.writeMu.Unlock()
 		return ErrClosed
 	}
-	raw := make([]byte, v.vecBytes)
-	copy(raw, vec)
+	raw := encodeRawUint8(v.encodeBuf[:0], vec)
+	v.encodeBuf = raw
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
@@ -1072,7 +1114,8 @@ func (v *VectorIdx) AddInt16(id NodeID, vec []int16) error {
 		v.writeMu.Unlock()
 		return ErrClosed
 	}
-	raw := encodeRawInt16(nil, vec)
+	raw := encodeRawInt16(v.encodeBuf[:0], vec)
+	v.encodeBuf = raw
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
@@ -1099,7 +1142,8 @@ func (v *VectorIdx) AddUint16(id NodeID, vec []uint16) error {
 		v.writeMu.Unlock()
 		return ErrClosed
 	}
-	raw := encodeRawUint16(nil, vec)
+	raw := encodeRawUint16(v.encodeBuf[:0], vec)
+	v.encodeBuf = raw
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
@@ -1126,7 +1170,8 @@ func (v *VectorIdx) AddFloat32(id NodeID, vec []float32) error {
 		v.writeMu.Unlock()
 		return ErrClosed
 	}
-	raw := encodeRawFloat32(nil, vec)
+	raw := encodeRawFloat32(v.encodeBuf[:0], vec)
+	v.encodeBuf = raw
 	cur := v.view.Load()
 	ns, err := v.addRawLocked(cur, id, raw)
 	if err != nil {
@@ -1395,7 +1440,7 @@ func (v *VectorIdx) Compact() (CompactionResult, error) {
 	}
 	type live struct {
 		id  NodeID
-		raw []byte
+		ord int
 	}
 	var liveIDs []NodeID
 	if len(cur.sortedIDs) != 0 {
@@ -1422,25 +1467,32 @@ func (v *VectorIdx) Compact() (CompactionResult, error) {
 		if !ok {
 			return CompactionResult{}, ErrCorruptStorage
 		}
-		raw := make([]byte, v.vecBytes)
-		copy(raw, cur.vectorAt(ord))
-		lives = append(lives, live{id: id, raw: raw})
+		lives = append(lives, live{id: id, ord: ord})
 	}
 	ns := &vectorSnapshot{
 		cfg:      cur.cfg,
 		dist:     v.dist,
+		dot:      v.dot,
 		vecBytes: v.vecBytes,
 		elemSize: v.elemSize,
 		dims:     v.dims,
+		vectors:  make([]byte, 0, len(lives)*v.vecBytes),
+	}
+	if cur.cfg.Metric == MetricCosine {
+		ns.norms = make([]float64, 0, len(lives))
 	}
 	v.rng = rand.New(rand.NewSource(0xC0FAC7))
 	ctx := acquireSearchContext()
 	defer releaseSearchContext(ctx)
 	for _, lv := range lives {
+		raw := cur.vectorAt(lv.ord)
 		level := v.sampleLevelLocked()
 		ord := len(ns.ids)
 		ns.ids = append(ns.ids, lv.id)
-		ns.vectors = append(ns.vectors, lv.raw...)
+		ns.vectors = append(ns.vectors, raw...)
+		if ns.cfg.Metric == MetricCosine {
+			ns.norms = append(ns.norms, cur.norms[lv.ord])
+		}
 		ns.levels = append(ns.levels, level)
 		holder := &atomic.Pointer[nodeLayers]{}
 		holder.Store(&nodeLayers{layers: make([][]NodeID, level+1)})
@@ -1452,7 +1504,7 @@ func (v *VectorIdx) Compact() (CompactionResult, error) {
 		}
 		if len(ns.ids) > 1 {
 			ctx.resetForNodes(len(ns.ids), v.vecBytes)
-			v.wireRebuilt(ctx, ns, lv.raw, ord, level, lv.id)
+			v.wireRebuilt(ctx, ns, raw, cur.normAt(lv.ord), ord, level, lv.id)
 		} else {
 			ns.entry = lv.id
 			ns.hasEntry = true
@@ -1487,7 +1539,8 @@ func (v *VectorIdx) Compact() (CompactionResult, error) {
 // wireRebuilt connects rebuilt ordinal ord (already appended) into the
 // prefix graph. It mirrors addRawLocked without WAL/LSN/locator-append.
 // ns is private until published, so direct mutation is safe.
-func (v *VectorIdx) wireRebuilt(ctx *SearchContext, s *vectorSnapshot, raw []byte, ord, level int, id NodeID) {
+func (v *VectorIdx) wireRebuilt(ctx *SearchContext, s *vectorSnapshot, raw []byte, queryNorm float64, ord, level int, id NodeID) {
+	ctx.queryNorm = queryNorm
 	entryOrd, ok := s.locate(s.entry)
 	if !ok {
 		s.entry = id
@@ -1500,11 +1553,11 @@ func (v *VectorIdx) wireRebuilt(ctx *SearchContext, s *vectorSnapshot, raw []byt
 		cur = 0
 	}
 	for l := s.maxLevel; l > level; l-- {
-		cur = s.greedyStep(cur, l, raw)
+		cur = s.greedyStep(cur, l, raw, ctx.queryNorm)
 	}
 	for l := min(s.maxLevel, level); l >= 0; l-- {
 		ef := int(s.cfg.EfConstruction)
-		cands := s.searchLayer(ctx, raw, cur, ef, l)
+		cands := s.searchLayer(ctx, raw, ctx.queryNorm, cur, ef, l)
 		filtered := cands[:0]
 		for _, c := range cands {
 			if c.ord != ord {
@@ -1516,7 +1569,7 @@ func (v *VectorIdx) wireRebuilt(ctx *SearchContext, s *vectorSnapshot, raw []byt
 		if l == 0 {
 			m = int(s.cfg.M0)
 		}
-		picked := pickNeighbors(s, cands, m, raw)
+		picked := pickNeighbors(s, cands, m)
 		g := s.links[ord].Load()
 		for _, p := range picked {
 			g.layers[l] = append(g.layers[l], s.ids[p.ord])
@@ -1543,6 +1596,17 @@ func (v *VectorIdx) Verify() error {
 	defer v.readers.Release(token)
 	if len(s.vectors) != len(s.ids)*v.vecBytes {
 		return ErrCorruptStorage
+	}
+	if s.cfg.Metric == MetricCosine {
+		if s.dot == nil || len(s.norms) != len(s.ids) {
+			return ErrCorruptStorage
+		}
+		for ord := range s.ids {
+			want := math.Sqrt(s.dot(s.vectorAt(ord), s.vectorAt(ord)))
+			if math.Abs(want-s.norms[ord]) > 1e-9*math.Max(1, want) {
+				return ErrCorruptStorage
+			}
+		}
 	}
 	if len(s.levels) != len(s.ids) || len(s.links) != len(s.ids) {
 		return ErrCorruptStorage

@@ -3,6 +3,7 @@ package vectoridx
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -319,6 +320,7 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 	ns := &vectorSnapshot{
 		cfg:        snap.cfg,
 		dist:       v.dist,
+		dot:        v.dot,
 		vecBytes:   v.vecBytes,
 		elemSize:   v.elemSize,
 		dims:       v.dims,
@@ -332,6 +334,15 @@ func (v *VectorIdx) loadRegions(h fileHeader, regions [][]byte) error {
 		hasEntry:   h.hasEntry,
 		maxLevel:   int(h.maxLevel),
 		gen:        h.generation + 1,
+	}
+	if ns.cfg.Metric == MetricCosine {
+		if ns.dot == nil {
+			return ErrCorruptStorage
+		}
+		ns.norms = make([]float64, count)
+		for ord := range count {
+			ns.norms[ord] = ns.rawNorm(ns.vectorAt(ord))
+		}
 	}
 	type pair struct {
 		id  NodeID
@@ -433,18 +444,21 @@ func (v *VectorIdx) writeBaseLocked() error {
 		tombstoneCount: uint64(len(snap.tombSorted)),
 		checkpointLSN:  v.checkpointLSN,
 	}
-	payloads := [][]byte{nodeMeta, append([]byte(nil), snap.vectors...), graph, tomb}
+	// Keep the vector region as a view into the published snapshot: stream it
+	// directly to the temporary file instead of copying the whole payload into
+	// a second buffer (and then into the output file).
+	payloads := [][]byte{nodeMeta, snap.vectors, graph, tomb}
 	kinds := []uint16{regionKindNodeMeta, regionKindVectors, regionKindGraph, regionKindTombstones}
 	dirOff := uint64(vectorHeaderSize)
-	total := dirOff + uint64(4*regionEntrySize)
+	next := dirOff + uint64(4*regionEntrySize)
 	offsets := make([]uint64, 4)
 	for i, p := range payloads {
-		total = storage.Align(total, 8)
-		offsets[i] = total
-		total += uint64(len(p))
+		next = storage.Align(next, 8)
+		offsets[i] = next
+		next += uint64(len(p))
 	}
-	file := make([]byte, total)
-	encodeHeader(file[0:vectorHeaderSize], h)
+	header := make([]byte, dirOff+uint64(4*regionEntrySize))
+	encodeHeader(header[:vectorHeaderSize], h)
 	for i, p := range payloads {
 		r := fileRegion{
 			kind:     kinds[i],
@@ -452,15 +466,33 @@ func (v *VectorIdx) writeBaseLocked() error {
 			length:   uint64(len(p)),
 			checksum: uint64(crc32.ChecksumIEEE(p)),
 		}
-		encodeRegionEntry(file[dirOff+uint64(i*regionEntrySize):], r)
-		copy(file[offsets[i]:], p)
+		encodeRegionEntry(header[dirOff+uint64(i*regionEntrySize):], r)
 	}
 	dir := filepath.Dir(v.path)
 	base := filepath.Base(v.path)
-	if err := storage.WriteFileAtomic(dir, base+".tmp", base, file, 0o644); err != nil {
-		return err
-	}
-	return nil
+	var padding [8]byte
+	err := storage.WriteFileAtomicFunc(dir, base+".tmp", base, 0o644, func(w io.Writer) error {
+		if err := storage.WriteFull(w, header); err != nil {
+			return err
+		}
+		cursor := uint64(len(header))
+		for i, p := range payloads {
+			if offsets[i] < cursor {
+				return ErrCorruptStorage
+			}
+			if gap := offsets[i] - cursor; gap != 0 {
+				if err := storage.WriteFull(w, padding[:gap]); err != nil {
+					return err
+				}
+			}
+			if err := storage.WriteFull(w, p); err != nil {
+				return err
+			}
+			cursor = offsets[i] + uint64(len(p))
+		}
+		return nil
+	})
+	return err
 }
 
 func sortNodeIDs(ids []NodeID) {

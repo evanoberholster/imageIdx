@@ -9,8 +9,8 @@ package vectoridx
 import (
 	"errors"
 
-	schema "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/internal/storage"
+	schema "github.com/evanoberholster/imageIdx/schema"
 )
 
 // NodeID is the identifier stored in HNSW edges. It is a compact uint32

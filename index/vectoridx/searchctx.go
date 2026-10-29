@@ -131,6 +131,8 @@ type SearchContext struct {
 	gen     uint32
 	// queryBuf holds the encoded raw query vector for the hot loop.
 	queryBuf []byte
+	// queryNorm caches the query's norm for the cosine metric.
+	queryNorm float64
 	// layer reuses the per-level candidate buffer across layer searches.
 	layer []searchEntry
 	// output reuses the result-assembly buffer; callers copy out before Put.
@@ -227,9 +229,9 @@ func selectClosest(cands []searchEntry, m int) []searchEntry {
 // selectHeuristic implements the hnswlib diversity heuristic: candidates
 // sorted by distance to the query are kept when closer to the query than to
 // any already-selected neighbor, spreading edges across directions instead
-// of collapsing onto one cluster. distFn measures raw-vector distance;
-// vectorAt resolves ordinals. It returns at most m entries.
-func selectHeuristic(cands []searchEntry, m int, query []byte, s *vectorSnapshot) []searchEntry {
+// of collapsing onto one cluster. distOrds measures stored-vector distance
+// with cached cosine norms. It returns at most m entries.
+func selectHeuristic(cands []searchEntry, m int, s *vectorSnapshot) []searchEntry {
 	if len(cands) <= m {
 		return cands
 	}
@@ -239,34 +241,39 @@ func selectHeuristic(cands []searchEntry, m int, query []byte, s *vectorSnapshot
 		if len(selected) >= m {
 			break
 		}
-		cVec := s.vectorAt(c.ord)
 		keep := true
 		for _, kept := range selected {
-			d := s.dist(cVec, s.vectorAt(kept.ord))
+			d := s.distOrds(c.ord, kept.ord)
 			if d < c.dist {
 				keep = false
 				break
 			}
 		}
-		_ = query
 		if keep {
 			selected = append(selected, c)
 		}
 	}
 	// If diversity pruned too aggressively, backfill closest remainder.
+	// Scan selected instead of allocating a map: selected is bounded by m,
+	// which is at most 128.
 	if len(selected) < m {
-		inSel := make(map[int]bool, len(selected))
-		for _, c := range selected {
-			inSel[c.ord] = true
-		}
 		for _, c := range cands {
 			if len(selected) >= m {
 				break
 			}
-			if !inSel[c.ord] {
+			if !containsOrd(selected, c.ord) {
 				selected = append(selected, c)
 			}
 		}
 	}
 	return selected
+}
+
+func containsOrd(entries []searchEntry, ord int) bool {
+	for _, e := range entries {
+		if e.ord == ord {
+			return true
+		}
+	}
+	return false
 }
