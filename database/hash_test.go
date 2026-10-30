@@ -42,7 +42,7 @@ func TestHashReplacementAndTombstoneReuse(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(data, idxPath, decodeHash, Options{})
+	db, err := OpenDirs(data, idxPath, decodeHash, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

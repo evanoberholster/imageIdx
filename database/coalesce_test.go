@@ -424,7 +424,7 @@ func decodeFamilyProjection(p []byte) (index.Entry, error) {
 
 func TestCoalescedTimeGeoHashFamilies(t *testing.T) {
 	data, indexDir := familyPaths(t)
-	db, err := Open(data, indexDir, decodeFamilyProjection, Options{BatchSize: 64})
+	db, err := OpenDirs(data, indexDir, decodeFamilyProjection, Options{BatchSize: 64})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,7 +608,7 @@ func TestCoalescedInsertUpdatePairReopen(t *testing.T) {
 		{
 			name: "Decoder",
 			open: func(data, idx string) *DB {
-				db, err := Open(data, idx, decodePair, Options{BatchSize: 64})
+				db, err := OpenDirs(data, idx, decodePair, Options{BatchSize: 64})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -618,7 +618,7 @@ func TestCoalescedInsertUpdatePairReopen(t *testing.T) {
 		{
 			name: "DecodeInto",
 			open: func(data, idx string) *DB {
-				db, err := Open(data, idx, nil, Options{BatchSize: 64, DecodeInto: decodePairInto})
+				db, err := OpenDirs(data, idx, nil, Options{BatchSize: 64, DecodeInto: decodePairInto})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -777,7 +777,7 @@ func decodeEmptyProjection(p []byte) (index.Entry, error) {
 
 func TestEmptyProjectionAdvancesGeneration(t *testing.T) {
 	data, idxPath := paths(t)
-	db, err := Open(data, idxPath, decodeEmptyProjection, Options{BatchSize: 64})
+	db, err := OpenDirs(data, idxPath, decodeEmptyProjection, Options{BatchSize: 64})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -873,7 +873,7 @@ func TestCoalescingMatchesSequentialRandomFamilies(t *testing.T) {
 
 	apply := func(coalesced bool) (*DB, func()) {
 		data, idxPath := familyPaths(t)
-		db, err := Open(data, idxPath, decodeFamilyProjection, Options{BatchSize: 64})
+		db, err := OpenDirs(data, idxPath, decodeFamilyProjection, Options{BatchSize: 64})
 		if err != nil {
 			t.Fatal(err)
 		}

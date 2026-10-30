@@ -47,7 +47,7 @@ func TestSchemaAdditionCrashChild(t *testing.T) {
 	if os.Getenv("IMAGEIDX_SCHEMA_TARGET") == "1" {
 		definitions = addTarget(t, data)
 	}
-	_, err := Open(data, indexDir, decodeTest, Options{Definitions: definitions, boundary: func(at string) {
+	_, err := OpenDirs(data, indexDir, decodeTest, Options{Definitions: definitions, boundary: func(at string) {
 		if at == phase {
 			os.Exit(74)
 		}
@@ -99,7 +99,7 @@ func TestSchemaAdditionCrashBoundaries(t *testing.T) {
 			if phase == "before schema prepare" {
 				options.Definitions = addTarget(t, data)
 			}
-			db, err = Open(data, indexDir, decodeTest, options)
+			db, err = OpenDirs(data, indexDir, decodeTest, options)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -130,7 +130,7 @@ func TestLegacyCleanupCrashChild(t *testing.T) {
 		return
 	}
 	root := os.Getenv("IMAGEIDX_LEGACY_ROOT")
-	_, err := Open(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeTest, Options{boundary: func(at string) {
+	_, err := OpenDirs(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeTest, Options{boundary: func(at string) {
 		if at == phase {
 			os.Exit(74)
 		}
@@ -159,7 +159,7 @@ func TestLegacySchemaCleanupCrashBoundaries(t *testing.T) {
 				t.Fatalf("child: %v", err)
 			}
 			for range 2 {
-				db, err := Open(data, indexDir, decodeTest, Options{})
+				db, err := OpenDirs(data, indexDir, decodeTest, Options{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -208,7 +208,7 @@ func TestAllocatorHighWaterAcrossInterruptedActivation(t *testing.T) {
 				t.Fatal(err)
 			}
 			crashSchemaOpen(t, filepath.Dir(data), phase, true)
-			db, err := Open(data, indexDir, decodeTest, Options{})
+			db, err := OpenDirs(data, indexDir, decodeTest, Options{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -235,7 +235,7 @@ func TestAllocatorHighWaterAcrossInterruptedActivation(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			db, err = Open(data, indexDir, decodeTest, Options{Definitions: target})
+			db, err = OpenDirs(data, indexDir, decodeTest, Options{Definitions: target})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -277,7 +277,7 @@ func TestRepeatedRecoveryIsIdempotent(t *testing.T) {
 			crashSchemaOpen(t, filepath.Dir(data), phase, true)
 			var want int
 			for i := 0; i < 3; i++ {
-				db, err := Open(data, indexDir, decodeTest, Options{})
+				db, err := OpenDirs(data, indexDir, decodeTest, Options{})
 				if err != nil {
 					t.Fatalf("open %d: %v", i, err)
 				}

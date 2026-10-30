@@ -62,7 +62,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(root)
-	dataDir, indexDir := root+"/data", root+"/index"
 
 	defs := schema.NewDefinitions()
 	tag, err := index.BitmapDef(bitmapidx.NamespaceSpec{
@@ -76,16 +75,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Bootstrap the derived index once. Later opens use database.Open directly.
-	idx, err := index.Create(indexDir, index.Spec{Schema: defs})
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := idx.Close(); err != nil {
-		log.Fatal(err)
-	}
-
-	db, err := database.Open(dataDir, indexDir, decodeProjection, database.Options{BatchSize: 64})
+	db, err := database.Open(root, decodeProjection, database.Options{
+		Definitions: defs,
+		BatchSize:   64,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -157,7 +150,7 @@ func main() {
 	}
 
 	// Reopen the same 0.5 database. No index creation or schema resupply is needed.
-	db, err = database.Open(dataDir, indexDir, decodeProjection, database.Options{})
+	db, err = database.Open(root, decodeProjection, database.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}

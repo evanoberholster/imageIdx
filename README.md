@@ -70,9 +70,10 @@ rejected explicitly rather than reinterpreted.
 
 ## Quick start
 
-The current bootstrap creates the derived index directory first with
-`index.Create`, then opens `database.DB`. This is a one-time creation step; later
-opens use `database.Open` directly.
+Create or open a database with one root directory. Canonical records live in
+`<root>/data` and every derived index lives in the shared `<root>/index`
+directory. On a new root, `Options.Definitions` builds the schema and index tree
+automatically; later opens reuse `schema.dat` and the existing indexes.
 
 ```go
 package main
@@ -113,10 +114,9 @@ func main() {
     if err != nil { log.Fatal(err) }
     if err := defs.Register(tag); err != nil { log.Fatal(err) }
 
-    if _, err := index.Create("./index", index.Spec{Schema: defs}); err != nil {
-        log.Fatal(err)
-    }
-    db, err := database.Open("./data", "./index", decodeProjection, database.Options{})
+    db, err := database.Open("./db", decodeProjection, database.Options{
+        Definitions: defs,
+    })
     if err != nil { log.Fatal(err) }
     defer db.Close()
 

@@ -34,10 +34,10 @@ func TestAutomaticRebuildSharedBitmapStore(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(data, dir, decodeTest, Options{}); !errors.Is(err, ErrRecoveryRequired) {
+	if _, err := OpenDirs(data, dir, decodeTest, Options{}); !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatalf("manual open: %v", err)
 	}
-	db, err := Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err := OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestRebuildCopiesBorrowedProjectionBytesAcrossBatch(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestAutomaticRebuildCorruptJournalIndependent(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,13 +135,13 @@ func TestRecoveryKeepsCanonicalWhenProjectionInvalid(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(data, dir, func([]byte) (index.Entry, error) { return index.Entry{}, ErrCorruptJournal }, Options{Recovery: RecoveryAutomatic})
+	_, err = OpenDirs(data, dir, func([]byte) (index.Entry, error) { return index.Entry{}, ErrCorruptJournal }, Options{Recovery: RecoveryAutomatic})
 	if !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatalf("invalid projection: %v", err)
 	}
 	// A partial staging directory is owned by the BUILDING marker, so the
 	// next Open safely discards it and starts again.
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestRecoveryGenerationMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The index watermark already proves this generation; no rebuild is needed.
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestMissingIndexSchemaRequiresExplicitRecovery(t *testing.T) {
 	if err := os.Rename(dir, dir+".removed-by-test"); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err := OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestCentralSchemaRebuildsWithoutLegacyIndexOrPebbleSchemaCopies(t *testing.
 	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestRetiredPebbleBackupCannotOverrideCentralSchema(t *testing.T) {
 	if err := kv.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatalf("retired backup was consulted: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestSparseSimHashRebuildPreservesExternalID(t *testing.T) {
 		}
 		return index.Entry{ValueID: uint64(b[0]), Sims: []index.SimValue{{Namespace: 141, Record: simhash.Record{PHash: 42}}}}, nil
 	}
-	db, err := Open(data, dir, decode, Options{})
+	db, err := OpenDirs(data, dir, decode, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestSparseSimHashRebuildPreservesExternalID(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "sim-008d.manifest")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decode, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decode, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestRebuildPreservesEntityOwnershipForOverlappingIDs(t *testing.T) {
 		p[10] = value
 		return p
 	}
-	db, err := Open(data, dir, decode, Options{})
+	db, err := OpenDirs(data, dir, decode, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestRebuildPreservesEntityOwnershipForOverlappingIDs(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decode, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decode, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestRebuildOmitsDeletedAndObsoleteHashAssociations(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(data, dir, decodeHash, Options{})
+	db, err := OpenDirs(data, dir, decodeHash, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +442,7 @@ func TestRebuildOmitsDeletedAndObsoleteHashAssociations(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "radix-0067.idx")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decodeHash, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeHash, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}

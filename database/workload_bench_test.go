@@ -147,7 +147,7 @@ func BenchmarkPhotoMetadataWorkloads(b *testing.B) {
 		for _, size := range []int{1, 16, 32, 64} {
 			b.Run(fmt.Sprintf("%s/batch-%d", workload, size), func(b *testing.B) {
 				data, idxPath := photoPaths(b)
-				db, err := Open(data, idxPath, decodePhoto, Options{BatchSize: 64})
+				db, err := OpenDirs(data, idxPath, decodePhoto, Options{BatchSize: 64})
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -229,7 +229,7 @@ func BenchmarkPhotoMetadataLatency(b *testing.B) {
 		for _, size := range []int{1, 16, 32, 64} {
 			b.Run(fmt.Sprintf("%s/batch-%d", workload, size), func(b *testing.B) {
 				data, idxPath := photoPaths(b)
-				db, err := Open(data, idxPath, decodePhoto, Options{BatchSize: 64})
+				db, err := OpenDirs(data, idxPath, decodePhoto, Options{BatchSize: 64})
 				if err != nil {
 					b.Fatal(err)
 				}

@@ -82,7 +82,7 @@ func TestRebuildAllFamiliesPreservesTypedValues(t *testing.T) {
 	projection[26] = 19
 	binary.BigEndian.PutUint64(projection[58:66], 808)
 	projection[66] = 10
-	db, err := Open(data, dir, decode, Options{})
+	db, err := OpenDirs(data, dir, decode, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestRebuildAllFamiliesPreservesTypedValues(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "radix-0071.idx")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decode, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decode, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}

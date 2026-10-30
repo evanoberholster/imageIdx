@@ -53,7 +53,7 @@ func TestSparseSimHashDatabaseReopenAndRebuild(t *testing.T) {
 	binary.BigEndian.PutUint64(projection[:8], 1<<32+1)
 	binary.BigEndian.PutUint64(projection[8:16], 77)
 
-	db, err := Open(data, idxPath, decodeSparseSim, Options{})
+	db, err := OpenDirs(data, idxPath, decodeSparseSim, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestSparseSimHashDatabaseReopenAndRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(data, idxPath, decodeSparseSim, Options{})
+	db, err = OpenDirs(data, idxPath, decodeSparseSim, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestSparseSimHashDatabaseReopenAndRebuild(t *testing.T) {
 	if err := os.Remove(filepath.Join(idxPath, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, idxPath, decodeSparseSim, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, idxPath, decodeSparseSim, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestSparseSimHashReplayBySourceGeneration(t *testing.T) {
 	projection := make([]byte, 16)
 	binary.BigEndian.PutUint64(projection[:8], 1<<32+1)
 	binary.BigEndian.PutUint64(projection[8:16], 77)
-	db, err := Open(data, idxPath, decodeSparseSim, Options{})
+	db, err := OpenDirs(data, idxPath, decodeSparseSim, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestSparseSimHashReplayBySourceGeneration(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, idxPath, decodeSparseSim, Options{})
+	db, err = OpenDirs(data, idxPath, decodeSparseSim, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestSparseSimHashCrashChild(t *testing.T) {
 		return
 	}
 	root := os.Getenv("IMAGEIDX_SPARSE_CRASH_ROOT")
-	db, err := Open(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeSparseSim, Options{
+	db, err := OpenDirs(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeSparseSim, Options{
 		boundary: func(at string) {
 			if at == phase {
 				os.Exit(75)
@@ -202,7 +202,7 @@ func TestSparseSimHashCrashBoundaries(t *testing.T) {
 			if !errors.As(err, &exit) || exit.ExitCode() != 75 {
 				t.Fatalf("child exit = %v", err)
 			}
-			db, err := Open(data, idxPath, decodeSparseSim, Options{})
+			db, err := OpenDirs(data, idxPath, decodeSparseSim, Options{})
 			if err != nil {
 				t.Fatal(err)
 			}

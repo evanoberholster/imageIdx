@@ -16,7 +16,7 @@ func BenchmarkCommitAndIndex(b *testing.B) {
 	for _, size := range []int{1, 16, 32, 64} {
 		b.Run(fmt.Sprintf("batch-%d", size), func(b *testing.B) {
 			data, idxPath := paths(b)
-			db, err := Open(data, idxPath, decodeTest, Options{BatchSize: 64})
+			db, err := OpenDirs(data, idxPath, decodeTest, Options{BatchSize: 64})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -49,7 +49,7 @@ func BenchmarkCommitAndIndexWarm(b *testing.B) {
 	for _, size := range []int{1, 16, 32, 64} {
 		b.Run(fmt.Sprintf("batch-%d", size), func(b *testing.B) {
 			data, idxPath := paths(b)
-			db, err := Open(data, idxPath, decodeTest, Options{BatchSize: 64})
+			db, err := OpenDirs(data, idxPath, decodeTest, Options{BatchSize: 64})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -91,7 +91,7 @@ func BenchmarkStartupRebuild(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				data, dir := paths(b)
-				db, err := Open(data, dir, decodeTest, Options{BatchSize: 64})
+				db, err := OpenDirs(data, dir, decodeTest, Options{BatchSize: 64})
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -118,7 +118,7 @@ func BenchmarkStartupRebuild(b *testing.B) {
 					b.Fatal(err)
 				}
 				b.StartTimer()
-				db, err = Open(data, dir, decodeTest, Options{BatchSize: 64, Recovery: RecoveryAutomatic})
+				db, err = OpenDirs(data, dir, decodeTest, Options{BatchSize: 64, Recovery: RecoveryAutomatic})
 				b.StopTimer()
 				if err != nil {
 					b.Fatal(err)
@@ -180,7 +180,7 @@ func BenchmarkGenerationPublication(b *testing.B) {
 
 func BenchmarkOpenExisting(b *testing.B) {
 	data, idxPath := paths(b)
-	db, err := Open(data, idxPath, decodeTest, Options{})
+	db, err := OpenDirs(data, idxPath, decodeTest, Options{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func BenchmarkOpenExisting(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		db, err := Open(data, idxPath, decodeTest, Options{})
+		db, err := OpenDirs(data, idxPath, decodeTest, Options{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -206,7 +206,7 @@ func BenchmarkKVNamespaceAddition(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		data, idxPath := paths(b)
-		db, err := Open(data, idxPath, decodeTest, Options{})
+		db, err := OpenDirs(data, idxPath, decodeTest, Options{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -220,7 +220,7 @@ func BenchmarkKVNamespaceAddition(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
-		db, err = Open(data, idxPath, decodeTest, Options{Definitions: target})
+		db, err = OpenDirs(data, idxPath, decodeTest, Options{Definitions: target})
 		b.StopTimer()
 		if err != nil {
 			b.Fatal(err)
@@ -244,7 +244,7 @@ func BenchmarkCanonicalProjectionModes(b *testing.B) {
 				options.CanonicalProjection = CanonicalProjectionExternal
 				options.ProjectFromRecord = func(record []byte) ([]byte, error) { return record, nil }
 			}
-			db, err := Open(data, idxPath, decodeTest, options)
+			db, err := OpenDirs(data, idxPath, decodeTest, options)
 			if err != nil {
 				b.Fatal(err)
 			}

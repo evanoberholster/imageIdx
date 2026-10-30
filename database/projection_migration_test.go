@@ -27,7 +27,7 @@ func changedProjectionDefinitions(t *testing.T, source *schema.Definitions, name
 func TestProjectionVersionMigrationRebuilds(t *testing.T) {
 	data, idxPath := paths(t)
 	project := func(record []byte) ([]byte, error) { return record, nil }
-	db, err := Open(data, idxPath, decodeTest, Options{
+	db, err := OpenDirs(data, idxPath, decodeTest, Options{
 		CanonicalProjection: CanonicalProjectionExternal,
 		ProjectFromRecord:   project,
 	})
@@ -51,10 +51,10 @@ func TestProjectionVersionMigrationRebuilds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(data, idxPath, decodeTest, Options{Definitions: target}); err == nil {
+	if _, err := OpenDirs(data, idxPath, decodeTest, Options{Definitions: target}); err == nil {
 		t.Fatal("projection version change without migration option was accepted")
 	}
-	db, err = Open(data, idxPath, decodeTest, Options{
+	db, err = OpenDirs(data, idxPath, decodeTest, Options{
 		Definitions:         target,
 		ProjectionMigration: true,
 		ProjectFromRecord:   project,
@@ -71,7 +71,7 @@ func TestProjectionVersionMigrationRebuilds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(data, idxPath, decodeTest, Options{Definitions: target, ProjectFromRecord: project})
+	db, err = OpenDirs(data, idxPath, decodeTest, Options{Definitions: target, ProjectFromRecord: project})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestProjectionMigrationRequiresExternalModeAndValidProjector(t *testing.T) 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(data, idxPath, decodeTest, Options{
+	if _, err := OpenDirs(data, idxPath, decodeTest, Options{
 		Definitions:         target,
 		ProjectionMigration: true,
 		ProjectFromRecord:   func(record []byte) ([]byte, error) { return record, nil },
@@ -131,7 +131,7 @@ func TestProjectionMigrationCrashChild(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(data, idxPath, decodeTest, Options{
+	_, err = OpenDirs(data, idxPath, decodeTest, Options{
 		Definitions:         target,
 		ProjectionMigration: true,
 		ProjectFromRecord:   func(record []byte) ([]byte, error) { return record, nil },
@@ -155,7 +155,7 @@ func TestProjectionMigrationCrashBoundaries(t *testing.T) {
 		t.Run(phase, func(t *testing.T) {
 			data, idxPath := paths(t)
 			project := func(record []byte) ([]byte, error) { return record, nil }
-			db, err := Open(data, idxPath, decodeTest, Options{
+			db, err := OpenDirs(data, idxPath, decodeTest, Options{
 				CanonicalProjection: CanonicalProjectionExternal,
 				ProjectFromRecord:   project,
 			})
@@ -180,7 +180,7 @@ func TestProjectionMigrationCrashBoundaries(t *testing.T) {
 			if err := cmd.Run(); !errors.As(err, &exit) || exit.ExitCode() != 76 {
 				t.Fatalf("%s child exit: %v", phase, err)
 			}
-			db, err = Open(data, idxPath, decodeTest, Options{ProjectFromRecord: project})
+			db, err = OpenDirs(data, idxPath, decodeTest, Options{ProjectFromRecord: project})
 			if err != nil {
 				t.Fatal(err)
 			}

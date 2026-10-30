@@ -25,7 +25,7 @@ func decodeAliasInto(encoded []byte, dst *index.Entry, scratch *DecodeScratch) e
 
 func TestDecodeIntoAliasedInputIsCopied(t *testing.T) {
 	data, idxPath := paths(t)
-	db, err := Open(data, idxPath, nil, Options{BatchSize: 64, DecodeInto: decodeAliasInto})
+	db, err := OpenDirs(data, idxPath, nil, Options{BatchSize: 64, DecodeInto: decodeAliasInto})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,8 +29,9 @@ store while the coordinator is running.
 
 ## Create and open
 
-The current 0.5 bootstrap creates the derived index directory once with
-`index.Create`, then opens `database.Open`:
+`database.Open` takes one root directory. Canonical records live in
+`<root>/data`; every derived index family, including vectors, shares
+`<root>/index`:
 
 ```go
 defs := schema.NewDefinitions()
@@ -41,22 +42,21 @@ tag, err := index.BitmapDef(bitmapidx.NamespaceSpec{
 if err != nil { return err }
 if err := defs.Register(tag); err != nil { return err }
 
-idx, err := index.Create(idxDir, index.Spec{Schema: defs})
-if err != nil { return err }
-if err := idx.Close(); err != nil { return err }
-
-db, err := database.Open(dataDir, idxDir, decodeProjection, database.Options{
-    BatchSize: 64,
+db, err := database.Open(root, decodeProjection, database.Options{
+    Definitions: defs,
+    BatchSize:   64,
 })
 if err != nil { return err }
 defer db.Close()
 ```
 
-On the first successful open, `database` validates the independently created
-index, writes `schema.dat`, and initializes Pebble. Later opens of an existing
-0.5 database use `database.Open` directly; the index directory already exists.
-The index creation step is a bootstrap exception, not a second database
-lifecycle.
+On a new root, `database.Open` creates the shared index tree from
+`Options.Definitions`, writes `schema.dat`, and initializes Pebble. Later opens
+pass no definitions; the persisted schema and existing indexes are reused.
+
+Applications that intentionally keep data and indexes at separate custom paths
+can use `database.OpenDirs(dataDir, indexDir, decode, options)`; that form also
+accepts a pre-created legacy index.
 
 An existing 0.5 database rejects missing `schema.dat`, incompatible index
 definitions, unsupported formats, and unrecoverable journal state. See
