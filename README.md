@@ -207,6 +207,7 @@ const clipNamespace schema.Namespace = 200
 
 def, err := index.VectorDef(vectoridx.Config{
     Namespace:   clipNamespace,
+    Model:       "siglip2-base-patch16-224",
     Dimensions:  vectoridx.Dim768,
     ElementType: vectoridx.ElementFloat32,
     Metric:      vectoridx.MetricCosine,
@@ -363,9 +364,10 @@ hits, err := filtered.RankVector(ctx, nil, ws, vec, query, 50)
   SigLIP2 handles lowercasing, EOS, truncation, and padding.
 - Keep the vision preprocessing consistent between ingest and model export;
   SigLIP2’s `ReferenceResize: true` is the Hugging Face/Pillow-compatible path.
-- The model/checkpoint ID is not stored in `vectoridx.Config` (it stores
-  dimensions, element type, and metric). Keep it in application metadata and
-  use a new namespace for a new model version.
+- The model/checkpoint ID is stored as `vectoridx.Config.Model` (maximum
+  `vectoridx.MaxModelBytes`, 128 bytes) and is persisted in both the schema
+  namespace config and the vector base header. Use a new namespace for a new
+  model version rather than changing it in place.
 - For a model upgrade, backfill a new namespace and switch reads; do not
   overwrite the old namespace in place.
 

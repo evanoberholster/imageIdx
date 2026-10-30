@@ -51,7 +51,7 @@ Helpers encode engine configuration into `NamespaceDef.Config`:
 
 ```go
 tags, _ := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: 6, Kind: schema.KindBitmapEnum}, "tags", schema.EntityImage)
-vec, _  := index.VectorDef(vectoridx.Config{Namespace: 5, Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementFloat32}, "embedding", schema.EntityImage)
+vec, _  := index.VectorDef(vectoridx.Config{Namespace: 5, Model: "my-embedding-v1", Dimensions: vectoridx.Dim512, ElementType: vectoridx.ElementFloat32}, "embedding", schema.EntityImage)
 ```
 
 ## Lifecycle

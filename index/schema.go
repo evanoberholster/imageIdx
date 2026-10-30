@@ -19,8 +19,9 @@ const livenessNamespace schematypes.Namespace = 0xFFF0
 const livenessName = "__liveness__"
 
 // VectorDef builds a namespace definition for a vectorix namespace, encoding
-// the persisted dimensions, element type, and metric into Config. Name and
-// entity are supplied here; the namespace number comes from cfg.
+// the persisted dimensions, element type, metric, and optional model into
+// Config. Name and entity are supplied here; the namespace number comes from
+// cfg.
 func VectorDef(cfg vectoridx.Config, name string, entity schematypes.EntityKind) (schematypes.NamespaceDef, error) {
 	if !cfg.Namespace.Valid() || !cfg.Dimensions.Valid() {
 		return schematypes.NamespaceDef{}, ErrInvalidSchema
@@ -35,10 +36,23 @@ func VectorDef(cfg vectoridx.Config, name string, entity schematypes.EntityKind)
 	if metric == 0 {
 		metric = vectoridx.MetricL2
 	}
-	config := make([]byte, 4)
+	if len(cfg.Model) > vectoridx.MaxModelBytes {
+		return schematypes.NamespaceDef{}, ErrInvalidSchema
+	}
+	// Keep the legacy 4-byte encoding when no model is attached; extended
+	// configs append a uint16 length and the UTF-8 model ID.
+	configLen := 4
+	if cfg.Model != "" {
+		configLen = 6 + len(cfg.Model)
+	}
+	config := make([]byte, configLen)
 	binary.LittleEndian.PutUint16(config[0:2], uint16(cfg.Dimensions))
 	config[2] = byte(cfg.ElementType)
 	config[3] = metric
+	if cfg.Model != "" {
+		binary.LittleEndian.PutUint16(config[4:6], uint16(len(cfg.Model)))
+		copy(config[6:], cfg.Model)
+	}
 	return schematypes.NamespaceDef{
 		Namespace: cfg.Namespace,
 		Name:      name,
@@ -62,15 +76,23 @@ func BitmapDef(spec bitmapidx.NamespaceSpec, name string, entity schematypes.Ent
 	return def, nil
 }
 
-// decodeVectorConfig recovers the persisted dimensions, element type and metric.
+// decodeVectorConfig recovers the persisted dimensions, element type, metric,
+// and optional model. Legacy 4-byte configs decode with an empty model.
 func decodeVectorConfig(config []byte) (vectoridx.Config, error) {
-	if len(config) != 4 {
+	if len(config) != 4 && len(config) < 6 {
 		return vectoridx.Config{}, ErrInvalidSchema
 	}
 	cfg := vectoridx.Config{
 		Dimensions:  vectoridx.Dimensions(binary.LittleEndian.Uint16(config[0:2])),
 		ElementType: vectoridx.ElementType(config[2]),
 		Metric:      config[3],
+	}
+	if len(config) > 4 {
+		modelLen := int(binary.LittleEndian.Uint16(config[4:6]))
+		if modelLen > vectoridx.MaxModelBytes || len(config) != 6+modelLen {
+			return vectoridx.Config{}, ErrInvalidSchema
+		}
+		cfg.Model = string(config[6:])
 	}
 	if !cfg.Dimensions.Valid() {
 		return vectoridx.Config{}, ErrInvalidSchema

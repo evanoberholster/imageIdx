@@ -17,8 +17,10 @@
 //     zero for self matches.
 //   - Namespace is the shared schema identity of one vector space: a
 //     non-zero schema.Namespace (KindVector) assigned by the application's
-//     schema. IDs are stored and filtered as compact uint32 NodeIDs and
-//     widened to schema.ValueID in Result values.
+//     schema. Config.Model optionally attaches an application-defined model ID
+//     (for example a SigLIP2 checkpoint) to that namespace; it is persisted
+//     and exposed through Config and Metadata. IDs are stored and filtered as
+//     compact uint32 NodeIDs and widened to schema.ValueID in Result values.
 //   - Standard HNSW insertion/search with direct uint32 NodeID edges, a dense
 //     O(1) locator with sorted sparse fallback, and heuristic neighbor
 //     selection (closest-only available for benchmarking).

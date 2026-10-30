@@ -41,6 +41,10 @@ const (
 	Dim1024 Dimensions = 1024
 )
 
+// MaxModelBytes bounds Config.Model in the persisted base header and schema
+// config. The model is metadata; it is not part of the vector payload.
+const MaxModelBytes = 128
+
 // Valid reports whether d is a supported fixed width.
 func (d Dimensions) Valid() bool {
 	switch d {
@@ -88,7 +92,11 @@ const (
 // zero. Dynamic-ef is disabled unless DynamicEfFactor != 0; FlatSearchCutoff
 // and FlatThreshold default when zero, negative FlatSearchCutoff forces ANN.
 type Config struct {
-	Namespace      schema.Namespace
+	Namespace schema.Namespace
+	// Model is an optional application-defined embedding model/checkpoint ID
+	// (for example "siglip2-base-patch16-224"). It is persisted with the index
+	// and namespace but does not affect distance calculations.
+	Model          string
 	Dimensions     Dimensions
 	ElementType    ElementType
 	Metric         uint8
@@ -137,7 +145,7 @@ func (c Config) NamespaceDef() schema.NamespaceDef {
 }
 
 func (c Config) withDefaults() (Config, error) {
-	if !c.Namespace.Valid() || !c.Dimensions.Valid() {
+	if !c.Namespace.Valid() || !c.Dimensions.Valid() || len(c.Model) > MaxModelBytes {
 		return Config{}, ErrInvalidConfig
 	}
 	switch c.ElementType {

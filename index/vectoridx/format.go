@@ -49,6 +49,12 @@ const (
 	regionKindTombstones = 4
 
 	regionEntrySize = 32
+
+	// The superblock reserved area stores an optional UTF-8 model ID. Legacy
+	// files have zeroes here, which decode as an empty model.
+	modelLenOffset  = 86
+	modelDataOffset = 88
+	modelHeaderEnd  = 252
 )
 
 var vectorMagic = [8]byte{
@@ -59,6 +65,7 @@ var vectorMagic = [8]byte{
 type fileHeader struct {
 	generation     uint64
 	namespace      schema.Namespace
+	model          string
 	elem           ElementType
 	metric         uint8
 	dims           uint16
@@ -107,9 +114,11 @@ func encodeHeader(dst []byte, h fileHeader) {
 	binary.LittleEndian.PutUint64(dst[66:74], vectorHeaderSize) // region dir offset
 	binary.LittleEndian.PutUint32(dst[74:78], 4)                // region count
 	binary.LittleEndian.PutUint64(dst[78:86], h.checkpointLSN)
-	for i := 86; i < 252; i++ {
+	for i := modelLenOffset; i < modelHeaderEnd; i++ {
 		dst[i] = 0
 	}
+	binary.LittleEndian.PutUint16(dst[modelLenOffset:modelDataOffset], uint16(len(h.model)))
+	copy(dst[modelDataOffset:modelHeaderEnd], h.model)
 	binary.LittleEndian.PutUint32(dst[252:256], crc32.ChecksumIEEE(dst[:252]))
 }
 
@@ -153,6 +162,11 @@ func decodeHeader(data []byte) (fileHeader, error) {
 		return h, ErrCorruptStorage
 	}
 	h.checkpointLSN = binary.LittleEndian.Uint64(data[78:86])
+	modelLen := int(binary.LittleEndian.Uint16(data[modelLenOffset:modelDataOffset]))
+	if modelLen > MaxModelBytes || modelDataOffset+modelLen > modelHeaderEnd {
+		return h, ErrCorruptStorage
+	}
+	h.model = string(data[modelDataOffset : modelDataOffset+modelLen])
 	if h.metric != vectorMetricL2 && h.metric != MetricCosine && h.metric != MetricDot {
 		return h, ErrCorruptStorage
 	}
@@ -440,6 +454,7 @@ func (v *VectorIdx) writeBaseLocked() error {
 	h := fileHeader{
 		generation:     v.gen.Load(),
 		namespace:      snap.cfg.Namespace,
+		model:          snap.cfg.Model,
 		elem:           snap.cfg.ElementType,
 		metric:         snap.cfg.Metric,
 		dims:           uint16(snap.cfg.Dimensions),

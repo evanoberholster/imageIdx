@@ -849,7 +849,7 @@ func (s *Store) openVectors(create bool) {
 			continue
 		}
 		got := idx.Config()
-		if got.Dimensions != want.Dimensions || got.ElementType != want.ElementType || got.Metric != want.Metric {
+		if got.Dimensions != want.Dimensions || got.ElementType != want.ElementType || got.Metric != want.Metric || got.Model != want.Model {
 			_ = idx.Close()
 			s.markUnavailable(def, fmt.Errorf("%w: vector config mismatch", ErrInvalidSchema))
 			continue

@@ -317,6 +317,7 @@ func OpenStore(path string, durability Durability, opts ...Option) (*VectorIdx, 
 	}
 	cfg := Config{
 		Namespace:      header.namespace,
+		Model:          header.model,
 		Dimensions:     Dimensions(header.dims),
 		ElementType:    header.elem,
 		Metric:         header.metric,
@@ -437,6 +438,12 @@ func (v *VectorIdx) Config() Config {
 	return v.view.Load().cfg
 }
 
+// Model returns the application-defined embedding model attached to this
+// namespace, or an empty string when none was configured.
+func (v *VectorIdx) Model() string {
+	return v.view.Load().cfg.Model
+}
+
 // Generation returns the current published generation number.
 func (v *VectorIdx) Generation() uint64 { return v.gen.Load() }
 
@@ -462,6 +469,7 @@ func (v *VectorIdx) TombstoneCount() int {
 // Metadata is a copied summary of the current generation.
 type Metadata struct {
 	Namespace      schema.Namespace
+	Model          string
 	Dimensions     Dimensions
 	ElementType    ElementType
 	Generation     uint64
@@ -478,6 +486,7 @@ func (v *VectorIdx) Metadata() Metadata {
 	snap := v.view.Load()
 	m := Metadata{
 		Namespace:      snap.cfg.Namespace,
+		Model:          snap.cfg.Model,
 		Dimensions:     snap.cfg.Dimensions,
 		ElementType:    snap.cfg.ElementType,
 		Generation:     v.gen.Load(),

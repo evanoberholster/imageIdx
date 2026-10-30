@@ -112,7 +112,7 @@ A base generation file plus a `<path>.manifest`, `<path>.delta.<gen>`
 generations, and segmented `<path>.wal.<seq>` logs:
 
 - 256-byte little-endian superblock (magic `VCTRIDX1`, version, config,
-  entry node, counts, checkpoint LSN, CRC32).
+  optional attached model ID, entry node, counts, checkpoint LSN, CRC32).
 - 4-entry region directory (node metadata, vectors, graph, tombstones)
   with offsets, lengths, and CRC32 checksums.
 - `Checkpoint` publishes the mutations since the last checkpoint as one
@@ -156,9 +156,12 @@ generation.
 
 ## API rules worth knowing
 
+- `Model` is optional application metadata (maximum 128 bytes) persisted with
+  the namespace and base header. It does not affect distances.
 - `Dimensions` is closed {512, 768, 1024} and element type is fixed for the
-  index lifetime; an invalid (zero) `Namespace` or `Dimensions` returns
-  `ErrInvalidConfig`. Mismatched vectors/queries return `ErrInvalidVector`.
+  index lifetime; an invalid (zero) `Namespace` or `Dimensions`, or a model
+  longer than `MaxModelBytes`, returns `ErrInvalidConfig`. Mismatched
+  vectors/queries return `ErrInvalidVector`.
 - Duplicate `Add` of a live NodeID returns `ErrDuplicateNodeID`. Adding a
   tombstoned NodeID replaces its vector and reconnects it, so `Delete`
   followed by `Add` is an update; `Compact` purges tombstones and rebuilds.
