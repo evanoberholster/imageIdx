@@ -1,0 +1,84 @@
+//go:build arm64
+
+#include "textflag.h"
+
+// func l2Float16NEON(a, b []byte) float32
+// Processes floor(len(a)/32) blocks of 16 binary16 values.
+TEXT ·l2Float16NEON(SB), NOSPLIT, $0-52
+	MOVD a_base+0(FP), R0
+	MOVD a_len+8(FP), R1
+	MOVD b_base+24(FP), R2
+	LSR  $5, R1, R3
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V1.B16, V1.B16, V1.B16
+	VEOR V2.B16, V2.B16, V2.B16
+	VEOR V3.B16, V3.B16, V3.B16
+	CBZ  R3, done
+loop:
+	VLD1.P 32(R0), [V4.H8, V5.H8]
+	VLD1.P 32(R2), [V6.H8, V7.H8]
+	// fcvtl/fcvtl2 for a: v4 -> v8,v9, v5 -> v10,v11
+	WORD $0x0e217888
+	WORD $0x4e217889
+	WORD $0x0e2178aa
+	WORD $0x4e2178ab
+	// b: v6 -> v12,v13, v7 -> v14,v15
+	WORD $0x0e2178cc
+	WORD $0x4e2178cd
+	WORD $0x0e2178ee
+	WORD $0x4e2178ef
+	VFSUB V12.S4, V8.S4, V16.S4
+	VFSUB V13.S4, V9.S4, V17.S4
+	VFSUB V14.S4, V10.S4, V18.S4
+	VFSUB V15.S4, V11.S4, V19.S4
+	VFMLA V16.S4, V16.S4, V0.S4
+	VFMLA V17.S4, V17.S4, V1.S4
+	VFMLA V18.S4, V18.S4, V2.S4
+	VFMLA V19.S4, V19.S4, V3.S4
+	SUBS $1, R3, R3
+	BNE  loop
+done:
+	VFADD V1.S4, V0.S4, V0.S4
+	VFADD V3.S4, V2.S4, V2.S4
+	VFADD V2.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	FMOVS F0, ret+48(FP)
+	RET
+
+// func dotFloat16NEON(a, b []byte) float32
+TEXT ·dotFloat16NEON(SB), NOSPLIT, $0-52
+	MOVD a_base+0(FP), R0
+	MOVD a_len+8(FP), R1
+	MOVD b_base+24(FP), R2
+	LSR  $5, R1, R3
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V1.B16, V1.B16, V1.B16
+	VEOR V2.B16, V2.B16, V2.B16
+	VEOR V3.B16, V3.B16, V3.B16
+	CBZ  R3, done2
+loop2:
+	VLD1.P 32(R0), [V4.H8, V5.H8]
+	VLD1.P 32(R2), [V6.H8, V7.H8]
+	WORD $0x0e217888
+	WORD $0x4e217889
+	WORD $0x0e2178aa
+	WORD $0x4e2178ab
+	WORD $0x0e2178cc
+	WORD $0x4e2178cd
+	WORD $0x0e2178ee
+	WORD $0x4e2178ef
+	VFMLA V12.S4, V8.S4, V0.S4
+	VFMLA V13.S4, V9.S4, V1.S4
+	VFMLA V14.S4, V10.S4, V2.S4
+	VFMLA V15.S4, V11.S4, V3.S4
+	SUBS $1, R3, R3
+	BNE  loop2
+done2:
+	VFADD V1.S4, V0.S4, V0.S4
+	VFADD V3.S4, V2.S4, V2.S4
+	VFADD V2.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
+	FMOVS F0, ret+48(FP)
+	RET

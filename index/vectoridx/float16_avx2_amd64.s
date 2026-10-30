@@ -1,0 +1,72 @@
+//go:build amd64
+
+#include "textflag.h"
+
+// func l2Float16AVX2(a, b []byte) float32
+// Processes floor(len(a)/32) blocks of 16 binary16 values.
+TEXT ·l2Float16AVX2(SB), NOSPLIT, $0-52
+	MOVQ a_base+0(FP), AX
+	MOVQ a_len+8(FP), CX
+	MOVQ b_base+24(FP), BX
+	SHRQ $5, CX
+	VXORPS Y0, Y0, Y0
+	VXORPS Y1, Y1, Y1
+	TESTQ CX, CX
+	JZ   done
+loop:
+	VCVTPH2PS (AX), Y4
+	VCVTPH2PS 16(AX), Y5
+	VCVTPH2PS (BX), Y6
+	VCVTPH2PS 16(BX), Y7
+	VSUBPS Y6, Y4, Y8
+	VSUBPS Y7, Y5, Y9
+	VMULPS Y8, Y8, Y8
+	VMULPS Y9, Y9, Y9
+	VADDPS Y8, Y0, Y0
+	VADDPS Y9, Y1, Y1
+	ADDQ $32, AX
+	ADDQ $32, BX
+	DECQ CX
+	JNZ  loop
+done:
+	VADDPS Y1, Y0, Y0
+	VEXTRACTF128 $1, Y0, X1
+	VADDPS X1, X0, X0
+	VHADDPS X0, X0, X0
+	VHADDPS X0, X0, X0
+	MOVSS X0, ret+48(FP)
+	VZEROUPPER
+	RET
+
+// func dotFloat16AVX2(a, b []byte) float32
+TEXT ·dotFloat16AVX2(SB), NOSPLIT, $0-52
+	MOVQ a_base+0(FP), AX
+	MOVQ a_len+8(FP), CX
+	MOVQ b_base+24(FP), BX
+	SHRQ $5, CX
+	VXORPS Y0, Y0, Y0
+	VXORPS Y1, Y1, Y1
+	TESTQ CX, CX
+	JZ   done2
+loop2:
+	VCVTPH2PS (AX), Y4
+	VCVTPH2PS 16(AX), Y5
+	VCVTPH2PS (BX), Y6
+	VCVTPH2PS 16(BX), Y7
+	VMULPS Y6, Y4, Y8
+	VMULPS Y7, Y5, Y9
+	VADDPS Y8, Y0, Y0
+	VADDPS Y9, Y1, Y1
+	ADDQ $32, AX
+	ADDQ $32, BX
+	DECQ CX
+	JNZ  loop2
+done2:
+	VADDPS Y1, Y0, Y0
+	VEXTRACTF128 $1, Y0, X1
+	VADDPS X1, X0, X0
+	VHADDPS X0, X0, X0
+	VHADDPS X0, X0, X0
+	MOVSS X0, ret+48(FP)
+	VZEROUPPER
+	RET

@@ -24,6 +24,10 @@ func BenchmarkDistanceInt8_512(b *testing.B) {
 	benchDistance(b, ElementInt8, Dim512)
 }
 
+func BenchmarkDistanceInt8_768(b *testing.B) {
+	benchDistance(b, ElementInt8, Dim768)
+}
+
 func BenchmarkDistanceInt16_1024(b *testing.B) {
 	benchDistance(b, ElementInt16, Dim1024)
 }
@@ -55,6 +59,141 @@ func benchDistance(b *testing.B, elem ElementType, dims Dimensions) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = dist(a, b2)
+	}
+}
+
+func BenchmarkDistanceFloat16_512(b *testing.B)  { benchDistanceFloat16(b, Dim512) }
+func BenchmarkDistanceFloat16_768(b *testing.B)  { benchDistanceFloat16(b, Dim768) }
+func BenchmarkDistanceFloat16_1024(b *testing.B) { benchDistanceFloat16(b, Dim1024) }
+
+func benchDistanceFloat16(b *testing.B, dims Dimensions) {
+	b.Helper()
+	rng := rand.New(rand.NewSource(85))
+	cfg, err := (Config{Namespace: testNamespace, Dimensions: dims, ElementType: ElementFloat16}).withDefaults()
+	if err != nil {
+		b.Fatal(err)
+	}
+	dist := resolveDistance(cfg)
+	a := make([]uint16, dims)
+	c := make([]uint16, dims)
+	for i := range a {
+		a[i] = Float32ToFloat16(rng.Float32()*4 - 2)
+		c[i] = Float32ToFloat16(rng.Float32()*4 - 2)
+	}
+	rawA := encodeRawFloat16(nil, a)
+	rawC := encodeRawFloat16(nil, c)
+	b.SetBytes(int64(cfg.VectorBytes()))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = dist(rawA, rawC)
+	}
+}
+
+func buildBenchIndexInt8(b *testing.B, n int, dims Dimensions) (*VectorIdx, [][]int8) {
+	b.Helper()
+	idx, err := NewMemory(Config{
+		Namespace:      testNamespace,
+		Dimensions:     dims,
+		ElementType:    ElementInt8,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+		FlatThreshold:  -1,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(87))
+	vecs := make([][]int8, n)
+	for i := range vecs {
+		vecs[i] = randInt8Vec(rng, dims)
+		if err := idx.AddInt8(NodeID(i+1), vecs[i]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return idx, vecs
+}
+
+func BenchmarkSearchInt8_512ANN(b *testing.B) {
+	idx, vecs := buildBenchIndexInt8(b, 1000, Dim512)
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchInt8(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSearchInt8_768ANN(b *testing.B) {
+	idx, vecs := buildBenchIndexInt8(b, 1000, Dim768)
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchInt8(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func buildBenchIndexFloat16(b *testing.B, n int, dims Dimensions) (*VectorIdx, [][]uint16) {
+	b.Helper()
+	idx, err := NewMemory(Config{
+		Namespace:      testNamespace,
+		Dimensions:     dims,
+		ElementType:    ElementFloat16,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		EfSearch:       64,
+		FlatThreshold:  -1,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(86))
+	vecs := make([][]uint16, n)
+	for i := range vecs {
+		vecs[i] = make([]uint16, dims)
+		for j := range vecs[i] {
+			vecs[i][j] = Float32ToFloat16(rng.Float32()*4 - 2)
+		}
+		if err := idx.AddFloat16(NodeID(i+1), vecs[i]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return idx, vecs
+}
+
+func BenchmarkSearchFloat16_512ANN(b *testing.B) {
+	idx, vecs := buildBenchIndexFloat16(b, 1000, Dim512)
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat16(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSearchFloat16_768ANN(b *testing.B) {
+	idx, vecs := buildBenchIndexFloat16(b, 1000, Dim768)
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat16(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

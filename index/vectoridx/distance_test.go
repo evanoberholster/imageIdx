@@ -154,6 +154,41 @@ func TestSIMDFloat32KernelsMatchScalar(t *testing.T) {
 	}
 }
 
+func TestSIMDInt8KernelsMatchScalar(t *testing.T) {
+	if !simdInt8Supported {
+		t.Skip("no int8 SIMD kernel on this architecture")
+	}
+	rng := rand.New(rand.NewSource(45))
+	for _, dims := range []Dimensions{Dim512, Dim768, Dim1024} {
+		a := make([]int8, dims)
+		b := make([]int8, dims)
+		au := make([]uint8, dims)
+		bu := make([]uint8, dims)
+		for i := range a {
+			a[i] = int8(rng.Intn(256) - 128)
+			b[i] = int8(rng.Intn(256) - 128)
+			au[i] = uint8(rng.Intn(256))
+			bu[i] = uint8(rng.Intn(256))
+		}
+		rawA := encodeRawInt8(nil, a)
+		rawB := encodeRawInt8(nil, b)
+		if got, want := simdDotInt8Bytes(rawA, rawB), DotInt8(a, b); got != want {
+			t.Fatalf("SIMD int8 dot dim %d = %v, want %v", dims, got, want)
+		}
+		if got, want := simdL2Int8Bytes(rawA, rawB), SquaredL2Int8(a, b); got != want {
+			t.Fatalf("SIMD int8 L2 dim %d = %v, want %v", dims, got, want)
+		}
+		rawAU := encodeRawUint8(nil, au)
+		rawBU := encodeRawUint8(nil, bu)
+		if got, want := simdDotUint8Bytes(rawAU, rawBU), DotUint8(au, bu); got != want {
+			t.Fatalf("SIMD uint8 dot dim %d = %v, want %v", dims, got, want)
+		}
+		if got, want := simdL2Uint8Bytes(rawAU, rawBU), SquaredL2Uint8(au, bu); got != want {
+			t.Fatalf("SIMD uint8 L2 dim %d = %v, want %v", dims, got, want)
+		}
+	}
+}
+
 func TestAccumulatorHeadroom1024D(t *testing.T) {
 	n := int(Dim1024)
 	// int8/uint8 worst case: every diff is 255.
@@ -220,7 +255,7 @@ func TestEncodeScoreMonotonicAndSaturating(t *testing.T) {
 }
 
 func TestResolveDistanceCoversMatrix(t *testing.T) {
-	for _, elem := range []ElementType{ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32} {
+	for _, elem := range []ElementType{ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32, ElementFloat16} {
 		for _, dims := range []Dimensions{Dim512, Dim768, Dim1024} {
 			fn := resolveDistance(Config{Dimensions: dims, ElementType: elem})
 			if fn == nil {
@@ -252,6 +287,8 @@ func TestConfigVectorBytesTable(t *testing.T) {
 		{ElementFloat32, Dim512, 2048},
 		{ElementFloat32, Dim768, 3072},
 		{ElementFloat32, Dim1024, 4096},
+		{ElementFloat16, Dim512, 1024},
+		{ElementFloat16, Dim768, 1536},
 	}
 	for _, c := range cases {
 		cfg, err := Config{Namespace: testNamespace, Dimensions: c.dims, ElementType: c.elem}.withDefaults()

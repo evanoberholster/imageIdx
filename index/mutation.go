@@ -870,6 +870,8 @@ func vectorLenMatches(v VectorValue, dims int) bool {
 	switch v.Element {
 	case vectoridx.ElementFloat32:
 		return len(v.Float32) == dims
+	case vectoridx.ElementFloat16:
+		return len(v.Float16) == dims
 	case vectoridx.ElementInt8:
 		return len(v.Int8) == dims
 	case vectoridx.ElementUint8:
@@ -1178,6 +1180,8 @@ func addVector(idx *vectoridx.VectorIdx, node vectoridx.NodeID, v VectorValue) e
 	switch v.Element {
 	case vectoridx.ElementFloat32:
 		return idx.AddFloat32(node, v.Float32)
+	case vectoridx.ElementFloat16:
+		return idx.AddFloat16(node, v.Float16)
 	case vectoridx.ElementInt8:
 		return idx.AddInt8(node, v.Int8)
 	case vectoridx.ElementUint8:

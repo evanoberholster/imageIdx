@@ -1383,6 +1383,31 @@ func (v *VectorIdx) DeleteBatch(ids []NodeID) error {
 	return v.syncWALAfterWrite(wal)
 }
 
+// AddFloat16 inserts one binary16 vector.
+func (v *VectorIdx) AddFloat16(id NodeID, vec []uint16) error {
+	if v.cfgBase.ElementType != ElementFloat16 || len(vec) != v.dims {
+		return ErrInvalidVector
+	}
+	v.writeMu.Lock()
+	if v.closed.Load() {
+		v.writeMu.Unlock()
+		return ErrClosed
+	}
+	raw := encodeRawFloat16(v.encodeBuf[:0], vec)
+	v.encodeBuf = raw
+	cur := v.view.Load()
+	ns, err := v.addRawLocked(cur, id, raw)
+	if err != nil {
+		v.writeMu.Unlock()
+		return err
+	}
+	v.view.Store(ns)
+	v.maybeAutoCompactLocked(ns)
+	wal := v.takePendingSyncLocked()
+	v.writeMu.Unlock()
+	return v.syncWALAfterWrite(wal)
+}
+
 // queryEncoder writes the typed query into dst (reusing pooled capacity)
 // and returns the raw encoding. It runs lock-free with ctx alive.
 type queryEncoder func(dst []byte) []byte
@@ -1553,6 +1578,46 @@ func (v *VectorIdx) SearchFloat32(query []float32, filter CandidateFilter, k int
 	return v.searchEncoded(filter, k, func(dst []byte) []byte {
 		return encodeRawFloat32(dst, query)
 	})
+}
+
+// SearchFloat16 returns up to k nearest live neighbors of a binary16 query.
+func (v *VectorIdx) SearchFloat16(query []uint16, filter CandidateFilter, k int) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat16 || len(query) != v.dims {
+		return nil, ErrInvalidVector
+	}
+	return v.searchEncoded(filter, k, func(dst []byte) []byte {
+		return encodeRawFloat16(dst, query)
+	})
+}
+
+// SearchIntoFloat16 appends up to k binary16 matches to dst.
+func (v *VectorIdx) SearchIntoFloat16(dst []Result, query []uint16, filter CandidateFilter, k int) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat16 || len(query) != v.dims {
+		return dst, ErrInvalidVector
+	}
+	return v.searchIntoEncoded(dst, filter, k, func(scratch []byte) []byte {
+		return encodeRawFloat16(scratch, query)
+	})
+}
+
+// ExactSearchFloat16 runs the exact reference scan for a binary16 query.
+func (v *VectorIdx) ExactSearchFloat16(query []uint16, filter CandidateFilter, k int) ([]Result, error) {
+	if v.cfgBase.ElementType != ElementFloat16 || len(query) != v.dims {
+		return nil, ErrInvalidVector
+	}
+	if k <= 0 {
+		return nil, ErrInvalidQuery
+	}
+	raw := encodeRawFloat16(nil, query)
+	token := v.readers.Acquire()
+	snap := v.view.Load()
+	if v.closed.Load() {
+		v.readers.Release(token)
+		return nil, ErrClosed
+	}
+	out, err := snap.exactSearch(nil, raw, filter, k)
+	v.readers.Release(token)
+	return out, err
 }
 
 // SearchFloat32WithOptions is SearchFloat32 with cancellation and per-query

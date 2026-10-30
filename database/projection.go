@@ -260,6 +260,9 @@ func compareVector(a, b index.VectorValue) int {
 	if c := compareFloat32s(a.Float32, b.Float32); c != 0 {
 		return c
 	}
+	if c := slices.Compare(a.Float16, b.Float16); c != 0 {
+		return c
+	}
 	if c := slices.Compare(a.Int8, b.Int8); c != 0 {
 		return c
 	}
@@ -306,7 +309,8 @@ func sameGeo(a, b index.GeoValue) bool   { return a == b }
 func sameSim(a, b index.SimValue) bool   { return a == b }
 func sameHash(a, b index.HashValue) bool { return a == b }
 func sameVector(a, b index.VectorValue) bool {
-	return a.Namespace == b.Namespace && a.Element == b.Element && slices.Equal(a.Float32, b.Float32) &&
+	return a.Namespace == b.Namespace && a.Element == b.Element &&
+		slices.Equal(a.Float32, b.Float32) && slices.Equal(a.Float16, b.Float16) &&
 		slices.Equal(a.Int8, b.Int8) && slices.Equal(a.Uint8, b.Uint8) &&
 		slices.Equal(a.Int16, b.Int16) && slices.Equal(a.Uint16, b.Uint16)
 }

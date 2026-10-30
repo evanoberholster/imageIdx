@@ -56,6 +56,42 @@ func TestVectorModelReopen(t *testing.T) {
 	}
 }
 
+func TestFloat16VectorNamespace(t *testing.T) {
+	defs := schematypes.NewDefinitions()
+	def, err := VectorDef(vectoridx.Config{
+		Namespace:   52,
+		Dimensions:  vectoridx.Dim512,
+		ElementType: vectoridx.ElementFloat16,
+	}, "float16", schematypes.EntityImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := defs.Register(def); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Create(filepath.Join(t.TempDir(), "index"), Spec{Schema: defs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	vec := make([]uint16, vectoridx.Dim512)
+	for i := range vec {
+		vec[i] = uint16(0x3c00) // 1.0
+	}
+	if err := store.Add(Entry{ValueID: 1, Vectors: []VectorValue{{
+		Namespace: 52, Element: vectoridx.ElementFloat16, Float16: vec,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	idx, ok := store.Vector(52)
+	if !ok {
+		t.Fatal("float16 namespace unavailable")
+	}
+	if got := idx.LiveCount(); got != 1 {
+		t.Fatalf("LiveCount = %d, want 1", got)
+	}
+}
+
 func TestVectorDefModelRoundTrip(t *testing.T) {
 	const model = "siglip2-base-patch16-224"
 	def, err := VectorDef(vectoridx.Config{

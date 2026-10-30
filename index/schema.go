@@ -29,7 +29,7 @@ func VectorDef(cfg vectoridx.Config, name string, entity schematypes.EntityKind)
 	if !entity.Valid() {
 		return schematypes.NamespaceDef{}, ErrEntityRequired
 	}
-	if cfg.ElementType < vectoridx.ElementInt8 || cfg.ElementType > vectoridx.ElementFloat32 {
+	if cfg.ElementType < vectoridx.ElementInt8 || cfg.ElementType > vectoridx.ElementFloat16 {
 		return schematypes.NamespaceDef{}, ErrInvalidSchema
 	}
 	metric := cfg.Metric

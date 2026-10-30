@@ -25,8 +25,14 @@ func resolveDistance(cfg Config) distRaw {
 	case MetricL2, 0:
 		switch cfg.ElementType {
 		case ElementInt8:
+			if simdInt8Supported {
+				return simdL2Int8Bytes
+			}
 			return func(a, b []byte) float64 { return squaredL2Int8Bytes(a, b, n) }
 		case ElementUint8:
+			if simdInt8Supported {
+				return simdL2Uint8Bytes
+			}
 			return func(a, b []byte) float64 { return squaredL2Uint8Bytes(a, b, n) }
 		case ElementInt16:
 			return func(a, b []byte) float64 { return squaredL2Int16Bytes(a, b, n) }
@@ -37,6 +43,11 @@ func resolveDistance(cfg Config) distRaw {
 				return simdL2Float32Bytes
 			}
 			return func(a, b []byte) float64 { return squaredL2Float32Bytes(a, b, n) }
+		case ElementFloat16:
+			if simdFloat16Supported {
+				return simdL2Float16Bytes
+			}
+			return func(a, b []byte) float64 { return squaredL2Float16Bytes(a, b, n) }
 		default:
 			return nil
 		}
@@ -52,14 +63,22 @@ func resolveDistance(cfg Config) distRaw {
 			return func(a, b []byte) float64 { return cosineUint16Bytes(a, b, n) }
 		case ElementFloat32:
 			return func(a, b []byte) float64 { return cosineFloat32Bytes(a, b, n) }
+		case ElementFloat16:
+			return func(a, b []byte) float64 { return cosineFloat16Bytes(a, b, n) }
 		default:
 			return nil
 		}
 	case MetricDot:
 		switch cfg.ElementType {
 		case ElementInt8:
+			if simdInt8Supported {
+				return func(a, b []byte) float64 { return -simdDotInt8Bytes(a, b) }
+			}
 			return func(a, b []byte) float64 { return negDotInt8Bytes(a, b, n) }
 		case ElementUint8:
+			if simdInt8Supported {
+				return func(a, b []byte) float64 { return -simdDotUint8Bytes(a, b) }
+			}
 			return func(a, b []byte) float64 { return negDotUint8Bytes(a, b, n) }
 		case ElementInt16:
 			return func(a, b []byte) float64 { return negDotInt16Bytes(a, b, n) }
@@ -70,6 +89,11 @@ func resolveDistance(cfg Config) distRaw {
 				return func(a, b []byte) float64 { return -simdDotFloat32Bytes(a, b) }
 			}
 			return func(a, b []byte) float64 { return negDotFloat32Bytes(a, b, n) }
+		case ElementFloat16:
+			if simdFloat16Supported {
+				return func(a, b []byte) float64 { return -simdDotFloat16Bytes(a, b) }
+			}
+			return func(a, b []byte) float64 { return negDotFloat16Bytes(a, b, n) }
 		default:
 			return nil
 		}
@@ -85,8 +109,14 @@ func resolveDot(cfg Config) distRaw {
 	n := int(cfg.Dimensions)
 	switch cfg.ElementType {
 	case ElementInt8:
+		if simdInt8Supported {
+			return simdDotInt8Bytes
+		}
 		return func(a, b []byte) float64 { return DotInt8(bytesAsInt8(a, n), bytesAsInt8(b, n)) }
 	case ElementUint8:
+		if simdInt8Supported {
+			return simdDotUint8Bytes
+		}
 		return func(a, b []byte) float64 { return DotUint8(bytesAsUint8(a, n), bytesAsUint8(b, n)) }
 	case ElementInt16:
 		return func(a, b []byte) float64 { return DotInt16(bytesAsInt16(a, n), bytesAsInt16(b, n)) }
@@ -97,6 +127,11 @@ func resolveDot(cfg Config) distRaw {
 			return simdDotFloat32Bytes
 		}
 		return func(a, b []byte) float64 { return DotFloat32(bytesAsFloat32(a, n), bytesAsFloat32(b, n)) }
+	case ElementFloat16:
+		if simdFloat16Supported {
+			return simdDotFloat16Bytes
+		}
+		return func(a, b []byte) float64 { return DotFloat16(bytesAsUint16(a, n), bytesAsUint16(b, n)) }
 	default:
 		return nil
 	}
@@ -167,6 +202,39 @@ func SquaredL2Float32(a, b []float32) float64 {
 		a0 += d * d
 	}
 	return (a0 + a1) + (a2 + a3)
+}
+
+// SquaredL2Float16 returns sum (a[i]-b[i])^2 over binary16 values.
+func SquaredL2Float16(a, b []uint16) float64 {
+	var acc float64
+	for i := range a {
+		d := float64(Float16ToFloat32(a[i])) - float64(Float16ToFloat32(b[i]))
+		acc += d * d
+	}
+	return acc
+}
+
+// DotFloat16 returns sum a[i]*b[i] over binary16 values.
+func DotFloat16(a, b []uint16) float64 {
+	var acc float64
+	for i := range a {
+		acc += float64(Float16ToFloat32(a[i])) * float64(Float16ToFloat32(b[i]))
+	}
+	return acc
+}
+
+func normFloat16(a []uint16) float64 {
+	var acc float64
+	for _, x := range a {
+		v := float64(Float16ToFloat32(x))
+		acc += v * v
+	}
+	return math.Sqrt(acc)
+}
+
+// CosineFloat16 returns 1-cos over binary16 vectors.
+func CosineFloat16(a, b []uint16) float64 {
+	return cosineFromDotNorms(DotFloat16(a, b), normFloat16(a), normFloat16(b))
 }
 
 // Dot-product kernels. All use a float64 accumulator; integer inputs are
@@ -362,6 +430,14 @@ func squaredL2Float32Bytes(a, b []byte, n int) float64 {
 	return SquaredL2Float32(bytesAsFloat32(a, n), bytesAsFloat32(b, n))
 }
 
+func squaredL2Float16Bytes(a, b []byte, n int) float64 {
+	return SquaredL2Float16(bytesAsUint16(a, n), bytesAsUint16(b, n))
+}
+
+func negDotFloat16Bytes(a, b []byte, n int) float64 {
+	return -DotFloat16(bytesAsUint16(a, n), bytesAsUint16(b, n))
+}
+
 func negDotInt8Bytes(a, b []byte, n int) float64 {
 	return -DotInt8(bytesAsInt8(a, n), bytesAsInt8(b, n))
 }
@@ -402,6 +478,10 @@ func cosineFloat32Bytes(a, b []byte, n int) float64 {
 	return CosineFloat32(bytesAsFloat32(a, n), bytesAsFloat32(b, n))
 }
 
+func cosineFloat16Bytes(a, b []byte, n int) float64 {
+	return CosineFloat16(bytesAsUint16(a, n), bytesAsUint16(b, n))
+}
+
 // dotSelfBytes returns |q|^2 for the query, used to zero-base dot scores so
 // self-search scores 0 while traversal ordering (offset-invariant) is kept.
 func dotSelfBytes(cfg Config, q []byte) float64 {
@@ -422,6 +502,9 @@ func dotSelfBytes(cfg Config, q []byte) float64 {
 	case ElementFloat32:
 		v := bytesAsFloat32(q, n)
 		return DotFloat32(v, v)
+	case ElementFloat16:
+		v := bytesAsUint16(q, n)
+		return DotFloat16(v, v)
 	default:
 		return 0
 	}
@@ -525,6 +608,17 @@ func encodeRawUint16(dst []byte, q []uint16) []byte {
 	}
 	out := bytesAsUint16(dst, len(q))
 	copy(out, q)
+	return dst
+}
+
+func encodeRawFloat16(dst []byte, q []uint16) []byte {
+	need := len(q) * 2
+	if cap(dst) < need {
+		dst = make([]byte, need)
+	} else {
+		dst = dst[:need]
+	}
+	copy(bytesAsUint16(dst, len(q)), q)
 	return dst
 }
 

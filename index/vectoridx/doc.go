@@ -8,13 +8,13 @@
 // The scope below describes the current implementation, not a release guarantee.
 //
 //   - Closed dimensions {512, 768, 1024} and one element type per index
-//     {int8, uint8, int16, uint16, float32}, stored as received.
-//   - One metric per index {L2, cosine, dot}. FP32 L2/dot use NEON on arm64
-//     and AVX2 on amd64 when available, with scalar float64-accumulator
-//     fallbacks; other element types remain scalar. Cosine indexes cache one
-//     norm per stored vector and compute the query norm once per search.
-//     Public Result Score is a saturating uint32, monotonic per metric and
-//     zero for self matches.
+//     {int8, uint8, int16, uint16, float32, float16}, stored as received.
+//   - One metric per index {L2, cosine, dot}. FP32 and int8/uint8 L2/dot use
+//     NEON on arm64 and AVX2 on amd64 when available; FP16 uses SIMD half
+//     conversion on supported hosts. Remaining kernels have scalar
+//     float64-accumulator fallbacks. Cosine indexes cache one norm per stored
+//     vector and compute the query norm once per search. Public Result Score
+//     is a saturating uint32, monotonic per metric and zero for self matches.
 //   - Namespace is the shared schema identity of one vector space: a
 //     non-zero schema.Namespace (KindVector) assigned by the application's
 //     schema. Config.Model optionally attaches an application-defined model ID
@@ -53,9 +53,9 @@
 //   - Readers use heap snapshots rather than fully lock-free mmap epoch
 //     reads. File generations remain immutable; a future change can swap in
 //     mmap views without altering the file format or public API.
-//   - SIMD covers FP32 L2/dot only; int8/int16 kernels remain scalar.
-//     resolveDistance/resolveDot are the single dispatch points behind the
-//     distRaw signature.
+//   - SIMD covers FP32, int8/uint8, and FP16 L2/dot on supported hosts;
+//     int16/uint16 kernels remain scalar. resolveDistance/resolveDot are the
+//     single dispatch points behind the distRaw signature.
 //   - Stored vectors are never quantized (v2 work). Vector storage is chunked
 //     copy-on-write, not yet mmap-backed.
 //   - OpenStore maps the base for validation, then copies retained regions into

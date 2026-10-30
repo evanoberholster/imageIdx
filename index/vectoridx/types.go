@@ -1,6 +1,6 @@
 // Package vectoridx implements a persistent HNSW approximate-nearest-neighbor
-// vector index with direct uint32 NodeIDs, fixed dimensions, and FP32
-// L2/cosine/dot distance kernels with SIMD acceleration where available.
+// vector index with direct uint32 NodeIDs, fixed dimensions, and L2/cosine/dot
+// distance kernels with FP32, int8, and FP16 SIMD acceleration where available.
 //
 // This file defines the core domain types. See doc.go for the package
 // overview, format notes, and concurrency model.
@@ -29,6 +29,8 @@ const (
 	ElementInt16
 	ElementUint16
 	ElementFloat32
+	// ElementFloat16 stores IEEE 754 binary16 bits in []uint16.
+	ElementFloat16
 )
 
 // Dimensions is a supported fixed vector width. The set is closed: an index
@@ -149,7 +151,7 @@ func (c Config) withDefaults() (Config, error) {
 		return Config{}, ErrInvalidConfig
 	}
 	switch c.ElementType {
-	case ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32:
+	case ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32, ElementFloat16:
 	default:
 		return Config{}, ErrInvalidConfig
 	}
@@ -235,7 +237,7 @@ func (c Config) ElementSize() int {
 	switch c.ElementType {
 	case ElementInt8, ElementUint8:
 		return 1
-	case ElementInt16, ElementUint16:
+	case ElementInt16, ElementUint16, ElementFloat16:
 		return 2
 	case ElementFloat32:
 		return 4

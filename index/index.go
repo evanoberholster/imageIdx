@@ -150,6 +150,7 @@ type VectorValue struct {
 	Namespace schematypes.Namespace
 	Element   vectoridx.ElementType
 	Float32   []float32
+	Float16   []uint16
 	Int8      []int8
 	Uint8     []uint8
 	Int16     []int16

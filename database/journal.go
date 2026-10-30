@@ -148,6 +148,8 @@ func associationSize(entry index.Entry) int {
 			size += 2 * (len(value.Int16) + len(value.Uint16))
 		case vectoridx.ElementFloat32:
 			size += 4 * len(value.Float32)
+		case vectoridx.ElementFloat16:
+			size += 2 * len(value.Float16)
 		}
 	}
 	for _, value := range entry.Bitmaps {
@@ -302,6 +304,14 @@ func appendVector(dst []byte, value index.VectorValue) ([]byte, error) {
 		for _, v := range value.Float32 {
 			dst = binary.BigEndian.AppendUint32(dst, math.Float32bits(v))
 		}
+	case vectoridx.ElementFloat16:
+		if len(value.Float16) > math.MaxUint32 {
+			return nil, ErrInvalidMutation
+		}
+		dst = binary.BigEndian.AppendUint32(dst, uint32(len(value.Float16)))
+		for _, v := range value.Float16 {
+			dst = binary.BigEndian.AppendUint16(dst, v)
+		}
 	default:
 		return nil, ErrInvalidMutation
 	}
@@ -452,6 +462,15 @@ func decodeVector(data []byte, pos int, ns schema.Namespace, dst *index.Entry) (
 			vector.Float32[i] = math.Float32frombits(binary.BigEndian.Uint32(data[pos+4*i : pos+4*i+4]))
 		}
 		pos += int(n) * 4
+	case vectoridx.ElementFloat16:
+		if uint64(n)*2 > uint64(len(data)-pos) {
+			return 0, ErrCorruptJournal
+		}
+		vector.Float16 = make([]uint16, n)
+		for i := range vector.Float16 {
+			vector.Float16[i] = binary.BigEndian.Uint16(data[pos+2*i : pos+2*i+2])
+		}
+		pos += int(n) * 2
 	default:
 		return 0, ErrCorruptJournal
 	}
