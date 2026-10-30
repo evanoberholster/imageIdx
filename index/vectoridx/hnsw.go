@@ -574,31 +574,6 @@ func (s *vectorSnapshot) searchCandidatesInto(ctx *SearchContext, dst []Result, 
 	return dst
 }
 
-func (s *vectorSnapshot) searchCandidatesFloat32(queryCtx context.Context, dst []Result, candidates []NodeID, query []float32, k int) ([]Result, error) {
-	if k <= 0 {
-		return dst, ErrInvalidQuery
-	}
-	if queryCtx != nil {
-		if err := queryCtx.Err(); err != nil {
-			return dst, err
-		}
-	}
-	ctx := acquireSearchContext()
-	defer releaseSearchContext(ctx)
-	ctx.ctx = queryCtx
-	ctx.err = nil
-	if cap(ctx.queryBuf) < s.vecBytes {
-		ctx.queryBuf = make([]byte, s.vecBytes)
-	}
-	raw := encodeRawFloat32(ctx.queryBuf[:0], query)
-	ctx.queryBuf = raw
-	out := s.searchCandidatesInto(ctx, dst, candidates, raw, k)
-	if ctx.err != nil {
-		return dst, ctx.err
-	}
-	return out, nil
-}
-
 // searchWithHint runs the full ANN path with an optional filter cardinality
 // hint for the cost-based flat fallback. flatSmall reports whether the flat
 // path was taken.
@@ -707,18 +682,4 @@ func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter
 		}
 	}
 	return results, false
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

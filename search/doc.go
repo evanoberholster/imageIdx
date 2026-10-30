@@ -1,8 +1,9 @@
 // Package search compiles conjunctive queries over bitmap namespaces, S2 cells,
 // timestamps, and optional ACL grants into immutable, reusable Plans. Vector
-// ranking is a separate ranked-source operation: Plan.RankVector pins a
-// vectoridx snapshot, applies the plan's liveness/ACL filters, and chooses
-// exact candidate scoring or filtered ANN with over-fetch.
+// ranking is a separate ranked-source operation: Plan.RankVector (float32) or
+// Plan.RankVectorQuery (any vectoridx element type) pins a vectoridx snapshot,
+// applies the plan's liveness/ACL filters, and chooses exact candidate scoring
+// or filtered ANN with over-fetch.
 //
 // # Compilation and snapshots
 //
