@@ -143,3 +143,61 @@ func TestDispatchMatrix(t *testing.T) {
 		t.Fatal("expected nil kernel for unknown element")
 	}
 }
+
+func TestSIMDInt8L2Tails(t *testing.T) {
+	if !simdInt8Supported {
+		t.Skip("no int8 SIMD kernel on this architecture")
+	}
+	rng := rand.New(rand.NewSource(46))
+	for n := 1; n <= 100; n++ {
+		a := make([]int8, n)
+		b := make([]int8, n)
+		au := make([]uint8, n)
+		bu := make([]uint8, n)
+		for i := range a {
+			a[i] = int8(rng.Intn(256) - 128)
+			b[i] = int8(rng.Intn(256) - 128)
+			au[i] = uint8(rng.Intn(256))
+			bu[i] = uint8(rng.Intn(256))
+		}
+		rawA := make([]byte, n)
+		rawB := make([]byte, n)
+		copy(BytesAsInt8(rawA, n), a)
+		copy(BytesAsInt8(rawB, n), b)
+		if got, want := simdL2Int8Bytes(rawA, rawB), SquaredL2Int8(a, b); got != want {
+			t.Fatalf("int8 L2 n=%d = %v, want %v", n, got, want)
+		}
+		copy(BytesAsUint8(rawA, n), au)
+		copy(BytesAsUint8(rawB, n), bu)
+		if got, want := simdL2Uint8Bytes(rawA, rawB), SquaredL2Uint8(au, bu); got != want {
+			t.Fatalf("uint8 L2 n=%d = %v, want %v", n, got, want)
+		}
+	}
+}
+
+func TestSIMDFloat16Tails(t *testing.T) {
+	if !simdFloat16Supported {
+		t.Skip("no FP16 SIMD kernel on this architecture")
+	}
+	rng := rand.New(rand.NewSource(47))
+	for n := 1; n <= 100; n++ {
+		a := make([]uint16, n)
+		b := make([]uint16, n)
+		for i := range a {
+			a[i] = Float32ToFloat16(rng.Float32()*4 - 2)
+			b[i] = Float32ToFloat16(rng.Float32()*4 - 2)
+		}
+		rawA := make([]byte, n*2)
+		rawB := make([]byte, n*2)
+		copy(BytesAsUint16(rawA, n), a)
+		copy(BytesAsUint16(rawB, n), b)
+		wantL2 := SquaredL2Float16(a, b)
+		if got := simdL2Float16Bytes(rawA, rawB); math.Abs(got-wantL2) > 1e-3*math.Max(1, math.Abs(wantL2)) {
+			t.Fatalf("FP16 L2 n=%d = %v, want %v", n, got, wantL2)
+		}
+		wantDot := DotFloat16(a, b)
+		if got := simdDotFloat16Bytes(rawA, rawB); math.Abs(got-wantDot) > 1e-3*math.Max(1, math.Abs(wantDot)) {
+			t.Fatalf("FP16 dot n=%d = %v, want %v", n, got, wantDot)
+		}
+	}
+}

@@ -1,7 +1,36 @@
 package kernels
 
-// simdInt8Block is the number of bytes processed by one architecture SIMD
-// block. A zero block means the architecture has no int8 SIMD kernel.
+// int8L2Block is the number of bytes processed by one architecture L2 block.
+const int8L2Block = 32
+
+// simdL2Int8Bytes computes exact squared L2 in one pass over int8 inputs.
+func simdL2Int8Bytes(a, b []byte) float64 {
+	if !simdInt8Supported {
+		return SquaredL2Int8(BytesAsInt8(a, len(a)), BytesAsInt8(b, len(b)))
+	}
+	n := len(a) - len(a)%int8L2Block
+	v := l2Int8SIMD(a, b)
+	for i := n; i < len(a); i++ {
+		d := int32(int8(a[i])) - int32(int8(b[i]))
+		v += d * d
+	}
+	return float64(v)
+}
+
+// simdL2Uint8Bytes computes exact squared L2 in one pass over uint8 inputs.
+func simdL2Uint8Bytes(a, b []byte) float64 {
+	if !simdInt8Supported {
+		return SquaredL2Uint8(a, b)
+	}
+	n := len(a) - len(a)%int8L2Block
+	v := l2Uint8SIMD(a, b)
+	for i := n; i < len(a); i++ {
+		d := int32(a[i]) - int32(b[i])
+		v += d * d
+	}
+	return float64(v)
+}
+
 func simdDotInt8Bytes(a, b []byte) float64 {
 	block := int8SIMDBlock
 	if !simdInt8Supported || block == 0 {
@@ -26,50 +55,4 @@ func simdDotUint8Bytes(a, b []byte) float64 {
 		v += int32(a[i]) * int32(b[i])
 	}
 	return float64(v)
-}
-
-func simdL2Int8Bytes(a, b []byte) float64 {
-	if !simdInt8Supported {
-		return SquaredL2Int8(BytesAsInt8(a, len(a)), BytesAsInt8(b, len(b)))
-	}
-	aa := dotInt8Pair(a, a)
-	bb := dotInt8Pair(b, b)
-	ab := dotInt8Pair(a, b)
-	return float64(aa + bb - 2*ab)
-}
-
-func simdL2Uint8Bytes(a, b []byte) float64 {
-	if !simdInt8Supported {
-		return SquaredL2Uint8(a, b)
-	}
-	aa := dotUint8Pair(a, a)
-	bb := dotUint8Pair(b, b)
-	ab := dotUint8Pair(a, b)
-	return float64(aa + bb - 2*ab)
-}
-
-func dotInt8Pair(a, b []byte) int32 {
-	block := int8SIMDBlock
-	if block == 0 {
-		return 0
-	}
-	n := len(a) - len(a)%block
-	v := dotInt8SIMD(a, b)
-	for i := n; i < len(a); i++ {
-		v += int32(int8(a[i])) * int32(int8(b[i]))
-	}
-	return v
-}
-
-func dotUint8Pair(a, b []byte) int32 {
-	block := int8SIMDBlock
-	if block == 0 {
-		return 0
-	}
-	n := len(a) - len(a)%block
-	v := dotUint8SIMD(a, b)
-	for i := n; i < len(a); i++ {
-		v += int32(a[i]) * int32(b[i])
-	}
-	return v
 }

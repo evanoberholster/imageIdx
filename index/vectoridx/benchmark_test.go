@@ -292,6 +292,73 @@ func BenchmarkSearchFloat32_768ANN(b *testing.B) {
 	}
 }
 
+func BenchmarkSearchFloat32_768DefaultEf(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:      testNamespace,
+		Dimensions:     Dim768,
+		ElementType:    ElementFloat32,
+		M:              DefaultM,
+		M0:             DefaultM0,
+		EfConstruction: 100,
+		FlatThreshold:  -1,
+	})
+	defer idx.Close()
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32(q, nil, 10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFilteredSearchFloat32_768Hint(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:        testNamespace,
+		Dimensions:       Dim768,
+		ElementType:      ElementFloat32,
+		M:                DefaultM,
+		M0:               DefaultM0,
+		EfConstruction:   100,
+		FlatThreshold:    -1,
+		FlatSearchCutoff: -1,
+	})
+	defer idx.Close()
+	filter := CandidateFilter(func(id NodeID) bool { return id%2 == 0 })
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32WithOptions(context.Background(), q, SearchOptions{K: 10, Filter: filter, FilterHint: 500}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFilteredSearchFloat32_768NoHint(b *testing.B) {
+	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
+		Namespace:        testNamespace,
+		Dimensions:       Dim768,
+		ElementType:      ElementFloat32,
+		M:                DefaultM,
+		M0:               DefaultM0,
+		EfConstruction:   100,
+		FlatThreshold:    -1,
+		FlatSearchCutoff: -1,
+	})
+	defer idx.Close()
+	filter := CandidateFilter(func(id NodeID) bool { return id%2 == 0 })
+	q := vecs[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := idx.SearchFloat32WithOptions(context.Background(), q, SearchOptions{K: 10, Filter: filter, FilterHint: UnknownFilterHint}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkSearchFloat32_512ANN(b *testing.B) {
 	idx, vecs := buildBenchIndexCfg(b, 1000, Config{
 		Namespace:      testNamespace,

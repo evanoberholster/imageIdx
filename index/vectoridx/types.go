@@ -66,10 +66,14 @@ const (
 // HNSW baseline defaults. These are benchmark starting points, not format
 // constants; every field is configurable through Config.
 const (
+	// M/M0 stay at 16/32: 768D sweeps showed larger graphs increased
+	// build and query cost faster than they improved recall.
 	DefaultM              = 16
 	DefaultM0             = 32
 	DefaultEfConstruction = 128
-	DefaultEfSearch       = 64
+	// DefaultEfSearch is tuned for k <= 20; recall-sensitive workloads can
+	// raise it or set DynamicEfFactor.
+	DefaultEfSearch = 48
 
 	// Dynamic-ef defaults mirror Weaviate's dynamicEf behaviour:
 	// ef = clamp(k*DynamicEfFactor, DynamicEfMin, DynamicEfMax).
@@ -80,7 +84,7 @@ const (
 	// DefaultFlatSearchCutoff mirrors Weaviate's flatSearchCutoff: when a
 	// filter's estimated match count is at or below the cutoff, an exact
 	// scan beats ANN traversal. Negative disables the flat fallback.
-	DefaultFlatSearchCutoff = 4000
+	DefaultFlatSearchCutoff = 3000
 	// DefaultFlatThreshold is the index size at or below which exact search
 	// replaces HNSW entirely (Weaviate flat/dynamic index analogue).
 	DefaultFlatThreshold = 2000

@@ -8,7 +8,7 @@ import (
 	"golang.org/x/sys/cpu"
 )
 
-const simdFloat16Block = 32
+const simdFloat16Block = 64
 
 var simdFloat16Supported = runtime.GOOS == "darwin" || cpu.ARM64.HasASIMDHP
 

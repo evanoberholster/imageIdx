@@ -45,7 +45,9 @@ scalar kernels remain the correctness reference.
 - **Search budget.** Static `EfSearch` or dynamic `ef`
   (`clamp(k*DynamicEfFactor, Min, Max)`, Weaviate analogue) with
   `OversampleFactor` scaling under filters and one iterative expansion round
-  before the exact-scan fallback.
+  before the exact-scan fallback. When a filter cardinality hint says at least
+  half the index matches, oversampling drops from 8x to 6x; the configured
+  `OversampleFactor` remains the cap for narrower filters.
 - **Flat fast path.** Indexes at/below `FlatThreshold` live nodes and filter
   hints at/below `FlatSearchCutoff` run the pooled exact scan directly
   (Weaviate flat/dynamic analogue); `SearchWithFilterHint` takes the hint.

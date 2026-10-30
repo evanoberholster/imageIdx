@@ -19,3 +19,9 @@ func dotUint8SIMD(a, b []byte) int32 { return dotUint8NEON(a, b) }
 
 func dotInt8NEON(a, b []byte) int32
 func dotUint8NEON(a, b []byte) int32
+
+func l2Int8SIMD(a, b []byte) int32  { return l2Int8NEON(a, b) }
+func l2Uint8SIMD(a, b []byte) int32 { return l2Uint8NEON(a, b) }
+
+func l2Int8NEON(a, b []byte) int32
+func l2Uint8NEON(a, b []byte) int32

@@ -68,6 +68,10 @@ func (plan Plan) RankVectorWithOptions(ctx context.Context, dst []VectorResult, 
 		cutoff = snap.Config().FlatSearchCutoff
 	}
 	estimate := plan.Estimate()
+	hint := vectoridx.UnknownFilterHint
+	if estimate > 0 {
+		hint = int(min(estimate, uint64(^uint(0)>>1)))
+	}
 	if cutoff >= 0 && estimate > 0 && estimate <= uint64(cutoff) {
 		ids, err := plan.searchInto(ctx, ws.vectorIDs[:0], ws, nil)
 		ws.vectorIDs = ids
@@ -119,7 +123,7 @@ func (plan Plan) RankVectorWithOptions(ctx context.Context, dst []VectorResult, 
 	for {
 		ann, err := snap.SearchIntoFloat32WithOptions(ctx, ws.vectorResults[:0], query, vectoridx.SearchOptions{
 			K:          over,
-			FilterHint: vectoridx.UnknownFilterHint,
+			FilterHint: hint,
 			EfSearch:   opts.EfSearch,
 			Oversample: opts.Oversample,
 		})

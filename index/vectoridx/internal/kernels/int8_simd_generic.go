@@ -9,3 +9,6 @@ const (
 
 func dotInt8SIMD(a, b []byte) int32  { return 0 }
 func dotUint8SIMD(a, b []byte) int32 { return 0 }
+
+func l2Int8SIMD(a, b []byte) int32  { return 0 }
+func l2Uint8SIMD(a, b []byte) int32 { return 0 }
