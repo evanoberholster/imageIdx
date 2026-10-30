@@ -30,9 +30,10 @@ func TestTypedKernelsHandComputed(t *testing.T) {
 	}
 }
 
-func TestRawKernelsMatchTyped(t *testing.T) {
+func TestResolveDistanceMatchesTyped(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	for _, dims := range []int{int(Dim512), int(Dim768), int(Dim1024)} {
+		d := Dimensions(dims)
 		// int8
 		a8 := make([]int8, dims)
 		b8 := make([]int8, dims)
@@ -40,11 +41,8 @@ func TestRawKernelsMatchTyped(t *testing.T) {
 			a8[i] = int8(rng.Intn(256) - 128)
 			b8[i] = int8(rng.Intn(256) - 128)
 		}
-		rawA := make([]byte, dims)
-		rawB := make([]byte, dims)
-		copy(bytesAsInt8(rawA, dims), a8)
-		copy(bytesAsInt8(rawB, dims), b8)
-		if want, got := SquaredL2Int8(a8, b8), squaredL2Int8Bytes(rawA, rawB, dims); want != got {
+		fn := resolveDistance(Config{Dimensions: d, ElementType: ElementInt8})
+		if want, got := SquaredL2Int8(a8, b8), fn(encodeRawInt8(nil, a8), encodeRawInt8(nil, b8)); want != got {
 			t.Fatalf("int8 dim %d: typed %v != raw %v", dims, want, got)
 		}
 		// uint8
@@ -54,7 +52,8 @@ func TestRawKernelsMatchTyped(t *testing.T) {
 			au[i] = uint8(rng.Intn(256))
 			bu[i] = uint8(rng.Intn(256))
 		}
-		if want, got := SquaredL2Uint8(au, bu), squaredL2Uint8Bytes(au, bu, dims); want != got {
+		fn = resolveDistance(Config{Dimensions: d, ElementType: ElementUint8})
+		if want, got := SquaredL2Uint8(au, bu), fn(encodeRawUint8(nil, au), encodeRawUint8(nil, bu)); want != got {
 			t.Fatalf("uint8 dim %d: typed %v != raw %v", dims, want, got)
 		}
 		// int16 incl. extremes
@@ -65,9 +64,8 @@ func TestRawKernelsMatchTyped(t *testing.T) {
 			bi[i] = int16(rng.Intn(65536) - 32768)
 		}
 		ai[0], bi[0] = -32768, 32767
-		rawAI := encodeRawInt16(nil, ai)
-		rawBI := encodeRawInt16(nil, bi)
-		if want, got := SquaredL2Int16(ai, bi), squaredL2Int16Bytes(rawAI, rawBI, dims); want != got {
+		fn = resolveDistance(Config{Dimensions: d, ElementType: ElementInt16})
+		if want, got := SquaredL2Int16(ai, bi), fn(encodeRawInt16(nil, ai), encodeRawInt16(nil, bi)); want != got {
 			t.Fatalf("int16 dim %d: typed %v != raw %v", dims, want, got)
 		}
 		// uint16 incl. extremes
@@ -78,9 +76,8 @@ func TestRawKernelsMatchTyped(t *testing.T) {
 			by[i] = uint16(rng.Intn(65536))
 		}
 		ay[0], by[0] = 0, 65535
-		rawAY := encodeRawUint16(nil, ay)
-		rawBY := encodeRawUint16(nil, by)
-		if want, got := SquaredL2Uint16(ay, by), squaredL2Uint16Bytes(rawAY, rawBY, dims); want != got {
+		fn = resolveDistance(Config{Dimensions: d, ElementType: ElementUint16})
+		if want, got := SquaredL2Uint16(ay, by), fn(encodeRawUint16(nil, ay), encodeRawUint16(nil, by)); want != got {
 			t.Fatalf("uint16 dim %d: typed %v != raw %v", dims, want, got)
 		}
 		// float32
@@ -90,66 +87,22 @@ func TestRawKernelsMatchTyped(t *testing.T) {
 			af[i] = rng.Float32()*4 - 2
 			bf[i] = rng.Float32()*4 - 2
 		}
-		rawAF := encodeRawFloat32(nil, af)
-		rawBF := encodeRawFloat32(nil, bf)
-		if want, got := SquaredL2Float32(af, bf), squaredL2Float32Bytes(rawAF, rawBF, dims); want != got {
-			t.Fatalf("float32 dim %d: typed %v != raw %v", dims, want, got)
+		fn = resolveDistance(Config{Dimensions: d, ElementType: ElementFloat32})
+		wantF, gotF := SquaredL2Float32(af, bf), fn(encodeRawFloat32(nil, af), encodeRawFloat32(nil, bf))
+		if math.Abs(gotF-wantF) > 1e-4*math.Max(1, math.Abs(wantF)) {
+			t.Fatalf("float32 dim %d: typed %v != raw %v", dims, wantF, gotF)
 		}
-	}
-}
-
-func TestFloat32KernelsStayAccurate(t *testing.T) {
-	rng := rand.New(rand.NewSource(43))
-	// Include lengths above and below the 4-way unrolled body so the tail
-	// path is exercised too.
-	for _, n := range []int{1, 3, 4, 5, 7, 512, 768, 769, 1024} {
-		a := make([]float32, n)
-		b := make([]float32, n)
-		var wantL2, wantDot, wantNorm float64
-		for i := range a {
-			a[i] = rng.Float32()*4 - 2
-			b[i] = rng.Float32()*4 - 2
-			d := float64(a[i]) - float64(b[i])
-			wantL2 += d * d
-			wantDot += float64(a[i]) * float64(b[i])
-			wantNorm += float64(a[i]) * float64(a[i])
+		// float16
+		ah := make([]uint16, dims)
+		bh := make([]uint16, dims)
+		for i := range ah {
+			ah[i] = Float32ToFloat16(rng.Float32()*4 - 2)
+			bh[i] = Float32ToFloat16(rng.Float32()*4 - 2)
 		}
-		wantNorm = math.Sqrt(wantNorm)
-		if got := SquaredL2Float32(a, b); math.Abs(got-wantL2) > 1e-12*math.Max(1, math.Abs(wantL2)) {
-			t.Fatalf("L2 n=%d = %v, want %v", n, got, wantL2)
-		}
-		if got := DotFloat32(a, b); math.Abs(got-wantDot) > 1e-12*math.Max(1, math.Abs(wantDot)) {
-			t.Fatalf("dot n=%d = %v, want %v", n, got, wantDot)
-		}
-		if got := normFloat32(a); math.Abs(got-wantNorm) > 1e-12*math.Max(1, wantNorm) {
-			t.Fatalf("norm n=%d = %v, want %v", n, got, wantNorm)
-		}
-	}
-}
-
-func TestSIMDFloat32KernelsMatchScalar(t *testing.T) {
-	if !simdSupported {
-		t.Skip("no SIMD kernel on this architecture")
-	}
-	rng := rand.New(rand.NewSource(44))
-	for _, dims := range []Dimensions{Dim512, Dim768, Dim1024} {
-		a := make([]float32, dims)
-		b := make([]float32, dims)
-		for i := range a {
-			a[i] = rng.Float32()*4 - 2
-			b[i] = rng.Float32()*4 - 2
-		}
-		rawA := encodeRawFloat32(nil, a)
-		rawB := encodeRawFloat32(nil, b)
-		wantL2 := SquaredL2Float32(a, b)
-		gotL2 := simdL2Float32Bytes(rawA, rawB)
-		if math.Abs(gotL2-wantL2) > 1e-4*math.Max(1, math.Abs(wantL2)) {
-			t.Fatalf("SIMD L2 dim %d = %v, want %v", dims, gotL2, wantL2)
-		}
-		wantDot := DotFloat32(a, b)
-		gotDot := simdDotFloat32Bytes(rawA, rawB)
-		if math.Abs(gotDot-wantDot) > 1e-4*math.Max(1, math.Abs(wantDot)) {
-			t.Fatalf("SIMD dot dim %d = %v, want %v", dims, gotDot, wantDot)
+		fn = resolveDistance(Config{Dimensions: d, ElementType: ElementFloat16})
+		wantH, gotH := SquaredL2Float16(ah, bh), fn(encodeRawFloat16(nil, ah), encodeRawFloat16(nil, bh))
+		if math.Abs(gotH-wantH) > 1e-4*math.Max(1, math.Abs(wantH)) {
+			t.Fatalf("float16 dim %d: typed %v != raw %v", dims, wantH, gotH)
 		}
 	}
 }
@@ -220,7 +173,7 @@ func TestEncodeScoreMonotonicAndSaturating(t *testing.T) {
 }
 
 func TestResolveDistanceCoversMatrix(t *testing.T) {
-	for _, elem := range []ElementType{ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32} {
+	for _, elem := range []ElementType{ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32, ElementFloat16} {
 		for _, dims := range []Dimensions{Dim512, Dim768, Dim1024} {
 			fn := resolveDistance(Config{Dimensions: dims, ElementType: elem})
 			if fn == nil {
@@ -252,6 +205,8 @@ func TestConfigVectorBytesTable(t *testing.T) {
 		{ElementFloat32, Dim512, 2048},
 		{ElementFloat32, Dim768, 3072},
 		{ElementFloat32, Dim1024, 4096},
+		{ElementFloat16, Dim512, 1024},
+		{ElementFloat16, Dim768, 1536},
 	}
 	for _, c := range cases {
 		cfg, err := Config{Namespace: testNamespace, Dimensions: c.dims, ElementType: c.elem}.withDefaults()

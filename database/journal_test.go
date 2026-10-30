@@ -196,6 +196,7 @@ func TestJournalV2VectorElementKinds(t *testing.T) {
 		{Namespace: 5, Element: vectoridx.ElementInt16, Int16: []int16{-300, 300}},
 		{Namespace: 5, Element: vectoridx.ElementUint16, Uint16: []uint16{1, 65535}},
 		{Namespace: 5, Element: vectoridx.ElementFloat32, Float32: []float32{-1.5, 2.5}},
+		{Namespace: 5, Element: vectoridx.ElementFloat16, Float16: []uint16{0x3e00, 0x4100}},
 	}
 	for _, value := range cases {
 		t.Run(fmt.Sprintf("%d", value.Element), func(t *testing.T) {

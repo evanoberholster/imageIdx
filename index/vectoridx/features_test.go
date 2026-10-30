@@ -319,3 +319,33 @@ func TestDotScoreEncoding(t *testing.T) {
 		t.Fatalf("cosine scores not monotonic: %d vs %d", a, b)
 	}
 }
+
+func TestAdaptiveFilterOversample(t *testing.T) {
+	s := &vectorSnapshot{ids: make([]NodeID, 10000)}
+	s.cfg.EfSearch = 48
+	s.cfg.OversampleFactor = 8
+	filter := CandidateFilter(func(NodeID) bool { return true })
+	cases := []struct {
+		name       string
+		hint       int
+		oversample uint32
+		want       int
+	}{
+		{"unknown", UnknownFilterHint, 0, 80},
+		{"all-match", 10000, 0, 60},
+		{"half", 5000, 0, 60},
+		{"quarter", 2500, 0, 80},
+		{"selective", 1000, 0, 80},
+		{"explicit", 5000, 4, 48},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := s.effectiveEf(10, filter, c.hint, 0, c.oversample); got != c.want {
+				t.Fatalf("effectiveEf = %d, want %d", got, c.want)
+			}
+		})
+	}
+	if got := s.effectiveEf(10, nil, 5000, 0, 0); got != 48 {
+		t.Fatalf("unfiltered effectiveEf = %d, want 48", got)
+	}
+}

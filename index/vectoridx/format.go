@@ -171,7 +171,7 @@ func decodeHeader(data []byte) (fileHeader, error) {
 		return h, ErrCorruptStorage
 	}
 	switch h.elem {
-	case ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32:
+	case ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32, ElementFloat16:
 	default:
 		return h, ErrCorruptStorage
 	}

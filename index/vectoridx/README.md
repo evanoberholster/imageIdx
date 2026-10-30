@@ -7,12 +7,13 @@
 
 Persistent HNSW approximate-nearest-neighbor vector index implementing
 experimental phases 1–2 (in-memory HNSW correctness), 4 (WAL and
-tombstones), 5 (pooled search state), 6 (post-ANN filtering), 7 (FP32 SIMD),
-and 8 (explicit compact/rebuild), plus Weaviate-inspired production features:
-multi-metric distance (L2/cosine/dot), dynamic `ef`, heuristic neighbor
-selection, dense O(1) locator, cost-based flat fallback, async writes, and
-lock-free reads. FP32 L2/dot use NEON on arm64 and AVX2 on amd64 when
-available; the scalar kernels remain the correctness reference.
+tombstones), 5 (pooled search state), 6 (post-ANN filtering), 7 (FP32/int8/
+FP16 SIMD), and 8 (explicit compact/rebuild), plus Weaviate-inspired production
+features: multi-metric distance (L2/cosine/dot), dynamic `ef`, heuristic
+neighbor selection, dense O(1) locator, cost-based flat fallback, async writes,
+and lock-free reads. FP32 and int8/uint8 L2/dot use NEON on arm64 and AVX2 on
+amd64 when available; FP16 uses SIMD half conversion on supported hosts. The
+scalar kernels remain the correctness reference.
 
 ## Concepts
 
@@ -44,7 +45,9 @@ available; the scalar kernels remain the correctness reference.
 - **Search budget.** Static `EfSearch` or dynamic `ef`
   (`clamp(k*DynamicEfFactor, Min, Max)`, Weaviate analogue) with
   `OversampleFactor` scaling under filters and one iterative expansion round
-  before the exact-scan fallback.
+  before the exact-scan fallback. When a filter cardinality hint says at least
+  half the index matches, oversampling drops from 8x to 6x; the configured
+  `OversampleFactor` remains the cap for narrower filters.
 - **Flat fast path.** Indexes at/below `FlatThreshold` live nodes and filter
   hints at/below `FlatSearchCutoff` run the pooled exact scan directly
   (Weaviate flat/dynamic analogue); `SearchWithFilterHint` takes the hint.
@@ -91,10 +94,12 @@ filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
 })
 ```
 
-Typed `Add`/`Search`/`SearchInto` variants exist for all five element
-types (`Int8`, `Uint8`, `Int16`, `Uint16`, `Float32`). There are no
+Typed `Add`/`Search`/`SearchInto` variants exist for all six element
+types (`Int8`, `Uint8`, `Int16`, `Uint16`, `Float32`, `Float16`). There are no
 `any`-typed hot paths: dispatch happens once per call, distance dispatch
-once per index open.
+once per index open. FP16 values are stored as IEEE binary16 bits in
+`[]uint16`; `Float16ToFloat32` and `Float32ToFloat16` are provided for
+conversion at the application boundary.
 
 For an application-level text-to-image guide using an external image/text
 encoder, see the repository root
@@ -233,9 +238,12 @@ graph fail loudly.
 |---|---|
 | `doc.go` | Package overview, experimental scope and current limitations |
 | `types.go` | Namespace/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
-| `distance.go` | Scalar L2/cosine/dot kernels, dispatch, `EncodeScore` |
-| `distance_neon_arm64.*` | FP32 NEON L2/dot kernels |
-| `distance_avx2_amd64.*` | FP32 AVX2 L2/dot kernels |
+| `distance.go` | Public scalar kernel API, metric dispatch, `EncodeScore` |
+| `float16.go` | Public IEEE binary16 conversion helpers |
+| `internal/kernels/kernels.go` | Element type and raw-kernel dispatch |
+| `internal/kernels/{integer,fp32,fp16}.go` | Typed scalar reference kernels |
+| `internal/kernels/*_arm64.*`, `*_amd64.*` | NEON/AVX2 assembly kernels |
+| `internal/kernels/util.go` | Raw byte views and cosine helper |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
 | `snapshot.go` | Pinned read-only snapshot, context-aware search, candidate scoring |
 | `hnsw.go` | Locator, greedy descent, layer search, assembly, exact oracle |

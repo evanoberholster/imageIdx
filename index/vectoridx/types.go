@@ -1,6 +1,6 @@
 // Package vectoridx implements a persistent HNSW approximate-nearest-neighbor
-// vector index with direct uint32 NodeIDs, fixed dimensions, and FP32
-// L2/cosine/dot distance kernels with SIMD acceleration where available.
+// vector index with direct uint32 NodeIDs, fixed dimensions, and L2/cosine/dot
+// distance kernels with FP32, int8, and FP16 SIMD acceleration where available.
 //
 // This file defines the core domain types. See doc.go for the package
 // overview, format notes, and concurrency model.
@@ -29,6 +29,8 @@ const (
 	ElementInt16
 	ElementUint16
 	ElementFloat32
+	// ElementFloat16 stores IEEE 754 binary16 bits in []uint16.
+	ElementFloat16
 )
 
 // Dimensions is a supported fixed vector width. The set is closed: an index
@@ -64,10 +66,14 @@ const (
 // HNSW baseline defaults. These are benchmark starting points, not format
 // constants; every field is configurable through Config.
 const (
+	// M/M0 stay at 16/32: 768D sweeps showed larger graphs increased
+	// build and query cost faster than they improved recall.
 	DefaultM              = 16
 	DefaultM0             = 32
 	DefaultEfConstruction = 128
-	DefaultEfSearch       = 64
+	// DefaultEfSearch is tuned for k <= 20; recall-sensitive workloads can
+	// raise it or set DynamicEfFactor.
+	DefaultEfSearch = 48
 
 	// Dynamic-ef defaults mirror Weaviate's dynamicEf behaviour:
 	// ef = clamp(k*DynamicEfFactor, DynamicEfMin, DynamicEfMax).
@@ -78,7 +84,7 @@ const (
 	// DefaultFlatSearchCutoff mirrors Weaviate's flatSearchCutoff: when a
 	// filter's estimated match count is at or below the cutoff, an exact
 	// scan beats ANN traversal. Negative disables the flat fallback.
-	DefaultFlatSearchCutoff = 4000
+	DefaultFlatSearchCutoff = 3000
 	// DefaultFlatThreshold is the index size at or below which exact search
 	// replaces HNSW entirely (Weaviate flat/dynamic index analogue).
 	DefaultFlatThreshold = 2000
@@ -149,7 +155,7 @@ func (c Config) withDefaults() (Config, error) {
 		return Config{}, ErrInvalidConfig
 	}
 	switch c.ElementType {
-	case ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32:
+	case ElementInt8, ElementUint8, ElementInt16, ElementUint16, ElementFloat32, ElementFloat16:
 	default:
 		return Config{}, ErrInvalidConfig
 	}
@@ -235,7 +241,7 @@ func (c Config) ElementSize() int {
 	switch c.ElementType {
 	case ElementInt8, ElementUint8:
 		return 1
-	case ElementInt16, ElementUint16:
+	case ElementInt16, ElementUint16, ElementFloat16:
 		return 2
 	case ElementFloat32:
 		return 4

@@ -311,7 +311,7 @@ func (s *vectorSnapshot) layer0Search(ctx *SearchContext, query []byte, filter C
 
 // effectiveEf computes the layer-0 exploration budget for k, applying the
 // dynamic-ef policy (Weaviate dynamicEf analogue) and filtered oversampling.
-func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter, efOverride, oversample uint32) int {
+func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter, filterHint int, efOverride, oversample uint32) int {
 	ef := int(s.cfg.EfSearch)
 	if efOverride != 0 {
 		ef = int(efOverride)
@@ -332,6 +332,12 @@ func (s *vectorSnapshot) effectiveEf(k int, filter CandidateFilter, efOverride, 
 		factor := s.cfg.OversampleFactor
 		if oversample != 0 {
 			factor = oversample
+		} else if filterHint > 0 && filterHint <= len(s.ids) && filterHint*2 >= len(s.ids) && factor > 6 {
+			// Filters matching at least half the index already yield plenty
+			// of candidates per ef step; 6x oversampling is enough. Keep the
+			// configured factor for narrower filters where recall is more
+			// sensitive to the traversal budget.
+			factor = 6
 		}
 		if want := k * int(factor); want > ef {
 			ef = want
@@ -622,7 +628,7 @@ func (s *vectorSnapshot) searchWithHint(ctx *SearchContext, query []byte, filter
 	if s.cfg.Metric == MetricDot {
 		querySelfDot = dotSelfBytes(s.cfg, query)
 	}
-	ef := s.effectiveEf(k, filter, efOverride, oversample)
+	ef := s.effectiveEf(k, filter, filterHint, efOverride, oversample)
 	ctx.resetForNodes(len(s.ids), s.vecBytes)
 	entries := s.layer0Search(ctx, query, filter, ef)
 	if ctx.err != nil {
