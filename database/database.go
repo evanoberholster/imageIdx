@@ -23,6 +23,11 @@ import (
 const journalNS schema.Namespace = 65533
 const metadataNS schema.Namespace = 65534
 
+const (
+	rootDataDir  = "data"
+	rootIndexDir = "index"
+)
+
 var (
 	ErrRecoveryRequired            = errors.New("database: index recovery required; journal retained")
 	ErrCorruptJournal              = errors.New("database: corrupt mutation journal")
@@ -130,13 +135,33 @@ type DB struct {
 	done              chan struct{}
 }
 
-// Open opens the canonical Pebble directory and its derived index directory.
-// On a fresh database, the index directory must first be created with
-// index.Create or index.CreateWithDefinitions. Later opens reuse schema.dat and
-// the existing index. A reconciliation failure closes both stores and leaves
-// the journal intact; ownership and recovery semantics are documented in
-// database/README.md and database/FORMAT.md.
-func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
+// Open opens or creates the database rooted at root. Canonical Pebble data
+// lives in root/data and every derived index lives in the shared root/index
+// directory, including vector namespaces. On a new root, Options.Definitions
+// is required and the index tree is created automatically; later opens reuse
+// schema.dat and the existing index without supplying definitions.
+func Open(root string, decode Decoder, options Options) (*DB, error) {
+	if root == "" {
+		return nil, store.ErrInvalidDir
+	}
+	root = filepath.Clean(root)
+	if root == string(filepath.Separator) {
+		return nil, fmt.Errorf("%w: unsafe database root", ErrInvalidMutation)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, err
+	}
+	return OpenDirs(filepath.Join(root, rootDataDir), filepath.Join(root, rootIndexDir), decode, options)
+}
+
+// OpenDirs opens the canonical Pebble directory and its derived index directory
+// explicitly. It is the advanced form of Open for applications that keep data
+// and indexes at custom paths. On a fresh database, the index directory is
+// created from Options.Definitions when provided; a pre-created index remains
+// supported for legacy bootstrap. A reconciliation failure closes both stores
+// and leaves the journal intact; ownership and recovery semantics are
+// documented in database/README.md and database/FORMAT.md.
+func OpenDirs(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	if decode == nil && options.DecodeInto == nil {
 		return nil, ErrInvalidMutation
 	}
@@ -244,10 +269,20 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 		return nil, err
 	}
 	if fresh {
-		// Validate the independently created index before creating schema.dat.
-		// New Pebble directories are opened only after the central file is
-		// durable; the fresh path never writes a Pebble schema registry.
-		idx, err := index.Open(indexDir)
+		// Create the shared index tree from the supplied definitions before
+		// schema.dat exists. A pre-created legacy index is still accepted.
+		if err := ensureIndexCreated(indexDir, options.Definitions); err != nil {
+			return nil, err
+		}
+		// Validate the index before creating schema.dat. New Pebble directories
+		// are opened only after the central file is durable; the fresh path
+		// never writes a Pebble schema registry.
+		var idx *index.Store
+		if options.Definitions != nil {
+			idx, err = index.OpenWithDefinitions(indexDir, options.Definitions)
+		} else {
+			idx, err = index.Open(indexDir)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -271,7 +306,7 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 			}
 		}
 		if err == nil && options.Definitions != nil {
-			err = validateDefinitions(options.Definitions, defs)
+			err = validateIndexDefinitions(options.Definitions, idx.Schema())
 		}
 		closeErr := idx.Close()
 		if err != nil {
@@ -296,6 +331,9 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 			_ = existing.Close()
 			return nil, err
 		}
+		// Definitions were consumed to create the central schema; the
+		// persisted schema is authoritative from here on.
+		options.Definitions = nil
 	}
 	var values *store.Store
 	if existing != nil {
@@ -337,6 +375,22 @@ func Open(dir, indexDir string, decode Decoder, options Options) (*DB, error) {
 	}
 	db.owner, owned = owner, false
 	return db, nil
+}
+
+func ensureIndexCreated(indexDir string, definitions *schema.Definitions) error {
+	if _, err := os.Stat(filepath.Join(indexDir, "store.bin")); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if definitions == nil {
+		return fmt.Errorf("%w: a new database requires Options.Definitions", ErrInvalidMutation)
+	}
+	idx, err := index.CreateWithDefinitions(indexDir, definitions)
+	if err != nil {
+		return err
+	}
+	return idx.Close()
 }
 
 func canonicalSpecs() []store.Spec {

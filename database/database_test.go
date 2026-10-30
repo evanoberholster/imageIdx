@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/evanoberholster/imageIdx/index"
 	"github.com/evanoberholster/imageIdx/index/bitmapidx"
+	"github.com/evanoberholster/imageIdx/index/vectoridx"
 	schematypes "github.com/evanoberholster/imageIdx/schema"
 	"github.com/evanoberholster/imageIdx/store"
 )
@@ -63,7 +65,7 @@ func paths(t testing.TB) (string, string) {
 
 func openTest(t *testing.T, data, idxPath string) *DB {
 	t.Helper()
-	db, err := Open(data, idxPath, decodeTest, Options{BatchSize: 16})
+	db, err := OpenDirs(data, idxPath, decodeTest, Options{BatchSize: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +242,7 @@ func TestAcknowledgmentCannotExceedRecoverableIndex(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(data, idxPath, decodeTest, Options{})
+	_, err = OpenDirs(data, idxPath, decodeTest, Options{})
 	if !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatalf("unsupported acknowledgment: %v", err)
 	}
@@ -292,7 +294,7 @@ func TestWaitIndexedCancellation(t *testing.T) {
 	data, idxPath := paths(t)
 	blocked := make(chan struct{})
 	release := make(chan struct{})
-	db, err := Open(data, idxPath, decodeTest, Options{boundary: func(at string) {
+	db, err := OpenDirs(data, idxPath, decodeTest, Options{boundary: func(at string) {
 		if at == "before index apply" {
 			close(blocked)
 			<-release
@@ -352,4 +354,76 @@ func TestCheckpointPersistsDerivedIndex(t *testing.T) {
 	db = openTest(t, data, idxPath)
 	defer db.Close()
 	contains(t, db, 1, 'a', true)
+}
+
+func TestOpenRootCreatesAndReopens(t *testing.T) {
+	root := t.TempDir()
+	defs := schematypes.NewDefinitions()
+	tag, err := index.BitmapDef(bitmapidx.NamespaceSpec{Namespace: tagNS, Kind: schematypes.KindBitmapEnum}, "tags", schematypes.EntityImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := defs.Register(tag); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(root, decodeTest, Options{Definitions: defs, BatchSize: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, rootDataDir, "schema.dat")); err != nil {
+		t.Fatalf("schema.dat: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, rootIndexDir, "store.bin")); err != nil {
+		t.Fatalf("store.bin: %v", err)
+	}
+	generation, err := db.Commit(Mutation{Entity: schematypes.EntityImage, ValueID: 1, Record: []byte("image"), Projection: projection(1, 'a')})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait(t, db, generation)
+	contains(t, db, 1, 'a', true)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(root, decodeTest, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	contains(t, db, 1, 'a', true)
+}
+
+func TestOpenRootCreatesVectorNamespace(t *testing.T) {
+	root := t.TempDir()
+	defs := schematypes.NewDefinitions()
+	vec, err := index.VectorDef(vectoridx.Config{
+		Namespace:   60,
+		Dimensions:  vectoridx.Dim512,
+		ElementType: vectoridx.ElementFloat32,
+	}, "embedding", schematypes.EntityImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := defs.Register(vec); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(root, decodeTest, Options{Definitions: defs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, ok := db.Index().Vector(60); !ok {
+		t.Fatal("vector namespace unavailable")
+	}
+	path := filepath.Join(root, rootIndexDir, fmt.Sprintf("vector-%04x.idx", 60))
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("vector index file: %v", err)
+	}
+}
+
+func TestOpenRootRequiresDefinitionsForFreshDatabase(t *testing.T) {
+	if _, err := Open(t.TempDir(), decodeTest, Options{}); !errors.Is(err, ErrInvalidMutation) {
+		t.Fatalf("Open without definitions err = %v, want ErrInvalidMutation", err)
+	}
 }

@@ -48,7 +48,7 @@ func TestCanonicalNamespaceIndependentOfEntityKind(t *testing.T) {
 	var options Options
 	options.CanonicalNamespaces[schema.EntityImage] = 100
 	options.CanonicalNamespaces[schema.EntityFace] = 200
-	db, err := Open(data, idx, decodeTest, options)
+	db, err := OpenDirs(data, idx, decodeTest, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestCanonicalNamespaceIndependentOfEntityKind(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, idx, decodeTest, options)
+	db, err = OpenDirs(data, idx, decodeTest, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestCanonicalNamespaceIndependentOfEntityKind(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, idx, decodeTest, Options{})
+	db, err = OpenDirs(data, idx, decodeTest, Options{})
 	if err != nil {
 		t.Fatalf("persisted canonical assignment not loaded: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestCanonicalNamespaceIndependentOfEntityKind(t *testing.T) {
 	}
 	var wrong Options
 	wrong.CanonicalNamespaces[schema.EntityImage] = 1
-	if _, err := Open(data, idx, decodeTest, wrong); err == nil {
+	if _, err := OpenDirs(data, idx, decodeTest, wrong); err == nil {
 		t.Fatal("accepted reassigned canonical namespace")
 	}
 }
@@ -113,7 +113,7 @@ func TestOpenRejectsCollidingCanonicalAndIndexNamespaces(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(data, idxPath, decodeTest, Options{})
+	db, err := OpenDirs(data, idxPath, decodeTest, Options{})
 	if db != nil {
 		_ = db.Close()
 		t.Fatal("accepted colliding namespace")
@@ -144,7 +144,7 @@ func TestPersistedCentralSchemaRejectsDifferentIndexCopy(t *testing.T) {
 	if err := other.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if db, err := Open(data, otherPath, decodeTest, Options{}); db != nil || !errors.Is(err, schema.ErrNamespace) {
+	if db, err := OpenDirs(data, otherPath, decodeTest, Options{}); db != nil || !errors.Is(err, schema.ErrNamespace) {
 		if db != nil {
 			_ = db.Close()
 		}
@@ -169,7 +169,7 @@ func TestBootstrapDoesNotPublishSchemaWithConflictingBackup(t *testing.T) {
 	if err := kv.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if db, err := Open(data, idxPath, decodeTest, Options{}); db != nil || !errors.Is(err, ErrRecoveryRequired) {
+	if db, err := OpenDirs(data, idxPath, decodeTest, Options{}); db != nil || !errors.Is(err, ErrRecoveryRequired) {
 		if db != nil {
 			_ = db.Close()
 		}
@@ -202,7 +202,7 @@ func TestExplicitAuthoritativeDefinitionsOnCreation(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(data, idxPath, decodeTest, Options{Definitions: defs})
+	db, err := OpenDirs(data, idxPath, decodeTest, Options{Definitions: defs})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestExplicitAuthoritativeDefinitionsOnCreation(t *testing.T) {
 	}
 	wrong := schema.NewDefinitions()
 	_ = wrong.Register(schema.NamespaceDef{Namespace: 100, Name: "wrong", Kind: schema.KindKV, Entity: schema.EntityImage})
-	if _, err := Open(data, idxPath, decodeTest, Options{Definitions: wrong}); !errors.Is(err, schema.ErrNamespace) {
+	if _, err := OpenDirs(data, idxPath, decodeTest, Options{Definitions: wrong}); !errors.Is(err, schema.ErrNamespace) {
 		t.Fatalf("accepted different authoritative definitions: %v", err)
 	}
 }
@@ -262,7 +262,7 @@ func TestMissingAllocatorPreflightDoesNotExtendPebbleSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		if opened, err := Open(data, idx, decodeTest, Options{Definitions: defs}); opened != nil || !errors.Is(err, schema.ErrCorrupt) {
+		if opened, err := OpenDirs(data, idx, decodeTest, Options{Definitions: defs}); opened != nil || !errors.Is(err, schema.ErrCorrupt) {
 			if opened != nil {
 				_ = opened.Close()
 			}
@@ -289,7 +289,7 @@ func TestMissingAllocatorPreflightDoesNotExtendPebbleSchema(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(data, "schema.dat"), allocator, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if opened, err := Open(data, idx, decodeTest, Options{Definitions: defs}); opened != nil || !errors.Is(err, schema.ErrCorrupt) {
+	if opened, err := OpenDirs(data, idx, decodeTest, Options{Definitions: defs}); opened != nil || !errors.Is(err, schema.ErrCorrupt) {
 		if opened != nil {
 			_ = opened.Close()
 		}
@@ -314,7 +314,7 @@ func TestExplicitIDCommitOverlapsAllocation(t *testing.T) {
 	data, idx := paths(t)
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db, err := Open(data, idx, decodeTest, Options{boundary: func(stage string) {
+	db, err := OpenDirs(data, idx, decodeTest, Options{boundary: func(stage string) {
 		if stage == "before canonical commit" {
 			close(entered)
 			<-release
@@ -382,7 +382,7 @@ func TestPreparedSchemaRecoversDuringDatabaseOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		opened, err := Open(data, idx, decodeTest, Options{})
+		opened, err := OpenDirs(data, idx, decodeTest, Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -430,7 +430,7 @@ func TestStartupAddsKVAndIndexNamespaces(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	db, err = Open(data, idx, decodeTest, Options{Definitions: target})
+	db, err = OpenDirs(data, idx, decodeTest, Options{Definitions: target})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +517,7 @@ func TestStartupRejectsNonAdditiveSchemaChanges(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if opened, err := Open(data, idx, decodeTest, Options{Definitions: tc.makeTarget()}); opened != nil || !errors.Is(err, schema.ErrNamespace) {
+			if opened, err := OpenDirs(data, idx, decodeTest, Options{Definitions: tc.makeTarget()}); opened != nil || !errors.Is(err, schema.ErrNamespace) {
 				if opened != nil {
 					_ = opened.Close()
 				}
@@ -721,7 +721,7 @@ func TestMigratesLegacyDurableHighWater(t *testing.T) {
 	if complete, err := store.InspectSchemaMigration(data); err != nil || !complete {
 		t.Fatalf("preflight marker lost: %v %v", complete, err)
 	}
-	if reopened, err := Open(data, idx, decodeTest, Options{}); !errors.Is(err, schema.ErrCorrupt) {
+	if reopened, err := OpenDirs(data, idx, decodeTest, Options{}); !errors.Is(err, schema.ErrCorrupt) {
 		if reopened != nil {
 			reopened.Close()
 		}
@@ -750,7 +750,7 @@ func TestKVOnlyAdditionSkipsIndexRebuild(t *testing.T) {
 		}
 	}
 	var rebuilds []string
-	db, err = Open(data, idx, decodeTest, Options{Definitions: target, boundary: func(at string) {
+	db, err = OpenDirs(data, idx, decodeTest, Options{Definitions: target, boundary: func(at string) {
 		if strings.Contains(at, "rebuild") {
 			rebuilds = append(rebuilds, at)
 		}
@@ -814,7 +814,7 @@ func TestStartupAddsNamespacesForDifferentEntities(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	db, err = Open(data, idx, decodeTest, Options{Definitions: target})
+	db, err = OpenDirs(data, idx, decodeTest, Options{Definitions: target})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,7 +874,7 @@ func TestRequestedDefinitionsRejectDuplicateIdentity(t *testing.T) {
 	if err := target.Register(schema.NamespaceDef{Namespace: 621, Name: "fresh", Kind: schema.KindKV, Entity: schema.EntityImage}); err != nil {
 		t.Fatal(err)
 	}
-	opened, err := Open(data, idx, decodeTest, Options{Definitions: target})
+	opened, err := OpenDirs(data, idx, decodeTest, Options{Definitions: target})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,7 +911,7 @@ func TestResumeInterruptedAdditionWithoutDefinitions(t *testing.T) {
 	if err := prepared.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, idx, decodeTest, Options{})
+	db, err = OpenDirs(data, idx, decodeTest, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -940,14 +940,14 @@ func TestFailedStartupReleasesOwnership(t *testing.T) {
 	if err := short.RegisterAll(defs[:len(defs)-1]...); err != nil {
 		t.Fatal(err)
 	}
-	if opened, err := Open(data, idx, decodeTest, Options{Definitions: short}); err == nil {
+	if opened, err := OpenDirs(data, idx, decodeTest, Options{Definitions: short}); err == nil {
 		_ = opened.Close()
 		t.Fatal("accepted non-additive schema")
 	}
 	// Ownership must be released so the next opener succeeds.
 	db = openTest(t, data, idx)
 	defer db.Close()
-	if opened, err := Open(data, idx, decodeTest, Options{}); err == nil {
+	if opened, err := OpenDirs(data, idx, decodeTest, Options{}); err == nil {
 		_ = opened.Close()
 		t.Fatal("second concurrent owner was allowed")
 	}
@@ -1029,7 +1029,7 @@ func TestDatabaseUpgradesV2SchemaInPlace(t *testing.T) {
 	if got := activeSchemaVersion(t, path); got != 2 {
 		t.Fatalf("downgrade version = %d", got)
 	}
-	db, err = Open(data, idx, decodeTest, Options{})
+	db, err = OpenDirs(data, idx, decodeTest, Options{})
 	if err != nil {
 		t.Fatalf("reopen v2 database: %v", err)
 	}

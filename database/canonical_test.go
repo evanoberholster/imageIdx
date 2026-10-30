@@ -13,7 +13,7 @@ func TestExternalCanonicalProjectionRoundTrip(t *testing.T) {
 	data, idxPath := paths(t)
 	project := func(record []byte) ([]byte, error) { return record, nil }
 	open := func() *DB {
-		db, err := Open(data, idxPath, decodePair, Options{
+		db, err := OpenDirs(data, idxPath, decodePair, Options{
 			BatchSize:           64,
 			CanonicalProjection: CanonicalProjectionExternal,
 			ProjectFromRecord:   project,
@@ -62,7 +62,7 @@ func TestExternalCanonicalProjectionRoundTrip(t *testing.T) {
 
 func TestExternalCanonicalProjectionRequiresCallback(t *testing.T) {
 	data, idxPath := paths(t)
-	if _, err := Open(data, idxPath, decodePair, Options{CanonicalProjection: CanonicalProjectionExternal}); !errors.Is(err, ErrInvalidMutation) {
+	if _, err := OpenDirs(data, idxPath, decodePair, Options{CanonicalProjection: CanonicalProjectionExternal}); !errors.Is(err, ErrInvalidMutation) {
 		t.Fatalf("external mode without callback: %v", err)
 	}
 }
@@ -70,7 +70,7 @@ func TestExternalCanonicalProjectionRequiresCallback(t *testing.T) {
 func TestExternalCanonicalProjectionRecovery(t *testing.T) {
 	data, idxPath := paths(t)
 	project := func(record []byte) ([]byte, error) { return record, nil }
-	db, err := Open(data, idxPath, decodePair, Options{
+	db, err := OpenDirs(data, idxPath, decodePair, Options{
 		BatchSize:           64,
 		CanonicalProjection: CanonicalProjectionExternal,
 		ProjectFromRecord:   project,
@@ -91,7 +91,7 @@ func TestExternalCanonicalProjectionRecovery(t *testing.T) {
 	if err := os.Remove(filepath.Join(idxPath, "manifest")); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, idxPath, decodePair, Options{
+	db, err = OpenDirs(data, idxPath, decodePair, Options{
 		BatchSize:           64,
 		Recovery:            RecoveryAutomatic,
 		CanonicalProjection: CanonicalProjectionExternal,
@@ -119,7 +119,7 @@ func assertPairStateForID(t *testing.T, db *DB, id uint64, camera, rating byte) 
 func TestCanonicalProjectionModeIsPersistedAndMismatchFails(t *testing.T) {
 	data, idxPath := paths(t)
 	project := func(record []byte) ([]byte, error) { return record, nil }
-	db, err := Open(data, idxPath, decodePair, Options{
+	db, err := OpenDirs(data, idxPath, decodePair, Options{
 		CanonicalProjection: CanonicalProjectionExternal,
 		ProjectFromRecord:   project,
 	})
@@ -139,10 +139,10 @@ func TestCanonicalProjectionModeIsPersistedAndMismatchFails(t *testing.T) {
 
 	// The durable mode is authoritative: no option is needed, but external
 	// mode still requires its reprojection callback.
-	if _, err := Open(data, idxPath, decodePair, Options{}); !errors.Is(err, ErrProjectionUnavailable) {
+	if _, err := OpenDirs(data, idxPath, decodePair, Options{}); !errors.Is(err, ErrProjectionUnavailable) {
 		t.Fatalf("external reopen without callback: %v", err)
 	}
-	db, err = Open(data, idxPath, decodePair, Options{
+	db, err = OpenDirs(data, idxPath, decodePair, Options{
 		ProjectFromRecord: project,
 	})
 	if err != nil {
@@ -154,7 +154,7 @@ func TestCanonicalProjectionModeIsPersistedAndMismatchFails(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(data, idxPath, decodePair, Options{
+	if _, err := OpenDirs(data, idxPath, decodePair, Options{
 		CanonicalProjection: CanonicalProjectionInline,
 		ProjectFromRecord:   project,
 	}); !errors.Is(err, ErrCanonicalModeMismatch) {
@@ -171,7 +171,7 @@ func TestInlineCanonicalProjectionModeRejectsExternalOption(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(data, idxPath, decodePair, Options{
+	if _, err := OpenDirs(data, idxPath, decodePair, Options{
 		CanonicalProjection: CanonicalProjectionExternal,
 		ProjectFromRecord:   func(record []byte) ([]byte, error) { return record, nil },
 	}); !errors.Is(err, ErrCanonicalModeMismatch) {
@@ -184,7 +184,7 @@ func TestExternalCanonicalProjectIntoCallback(t *testing.T) {
 	projectInto := func(dst, record []byte) ([]byte, error) {
 		return append(dst[:0], record...), nil
 	}
-	db, err := Open(data, idxPath, decodePair, Options{
+	db, err := OpenDirs(data, idxPath, decodePair, Options{
 		CanonicalProjection: CanonicalProjectionExternal,
 		ProjectInto:         projectInto,
 	})
@@ -202,7 +202,7 @@ func TestExternalCanonicalProjectIntoCallback(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, idxPath, decodePair, Options{ProjectInto: projectInto})
+	db, err = OpenDirs(data, idxPath, decodePair, Options{ProjectInto: projectInto})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,19 @@ The authoritative schema layout is documented separately in
 [`schema/FORMAT.md`](../schema/FORMAT.md). Derived index formats are described
 in [`index/README.md`](../index/README.md) and are rebuildable.
 
+## Root layout
+
+`database.Open(root, ...)` uses two fixed subdirectories:
+
+```text
+<root>/data/    canonical Pebble store, schema.dat, mutation journal
+<root>/index/   every derived index family, including vector-*.idx
+```
+
+`database.OpenDirs(dataDir, indexDir, ...)` preserves custom layouts. The
+compatibility contract applies to the files inside those directories; moving a
+database requires moving both trees together.
+
 ## Supported 0.5 formats
 
 | Artifact | 0.5 version | Read | Write | Notes |

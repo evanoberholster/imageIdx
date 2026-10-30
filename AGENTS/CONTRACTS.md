@@ -10,7 +10,7 @@ signatures and error wrapping.
 
 | Package | Public surface |
 |---|---|
-| `database` | `DB`, `Open`, `Mutation`, `Options`, `CanonicalProjectionMode`, `RecoveryPolicy`, `RecoveryStatus`, exported error sentinels, `Commit`, `WaitIndexed`, `Sync`, `Checkpoint`, `Get`, `DatabaseGeneration`, `IndexedGeneration`, `Close` |
+| `database` | `DB`, `Open`, `OpenDirs`, `Mutation`, `Options`, `CanonicalProjectionMode`, `RecoveryPolicy`, `RecoveryStatus`, exported error sentinels, `Commit`, `WaitIndexed`, `Sync`, `Checkpoint`, `Get`, `DatabaseGeneration`, `IndexedGeneration`, `Close` |
 | `schema` | `Definitions`, `NamespaceDef`, `EntityKind`, `Namespace`, identifier aliases, `Schema` open/ID APIs, durable format errors |
 | `search` | `Engine`, `Plan`, `Executor`, clause constructors, `Workspace`, `Page`, result types, metrics, exported errors |
 | `store` | Advanced KV `Store`, `Key`, `Batch`, `Spec`/`Open`, sync durability, owned `Get`, scan ownership |
@@ -32,17 +32,19 @@ stability. No Phase 4 batching or graph redesign is required for 0.5.
 
 ## Primary lifecycle
 
-Current 0.5 bootstrap:
+Current 0.5 lifecycle:
 
 1. build a `schema.Definitions`;
-2. create the derived index once with `index.Create` or
-   `index.CreateWithDefinitions`;
-3. call `database.Open(dataDir, indexDir, decoder, options)`;
-4. use `database.DB` for subsequent lifecycle operations.
+2. call `database.Open(root, decoder, options)` with `Options.Definitions` on a
+   new root;
+3. use `database.DB` for subsequent lifecycle operations.
 
-`database.Open` on an existing 0.5 database consumes `schema.dat` and does not
-need definitions or index creation repeated. `DB.Index()` is an advanced
-read accessor; do not write to or close it while the coordinator runs.
+`database.Open` places canonical data in `<root>/data` and all derived indexes,
+including vector namespaces, in the shared `<root>/index` directory. It creates
+the index tree on a new root and consumes `schema.dat` on reopen; definitions and
+index creation are not repeated. Applications with custom paths can use
+`database.OpenDirs(dataDir, indexDir, decoder, options)`. `DB.Index()` is an
+advanced read accessor; do not write to or close it while the coordinator runs.
 
 There is no `database.DB.Search` in 0.5. Search remains explicit:
 

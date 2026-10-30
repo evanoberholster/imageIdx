@@ -16,7 +16,7 @@ func TestCrashChild(t *testing.T) {
 		return
 	}
 	root := os.Getenv("IMAGEIDX_CRASH_ROOT")
-	db, err := Open(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeTest, Options{
+	db, err := OpenDirs(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeTest, Options{
 		boundary: func(at string) {
 			if at == phase {
 				os.Exit(73)
@@ -53,7 +53,7 @@ func TestCrashBoundaries(t *testing.T) {
 				t.Fatalf("child exit = %v", err)
 			}
 			if phase == "before index apply" {
-				_, err = Open(data, idxPath, decodeTest, Options{})
+				_, err = OpenDirs(data, idxPath, decodeTest, Options{})
 				if !errors.Is(err, ErrRecoveryRequired) {
 					t.Fatalf("interrupted batch: %v", err)
 				}

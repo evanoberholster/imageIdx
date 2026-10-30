@@ -18,7 +18,7 @@ func TestRebuildCrashChild(t *testing.T) {
 		return
 	}
 	root := os.Getenv("IMAGEIDX_REBUILD_ROOT")
-	_, err := Open(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeTest, Options{
+	_, err := OpenDirs(filepath.Join(root, "data"), filepath.Join(root, "index"), decodeTest, Options{
 		Recovery: RecoveryAutomatic,
 		boundary: func(at string) {
 			if at == phase {
@@ -59,7 +59,7 @@ func TestCrashDuringStartupRebuild(t *testing.T) {
 			if !errors.As(err, &exit) || exit.ExitCode() != 74 {
 				t.Fatalf("subprocess: %v", err)
 			}
-			db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+			db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -105,7 +105,7 @@ func TestCorruptActivationRecordDoesNotPublish(t *testing.T) {
 	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic}); !errors.Is(err, ErrRecoveryRequired) {
+	if _, err := OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic}); !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatalf("corrupt activation accepted: %v", err)
 	}
 	if _, err := os.Stat(stagePath(dir)); err != nil {
@@ -114,7 +114,7 @@ func TestCorruptActivationRecordDoesNotPublish(t *testing.T) {
 	if err := os.WriteFile(path, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestResumeIndexActivationUsesAuthoritativeSchema(t *testing.T) {
 	if err := pdb.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
+	db, err = OpenDirs(data, dir, decodeTest, Options{Recovery: RecoveryAutomatic})
 	if err != nil {
 		t.Fatal(err)
 	}

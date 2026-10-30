@@ -14,7 +14,7 @@ func TestCoalescingCrashChild(t *testing.T) {
 		return
 	}
 	root := os.Getenv("IMAGEIDX_COALESCE_CRASH_ROOT")
-	db, err := Open(filepath.Join(root, "data"), filepath.Join(root, "index"), decodePair, Options{
+	db, err := OpenDirs(filepath.Join(root, "data"), filepath.Join(root, "index"), decodePair, Options{
 		BatchSize: 64,
 		boundary: func(at string) {
 			if at == phase {
@@ -40,7 +40,7 @@ func TestCoalescingCrashBoundaries(t *testing.T) {
 	} {
 		t.Run(phase, func(t *testing.T) {
 			data, idxPath := paths(t)
-			db, err := Open(data, idxPath, decodePair, Options{BatchSize: 64})
+			db, err := OpenDirs(data, idxPath, decodePair, Options{BatchSize: 64})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -57,12 +57,12 @@ func TestCoalescingCrashBoundaries(t *testing.T) {
 				t.Fatalf("child exit = %v", runErr)
 			}
 			if phase == "before index apply" {
-				if _, err := Open(data, idxPath, decodePair, Options{}); !errors.Is(err, ErrRecoveryRequired) {
+				if _, err := OpenDirs(data, idxPath, decodePair, Options{}); !errors.Is(err, ErrRecoveryRequired) {
 					t.Fatalf("interrupted coalesced batch: %v", err)
 				}
 				return
 			}
-			db, err = Open(data, idxPath, decodePair, Options{BatchSize: 64})
+			db, err = OpenDirs(data, idxPath, decodePair, Options{BatchSize: 64})
 			if err != nil {
 				t.Fatal(err)
 			}
