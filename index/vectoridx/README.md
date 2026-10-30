@@ -96,6 +96,10 @@ types (`Int8`, `Uint8`, `Int16`, `Uint16`, `Float32`). There are no
 `any`-typed hot paths: dispatch happens once per call, distance dispatch
 once per index open.
 
+For an application-level text-to-image guide using an external image/text
+encoder, see the repository root
+[Text search with external embeddings](../../README.md#text-search-with-external-embeddings).
+
 In-memory indexes (tests, caller-managed durability):
 
 ```go

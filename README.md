@@ -21,6 +21,8 @@ for advanced and standalone use.
   `schema.dat` allocation.
 - [Unified index](index/README.md) — standalone/advanced index store.
 - [Search](search/README.md) — reusable plans, workspaces, and execution.
+- [Text search with external embeddings](#text-search-with-external-embeddings) —
+  image/text vector search without an imageIdx dependency on an ML runtime.
 - [0.5 contracts](AGENTS/CONTRACTS.md) — public, advanced, and experimental API
   classification, limits, and release policy.
 
@@ -169,6 +171,218 @@ coherent publication generation across its participating indexes, while writers
 continue publishing. Direct `search.Compile` plans are lower-level and read live
 engine views; keep their indexes open. `search.Executor` pools workspaces for
 services without changing plan or result ownership.
+
+## Text search with external embeddings
+
+Text search is normal vector search: embed the text, then query the vector
+namespace. `imageIdx` does not import an ML runtime and does not need to. The
+application owns model loading, tokenization, preprocessing, and model version;
+`imageIdx` only receives `[]float32`.
+
+Use a paired image/text encoder. For example, `imageml`'s
+`github.com/evanoberholster/imagemL/siglip2` package has paired 768D SigLIP2
+image and text towers. DINOv3 is image-only and cannot answer a text query
+because it has no matching text tower.
+
+Keep the encoder in your application package. This interface is enough:
+
+```go
+type Embedder interface {
+    Dim() int
+    EmbedImageIntoContext(context.Context, []float32, image.Image) error
+    EmbedTextIntoContext(context.Context, []float32, string) error
+}
+```
+
+`*siglip2.Embedder` satisfies it directly. Do not add `imageml` to the
+`imageIdx` module; a service or a separate adapter module can import both.
+
+### 1. Register a vector namespace
+
+One namespace holds one embedding model/space. For a 768D normalized SigLIP2
+model:
+
+```go
+const clipNamespace schema.Namespace = 200
+
+def, err := index.VectorDef(vectoridx.Config{
+    Namespace:   clipNamespace,
+    Dimensions:  vectoridx.Dim768,
+    ElementType: vectoridx.ElementFloat32,
+    Metric:      vectoridx.MetricCosine,
+}, "siglip2-base-patch16-224", schema.EntityImage)
+if err != nil {
+    return err
+}
+if err := defs.Register(def); err != nil {
+    return err
+}
+```
+
+Use a new namespace for a different checkpoint or embedding space. The
+ImageID-to-namespace relationship is 1:1: each namespace stores one vector per
+image for that model/space, and additional models or embedding slots use
+additional namespaces. Do not mix SigLIP2 FixRes, SigLIP2 NaFlex, DINOv3, or
+different model versions in one namespace. `vectoridx` currently supports
+512/768/1024 dimensions, so a 768D SigLIP2 model fits; a 1536D model does not.
+
+### 2. Put the image embedding in the database projection
+
+The projection is the rebuild source for derived indexes, so the vector must be
+there. The projection format is application-defined; version it if it can
+change.
+
+```go
+func encodeProjection(id schema.ValueID, vec []float32) []byte {
+    b := make([]byte, 8+4*len(vec))
+    binary.BigEndian.PutUint64(b[:8], uint64(id))
+    for i, v := range vec {
+        binary.BigEndian.PutUint32(b[8+4*i:], math.Float32bits(v))
+    }
+    return b
+}
+
+func decodeProjection(p []byte) (index.Entry, error) {
+    if len(p) != 8+768*4 {
+        return index.Entry{}, database.ErrCorruptJournal
+    }
+    id := schema.ValueID(binary.BigEndian.Uint64(p[:8]))
+    vec := make([]float32, 768)
+    for i := range vec {
+        vec[i] = math.Float32frombits(binary.BigEndian.Uint32(p[8+4*i:]))
+    }
+    return index.Entry{
+        ValueID: id,
+        Vectors: []index.VectorValue{{
+            Namespace: clipNamespace,
+            Element:   vectoridx.ElementFloat32,
+            Float32:   vec,
+        }},
+    }, nil
+}
+```
+
+At ingest:
+
+```go
+vec := make([]float32, embedder.Dim())
+if err := embedder.EmbedImageIntoContext(ctx, vec, img); err != nil {
+    return err
+}
+
+record := []byte("application record")
+gen, err := db.Commit(database.Mutation{
+    Entity:     schema.EntityImage,
+    ValueID:    id,
+    Record:     record,
+    Projection: encodeProjection(id, vec),
+})
+if err != nil {
+    return err
+}
+if err := db.WaitIndexed(ctx, gen); err != nil {
+    return err
+}
+```
+
+`db.Index()` is derived. Do not add vectors directly to it while the database
+coordinator is running; write the projection and let the coordinator update the
+vector index.
+
+If the application also needs “more like this,” persist the embedding in the
+canonical record or an application side table as well. `vectoridx` does not yet
+expose a public “get stored vector by ImageID” API.
+
+### 3. Query with the text embedding
+
+Embed the query text with the **same checkpoint** used for image ingest, then
+rank the plan:
+
+```go
+engine, err := search.New(db.Index())
+if err != nil {
+    return err
+}
+
+vec, ok := engine.Vector(clipNamespace)
+if !ok {
+    return search.ErrNamespaceUnavailable
+}
+
+// Liveness is added automatically. Add metadata/ACL clauses here as needed.
+plan, err := engine.Compile(schema.EntityImage)
+if err != nil {
+    return err
+}
+
+query := make([]float32, embedder.Dim())
+if err := embedder.EmbedTextIntoContext(ctx, query, text); err != nil {
+    return err
+}
+
+hits, err := plan.RankVector(
+    ctx, nil, search.NewWorkspace(256), vec, query, 50,
+)
+if err != nil {
+    return err
+}
+
+for _, hit := range hits {
+    // MetricCosine: Distance is 1-cos in [0,2].
+    similarity := 1 - float64(hit.Distance)
+    _ = similarity
+}
+```
+
+`RankVector` applies plan liveness and ACL stages. A selective metadata plan
+uses exact candidate scoring; a broad plan uses filtered ANN with over-fetch.
+
+With metadata filters:
+
+```go
+clause, err := engine.Values(tagNamespace, bitmapidx.EnumStringValue("favorite"))
+if err != nil {
+    return err
+}
+filtered, err := engine.Compile(schema.EntityImage, clause)
+if err != nil {
+    return err
+}
+ws := search.NewWorkspace(256)
+hits, err := filtered.RankVector(ctx, nil, ws, vec, query, 50)
+```
+
+### Model and scoring rules
+
+- Use the same checkpoint for the image and text towers. Matching dimensions
+  alone does not make two spaces compatible.
+- SigLIP2 returns L2-normalized vectors. Use `MetricCosine` for simple score
+  handling; `Distance` is `1-cos`. `MetricDot` is also valid for normalized
+  vectors but its `Distance` is `-dot` and its score convention is different.
+- Do not re-tokenize text with a generic tokenizer. Use the encoder’s text API;
+  SigLIP2 handles lowercasing, EOS, truncation, and padding.
+- Keep the vision preprocessing consistent between ingest and model export;
+  SigLIP2’s `ReferenceResize: true` is the Hugging Face/Pillow-compatible path.
+- The model/checkpoint ID is not stored in `vectoridx.Config` (it stores
+  dimensions, element type, and metric). Keep it in application metadata and
+  use a new namespace for a new model version.
+- For a model upgrade, backfill a new namespace and switch reads; do not
+  overwrite the old namespace in place.
+
+### Text search variants
+
+- **Text-to-image:** paired SigLIP2 text/image embeddings in one namespace.
+  This is the path above.
+- **Caption or document text search:** store text embeddings in a separate
+  namespace using a text model, then map results back to `ImageID`. This is
+  text-to-text, not cross-modal, unless the model is jointly trained.
+- **Keyword search:** use bitmap text namespaces (`search.NamespaceText`) for
+  tags/captions. Lexical and vector results can be combined with
+  `search/ranking` (RRF), using `KindText` and `KindVector` lanes.
+
+For a multi-million-photo library, cache text query embeddings by
+`(model, normalized text)`. ONNX inference is much more expensive than the
+vector search itself.
 
 ## Consistency and lifecycle
 

@@ -199,7 +199,10 @@ byGeo, err := plan.RankGeo(ctx, nil, &ws, lat, lng, lookupGeo, 100)
 `RankVector` is the first-class vector path. It pins a `vectoridx` snapshot,
 applies liveness/ACL and the rest of the plan, and uses exact candidate scoring
 when the plan estimate is selective or filtered ANN with over-fetch otherwise.
-The result carries the raw vector distance for ranking/fusion.
+The result carries the raw vector distance for ranking/fusion. For end-to-end
+text-to-image search with an external encoder, see the root
+[Text search with external embeddings](../README.md#text-search-with-external-embeddings)
+guide.
 
 ```go
 vec, ok := engine.Vector(ns) // the registered embedding namespace

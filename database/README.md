@@ -190,6 +190,10 @@ ids, err := plan.AppendIDs(ctx, nil, workspace)
   destinations, and result buffers.
 - Direct `search.Compile` plans are lower-level and read live engine views.
   Keep their indexes open.
+- For text-to-image vector search with an external encoder, including vector
+  projections and `Plan.RankVector`, see the root
+  [Text search with external embeddings](../README.md#text-search-with-external-embeddings)
+  guide.
 
 ## Ownership, concurrency, and consistency
 
