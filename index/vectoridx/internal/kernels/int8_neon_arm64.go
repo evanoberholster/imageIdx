@@ -1,6 +1,6 @@
 //go:build arm64
 
-package vectoridx
+package kernels
 
 import (
 	"runtime"

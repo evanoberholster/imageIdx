@@ -1,11 +1,11 @@
-package vectoridx
+package kernels
 
 // simdInt8Block is the number of bytes processed by one architecture SIMD
 // block. A zero block means the architecture has no int8 SIMD kernel.
 func simdDotInt8Bytes(a, b []byte) float64 {
 	block := int8SIMDBlock
 	if !simdInt8Supported || block == 0 {
-		return DotInt8(bytesAsInt8(a, len(a)), bytesAsInt8(b, len(b)))
+		return DotInt8(BytesAsInt8(a, len(a)), BytesAsInt8(b, len(b)))
 	}
 	n := len(a) - len(a)%block
 	v := dotInt8SIMD(a, b)
@@ -30,7 +30,7 @@ func simdDotUint8Bytes(a, b []byte) float64 {
 
 func simdL2Int8Bytes(a, b []byte) float64 {
 	if !simdInt8Supported {
-		return SquaredL2Int8(bytesAsInt8(a, len(a)), bytesAsInt8(b, len(b)))
+		return SquaredL2Int8(BytesAsInt8(a, len(a)), BytesAsInt8(b, len(b)))
 	}
 	aa := dotInt8Pair(a, a)
 	bb := dotInt8Pair(b, b)

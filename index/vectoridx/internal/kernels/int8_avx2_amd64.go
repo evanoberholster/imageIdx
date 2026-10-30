@@ -1,6 +1,6 @@
 //go:build amd64
 
-package vectoridx
+package kernels
 
 import "golang.org/x/sys/cpu"
 

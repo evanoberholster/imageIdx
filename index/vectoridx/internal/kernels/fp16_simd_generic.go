@@ -1,6 +1,6 @@
 //go:build !arm64 && !amd64
 
-package vectoridx
+package kernels
 
 const (
 	simdFloat16Block     = 0

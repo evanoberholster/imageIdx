@@ -236,11 +236,12 @@ graph fail loudly.
 |---|---|
 | `doc.go` | Package overview, experimental scope and current limitations |
 | `types.go` | Namespace/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
-| `distance.go` | Scalar L2/cosine/dot kernels, dispatch, `EncodeScore` |
-| `distance_neon_arm64.*` | FP32 NEON L2/dot kernels |
-| `distance_avx2_amd64.*` | FP32 AVX2 L2/dot kernels |
-| `int8_*` | int8/uint8 NEON/AVX2 dot kernels |
-| `float16.go` / `float16_*` | IEEE binary16 conversion, scalar and SIMD kernels |
+| `distance.go` | Public scalar kernel API, metric dispatch, `EncodeScore` |
+| `float16.go` | Public IEEE binary16 conversion helpers |
+| `internal/kernels/kernels.go` | Element type and raw-kernel dispatch |
+| `internal/kernels/{integer,fp32,fp16}.go` | Typed scalar reference kernels |
+| `internal/kernels/*_arm64.*`, `*_amd64.*` | NEON/AVX2 assembly kernels |
+| `internal/kernels/util.go` | Raw byte views and cosine helper |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
 | `snapshot.go` | Pinned read-only snapshot, context-aware search, candidate scoring |
 | `hnsw.go` | Locator, greedy descent, layer search, assembly, exact oracle |

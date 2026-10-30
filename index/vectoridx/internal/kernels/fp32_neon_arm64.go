@@ -1,6 +1,6 @@
 //go:build arm64
 
-package vectoridx
+package kernels
 
 const simdSupported = true
 
@@ -15,7 +15,7 @@ func simdL2Float32Bytes(a, b []byte) float64 {
 	}
 	if n < len(a) {
 		rem := (len(a) - n) / 4
-		acc += SquaredL2Float32(bytesAsFloat32(a[n:], rem), bytesAsFloat32(b[n:], rem))
+		acc += SquaredL2Float32(BytesAsFloat32(a[n:], rem), BytesAsFloat32(b[n:], rem))
 	}
 	return acc
 }
@@ -28,7 +28,7 @@ func simdDotFloat32Bytes(a, b []byte) float64 {
 	}
 	if n < len(a) {
 		rem := (len(a) - n) / 4
-		acc += DotFloat32(bytesAsFloat32(a[n:], rem), bytesAsFloat32(b[n:], rem))
+		acc += DotFloat32(BytesAsFloat32(a[n:], rem), BytesAsFloat32(b[n:], rem))
 	}
 	return acc
 }

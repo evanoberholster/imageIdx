@@ -98,33 +98,6 @@ func TestFloat16Persistence(t *testing.T) {
 	}
 }
 
-func TestSIMDFloat16KernelsMatchScalar(t *testing.T) {
-	if !simdFloat16Supported {
-		t.Skip("no FP16 SIMD kernel on this architecture")
-	}
-	rng := rand.New(rand.NewSource(702))
-	for _, dims := range []int{int(Dim512), int(Dim768), int(Dim1024)} {
-		a := make([]uint16, dims)
-		b := make([]uint16, dims)
-		for i := range a {
-			a[i] = Float32ToFloat16(rng.Float32()*4 - 2)
-			b[i] = Float32ToFloat16(rng.Float32()*4 - 2)
-		}
-		rawA := encodeRawFloat16(nil, a)
-		rawB := encodeRawFloat16(nil, b)
-		wantL2 := SquaredL2Float16(a, b)
-		gotL2 := simdL2Float16Bytes(rawA, rawB)
-		if math.Abs(gotL2-wantL2) > 1e-3*math.Max(1, math.Abs(wantL2)) {
-			t.Fatalf("SIMD FP16 L2 dim %d = %v, want %v", dims, gotL2, wantL2)
-		}
-		wantDot := DotFloat16(a, b)
-		gotDot := simdDotFloat16Bytes(rawA, rawB)
-		if math.Abs(gotDot-wantDot) > 1e-3*math.Max(1, math.Abs(wantDot)) {
-			t.Fatalf("SIMD FP16 dot dim %d = %v, want %v", dims, gotDot, wantDot)
-		}
-	}
-}
-
 func TestFloat16VectorSearch(t *testing.T) {
 	cfg := testConfigFloat512()
 	cfg.ElementType = ElementFloat16

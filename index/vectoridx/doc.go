@@ -54,8 +54,9 @@
 //     reads. File generations remain immutable; a future change can swap in
 //     mmap views without altering the file format or public API.
 //   - SIMD covers FP32, int8/uint8, and FP16 L2/dot on supported hosts;
-//     int16/uint16 kernels remain scalar. resolveDistance/resolveDot are the
-//     single dispatch points behind the distRaw signature.
+//     int16/uint16 kernels remain scalar. Kernel implementations live in
+//     internal/kernels; resolveDistance/resolveDot are the single dispatch
+//     points behind the distRaw signature.
 //   - Stored vectors are never quantized (v2 work). Vector storage is chunked
 //     copy-on-write, not yet mmap-backed.
 //   - OpenStore maps the base for validation, then copies retained regions into

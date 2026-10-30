@@ -2,512 +2,154 @@ package vectoridx
 
 import (
 	"math"
-	"unsafe"
+
+	"github.com/evanoberholster/imageIdx/index/vectoridx/internal/kernels"
 )
 
-// This file holds the scalar distance kernels. They remain the correctness
-// reference; FP32 L2/dot select NEON or AVX2 implementations in resolveDistance
-// and resolveDot when the host supports them. Dispatch is resolved once per
-// index open; the hot loop calls a single pre-resolved func(a, b []byte)
-// float64 with no interface or type switch.
+// This file owns the public scalar kernel API, metric dispatch, and score
+// encoding. Scalar and SIMD implementations live in internal/kernels.
 
 // distRaw is a raw little-endian vector kernel. Distance kernels return the
 // index-metric distance (smaller is better: squared L2, 1-cos, or -dot);
 // resolveDot returns the positive dot-product kernel used with cached norms.
 // Slices must be exactly VectorBytes long.
-type distRaw func(a, b []byte) float64
+type distRaw = kernels.Func
 
-// resolveDistance returns the scalar kernel for cfg. Callers must validate
-// cfg first; an unknown element type or metric yields nil.
+// resolveDistance returns the kernel for cfg. Callers must validate cfg first;
+// an unknown element type or metric yields nil.
 func resolveDistance(cfg Config) distRaw {
+	e, ok := kernelElement(cfg.ElementType)
+	if !ok {
+		return nil
+	}
 	n := int(cfg.Dimensions)
 	switch cfg.Metric {
 	case MetricL2, 0:
-		switch cfg.ElementType {
-		case ElementInt8:
-			if simdInt8Supported {
-				return simdL2Int8Bytes
-			}
-			return func(a, b []byte) float64 { return squaredL2Int8Bytes(a, b, n) }
-		case ElementUint8:
-			if simdInt8Supported {
-				return simdL2Uint8Bytes
-			}
-			return func(a, b []byte) float64 { return squaredL2Uint8Bytes(a, b, n) }
-		case ElementInt16:
-			return func(a, b []byte) float64 { return squaredL2Int16Bytes(a, b, n) }
-		case ElementUint16:
-			return func(a, b []byte) float64 { return squaredL2Uint16Bytes(a, b, n) }
-		case ElementFloat32:
-			if simdSupported {
-				return simdL2Float32Bytes
-			}
-			return func(a, b []byte) float64 { return squaredL2Float32Bytes(a, b, n) }
-		case ElementFloat16:
-			if simdFloat16Supported {
-				return simdL2Float16Bytes
-			}
-			return func(a, b []byte) float64 { return squaredL2Float16Bytes(a, b, n) }
-		default:
-			return nil
-		}
+		return kernels.L2(e, n)
 	case MetricCosine:
-		switch cfg.ElementType {
-		case ElementInt8:
-			return func(a, b []byte) float64 { return cosineInt8Bytes(a, b, n) }
-		case ElementUint8:
-			return func(a, b []byte) float64 { return cosineUint8Bytes(a, b, n) }
-		case ElementInt16:
-			return func(a, b []byte) float64 { return cosineInt16Bytes(a, b, n) }
-		case ElementUint16:
-			return func(a, b []byte) float64 { return cosineUint16Bytes(a, b, n) }
-		case ElementFloat32:
-			return func(a, b []byte) float64 { return cosineFloat32Bytes(a, b, n) }
-		case ElementFloat16:
-			return func(a, b []byte) float64 { return cosineFloat16Bytes(a, b, n) }
-		default:
-			return nil
-		}
+		return kernels.Cosine(e, n)
 	case MetricDot:
-		switch cfg.ElementType {
-		case ElementInt8:
-			if simdInt8Supported {
-				return func(a, b []byte) float64 { return -simdDotInt8Bytes(a, b) }
-			}
-			return func(a, b []byte) float64 { return negDotInt8Bytes(a, b, n) }
-		case ElementUint8:
-			if simdInt8Supported {
-				return func(a, b []byte) float64 { return -simdDotUint8Bytes(a, b) }
-			}
-			return func(a, b []byte) float64 { return negDotUint8Bytes(a, b, n) }
-		case ElementInt16:
-			return func(a, b []byte) float64 { return negDotInt16Bytes(a, b, n) }
-		case ElementUint16:
-			return func(a, b []byte) float64 { return negDotUint16Bytes(a, b, n) }
-		case ElementFloat32:
-			if simdSupported {
-				return func(a, b []byte) float64 { return -simdDotFloat32Bytes(a, b) }
-			}
-			return func(a, b []byte) float64 { return negDotFloat32Bytes(a, b, n) }
-		case ElementFloat16:
-			if simdFloat16Supported {
-				return func(a, b []byte) float64 { return -simdDotFloat16Bytes(a, b) }
-			}
-			return func(a, b []byte) float64 { return negDotFloat16Bytes(a, b, n) }
-		default:
-			return nil
-		}
+		return kernels.NegDot(e, n)
 	default:
 		return nil
 	}
 }
 
-// resolveDot returns the raw dot-product kernel for cfg. The cosine metric
-// caches each stored vector's norm, so comparisons need only this one pass;
-// callers combine it with cosineFromDotNorms. Unknown element types return nil.
+// resolveDot returns the raw positive dot-product kernel for cfg. The cosine
+// metric caches each stored vector's norm, so comparisons need only this one
+// pass; callers combine it with cosineFromDotNorms. Unknown element types
+// return nil.
 func resolveDot(cfg Config) distRaw {
-	n := int(cfg.Dimensions)
-	switch cfg.ElementType {
-	case ElementInt8:
-		if simdInt8Supported {
-			return simdDotInt8Bytes
-		}
-		return func(a, b []byte) float64 { return DotInt8(bytesAsInt8(a, n), bytesAsInt8(b, n)) }
-	case ElementUint8:
-		if simdInt8Supported {
-			return simdDotUint8Bytes
-		}
-		return func(a, b []byte) float64 { return DotUint8(bytesAsUint8(a, n), bytesAsUint8(b, n)) }
-	case ElementInt16:
-		return func(a, b []byte) float64 { return DotInt16(bytesAsInt16(a, n), bytesAsInt16(b, n)) }
-	case ElementUint16:
-		return func(a, b []byte) float64 { return DotUint16(bytesAsUint16(a, n), bytesAsUint16(b, n)) }
-	case ElementFloat32:
-		if simdSupported {
-			return simdDotFloat32Bytes
-		}
-		return func(a, b []byte) float64 { return DotFloat32(bytesAsFloat32(a, n), bytesAsFloat32(b, n)) }
-	case ElementFloat16:
-		if simdFloat16Supported {
-			return simdDotFloat16Bytes
-		}
-		return func(a, b []byte) float64 { return DotFloat16(bytesAsUint16(a, n), bytesAsUint16(b, n)) }
-	default:
+	e, ok := kernelElement(cfg.ElementType)
+	if !ok {
 		return nil
+	}
+	return kernels.Dot(e, int(cfg.Dimensions))
+}
+
+func kernelElement(t ElementType) (kernels.Element, bool) {
+	switch t {
+	case ElementInt8:
+		return kernels.Int8, true
+	case ElementUint8:
+		return kernels.Uint8, true
+	case ElementInt16:
+		return kernels.Int16, true
+	case ElementUint16:
+		return kernels.Uint16, true
+	case ElementFloat32:
+		return kernels.Float32, true
+	case ElementFloat16:
+		return kernels.Float16, true
+	default:
+		return 0, false
 	}
 }
 
-// Typed scalar kernels. All use a float64 accumulator so integer inputs are
-// exact (max int16/1024D distance ~4.4e12 < 2^53) and float32 inputs keep
-// reference precision for ranking.
+// Typed scalar kernels. These forward to the internal scalar reference
+// implementations so callers keep a stable vectoridx API.
 
 // SquaredL2Int8 returns sum (a[i]-b[i])^2 over int8 vectors.
-func SquaredL2Int8(a, b []int8) float64 {
-	var acc float64
-	for i := range a {
-		d := float64(int16(a[i]) - int16(b[i]))
-		acc += d * d
-	}
-	return acc
-}
+func SquaredL2Int8(a, b []int8) float64 { return kernels.SquaredL2Int8(a, b) }
 
 // SquaredL2Uint8 returns sum (a[i]-b[i])^2 over uint8 vectors.
-func SquaredL2Uint8(a, b []uint8) float64 {
-	var acc float64
-	for i := range a {
-		d := float64(int16(a[i]) - int16(b[i]))
-		acc += d * d
-	}
-	return acc
-}
+func SquaredL2Uint8(a, b []uint8) float64 { return kernels.SquaredL2Uint8(a, b) }
 
 // SquaredL2Int16 returns sum (a[i]-b[i])^2 over int16 vectors.
-func SquaredL2Int16(a, b []int16) float64 {
-	var acc float64
-	for i := range a {
-		d := float64(int32(a[i]) - int32(b[i]))
-		acc += d * d
-	}
-	return acc
-}
+func SquaredL2Int16(a, b []int16) float64 { return kernels.SquaredL2Int16(a, b) }
 
 // SquaredL2Uint16 returns sum (a[i]-b[i])^2 over uint16 vectors.
-func SquaredL2Uint16(a, b []uint16) float64 {
-	var acc float64
-	for i := range a {
-		d := float64(int32(a[i]) - int32(b[i]))
-		acc += d * d
-	}
-	return acc
-}
+func SquaredL2Uint16(a, b []uint16) float64 { return kernels.SquaredL2Uint16(a, b) }
 
 // SquaredL2Float32 returns sum (a[i]-b[i])^2 accumulated in float64.
-// Four independent accumulators break the serial dependency chain on the
-// vector units; the final sum is still float64.
-func SquaredL2Float32(a, b []float32) float64 {
-	var a0, a1, a2, a3 float64
-	i := 0
-	for ; i+4 <= len(a); i += 4 {
-		d0 := float64(a[i+0]) - float64(b[i+0])
-		d1 := float64(a[i+1]) - float64(b[i+1])
-		d2 := float64(a[i+2]) - float64(b[i+2])
-		d3 := float64(a[i+3]) - float64(b[i+3])
-		a0 += d0 * d0
-		a1 += d1 * d1
-		a2 += d2 * d2
-		a3 += d3 * d3
-	}
-	for ; i < len(a); i++ {
-		d := float64(a[i]) - float64(b[i])
-		a0 += d * d
-	}
-	return (a0 + a1) + (a2 + a3)
-}
+func SquaredL2Float32(a, b []float32) float64 { return kernels.SquaredL2Float32(a, b) }
 
 // SquaredL2Float16 returns sum (a[i]-b[i])^2 over binary16 values.
-func SquaredL2Float16(a, b []uint16) float64 {
-	var acc float64
-	for i := range a {
-		d := float64(Float16ToFloat32(a[i])) - float64(Float16ToFloat32(b[i]))
-		acc += d * d
-	}
-	return acc
-}
-
-// DotFloat16 returns sum a[i]*b[i] over binary16 values.
-func DotFloat16(a, b []uint16) float64 {
-	var acc float64
-	for i := range a {
-		acc += float64(Float16ToFloat32(a[i])) * float64(Float16ToFloat32(b[i]))
-	}
-	return acc
-}
-
-func normFloat16(a []uint16) float64 {
-	var acc float64
-	for _, x := range a {
-		v := float64(Float16ToFloat32(x))
-		acc += v * v
-	}
-	return math.Sqrt(acc)
-}
-
-// CosineFloat16 returns 1-cos over binary16 vectors.
-func CosineFloat16(a, b []uint16) float64 {
-	return cosineFromDotNorms(DotFloat16(a, b), normFloat16(a), normFloat16(b))
-}
-
-// Dot-product kernels. All use a float64 accumulator; integer inputs are
-// exact (max int16 dot ~1.1e12 < 2^53). Positive means similar; the index
-// stores -dot so smaller is better.
+func SquaredL2Float16(a, b []uint16) float64 { return kernels.SquaredL2Float16(a, b) }
 
 // DotInt8 returns sum a[i]*b[i] over int8 vectors.
-func DotInt8(a, b []int8) float64 {
-	var acc float64
-	for i := range a {
-		acc += float64(a[i]) * float64(b[i])
-	}
-	return acc
-}
+func DotInt8(a, b []int8) float64 { return kernels.DotInt8(a, b) }
 
 // DotUint8 returns sum a[i]*b[i] over uint8 vectors.
-func DotUint8(a, b []uint8) float64 {
-	var acc float64
-	for i := range a {
-		acc += float64(a[i]) * float64(b[i])
-	}
-	return acc
-}
+func DotUint8(a, b []uint8) float64 { return kernels.DotUint8(a, b) }
 
 // DotInt16 returns sum a[i]*b[i] over int16 vectors.
-func DotInt16(a, b []int16) float64 {
-	var acc float64
-	for i := range a {
-		acc += float64(a[i]) * float64(b[i])
-	}
-	return acc
-}
+func DotInt16(a, b []int16) float64 { return kernels.DotInt16(a, b) }
 
 // DotUint16 returns sum a[i]*b[i] over uint16 vectors.
-func DotUint16(a, b []uint16) float64 {
-	var acc float64
-	for i := range a {
-		acc += float64(a[i]) * float64(b[i])
-	}
-	return acc
-}
+func DotUint16(a, b []uint16) float64 { return kernels.DotUint16(a, b) }
 
 // DotFloat32 returns sum a[i]*b[i] accumulated in float64.
-// Four independent accumulators break the serial dependency chain on the
-// vector units; the final sum is still float64.
-func DotFloat32(a, b []float32) float64 {
-	var a0, a1, a2, a3 float64
-	i := 0
-	for ; i+4 <= len(a); i += 4 {
-		a0 += float64(a[i+0]) * float64(b[i+0])
-		a1 += float64(a[i+1]) * float64(b[i+1])
-		a2 += float64(a[i+2]) * float64(b[i+2])
-		a3 += float64(a[i+3]) * float64(b[i+3])
-	}
-	for ; i < len(a); i++ {
-		a0 += float64(a[i]) * float64(b[i])
-	}
-	return (a0 + a1) + (a2 + a3)
-}
+func DotFloat32(a, b []float32) float64 { return kernels.DotFloat32(a, b) }
 
-// Cosine kernels return 1-cos in [0,2]; 0 for identical, 1 for orthogonal.
-// Zero vectors map to distance 1 (both zero map to 0).
+// DotFloat16 returns sum a[i]*b[i] over binary16 values.
+func DotFloat16(a, b []uint16) float64 { return kernels.DotFloat16(a, b) }
 
 // CosineInt8 returns 1-cos over int8 vectors.
-func CosineInt8(a, b []int8) float64 {
-	return cosineFromDotNorms(DotInt8(a, b), normInt8(a), normInt8(b))
-}
+func CosineInt8(a, b []int8) float64 { return kernels.CosineInt8(a, b) }
 
 // CosineUint8 returns 1-cos over uint8 vectors.
-func CosineUint8(a, b []uint8) float64 {
-	return cosineFromDotNorms(DotUint8(a, b), normUint8(a), normUint8(b))
-}
+func CosineUint8(a, b []uint8) float64 { return kernels.CosineUint8(a, b) }
 
 // CosineInt16 returns 1-cos over int16 vectors.
-func CosineInt16(a, b []int16) float64 {
-	return cosineFromDotNorms(DotInt16(a, b), normInt16(a), normInt16(b))
-}
+func CosineInt16(a, b []int16) float64 { return kernels.CosineInt16(a, b) }
 
 // CosineUint16 returns 1-cos over uint16 vectors.
-func CosineUint16(a, b []uint16) float64 {
-	return cosineFromDotNorms(DotUint16(a, b), normUint16(a), normUint16(b))
-}
+func CosineUint16(a, b []uint16) float64 { return kernels.CosineUint16(a, b) }
 
 // CosineFloat32 returns 1-cos over float32 vectors.
-func CosineFloat32(a, b []float32) float64 {
-	return cosineFromDotNorms(DotFloat32(a, b), normFloat32(a), normFloat32(b))
-}
+func CosineFloat32(a, b []float32) float64 { return kernels.CosineFloat32(a, b) }
 
-func normInt8(a []int8) float64 {
-	var acc float64
-	for _, x := range a {
-		acc += float64(x) * float64(x)
-	}
-	return math.Sqrt(acc)
-}
+// CosineFloat16 returns 1-cos over binary16 vectors.
+func CosineFloat16(a, b []uint16) float64 { return kernels.CosineFloat16(a, b) }
 
-func normUint8(a []uint8) float64 {
-	var acc float64
-	for _, x := range a {
-		acc += float64(x) * float64(x)
-	}
-	return math.Sqrt(acc)
-}
-
-func normInt16(a []int16) float64 {
-	var acc float64
-	for _, x := range a {
-		acc += float64(x) * float64(x)
-	}
-	return math.Sqrt(acc)
-}
-
-func normUint16(a []uint16) float64 {
-	var acc float64
-	for _, x := range a {
-		acc += float64(x) * float64(x)
-	}
-	return math.Sqrt(acc)
-}
-
-func normFloat32(a []float32) float64 {
-	var a0, a1, a2, a3 float64
-	i := 0
-	for ; i+4 <= len(a); i += 4 {
-		a0 += float64(a[i+0]) * float64(a[i+0])
-		a1 += float64(a[i+1]) * float64(a[i+1])
-		a2 += float64(a[i+2]) * float64(a[i+2])
-		a3 += float64(a[i+3]) * float64(a[i+3])
-	}
-	for ; i < len(a); i++ {
-		a0 += float64(a[i]) * float64(a[i])
-	}
-	return math.Sqrt((a0 + a1) + (a2 + a3))
-}
-
-func cosineFromDotNorms(dot, na, nb float64) float64 {
-	if na == 0 && nb == 0 {
-		return 0
-	}
-	if na == 0 || nb == 0 {
-		return 1
-	}
-	cos := dot / (na * nb)
-	// SIMD and scalar accumulation can differ by a few ulps near identical
-	// vectors. Snap the endpoints so a self-search stays exactly zero.
-	const cosineSnap = 1e-7
-	if cos > 1-cosineSnap {
-		cos = 1
-	} else if cos < -1+cosineSnap {
-		cos = -1
-	}
-	return 1 - cos
-}
-
-// Raw-byte kernels reinterpret LE storage without copying. The format
+// Raw-byte helpers reinterpret LE storage without copying. The format
 // requires a little-endian host; Open/Create reject other hosts.
 
-func bytesAsInt8(b []byte, n int) []int8 {
-	return unsafe.Slice((*int8)(unsafe.Pointer(&b[0])), n)
+func bytesAsInt8(b []byte, n int) []int8 { return kernels.BytesAsInt8(b, n) }
+
+func bytesAsUint8(b []byte, n int) []uint8 { return kernels.BytesAsUint8(b, n) }
+
+func bytesAsInt16(b []byte, n int) []int16 { return kernels.BytesAsInt16(b, n) }
+
+func bytesAsUint16(b []byte, n int) []uint16 { return kernels.BytesAsUint16(b, n) }
+
+func bytesAsFloat32(b []byte, n int) []float32 { return kernels.BytesAsFloat32(b, n) }
+
+func cosineFromDotNorms(dot, na, nb float64) float64 {
+	return kernels.CosineFromDotNorms(dot, na, nb)
 }
 
-func bytesAsUint8(b []byte, n int) []uint8 { return b[:n] }
-
-func bytesAsInt16(b []byte, n int) []int16 {
-	return unsafe.Slice((*int16)(unsafe.Pointer(&b[0])), n)
-}
-
-func bytesAsUint16(b []byte, n int) []uint16 {
-	return unsafe.Slice((*uint16)(unsafe.Pointer(&b[0])), n)
-}
-
-func bytesAsFloat32(b []byte, n int) []float32 {
-	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), n)
-}
-
-func squaredL2Int8Bytes(a, b []byte, n int) float64 {
-	return SquaredL2Int8(bytesAsInt8(a, n), bytesAsInt8(b, n))
-}
-
-func squaredL2Uint8Bytes(a, b []byte, n int) float64 {
-	return SquaredL2Uint8(bytesAsUint8(a, n), bytesAsUint8(b, n))
-}
-
-func squaredL2Int16Bytes(a, b []byte, n int) float64 {
-	return SquaredL2Int16(bytesAsInt16(a, n), bytesAsInt16(b, n))
-}
-
-func squaredL2Uint16Bytes(a, b []byte, n int) float64 {
-	return SquaredL2Uint16(bytesAsUint16(a, n), bytesAsUint16(b, n))
-}
-
-func squaredL2Float32Bytes(a, b []byte, n int) float64 {
-	return SquaredL2Float32(bytesAsFloat32(a, n), bytesAsFloat32(b, n))
-}
-
-func squaredL2Float16Bytes(a, b []byte, n int) float64 {
-	return SquaredL2Float16(bytesAsUint16(a, n), bytesAsUint16(b, n))
-}
-
-func negDotFloat16Bytes(a, b []byte, n int) float64 {
-	return -DotFloat16(bytesAsUint16(a, n), bytesAsUint16(b, n))
-}
-
-func negDotInt8Bytes(a, b []byte, n int) float64 {
-	return -DotInt8(bytesAsInt8(a, n), bytesAsInt8(b, n))
-}
-
-func negDotUint8Bytes(a, b []byte, n int) float64 {
-	return -DotUint8(bytesAsUint8(a, n), bytesAsUint8(b, n))
-}
-
-func negDotInt16Bytes(a, b []byte, n int) float64 {
-	return -DotInt16(bytesAsInt16(a, n), bytesAsInt16(b, n))
-}
-
-func negDotUint16Bytes(a, b []byte, n int) float64 {
-	return -DotUint16(bytesAsUint16(a, n), bytesAsUint16(b, n))
-}
-
-func negDotFloat32Bytes(a, b []byte, n int) float64 {
-	return -DotFloat32(bytesAsFloat32(a, n), bytesAsFloat32(b, n))
-}
-
-func cosineInt8Bytes(a, b []byte, n int) float64 {
-	return CosineInt8(bytesAsInt8(a, n), bytesAsInt8(b, n))
-}
-
-func cosineUint8Bytes(a, b []byte, n int) float64 {
-	return CosineUint8(bytesAsUint8(a, n), bytesAsUint8(b, n))
-}
-
-func cosineInt16Bytes(a, b []byte, n int) float64 {
-	return CosineInt16(bytesAsInt16(a, n), bytesAsInt16(b, n))
-}
-
-func cosineUint16Bytes(a, b []byte, n int) float64 {
-	return CosineUint16(bytesAsUint16(a, n), bytesAsUint16(b, n))
-}
-
-func cosineFloat32Bytes(a, b []byte, n int) float64 {
-	return CosineFloat32(bytesAsFloat32(a, n), bytesAsFloat32(b, n))
-}
-
-func cosineFloat16Bytes(a, b []byte, n int) float64 {
-	return CosineFloat16(bytesAsUint16(a, n), bytesAsUint16(b, n))
-}
+func normFloat32(a []float32) float64 { return math.Sqrt(DotFloat32(a, a)) }
 
 // dotSelfBytes returns |q|^2 for the query, used to zero-base dot scores so
 // self-search scores 0 while traversal ordering (offset-invariant) is kept.
 func dotSelfBytes(cfg Config, q []byte) float64 {
-	n := int(cfg.Dimensions)
-	switch cfg.ElementType {
-	case ElementInt8:
-		v := bytesAsInt8(q, n)
-		return DotInt8(v, v)
-	case ElementUint8:
-		v := bytesAsUint8(q, n)
-		return DotUint8(v, v)
-	case ElementInt16:
-		v := bytesAsInt16(q, n)
-		return DotInt16(v, v)
-	case ElementUint16:
-		v := bytesAsUint16(q, n)
-		return DotUint16(v, v)
-	case ElementFloat32:
-		v := bytesAsFloat32(q, n)
-		return DotFloat32(v, v)
-	case ElementFloat16:
-		v := bytesAsUint16(q, n)
-		return DotFloat16(v, v)
-	default:
+	e, ok := kernelElement(cfg.ElementType)
+	if !ok {
 		return 0
 	}
+	return kernels.SelfDot(e, q, int(cfg.Dimensions))
 }
 
 // EncodeScore maps an internal L2/dot distance to the public uint32
