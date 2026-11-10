@@ -46,7 +46,9 @@
 //     query buffer) and SearchInto result reuse with zero steady-state allocs
 //     on the flat and ANN paths. SearchFloat32WithOptions adds cancellation,
 //     per-query ef/oversample controls, and SearchCandidatesFloat32 scores a
-//     caller-supplied filtered candidate set exactly.
+//     caller-supplied filtered candidate set exactly. Query plus the generic
+//     Search/SearchInto/ExactSearch/SearchCandidates methods serve callers that
+//     choose the element type at runtime; Snapshot exposes the same surface.
 //
 // # Current experimental limits
 //

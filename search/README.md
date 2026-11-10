@@ -118,7 +118,7 @@ ids, err := executor.AppendIDs(ctx, dst[:0], plan)
 | `Visit` | Sorted IDs with error reporting and early callback stop. |
 | `RankTime` | Top-k by exact `uint64` timestamp gap. |
 | `RankGeo` | Top-k by `float64` haversine metres, including fractional metres. |
-| `RankVector` | Top-k vector matches with plan liveness/ACL and selective-filter handling. |
+| `RankVector` / `RankVectorQuery` | Top-k vector matches with plan liveness/ACL and selective-filter handling; `RankVectorQuery` accepts any `vectoridx` element type. |
 | `FilterRanked` | Probe supplied entries, preserving order, duplicates and scores. |
 
 ## Per-run metrics
@@ -209,6 +209,14 @@ vec, ok := engine.Vector(ns) // the registered embedding namespace
 if !ok { return search.ErrNamespaceUnavailable }
 hits, err := plan.RankVector(ctx, nil, &ws, vec, queryEmbedding, 50)
 // hits[i].ImageID, hits[i].Distance, hits[i].Score
+```
+
+`RankVectorQuery` accepts any vector element type supported by `vectoridx`
+through `search.VectorQuery` (`vectoridx.Query`):
+
+```go
+hits, err := plan.RankVectorQuery(ctx, nil, &ws, vec,
+    search.VectorQuery{Int8: quantizedQuery}, 50)
 ```
 
 `FilterRanked` remains as the low-level bridge when the caller already owns an

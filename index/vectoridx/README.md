@@ -95,11 +95,20 @@ filter := vectoridx.CandidateFilter(func(id vectoridx.NodeID) bool {
 ```
 
 Typed `Add`/`Search`/`SearchInto` variants exist for all six element
-types (`Int8`, `Uint8`, `Int16`, `Uint16`, `Float32`, `Float16`). There are no
-`any`-typed hot paths: dispatch happens once per call, distance dispatch
-once per index open. FP16 values are stored as IEEE binary16 bits in
-`[]uint16`; `Float16ToFloat32` and `Float32ToFloat16` are provided for
-conversion at the application boundary.
+types (`Int8`, `Uint8`, `Int16`, `Uint16`, `Float32`, `Float16`). Callers that
+select the element type at runtime can use `Query` with the generic
+`Search`, `SearchInto`, `ExactSearch`, and `SearchCandidates` methods:
+
+```go
+results, err := idx.Search(vectoridx.Query{Float32: query},
+    vectoridx.SearchOptions{K: 10, FilterHint: 2500})
+```
+
+`Snapshot` exposes the same generic query surface. There are no `any`-typed
+hot paths: dispatch happens once per call, distance dispatch once per index
+open. FP16 values are stored as IEEE binary16 bits in `[]uint16`;
+`Float16ToFloat32` and `Float32ToFloat16` are provided for conversion at the
+application boundary.
 
 For an application-level text-to-image guide using an external image/text
 encoder, see the repository root
@@ -239,15 +248,20 @@ graph fail loudly.
 | `doc.go` | Package overview, experimental scope and current limitations |
 | `types.go` | Namespace/Dimensions/NodeID/ElementType/Config/Result/CandidateFilter/errors |
 | `distance.go` | Public scalar kernel API, metric dispatch, `EncodeScore` |
+| `query.go` | Typed `Query` validation and raw encoding |
+| `search.go` | VectorIdx generic/typed search, exact scan, candidate scoring |
+| `snapshot.go` | Pinned read-only snapshot and generic/typed search |
 | `float16.go` | Public IEEE binary16 conversion helpers |
 | `internal/kernels/kernels.go` | Element type and raw-kernel dispatch |
 | `internal/kernels/{integer,fp32,fp16}.go` | Typed scalar reference kernels |
 | `internal/kernels/*_arm64.*`, `*_amd64.*` | NEON/AVX2 assembly kernels |
 | `internal/kernels/util.go` | Raw byte views and cosine helper |
 | `searchctx.go` | Pooled scratch: heaps, generation-tag visited set, buffers |
-| `snapshot.go` | Pinned read-only snapshot, context-aware search, candidate scoring |
 | `hnsw.go` | Locator, greedy descent, layer search, assembly, exact oracle |
-| `index.go` | VectorIdx: typed Add/Search, Delete, Checkpoint/Compact/Verify, async queue, policies |
+| `index.go` | VectorIdx core: construction, writer helpers, mutation internals |
+| `storage.go` | Snapshot chunk storage, locators, dense table, tombstones |
+| `mutation.go` | Typed Add methods, batch add/delete |
+| `maintenance.go` | Checkpoint/Compact/Verify, async queue, sync, runtime policies |
 | `options.go` | Runtime `Option`s (WithSyncInterval) |
 | `stats.go` | `Stats`/`FileSize`/`CompactionResult` |
 | `format.go` | Base superblock + region encode/decode, `VerifyFile` |

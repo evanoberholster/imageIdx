@@ -140,3 +140,90 @@ func TestRankVectorInvalidOptions(t *testing.T) {
 		t.Fatal("nil vector index accepted")
 	}
 }
+
+func TestRankVectorQueryInt8(t *testing.T) {
+	defs := schematypes.NewDefinitions()
+	vectorDef, err := index.VectorDef(vectoridx.Config{
+		Namespace:   60,
+		Dimensions:  vectoridx.Dim512,
+		ElementType: vectoridx.ElementInt8,
+		Metric:      vectoridx.MetricL2,
+	}, "int8-embedding", schematypes.EntityImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := defs.Register(vectorDef); err != nil {
+		t.Fatal(err)
+	}
+	db, err := index.Create(t.TempDir(), index.Spec{Schema: defs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	rng := rand.New(rand.NewSource(402))
+	vectors := make([][]int8, 20)
+	for i := range vectors {
+		vectors[i] = make([]int8, vectoridx.Dim512)
+		for j := range vectors[i] {
+			vectors[i][j] = int8(rng.Intn(256) - 128)
+		}
+		if err := db.Add(index.Entry{
+			ValueID: schematypes.ValueID(i + 1),
+			Vectors: []index.VectorValue{{
+				Namespace: 60,
+				Element:   vectoridx.ElementInt8,
+				Int8:      vectors[i],
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	engine, err := New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vec, ok := engine.Vector(60)
+	if !ok {
+		t.Fatal("int8 vector namespace unavailable")
+	}
+	plan, err := engine.Compile(schematypes.EntityImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := NewWorkspace(16)
+	query := VectorQuery{Int8: vectors[0]}
+	got, err := plan.RankVectorQuery(context.Background(), nil, ws, vec, query, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("RankVectorQuery returned %d results, want 5", len(got))
+	}
+	if got[0].ImageID != 1 || got[0].Distance != 0 {
+		t.Fatalf("self result = %+v, want image 1 distance 0", got[0])
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].Distance < got[i-1].Distance {
+			t.Fatalf("results not distance ordered: %+v", got)
+		}
+	}
+
+	// Force the ANN branch with the int8 index.
+	if err := vec.SetSearchParams(0, 0, 0, 0, 1, -1, 0); err != nil {
+		t.Fatal(err)
+	}
+	ann, err := plan.RankVectorQuery(context.Background(), nil, ws, vec, query, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ann) != 3 {
+		t.Fatalf("ANN RankVectorQuery returned %d results, want 3", len(ann))
+	}
+	for _, r := range ann {
+		if r.ImageID < 1 || r.ImageID > 20 {
+			t.Fatalf("ANN result outside namespace: %+v", ann)
+		}
+	}
+}

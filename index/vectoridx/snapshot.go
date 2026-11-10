@@ -90,103 +90,163 @@ func (s *Snapshot) ready() error {
 // Err reports whether this snapshot is usable.
 func (s *Snapshot) Err() error { return s.ready() }
 
-// SearchFloat32 returns up to k nearest live neighbors in this snapshot.
-func (s *Snapshot) SearchFloat32(query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	return s.SearchFloat32WithOptions(nil, query, SearchOptions{K: k, Filter: filter, FilterHint: UnknownFilterHint})
+// Search returns up to opts.K nearest live neighbors in this snapshot for a
+// typed query. The query element type must match the pinned index.
+func (s *Snapshot) Search(query Query, opts SearchOptions) ([]Result, error) {
+	return s.SearchContext(nil, query, opts)
 }
 
-// SearchFloat32WithOptions is SearchFloat32 with cancellation and per-query
-// ef/oversample/filter-hint controls.
-func (s *Snapshot) SearchFloat32WithOptions(queryCtx context.Context, query []float32, opts SearchOptions) ([]Result, error) {
+// SearchContext is Search with cancellation.
+func (s *Snapshot) SearchContext(queryCtx context.Context, query Query, opts SearchOptions) ([]Result, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
-	if s.view.cfg.ElementType != ElementFloat32 || len(query) != s.view.dims {
-		return nil, ErrInvalidVector
+	if _, err := query.validate(s.view.cfg); err != nil {
+		return nil, err
 	}
-	hint := opts.FilterHint
-	if hint == 0 {
-		hint = UnknownFilterHint
-	}
-	return s.view.searchEncodedWithOptions(queryCtx, opts.Filter, opts.K, hint, opts.EfSearch, opts.Oversample, func(dst []byte) []byte {
-		return encodeRawFloat32(dst, query)
-	})
+	return s.view.searchEncodedWithOptions(queryCtx, opts.Filter, opts.K, normalizeFilterHint(opts.FilterHint), opts.EfSearch, opts.Oversample, query.encode)
 }
 
-// SearchFloat32Context is SearchFloat32 with cancellation.
-func (s *Snapshot) SearchFloat32Context(queryCtx context.Context, query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	return s.SearchFloat32WithOptions(queryCtx, query, SearchOptions{K: k, Filter: filter, FilterHint: UnknownFilterHint})
+// SearchInto appends matches to dst, reusing caller storage.
+func (s *Snapshot) SearchInto(dst []Result, query Query, opts SearchOptions) ([]Result, error) {
+	return s.SearchIntoContext(nil, dst, query, opts)
 }
 
-// SearchIntoFloat32 appends matches to dst, reusing caller storage.
-func (s *Snapshot) SearchIntoFloat32(dst []Result, query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	return s.SearchIntoFloat32WithOptions(nil, dst, query, SearchOptions{K: k, Filter: filter, FilterHint: UnknownFilterHint})
-}
-
-// SearchIntoFloat32WithOptions appends matches to dst with per-query controls.
-func (s *Snapshot) SearchIntoFloat32WithOptions(queryCtx context.Context, dst []Result, query []float32, opts SearchOptions) ([]Result, error) {
+// SearchIntoContext is SearchInto with cancellation.
+func (s *Snapshot) SearchIntoContext(queryCtx context.Context, dst []Result, query Query, opts SearchOptions) ([]Result, error) {
 	if err := s.ready(); err != nil {
 		return dst, err
 	}
-	if s.view.cfg.ElementType != ElementFloat32 || len(query) != s.view.dims {
-		return dst, ErrInvalidVector
+	if _, err := query.validate(s.view.cfg); err != nil {
+		return dst, err
 	}
-	hint := opts.FilterHint
-	if hint == 0 {
-		hint = UnknownFilterHint
-	}
-	return s.view.searchIntoEncodedWithOptions(queryCtx, dst, opts.Filter, opts.K, hint, opts.EfSearch, opts.Oversample, func(scratch []byte) []byte {
-		return encodeRawFloat32(scratch, query)
-	})
+	return s.view.searchIntoEncodedWithOptions(queryCtx, dst, opts.Filter, opts.K, normalizeFilterHint(opts.FilterHint), opts.EfSearch, opts.Oversample, query.encode)
 }
 
-// SearchIntoFloat32Context is SearchIntoFloat32 with cancellation.
-func (s *Snapshot) SearchIntoFloat32Context(queryCtx context.Context, dst []Result, query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	return s.SearchIntoFloat32WithOptions(queryCtx, dst, query, SearchOptions{K: k, Filter: filter, FilterHint: UnknownFilterHint})
+// ExactSearch runs the scalar exact reference scan in this snapshot.
+func (s *Snapshot) ExactSearch(query Query, filter CandidateFilter, k int) ([]Result, error) {
+	return s.ExactSearchContext(nil, query, filter, k)
 }
 
-// ExactSearchFloat32 runs the scalar exact reference scan in this snapshot.
-func (s *Snapshot) ExactSearchFloat32(query []float32, filter CandidateFilter, k int) ([]Result, error) {
-	return s.ExactSearchFloat32Context(nil, query, filter, k)
-}
-
-// ExactSearchFloat32Context is ExactSearchFloat32 with cancellation.
-func (s *Snapshot) ExactSearchFloat32Context(queryCtx context.Context, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+// ExactSearchContext is ExactSearch with cancellation.
+func (s *Snapshot) ExactSearchContext(queryCtx context.Context, query Query, filter CandidateFilter, k int) ([]Result, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
-	if s.view.cfg.ElementType != ElementFloat32 || len(query) != s.view.dims {
-		return nil, ErrInvalidVector
+	if _, err := query.validate(s.view.cfg); err != nil {
+		return nil, err
 	}
 	if k <= 0 {
 		return nil, ErrInvalidQuery
 	}
-	raw := encodeRawFloat32(nil, query)
-	return s.view.exactSearch(queryCtx, raw, filter, k)
+	if queryCtx != nil {
+		if err := queryCtx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return s.view.exactSearch(queryCtx, query.encode(nil), filter, k)
 }
 
-// SearchCandidatesFloat32 scores exactly the supplied unique candidate NodeIDs.
-func (s *Snapshot) SearchCandidatesFloat32(queryCtx context.Context, candidates []NodeID, query []float32, k int) ([]Result, error) {
+// SearchCandidates scores exactly the supplied unique candidate NodeIDs.
+func (s *Snapshot) SearchCandidates(queryCtx context.Context, candidates []NodeID, query Query, k int) ([]Result, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
-	if s.view.cfg.ElementType != ElementFloat32 || len(query) != s.view.dims {
-		return nil, ErrInvalidVector
+	if _, err := query.validate(s.view.cfg); err != nil {
+		return nil, err
 	}
 	if k <= 0 {
 		return nil, ErrInvalidQuery
 	}
 	out := make([]Result, 0, min(k, len(candidates)))
-	return s.SearchCandidatesIntoFloat32(queryCtx, out, candidates, query, k)
+	return s.SearchCandidatesInto(queryCtx, out, candidates, query, k)
+}
+
+// SearchCandidatesInto appends the best candidate matches to dst.
+func (s *Snapshot) SearchCandidatesInto(queryCtx context.Context, dst []Result, candidates []NodeID, query Query, k int) ([]Result, error) {
+	if err := s.ready(); err != nil {
+		return dst, err
+	}
+	if _, err := query.validate(s.view.cfg); err != nil {
+		return dst, err
+	}
+	return s.view.searchCandidatesEncoded(queryCtx, dst, candidates, query.encode, k)
+}
+
+func (s *vectorSnapshot) searchCandidatesEncoded(queryCtx context.Context, dst []Result, candidates []NodeID, encode queryEncoder, k int) ([]Result, error) {
+	if k <= 0 {
+		return dst, ErrInvalidQuery
+	}
+	if queryCtx != nil {
+		if err := queryCtx.Err(); err != nil {
+			return dst, err
+		}
+	}
+	ctx := acquireSearchContext()
+	defer releaseSearchContext(ctx)
+	ctx.ctx = queryCtx
+	ctx.err = nil
+	if cap(ctx.queryBuf) < s.vecBytes {
+		ctx.queryBuf = make([]byte, s.vecBytes)
+	}
+	raw := encode(ctx.queryBuf[:0])
+	ctx.queryBuf = raw
+	out := s.searchCandidatesInto(ctx, dst, candidates, raw, k)
+	if ctx.err != nil {
+		return dst, ctx.err
+	}
+	return out, nil
+}
+
+// ---- typed Snapshot conveniences ----
+
+// SearchFloat32 returns up to k nearest live neighbors in this snapshot.
+func (s *Snapshot) SearchFloat32(query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return s.Search(Query{Float32: query}, SearchOptions{K: k, Filter: filter})
+}
+
+// SearchFloat32WithOptions is SearchFloat32 with cancellation and per-query
+// ef/oversample/filter-hint controls.
+func (s *Snapshot) SearchFloat32WithOptions(queryCtx context.Context, query []float32, opts SearchOptions) ([]Result, error) {
+	return s.SearchContext(queryCtx, Query{Float32: query}, opts)
+}
+
+// SearchFloat32Context is SearchFloat32 with cancellation.
+func (s *Snapshot) SearchFloat32Context(queryCtx context.Context, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return s.SearchContext(queryCtx, Query{Float32: query}, SearchOptions{K: k, Filter: filter})
+}
+
+// SearchIntoFloat32 appends matches to dst, reusing caller storage.
+func (s *Snapshot) SearchIntoFloat32(dst []Result, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return s.SearchInto(dst, Query{Float32: query}, SearchOptions{K: k, Filter: filter})
+}
+
+// SearchIntoFloat32WithOptions appends matches to dst with per-query controls.
+func (s *Snapshot) SearchIntoFloat32WithOptions(queryCtx context.Context, dst []Result, query []float32, opts SearchOptions) ([]Result, error) {
+	return s.SearchIntoContext(queryCtx, dst, Query{Float32: query}, opts)
+}
+
+// SearchIntoFloat32Context is SearchIntoFloat32 with cancellation.
+func (s *Snapshot) SearchIntoFloat32Context(queryCtx context.Context, dst []Result, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return s.SearchIntoContext(queryCtx, dst, Query{Float32: query}, SearchOptions{K: k, Filter: filter})
+}
+
+// ExactSearchFloat32 runs the scalar exact reference scan in this snapshot.
+func (s *Snapshot) ExactSearchFloat32(query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return s.ExactSearch(Query{Float32: query}, filter, k)
+}
+
+// ExactSearchFloat32Context is ExactSearchFloat32 with cancellation.
+func (s *Snapshot) ExactSearchFloat32Context(queryCtx context.Context, query []float32, filter CandidateFilter, k int) ([]Result, error) {
+	return s.ExactSearchContext(queryCtx, Query{Float32: query}, filter, k)
+}
+
+// SearchCandidatesFloat32 scores exactly the supplied unique candidate NodeIDs.
+func (s *Snapshot) SearchCandidatesFloat32(queryCtx context.Context, candidates []NodeID, query []float32, k int) ([]Result, error) {
+	return s.SearchCandidates(queryCtx, candidates, Query{Float32: query}, k)
 }
 
 // SearchCandidatesIntoFloat32 appends the best candidate matches to dst.
 func (s *Snapshot) SearchCandidatesIntoFloat32(queryCtx context.Context, dst []Result, candidates []NodeID, query []float32, k int) ([]Result, error) {
-	if err := s.ready(); err != nil {
-		return dst, err
-	}
-	if s.view.cfg.ElementType != ElementFloat32 || len(query) != s.view.dims {
-		return dst, ErrInvalidVector
-	}
-	return s.view.searchCandidatesFloat32(queryCtx, dst, candidates, query, k)
+	return s.SearchCandidatesInto(queryCtx, dst, candidates, Query{Float32: query}, k)
 }

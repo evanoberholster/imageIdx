@@ -6,6 +6,10 @@ import (
 	"github.com/evanoberholster/imageIdx/index/vectoridx"
 )
 
+// VectorQuery is a typed vector query. It is an alias for vectoridx.Query so
+// callers can pass any supported element type through the search layer.
+type VectorQuery = vectoridx.Query
+
 // VectorResult is one ANN/filtered-vector result. Distance is the raw index
 // metric distance (smaller is better); Score is vectoridx's encoded score.
 type VectorResult struct {
@@ -30,11 +34,23 @@ type VectorOptions struct {
 // idx through Engine.Vector so the namespace belongs to the same unified store
 // as the plan.
 func (plan Plan) RankVector(ctx context.Context, dst []VectorResult, ws *Workspace, idx *vectoridx.VectorIdx, query []float32, k int) ([]VectorResult, error) {
-	return plan.RankVectorWithOptions(ctx, dst, ws, idx, query, k, VectorOptions{})
+	return plan.RankVectorQuery(ctx, dst, ws, idx, vectoridx.Query{Float32: query}, k)
 }
 
 // RankVectorWithOptions is RankVector with per-query controls.
 func (plan Plan) RankVectorWithOptions(ctx context.Context, dst []VectorResult, ws *Workspace, idx *vectoridx.VectorIdx, query []float32, k int, opts VectorOptions) ([]VectorResult, error) {
+	return plan.RankVectorQueryWithOptions(ctx, dst, ws, idx, vectoridx.Query{Float32: query}, k, opts)
+}
+
+// RankVectorQuery applies the plan to a typed vector query. It is the generic
+// form of RankVector: query must contain exactly one slice matching the vector
+// namespace's element type.
+func (plan Plan) RankVectorQuery(ctx context.Context, dst []VectorResult, ws *Workspace, idx *vectoridx.VectorIdx, query vectoridx.Query, k int) ([]VectorResult, error) {
+	return plan.RankVectorQueryWithOptions(ctx, dst, ws, idx, query, k, VectorOptions{})
+}
+
+// RankVectorQueryWithOptions is RankVectorQuery with per-query controls.
+func (plan Plan) RankVectorQueryWithOptions(ctx context.Context, dst []VectorResult, ws *Workspace, idx *vectoridx.VectorIdx, query vectoridx.Query, k int, opts VectorOptions) ([]VectorResult, error) {
 	if idx == nil || k <= 0 {
 		return dst, ErrInvalidOptions
 	}
@@ -89,7 +105,7 @@ func (plan Plan) RankVectorWithOptions(ctx context.Context, dst []VectorResult, 
 				}
 				ws.vectorNodes = append(ws.vectorNodes, vectoridx.NodeID(id))
 			}
-			results, err := snap.SearchCandidatesIntoFloat32(ctx, ws.vectorResults[:0], ws.vectorNodes, query, k)
+			results, err := snap.SearchCandidatesInto(ctx, ws.vectorResults[:0], ws.vectorNodes, query, k)
 			ws.vectorResults = results
 			if err != nil {
 				return dst, err
@@ -121,7 +137,7 @@ func (plan Plan) RankVectorWithOptions(ctx context.Context, dst []VectorResult, 
 	}
 	start := len(dst)
 	for {
-		ann, err := snap.SearchIntoFloat32WithOptions(ctx, ws.vectorResults[:0], query, vectoridx.SearchOptions{
+		ann, err := snap.SearchIntoContext(ctx, ws.vectorResults[:0], query, vectoridx.SearchOptions{
 			K:          over,
 			FilterHint: hint,
 			EfSearch:   opts.EfSearch,
